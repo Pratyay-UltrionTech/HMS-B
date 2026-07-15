@@ -10,11 +10,15 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  APP_NAME: HMS-Ultrion-Dev
+  PYTHON_VERSION: '3.14'
+
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -22,44 +26,47 @@ jobs:
       - name: Set up Python version
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
-      # 🛠️ Local Build Section (Optional)
-      # The following section in your workflow is designed to catch build issues early on the client side, before deployment. This can be helpful for debugging and validation. However, if this step significantly increases deployment time and early detection is not critical for your workflow, you may remove this section to streamline the deployment process.
-      - name: Create and Start virtual environment and Install dependencies
+      - name: Create virtual environment and install dependencies
         run: |
           python -m venv antenv
           source antenv/bin/activate
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-                
-      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size. 
+
+      # Ship antenv so Azure does not run a long remote Oryx build (that was restarting SCM mid-deploy).
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
+          include-hidden-files: true
           path: |
             .
-            !antenv/
-
-      # 🚫 Opting Out of Oryx Build
-      # If you prefer to disable the Oryx build process during deployment, follow these steps:
-      # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
-      # 2. Refer to sample workflows for alternative deployment strategies: https://github.com/Azure/actions-workflow-samples/tree/master/AppService
-      
+            !.git/
+            !.github/
+            !.env
+            !.env.*
+            !**/__pycache__/
+            !**/*.pyc
+            !.pytest_cache/
+            !.mypy_cache/
+            !.venv/
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
+      id-token: write
+      contents: read
 
     steps:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -67,10 +74,79 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_722F9F68A94142E7BCE13E5BAD0CA697 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_67EF4B9861994501B8A26C1372B75344 }}
 
-      - name: 'Deploy to Azure Web App'
+      # Disabling remote build avoids 15–20m Oryx runs that collide with SCM restarts.
+      # Only update settings when needed — appsettings changes restart SCM.
+      - name: Disable remote Oryx build if needed
+        id: appsettings
+        run: |
+          set -euo pipefail
+          RG=$(az webapp list --query "[?name=='${{ env.APP_NAME }}'].resourceGroup | [0]" -o tsv)
+          if [ -z "$RG" ]; then
+            echo "Could not resolve resource group for ${{ env.APP_NAME }}"
+            exit 1
+          fi
+          echo "RESOURCE_GROUP=$RG" >> "$GITHUB_ENV"
+
+          SCM_BUILD=$(az webapp config appsettings list \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "$RG" \
+            --query "[?name=='SCM_DO_BUILD_DURING_DEPLOYMENT'].value | [0]" -o tsv)
+          ORYX_BUILD=$(az webapp config appsettings list \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "$RG" \
+            --query "[?name=='ENABLE_ORYX_BUILD'].value | [0]" -o tsv)
+
+          NEED_UPDATE=false
+          if [ "${SCM_BUILD}" != "false" ]; then NEED_UPDATE=true; fi
+          if [ "${ORYX_BUILD}" != "false" ]; then NEED_UPDATE=true; fi
+
+          if [ "$NEED_UPDATE" = "true" ]; then
+            echo "Updating app settings to disable remote build..."
+            az webapp config appsettings set \
+              --name "${{ env.APP_NAME }}" \
+              --resource-group "$RG" \
+              --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false ENABLE_ORYX_BUILD=false \
+              --output none
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Remote build already disabled."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for SCM to settle after settings change
+        if: steps.appsettings.outputs.changed == 'true'
+        run: |
+          echo "App settings change restarts SCM; waiting 90s before deploy..."
+          sleep 90
+
+      - name: Brief settle before deploy
+        if: steps.appsettings.outputs.changed != 'true'
+        run: sleep 20
+
+      - name: Deploy to Azure Web App
+        id: deploy
+        continue-on-error: true
         uses: azure/webapps-deploy@v3
-        id: deploy-to-webapp
         with:
-          app-name: 'HMS-Ultrion-Dev'
-          slot-name: 'Production'
-          
+          app-name: ${{ env.APP_NAME }}
+          slot-name: Production
+
+      - name: Wait before deploy retry
+        if: steps.deploy.outcome == 'failure'
+        run: |
+          echo "First deploy failed (often SCM restart). Waiting 90s then retrying..."
+          sleep 90
+
+      - name: Deploy to Azure Web App (retry)
+        id: deploy-retry
+        if: steps.deploy.outcome == 'failure'
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.APP_NAME }}
+          slot-name: Production
+
+      - name: Fail if deploy still unsuccessful
+        if: steps.deploy.outcome == 'failure' && steps.deploy-retry.outcome != 'success'
+        run: |
+          echo "Deployment failed after retry."
+          exit 1
