@@ -29,20 +29,28 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      # App Service Linux extracts antenv.tar.gz at startup. Shipping only an antenv/
-      # folder leaves an old Oryx antenv.tar.gz on the site (sqlalchemy 2.0.36), which
-      # keeps crashing on Python 3.14 even after requirements.txt is updated.
+      # App Service extracts antenv.tar.gz into /antenv and sets
+      # PYTHONPATH=/antenv/lib/python3.14/site-packages. The archive root must be
+      # bin/, lib/, … — NOT a nested antenv/ folder (that causes ModuleNotFoundError).
       - name: Create virtual environment and package antenv.tar.gz
         run: |
           python -m venv antenv
           source antenv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -c "import sqlalchemy; print('sqlalchemy', sqlalchemy.__version__)"
+          python -c "import fastapi, sqlalchemy; print('fastapi', fastapi.__version__); print('sqlalchemy', sqlalchemy.__version__)"
           deactivate
-          tar -czf antenv.tar.gz antenv
+          # Pack venv contents at archive root (Oryx extracts into /antenv)
+          tar -czf antenv.tar.gz -C antenv .
           rm -rf antenv
+          echo "Archive top entries (must be bin/ lib/ etc, not antenv/):"
+          tar -tzf antenv.tar.gz | head -n 20
           ls -lh antenv.tar.gz
+          # Sanity: extracting to a temp dir must yield lib/python*/site-packages/fastapi
+          mkdir -p /tmp/antenv-check
+          tar -xzf antenv.tar.gz -C /tmp/antenv-check
+          test -d /tmp/antenv-check/lib/python3.14/site-packages/fastapi
+          echo "antenv.tar.gz layout OK"
 
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
