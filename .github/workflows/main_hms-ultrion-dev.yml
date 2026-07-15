@@ -29,14 +29,21 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - name: Create virtual environment and install dependencies
+      # App Service Linux extracts antenv.tar.gz at startup. Shipping only an antenv/
+      # folder leaves an old Oryx antenv.tar.gz on the site (sqlalchemy 2.0.36), which
+      # keeps crashing on Python 3.14 even after requirements.txt is updated.
+      - name: Create virtual environment and package antenv.tar.gz
         run: |
           python -m venv antenv
           source antenv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -c "import sqlalchemy; print('sqlalchemy', sqlalchemy.__version__)"
+          deactivate
+          tar -czf antenv.tar.gz antenv
+          rm -rf antenv
+          ls -lh antenv.tar.gz
 
-      # Ship antenv so Azure does not run a long remote Oryx build (that was restarting SCM mid-deploy).
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -53,6 +60,7 @@ jobs:
             !.pytest_cache/
             !.mypy_cache/
             !.venv/
+            !antenv/
 
   deploy:
     runs-on: ubuntu-latest
