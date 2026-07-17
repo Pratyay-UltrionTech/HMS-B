@@ -9,6 +9,7 @@ from app.models import (
     AppointmentType,
     Department,
     Holiday,
+    OtRoom,
     Room,
     ShiftType,
     Supplier,
@@ -25,6 +26,9 @@ from app.schemas_masters import (
     HolidayCreate,
     HolidayResponse,
     HolidayUpdate,
+    OtRoomCreate,
+    OtRoomResponse,
+    OtRoomUpdate,
     RoomCreate,
     RoomResponse,
     RoomUpdate,
@@ -41,7 +45,7 @@ from app.schemas_masters import (
     WingResponse,
     WingUpdate,
 )
-from app.utils.auth import get_hospital_uuid, require_hospital_admin
+from app.utils.auth import get_hospital_context, get_hospital_uuid, require_hospital_admin
 from app.utils.audit import write_audit
 
 router = APIRouter(prefix="/masters", tags=["masters"])
@@ -156,14 +160,15 @@ def create_department(
     hospital_id: UUID = Depends(get_hospital_uuid),
     actor: dict = Depends(require_hospital_admin),
 ):
-    _get_or_404(db, Wing, payload.wing_id, hospital_id, "Wing")
+    if payload.wing_id:
+        _get_or_404(db, Wing, payload.wing_id, hospital_id, "Wing")
     dept = Department(hospital_id=hospital_id, **payload.model_dump())
     db.add(dept)
     db.flush()
     _audit(db, hospital_id, actor, "create", "department", dept.id, f"Created department '{dept.name}'")
     db.commit()
     db.refresh(dept)
-    wing = db.query(Wing).filter(Wing.id == dept.wing_id).first()
+    wing = db.query(Wing).filter(Wing.id == dept.wing_id).first() if dept.wing_id else None
     data = DepartmentResponse.model_validate(dept)
     data.wing_name = wing.name if wing else None
     return data
@@ -178,13 +183,15 @@ def update_department(
     actor: dict = Depends(require_hospital_admin),
 ):
     dept = _get_or_404(db, Department, department_id, hospital_id, "Department")
-    if payload.wing_id is not None:
-        _get_or_404(db, Wing, payload.wing_id, hospital_id, "Wing")
-    _apply_updates(dept, payload)
+    updates = payload.model_dump(exclude_unset=True)
+    if "wing_id" in updates and updates["wing_id"] is not None:
+        _get_or_404(db, Wing, updates["wing_id"], hospital_id, "Wing")
+    for key, value in updates.items():
+        setattr(dept, key, value)
     _audit(db, hospital_id, actor, "update", "department", dept.id, f"Updated department '{dept.name}'")
     db.commit()
     db.refresh(dept)
-    wing = db.query(Wing).filter(Wing.id == dept.wing_id).first()
+    wing = db.query(Wing).filter(Wing.id == dept.wing_id).first() if dept.wing_id else None
     data = DepartmentResponse.model_validate(dept)
     data.wing_name = wing.name if wing else None
     return data
@@ -428,11 +435,13 @@ def update_ward(
     hospital_id: UUID = Depends(get_hospital_uuid),
 ):
     ward = _get_or_404(db, Ward, ward_id, hospital_id, "Ward")
-    if payload.wing_id:
-        _get_or_404(db, Wing, payload.wing_id, hospital_id, "Wing")
-    if payload.department_id:
-        _get_or_404(db, Department, payload.department_id, hospital_id, "Department")
-    _apply_updates(ward, payload)
+    updates = payload.model_dump(exclude_unset=True)
+    if updates.get("wing_id"):
+        _get_or_404(db, Wing, updates["wing_id"], hospital_id, "Wing")
+    if updates.get("department_id"):
+        _get_or_404(db, Department, updates["department_id"], hospital_id, "Department")
+    for key, value in updates.items():
+        setattr(ward, key, value)
     db.commit()
     db.refresh(ward)
     data = WardResponse.model_validate(ward)
@@ -518,6 +527,122 @@ def delete_room(
 ):
     room = _get_or_404(db, Room, room_id, hospital_id, "Room")
     db.delete(room)
+    db.commit()
+
+
+def _ot_room_response(db: Session, room: OtRoom) -> OtRoomResponse:
+    data = OtRoomResponse.model_validate(room)
+    if room.wing_id:
+        wing = db.query(Wing).filter(Wing.id == room.wing_id).first()
+        data.wing_name = wing.name if wing else None
+    dept = db.query(Department).filter(Department.id == room.department_id).first()
+    data.department_name = dept.name if dept else None
+    return data
+
+
+# ── OT Rooms ───────────────────────────────────────────────────────────────────
+@router.get("/ot-rooms", response_model=list[OtRoomResponse])
+def list_ot_rooms(
+    department_id: UUID | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Readable by hospital admin and staff (used by OT booking)."""
+    q = db.query(OtRoom).filter(OtRoom.hospital_id == hospital_id)
+    if department_id is not None:
+        q = q.filter(OtRoom.department_id == department_id)
+    if active_only:
+        q = q.filter(OtRoom.is_active.is_(True))
+    rooms = q.order_by(OtRoom.code).all()
+    return [_ot_room_response(db, r) for r in rooms]
+
+
+@router.post("/ot-rooms", response_model=OtRoomResponse, status_code=status.HTTP_201_CREATED)
+def create_ot_room(
+    payload: OtRoomCreate,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    actor: dict = Depends(require_hospital_admin),
+):
+    if payload.wing_id:
+        _get_or_404(db, Wing, payload.wing_id, hospital_id, "Wing")
+    _get_or_404(db, Department, payload.department_id, hospital_id, "Department")
+    code = payload.code.strip().upper()
+    exists = (
+        db.query(OtRoom.id)
+        .filter(OtRoom.hospital_id == hospital_id, OtRoom.code == code)
+        .first()
+    )
+    if exists:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="OT room code already exists")
+    room = OtRoom(
+        hospital_id=hospital_id,
+        wing_id=payload.wing_id,
+        department_id=payload.department_id,
+        code=code,
+        name=payload.name.strip(),
+        description=payload.description.strip() if payload.description else None,
+        is_active=payload.is_active,
+    )
+    db.add(room)
+    db.flush()
+    _audit(db, hospital_id, actor, "create", "ot_room", room.id, f"Created OT room '{room.code}'")
+    db.commit()
+    db.refresh(room)
+    return _ot_room_response(db, room)
+
+
+@router.put("/ot-rooms/{room_id}", response_model=OtRoomResponse)
+def update_ot_room(
+    room_id: UUID,
+    payload: OtRoomUpdate,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    actor: dict = Depends(require_hospital_admin),
+):
+    room = _get_or_404(db, OtRoom, room_id, hospital_id, "OT room")
+    updates = payload.model_dump(exclude_unset=True)
+    if "wing_id" in updates and updates["wing_id"] is not None:
+        _get_or_404(db, Wing, updates["wing_id"], hospital_id, "Wing")
+    if updates.get("department_id"):
+        _get_or_404(db, Department, updates["department_id"], hospital_id, "Department")
+    if "code" in updates and updates["code"] is not None:
+        updates["code"] = str(updates["code"]).strip().upper()
+        clash = (
+            db.query(OtRoom.id)
+            .filter(
+                OtRoom.hospital_id == hospital_id,
+                OtRoom.code == updates["code"],
+                OtRoom.id != room_id,
+            )
+            .first()
+        )
+        if clash:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="OT room code already exists")
+    if "name" in updates and updates["name"] is not None:
+        updates["name"] = str(updates["name"]).strip()
+    if "description" in updates and isinstance(updates["description"], str):
+        updates["description"] = updates["description"].strip() or None
+    for key, value in updates.items():
+        setattr(room, key, value)
+    _audit(db, hospital_id, actor, "update", "ot_room", room.id, f"Updated OT room '{room.code}'")
+    db.commit()
+    db.refresh(room)
+    return _ot_room_response(db, room)
+
+
+@router.delete("/ot-rooms/{room_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_ot_room(
+    room_id: UUID,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    actor: dict = Depends(require_hospital_admin),
+):
+    room = _get_or_404(db, OtRoom, room_id, hospital_id, "OT room")
+    code = room.code
+    db.delete(room)
+    _audit(db, hospital_id, actor, "delete", "ot_room", room_id, f"Deleted OT room '{code}'")
     db.commit()
 
 

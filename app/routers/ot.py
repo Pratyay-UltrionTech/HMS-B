@@ -8,7 +8,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
-from app.models import Hospital, HospitalUser, OtSurgery, OtSurgeryStatus, Patient
+from app.models import Department, Hospital, HospitalUser, OtRoom, OtSurgery, OtSurgeryStatus, Patient
 from app.schemas_ot import (
     OtCompleteRequest,
     OtDashboardResponse,
@@ -37,7 +37,29 @@ def _next_surgery_no(db: Session, hospital_id: UUID) -> str:
     return f"OT{int(count) + 1:04d}"
 
 
+def _resolve_ot_room(db: Session, hospital_id: UUID, ot_room_id: UUID, department_id: UUID | None = None) -> OtRoom:
+    room = (
+        db.query(OtRoom)
+        .filter(OtRoom.id == ot_room_id, OtRoom.hospital_id == hospital_id, OtRoom.is_active.is_(True))
+        .first()
+    )
+    if not room:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OT room not found")
+    if department_id and room.department_id != department_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected OT room does not belong to the selected department",
+        )
+    return room
+
+
+def _room_label(room: OtRoom) -> str:
+    return f"{room.code} — {room.name}"
+
+
 def _surgery_to_response(item: OtSurgery) -> OtSurgeryResponse:
+    dept = item.department
+    room = item.ot_room_ref
     return OtSurgeryResponse(
         id=item.id,
         hospital_id=item.hospital_id,
@@ -48,6 +70,8 @@ def _surgery_to_response(item: OtSurgery) -> OtSurgeryResponse:
         surgery_type=item.surgery_type,
         surgery_category=item.surgery_category,
         priority=item.priority,
+        department_id=item.department_id,
+        ot_room_id=item.ot_room_id,
         ot_room=item.ot_room,
         scheduled_at=item.scheduled_at,
         duration_minutes=item.duration_minutes,
@@ -81,13 +105,20 @@ def _surgery_to_response(item: OtSurgery) -> OtSurgeryResponse:
         patient_uhid=item.patient.uhid if item.patient else None,
         patient_mobile=item.patient.mobile if item.patient else None,
         surgeon_name=item.surgeon.name if item.surgeon else None,
+        department_name=dept.name if dept else None,
+        ot_room_name=room.name if room else None,
     )
 
 
 def _get_surgery(db: Session, surgery_id: UUID, hospital_id: UUID) -> OtSurgery:
     item = (
         db.query(OtSurgery)
-        .options(joinedload(OtSurgery.patient), joinedload(OtSurgery.surgeon))
+        .options(
+            joinedload(OtSurgery.patient),
+            joinedload(OtSurgery.surgeon),
+            joinedload(OtSurgery.department),
+            joinedload(OtSurgery.ot_room_ref),
+        )
         .filter(OtSurgery.id == surgery_id, OtSurgery.hospital_id == hospital_id)
         .first()
     )
@@ -137,7 +168,7 @@ def list_surgeries(
 ):
     q = (
         db.query(OtSurgery)
-        .options(joinedload(OtSurgery.patient), joinedload(OtSurgery.surgeon))
+        .options(joinedload(OtSurgery.patient), joinedload(OtSurgery.surgeon), joinedload(OtSurgery.department), joinedload(OtSurgery.ot_room_ref))
         .filter(OtSurgery.hospital_id == hospital_id)
     )
     if patient_id:
@@ -212,6 +243,16 @@ def create_surgery(
         if not surgeon:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Surgeon not found")
 
+    dept = (
+        db.query(Department)
+        .filter(Department.id == payload.department_id, Department.hospital_id == hospital_id)
+        .first()
+    )
+    if not dept:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+
+    ot_room = _resolve_ot_room(db, hospital_id, payload.ot_room_id, payload.department_id)
+
     item = OtSurgery(
         hospital_id=hospital_id,
         surgery_no=_next_surgery_no(db, hospital_id),
@@ -221,7 +262,9 @@ def create_surgery(
         surgery_type=payload.surgery_type.strip(),
         surgery_category=payload.surgery_category.strip() or "General",
         priority=payload.priority,
-        ot_room=payload.ot_room.strip() or "OT-1",
+        department_id=payload.department_id,
+        ot_room_id=ot_room.id,
+        ot_room=_room_label(ot_room),
         scheduled_at=payload.scheduled_at,
         duration_minutes=payload.duration_minutes,
         anaesthetist=payload.anaesthetist.strip() if payload.anaesthetist else None,
@@ -320,7 +363,23 @@ def reschedule_surgery(
     if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled, OtSurgeryStatus.in_progress):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot reschedule this surgery")
     item.scheduled_at = payload.scheduled_at
-    if payload.ot_room:
+    if payload.ot_room_id:
+        dept_id = payload.department_id or item.department_id
+        if payload.department_id:
+            dept = (
+                db.query(Department)
+                .filter(Department.id == payload.department_id, Department.hospital_id == hospital_id)
+                .first()
+            )
+            if not dept:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+            item.department_id = payload.department_id
+        ot_room = _resolve_ot_room(db, hospital_id, payload.ot_room_id, dept_id)
+        item.ot_room_id = ot_room.id
+        item.ot_room = _room_label(ot_room)
+        if not item.department_id:
+            item.department_id = ot_room.department_id
+    elif payload.ot_room:
         item.ot_room = payload.ot_room.strip()
     if payload.duration_minutes:
         item.duration_minutes = payload.duration_minutes

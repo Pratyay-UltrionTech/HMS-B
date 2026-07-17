@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
+from app.utils.phone import PhoneNumber
+
 from app.models import CustomFieldType
 
 BASIC_MODULE_KEYS = [
@@ -113,7 +115,7 @@ class ModuleInfo(BaseModel):
 class HospitalUserCreate(BaseModel):
     role_id: UUID
     name: str = Field(min_length=1, max_length=255)
-    phone: str = Field(min_length=1, max_length=32)
+    phone: PhoneNumber
     email: EmailStr
     password: str = Field(min_length=4, max_length=128)
     shift_id: UUID | None = None
@@ -124,7 +126,7 @@ class HospitalUserCreate(BaseModel):
 class HospitalUserUpdate(BaseModel):
     role_id: UUID | None = None
     name: str | None = Field(default=None, min_length=1, max_length=255)
-    phone: str | None = Field(default=None, min_length=1, max_length=32)
+    phone: PhoneNumber | None = None
     email: EmailStr | None = None
     password: str | None = Field(default=None, min_length=4, max_length=128)
     shift_id: UUID | None = None

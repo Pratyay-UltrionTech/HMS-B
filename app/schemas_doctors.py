@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.utils.phone import PhoneNumber
+
 from app.models import AppointmentStatus
 from app.schemas_laboratory import LabOrderResponse
 from app.schemas_radiology import RadOrderResponse
@@ -23,7 +25,7 @@ class DoctorSummary(BaseModel):
 
 class PatientCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
-    mobile: str = Field(min_length=1, max_length=32)
+    mobile: PhoneNumber
     age: int | None = Field(default=None, ge=0, le=150)
     gender: str | None = Field(default=None, max_length=32)
     address: str | None = None
@@ -31,7 +33,7 @@ class PatientCreate(BaseModel):
 
 class PatientUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
-    mobile: str | None = Field(default=None, min_length=1, max_length=32)
+    mobile: PhoneNumber | None = None
     age: int | None = Field(default=None, ge=0, le=150)
     gender: str | None = Field(default=None, max_length=32)
     address: str | None = None

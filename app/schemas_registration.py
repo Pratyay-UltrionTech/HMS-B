@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
+from app.utils.phone import OptionalPhoneNumber, PhoneNumber
+
 from app.models import AdmissionStatus, PatientStatus
 
 
@@ -15,10 +17,10 @@ class PatientRegister(BaseModel):
     gender: str = Field(min_length=1, max_length=32)
     date_of_birth: date | None = None
     age: int | None = Field(default=None, ge=0, le=150)
-    mobile: str = Field(min_length=1, max_length=32)
+    mobile: PhoneNumber
     email: EmailStr | None = None
     address: str | None = None
-    emergency_contact: str | None = Field(default=None, max_length=64)
+    emergency_contact: OptionalPhoneNumber = None
     blood_group: str | None = Field(default=None, max_length=16)
 
 
@@ -28,10 +30,10 @@ class PatientRegisterUpdate(BaseModel):
     gender: str | None = Field(default=None, min_length=1, max_length=32)
     date_of_birth: date | None = None
     age: int | None = Field(default=None, ge=0, le=150)
-    mobile: str | None = Field(default=None, min_length=1, max_length=32)
+    mobile: PhoneNumber | None = None
     email: EmailStr | None = None
     address: str | None = None
-    emergency_contact: str | None = Field(default=None, max_length=64)
+    emergency_contact: OptionalPhoneNumber = None
     blood_group: str | None = Field(default=None, max_length=16)
     status: PatientStatus | None = None
 

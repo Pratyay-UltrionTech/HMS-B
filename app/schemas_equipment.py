@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.utils.phone import OptionalPhoneNumber
+
 from app.models import (
     EquipmentAssignTarget,
     EquipmentRequestStatus,
@@ -52,7 +54,7 @@ class EquipmentCreate(BaseModel):
     warranty_end: date | None = None
     amc_start: date | None = None
     amc_end: date | None = None
-    vendor_contact: str | None = None
+    vendor_contact: OptionalPhoneNumber = None
     notes: str | None = None
 
 
@@ -72,7 +74,7 @@ class EquipmentUpdate(BaseModel):
     warranty_end: date | None = None
     amc_start: date | None = None
     amc_end: date | None = None
-    vendor_contact: str | None = None
+    vendor_contact: OptionalPhoneNumber = None
     notes: str | None = None
 
 
@@ -187,7 +189,7 @@ class AmcUpdate(BaseModel):
     warranty_end: date | None = None
     amc_start: date | None = None
     amc_end: date | None = None
-    vendor_contact: str | None = None
+    vendor_contact: OptionalPhoneNumber = None
 
 
 class RequestCreate(BaseModel):

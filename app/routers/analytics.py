@@ -6,10 +6,9 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Hospital, HospitalUser, PlanType, RolePermission
+from app.models import Hospital, HospitalUser, Patient, PlanType, RolePermission
 from app.schemas_admin import BASIC_MODULE_KEYS
 from app.schemas_analytics import (
-    MonthAmount,
     MonthCount,
     PlanCount,
     PlatformAnalyticsResponse,
@@ -18,13 +17,6 @@ from app.schemas_analytics import (
 from app.utils.auth import require_super_admin
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
-
-# Estimated subscription prices (INR / month) until billing is wired.
-PLAN_MONTHLY_INR: dict[PlanType, float] = {
-    PlanType.basic: 9_999,
-    PlanType.premium: 24_999,
-    PlanType.platinum: 49_999,
-}
 
 PLAN_LABELS = {
     PlanType.basic: "Basic",
@@ -68,7 +60,6 @@ def platform_analytics(
         if h.is_active:
             plan_counts[h.plan] = plan_counts.get(h.plan, 0) + 1
 
-    monthly_revenue = sum(plan_counts[plan] * PLAN_MONTHLY_INR[plan] for plan in PlanType)
     active_modules = sum(plan_counts[plan] * MODULES_PER_PLAN[plan] for plan in PlanType)
 
     distinct_perm_modules = (
@@ -88,8 +79,11 @@ def platform_analytics(
     )
     platform_users = int(staff_users) + active_hospitals
 
+    total_patients = int(db.query(func.count(Patient.id)).scalar() or 0)
+    patients = db.query(Patient.id, Patient.created_at).all()
+
     growth: list[MonthCount] = []
-    revenue_trend: list[MonthAmount] = []
+    patient_growth: list[MonthCount] = []
     for i in range(5, -1, -1):
         year, month = _add_months(now.year, now.month, -i)
         cursor = _month_start(year, month)
@@ -107,20 +101,20 @@ def platform_analytics(
         )
         growth.append(MonthCount(month=key, label=label, count=created))
 
-        month_rev = 0.0
-        for h in hospitals:
-            if not h.is_active or not h.created_at:
-                continue
-            if h.created_at.astimezone(timezone.utc) < next_month:
-                month_rev += PLAN_MONTHLY_INR.get(h.plan, 0.0)
-        revenue_trend.append(MonthAmount(month=key, label=label, amount=month_rev))
+        registered = sum(
+            1
+            for _pid, created_at in patients
+            if created_at
+            and created_at.astimezone(timezone.utc) >= cursor
+            and created_at.astimezone(timezone.utc) < next_month
+        )
+        patient_growth.append(MonthCount(month=key, label=label, count=registered))
 
     plan_distribution = [
         PlanCount(
             plan=plan.value,
             label=PLAN_LABELS[plan],
             count=plan_counts[plan],
-            monthly_revenue=plan_counts[plan] * PLAN_MONTHLY_INR[plan],
         )
         for plan in PlanType
     ]
@@ -142,10 +136,10 @@ def platform_analytics(
         total_hospitals=total_hospitals,
         active_hospitals=active_hospitals,
         active_modules=active_modules,
-        monthly_revenue=monthly_revenue,
+        total_patients=total_patients,
         platform_users=platform_users,
         hospital_growth=growth,
-        revenue_trend=revenue_trend,
+        patient_growth=patient_growth,
         plan_distribution=plan_distribution,
         recent_hospitals=recent_hospitals,
         generated_at=now,

@@ -772,7 +772,7 @@ def prescription_pdf(
 
 
 def _prescription_html(rx: Prescription, hospital: Hospital | None = None) -> str:
-    follow = rx.follow_up_date.isoformat() if rx.follow_up_date else "—"
+    follow = rx.follow_up_date.strftime("%d %b %Y") if rx.follow_up_date else "—"
     created = rx.created_at.strftime("%d %b %Y") if rx.created_at else ""
     doctor = rx.doctor
     patient = rx.patient
@@ -786,53 +786,56 @@ def _prescription_html(rx: Prescription, hospital: Hospital | None = None) -> st
         return ""
 
     qualification = cv_get("qualification", "qualifications", "degree", "specialization") or "Physician"
-    certification = cv_get(
-        "certification",
-        "registration_number",
-        "registration_no",
-        "medical_registration",
-        "license_number",
-        "reg_no",
-    )
+    doctor_name = doctor.name if doctor else "—"
+    if doctor_name and not str(doctor_name).lower().startswith("dr"):
+        doctor_name = f"Dr. {doctor_name}"
     hosp_name = hospital.name if hospital else "Hospital"
-    hosp_phone = hospital.phone if hospital else ""
-    hosp_email = hospital.email if hospital else ""
-    hosp_address = hospital.address if hospital else ""
-    cert_line = f"Certification: {certification}" if certification else ""
+    hosp_phone = hospital.phone if hospital else "—"
+    hosp_email = hospital.email if hospital else "—"
+    hosp_address = hospital.address if hospital else "—"
+    # Prefer free-flow body stored in medicines; fall back to combined legacy fields
+    body = (rx.medicines or "").strip()
+    if not body or body == "—":
+        parts = [p for p in [rx.symptoms, rx.dosage, rx.advice] if p and str(p).strip() and str(p).strip() != "—"]
+        body = "\n\n".join(parts) if parts else "—"
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"/><title>Prescription</title>
 <style>
   * {{ box-sizing: border-box; }}
+  @page {{ margin: 12mm; }}
   body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; background: #eef2f7; color: #1e293b; }}
   .pad {{ max-width: 780px; margin: 24px auto; background: #fff; border-left: 10px solid #2563eb; border-right: 10px solid #2563eb; min-height: 920px; display: flex; flex-direction: column; }}
-  .header {{ display: flex; justify-content: space-between; padding: 28px 36px 16px; background: linear-gradient(135deg, #dbeafe 0%, #fff 55%); }}
-  .doc-name {{ font-size: 28px; font-weight: 800; color: #1d4ed8; margin: 0; }}
-  .doc-meta {{ color: #64748b; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; margin-top: 4px; }}
-  .caduceus {{ width: 64px; height: 64px; border-radius: 50%; background: #2563eb; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; }}
-  .body {{ padding: 8px 36px 24px; flex: 1; }}
+  .header {{ padding: 24px 36px 16px; background: linear-gradient(135deg, #dbeafe 0%, #fff 55%); border-bottom: 1px solid #bfdbfe; display: flex; justify-content: space-between; gap: 16px; }}
+  .hosp-name {{ font-size: 28px; font-weight: 800; color: #1d4ed8; margin: 0; }}
+  .hosp-meta {{ color: #475569; font-size: 12px; margin-top: 6px; line-height: 1.5; }}
+  .caduceus {{ width: 64px; height: 64px; border-radius: 50%; background: #2563eb; color: #fff; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; flex-shrink: 0; }}
+  .body {{ padding: 12px 36px 24px; flex: 1; }}
   .line {{ display: flex; align-items: baseline; gap: 8px; margin: 10px 0; font-size: 14px; }}
   .line label {{ font-weight: 600; color: #334155; white-space: nowrap; }}
   .line .fill {{ flex: 1; border-bottom: 1px solid #94a3b8; min-height: 22px; padding: 2px 4px; }}
   .row {{ display: flex; gap: 24px; }}
   .row .line {{ flex: 1; }}
-  .rx {{ margin-top: 18px; position: relative; min-height: 280px; padding: 8px 8px 8px 56px; }}
+  .rx {{ margin-top: 18px; position: relative; min-height: 320px; padding: 8px 8px 8px 56px; }}
   .rx-mark {{ position: absolute; left: 0; top: 0; font-size: 42px; font-weight: 800; color: #2563eb; font-family: Georgia, serif; }}
-  .rx-content {{ white-space: pre-wrap; font-size: 15px; line-height: 1.6; }}
-  .sign {{ margin-top: 48px; text-align: right; padding-right: 12px; }}
+  .rx-content {{ white-space: pre-wrap; font-size: 15px; line-height: 1.7; min-height: 280px; }}
+  .sign {{ margin-top: 40px; text-align: right; padding-right: 12px; }}
   .sign-line {{ display: inline-block; width: 180px; border-top: 1px solid #64748b; padding-top: 6px; font-size: 11px; letter-spacing: 0.12em; color: #64748b; text-align: center; }}
-  .footer {{ margin-top: auto; background: linear-gradient(90deg, #dbeafe, #eff6ff); padding: 16px 36px; display: flex; gap: 20px; align-items: flex-start; border-top: 2px solid #93c5fd; }}
-  .footer h3 {{ margin: 0; color: #1d4ed8; font-size: 16px; }}
-  .footer p {{ margin: 2px 0; font-size: 12px; color: #475569; }}
-  .divider {{ width: 2px; background: #60a5fa; align-self: stretch; }}
-  @media print {{ body {{ background: #fff; }} .pad {{ margin: 0; max-width: none; }} }}
+  .footer {{ margin-top: auto; background: linear-gradient(90deg, #dbeafe, #eff6ff); padding: 16px 36px; border-top: 2px solid #93c5fd; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }}
+  .footer .label {{ font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #94a3b8; margin: 0 0 4px; }}
+  .footer p {{ margin: 0; font-size: 12px; color: #334155; }}
+  .footer .strong {{ font-weight: 700; color: #1d4ed8; }}
+  @media print {{
+    body {{ background: #fff; }}
+    .pad {{ margin: 0; max-width: none; min-height: 100vh; page-break-inside: avoid; }}
+    .header, .footer {{ position: running(none); }}
+  }}
 </style></head><body>
   <div class="pad">
     <div class="header">
       <div>
-        <p class="doc-name">Dr. {doctor.name if doctor else "—"}</p>
-        <p class="doc-meta">{qualification}</p>
-        <p class="doc-meta">{cert_line}</p>
+        <p class="hosp-name">{hosp_name}</p>
+        <p class="hosp-meta">📍 {hosp_address}<br/>☎ {hosp_phone} &nbsp; ✉ {hosp_email}</p>
       </div>
       <div class="caduceus">⚕</div>
     </div>
@@ -846,32 +849,25 @@ def _prescription_html(rx: Prescription, hospital: Hospital | None = None) -> st
       <div class="line"><label>Diagnosis:</label><div class="fill">{rx.diagnosis}</div></div>
       <div class="rx">
         <div class="rx-mark">℞</div>
-        <div class="rx-content"><strong>Medicines:</strong>
-{rx.medicines}
-
-<strong>Dosage:</strong>
-{rx.dosage}
-
-<strong>Symptoms:</strong>
-{rx.symptoms}
-
-<strong>Advice:</strong>
-{rx.advice or "—"}
-
-<strong>Follow-up:</strong> {follow}</div>
+        <div class="rx-content">{body}</div>
       </div>
+      <div class="line"><label>Follow-up:</label><div class="fill">{follow}</div></div>
       <div class="sign"><div class="sign-line">SIGNATURE</div></div>
     </div>
     <div class="footer">
       <div>
-        <h3>{hosp_name}</h3>
-        <p>Caring for life</p>
-      </div>
-      <div class="divider"></div>
-      <div>
+        <p class="label">Phone</p>
         <p>☎ {hosp_phone}</p>
-        <p>✉ {hosp_email}</p>
-        <p>📍 {hosp_address}</p>
+      </div>
+      <div>
+        <p class="label">Doctor</p>
+        <p class="strong">{doctor_name}</p>
+        <p>{qualification}</p>
+      </div>
+      <div>
+        <p class="label">Hospital</p>
+        <p class="strong">{hosp_name}</p>
+        <p>{hosp_address}</p>
       </div>
     </div>
   </div>

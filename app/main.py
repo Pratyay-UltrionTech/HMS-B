@@ -220,6 +220,118 @@ def _migrate_hospital_users_shift_id() -> None:
         logger.warning("hospital_users shift_id migration skipped: %s", exc)
 
 
+def _migrate_departments_optional_wing() -> None:
+    """Allow departments without a wing."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        if "departments" not in insp.get_table_names():
+            return
+        cols = {c["name"]: c for c in insp.get_columns("departments")}
+        wing_col = cols.get("wing_id")
+        with engine.begin() as conn:
+            if wing_col is not None and not wing_col.get("nullable", True):
+                logger.info("Making departments.wing_id nullable")
+                # Drop FK first so we can alter nullability / recreate with SET NULL.
+                conn.execute(
+                    text(
+                        """
+                        DO $$ DECLARE r record;
+                        BEGIN
+                          FOR r IN (
+                            SELECT conname FROM pg_constraint
+                            WHERE conrelid = 'departments'::regclass AND contype = 'f'
+                              AND pg_get_constraintdef(oid) ILIKE '%wing_id%'
+                          ) LOOP
+                            EXECUTE format('ALTER TABLE departments DROP CONSTRAINT %I', r.conname);
+                          END LOOP;
+                        END $$;
+                        """
+                    )
+                )
+                conn.execute(text("ALTER TABLE departments ALTER COLUMN wing_id DROP NOT NULL"))
+                conn.execute(
+                    text(
+                        """
+                        ALTER TABLE departments
+                        ADD CONSTRAINT fk_departments_wing_id
+                        FOREIGN KEY (wing_id) REFERENCES wings(id) ON DELETE SET NULL
+                        """
+                    )
+                )
+            # Replace unique (hospital_id, wing_id, name) with (hospital_id, name).
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TABLE departments DROP CONSTRAINT IF EXISTS uq_dept_hospital_wing_name;
+                    EXCEPTION WHEN undefined_object THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TABLE departments ADD CONSTRAINT uq_dept_hospital_name UNIQUE (hospital_id, name);
+                    EXCEPTION WHEN duplicate_object THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+    except Exception as exc:
+        logger.warning("departments optional wing migration skipped: %s", exc)
+
+
+def _migrate_ot_rooms_and_surgery_links() -> None:
+    """Add OT room master table columns onto existing ot_surgeries."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        if "ot_surgeries" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("ot_surgeries")}
+        with engine.begin() as conn:
+            if "department_id" not in cols:
+                logger.info("Adding department_id to ot_surgeries")
+                conn.execute(text("ALTER TABLE ot_surgeries ADD COLUMN department_id UUID"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ot_surgeries_department_id ON ot_surgeries (department_id)"))
+            if "ot_room_id" not in cols:
+                logger.info("Adding ot_room_id to ot_surgeries")
+                conn.execute(text("ALTER TABLE ot_surgeries ADD COLUMN ot_room_id UUID"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_ot_surgeries_ot_room_id ON ot_surgeries (ot_room_id)"))
+            # FKs are created by create_all for new tables; for existing DBs add if missing.
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TABLE ot_surgeries
+                        ADD CONSTRAINT fk_ot_surgeries_department_id
+                        FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL;
+                    EXCEPTION WHEN duplicate_object THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TABLE ot_surgeries
+                        ADD CONSTRAINT fk_ot_surgeries_ot_room_id
+                        FOREIGN KEY (ot_room_id) REFERENCES ot_rooms(id) ON DELETE SET NULL;
+                    EXCEPTION WHEN duplicate_object THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+    except Exception as exc:
+        logger.warning("ot room/surgery link migration skipped: %s", exc)
+
+
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         logger.info("→ %s %s", request.method, request.url.path)
@@ -236,7 +348,9 @@ async def lifespan(_: FastAPI):
     _migrate_appointments_extra_fields()
     _migrate_admissions_discharge_notes()
     _migrate_hospital_users_shift_id()
+    _migrate_departments_optional_wing()
     Base.metadata.create_all(bind=engine)
+    _migrate_ot_rooms_and_surgery_links()
     yield
 
 

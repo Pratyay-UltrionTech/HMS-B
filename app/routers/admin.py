@@ -22,7 +22,7 @@ from app.schemas_admin import (
     RoleUpdate,
 )
 from app.utils.audit import write_audit
-from app.utils.auth import get_hospital_uuid, require_hospital_admin
+from app.utils.auth import get_current_user, get_hospital_uuid, require_hospital_admin
 from app.utils.password import hash_password
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -108,7 +108,8 @@ def _sync_permissions(db: Session, role: StaffRole, hospital_id: UUID, perms_in)
 
 
 @router.get("/modules", response_model=list[ModuleInfo])
-def list_modules(_: UUID = Depends(get_hospital_uuid)):
+def list_modules(_: dict = Depends(get_current_user)):
+    """Return the modules implemented by this backend for any signed-in user."""
     return [ModuleInfo(key=k, label=BASIC_MODULE_LABELS[k]) for k in BASIC_MODULE_KEYS]
 
 

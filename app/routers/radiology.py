@@ -497,15 +497,14 @@ def upload_report(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Report file too large (max ~1.5MB)")
     if payload.image_file_data and len(payload.image_file_data) > 2_500_000:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image file too large (max ~1.5MB)")
+    if not payload.image_file_data and not order.image_file_data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scan image is required")
 
     order.findings = payload.findings.strip()
     order.impression = payload.impression.strip()
     order.remarks = payload.remarks.strip() if payload.remarks else None
     order.report_date = payload.report_date or date.today()
     order.report_uploaded_by = _actor_name(user)
-    if payload.report_file_data:
-        order.report_file_name = payload.report_file_name
-        order.report_file_data = payload.report_file_data
     if payload.image_file_data:
         order.image_file_name = payload.image_file_name
         order.image_file_data = payload.image_file_data

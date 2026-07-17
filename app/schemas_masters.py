@@ -35,7 +35,7 @@ class WingResponse(BaseModel):
 
 # ── Departments ────────────────────────────────────────────────────────────────
 class DepartmentCreate(BaseModel):
-    wing_id: UUID
+    wing_id: UUID | None = None
     name: str = Field(min_length=1, max_length=255)
     code: str | None = Field(default=None, max_length=32)
     description: str | None = None
@@ -53,7 +53,7 @@ class DepartmentUpdate(BaseModel):
 class DepartmentResponse(BaseModel):
     id: UUID
     hospital_id: UUID
-    wing_id: UUID
+    wing_id: UUID | None
     name: str
     code: str | None
     description: str | None
@@ -214,6 +214,41 @@ class RoomResponse(BaseModel):
     is_active: bool
     created_at: datetime
     ward_name: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+# ── OT Rooms ───────────────────────────────────────────────────────────────────
+class OtRoomCreate(BaseModel):
+    wing_id: UUID | None = None
+    department_id: UUID
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    is_active: bool = True
+
+
+class OtRoomUpdate(BaseModel):
+    wing_id: UUID | None = None
+    department_id: UUID | None = None
+    code: str | None = Field(default=None, min_length=1, max_length=64)
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+    is_active: bool | None = None
+
+
+class OtRoomResponse(BaseModel):
+    id: UUID
+    hospital_id: UUID
+    wing_id: UUID | None
+    department_id: UUID
+    code: str
+    name: str
+    description: str | None
+    is_active: bool
+    created_at: datetime
+    wing_name: str | None = None
+    department_name: str | None = None
 
     model_config = {"from_attributes": True}
 

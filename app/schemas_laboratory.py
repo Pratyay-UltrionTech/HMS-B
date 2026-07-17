@@ -10,7 +10,7 @@ from app.models import LabItemStatus, LabOrderStatus, LabSampleType
 class LabTestCreate(BaseModel):
     test_code: str = Field(min_length=1, max_length=32)
     test_name: str = Field(min_length=1, max_length=255)
-    department: str = Field(min_length=1, max_length=128)
+    department: str = Field(default="Laboratory", min_length=1, max_length=128)
     price: float = Field(ge=0, default=0)
     sample_type: LabSampleType = LabSampleType.blood
     tat_hours: int = Field(ge=1, le=720, default=24)

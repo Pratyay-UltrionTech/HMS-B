@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
+from app.utils.phone import PhoneNumber
+
 from app.models import PlanType
 
 
@@ -26,7 +28,7 @@ class LoginResponse(BaseModel):
 class HospitalCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     address: str = Field(min_length=1)
-    phone: str = Field(min_length=1, max_length=32)
+    phone: PhoneNumber
     email: EmailStr
     plan: PlanType = PlanType.basic
     icon_url: str | None = None
@@ -49,3 +51,24 @@ class HospitalResponse(BaseModel):
 
 class HospitalCreateResponse(HospitalResponse):
     generated_password: str
+
+
+class HospitalDashboardResponse(BaseModel):
+    id: UUID
+    hospital_id: str
+    name: str
+    address: str
+    phone: str
+    email: EmailStr
+    plan: PlanType
+    icon_url: str | None
+    is_active: bool
+    created_at: datetime
+    staff_count: int
+    doctor_count: int
+    patient_count: int
+    appointments_today: int
+    active_admissions: int
+    beds_total: int
+    beds_occupied: int
+    modules_available: int

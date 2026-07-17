@@ -52,19 +52,19 @@ class Wing(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    departments: Mapped[list["Department"]] = relationship(back_populates="wing", cascade="all, delete-orphan")
+    departments: Mapped[list["Department"]] = relationship(back_populates="wing")
 
 
 class Department(Base):
     __tablename__ = "departments"
-    __table_args__ = (UniqueConstraint("hospital_id", "wing_id", "name", name="uq_dept_hospital_wing_name"),)
+    __table_args__ = (UniqueConstraint("hospital_id", "name", name="uq_dept_hospital_name"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     hospital_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    wing_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("wings.id", ondelete="CASCADE"), nullable=False, index=True
+    wing_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wings.id", ondelete="SET NULL"), nullable=True, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     code: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -72,7 +72,7 @@ class Department(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    wing: Mapped["Wing"] = relationship(back_populates="departments")
+    wing: Mapped["Wing | None"] = relationship(back_populates="departments")
 
 
 class ShiftType(Base):
@@ -167,6 +167,32 @@ class Room(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     ward: Mapped["Ward"] = relationship(back_populates="rooms")
+
+
+class OtRoom(Base):
+    """Operation theatre rooms configured under Masters → Organization → OT."""
+
+    __tablename__ = "ot_rooms"
+    __table_args__ = (UniqueConstraint("hospital_id", "code", name="uq_ot_room_hospital_code"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    wing_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    wing: Mapped["Wing | None"] = relationship()
+    department: Mapped["Department"] = relationship()
 
 
 class Supplier(Base):
@@ -761,6 +787,12 @@ class OtSurgery(Base):
         nullable=False,
         default=OtPriority.elective,
     )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    ot_room_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ot_rooms.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     ot_room: Mapped[str] = mapped_column(String(64), nullable=False, default="OT-1")
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
@@ -800,6 +832,8 @@ class OtSurgery(Base):
 
     patient: Mapped["Patient"] = relationship(back_populates="ot_surgeries")
     surgeon: Mapped["HospitalUser | None"] = relationship()
+    department: Mapped["Department | None"] = relationship()
+    ot_room_ref: Mapped["OtRoom | None"] = relationship()
 
 
 class PatientDocumentCategory(str, enum.Enum):

@@ -13,7 +13,9 @@ class OtSurgeryCreate(BaseModel):
     surgery_type: str = Field(min_length=1, max_length=255)
     surgery_category: str = Field(min_length=1, max_length=128, default="General")
     priority: OtPriority = OtPriority.elective
-    ot_room: str = Field(min_length=1, max_length=64, default="OT-1")
+    department_id: UUID
+    ot_room_id: UUID
+    ot_room: str | None = Field(default=None, max_length=64)
     scheduled_at: datetime
     duration_minutes: int = Field(ge=15, le=1440, default=60)
     anaesthetist: str | None = Field(default=None, max_length=255)
@@ -26,6 +28,8 @@ class OtSurgeryUpdate(BaseModel):
     surgery_type: str | None = Field(default=None, min_length=1, max_length=255)
     surgery_category: str | None = Field(default=None, min_length=1, max_length=128)
     priority: OtPriority | None = None
+    department_id: UUID | None = None
+    ot_room_id: UUID | None = None
     ot_room: str | None = Field(default=None, min_length=1, max_length=64)
     scheduled_at: datetime | None = None
     duration_minutes: int | None = Field(default=None, ge=15, le=1440)
@@ -35,6 +39,8 @@ class OtSurgeryUpdate(BaseModel):
 
 class OtRescheduleRequest(BaseModel):
     scheduled_at: datetime
+    department_id: UUID | None = None
+    ot_room_id: UUID | None = None
     ot_room: str | None = Field(default=None, min_length=1, max_length=64)
     duration_minutes: int | None = Field(default=None, ge=15, le=1440)
     remarks: str | None = None
@@ -72,6 +78,8 @@ class OtSurgeryResponse(BaseModel):
     surgery_type: str
     surgery_category: str
     priority: OtPriority
+    department_id: UUID | None = None
+    ot_room_id: UUID | None = None
     ot_room: str
     scheduled_at: datetime
     duration_minutes: int
@@ -105,6 +113,8 @@ class OtSurgeryResponse(BaseModel):
     patient_uhid: str | None = None
     patient_mobile: str | None = None
     surgeon_name: str | None = None
+    department_name: str | None = None
+    ot_room_name: str | None = None
 
     model_config = {"from_attributes": True}
 
