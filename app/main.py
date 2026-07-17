@@ -332,6 +332,45 @@ def _migrate_ot_rooms_and_surgery_links() -> None:
         logger.warning("ot room/surgery link migration skipped: %s", exc)
 
 
+def _migrate_appointment_linked_clinical() -> None:
+    """Link lab/radiology orders and medical records to appointments."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        with engine.begin() as conn:
+            if "lab_orders" in insp.get_table_names():
+                cols = {c["name"] for c in insp.get_columns("lab_orders")}
+                if "appointment_id" not in cols:
+                    conn.execute(text("ALTER TABLE lab_orders ADD COLUMN appointment_id UUID"))
+                    conn.execute(
+                        text(
+                            "ALTER TABLE lab_orders ADD CONSTRAINT fk_lab_orders_appointment_id "
+                            "FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE SET NULL"
+                        )
+                    )
+            if "radiology_orders" in insp.get_table_names():
+                cols = {c["name"] for c in insp.get_columns("radiology_orders")}
+                if "appointment_id" not in cols:
+                    conn.execute(text("ALTER TABLE radiology_orders ADD COLUMN appointment_id UUID"))
+                    conn.execute(
+                        text(
+                            "ALTER TABLE radiology_orders ADD CONSTRAINT fk_radiology_orders_appointment_id "
+                            "FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE SET NULL"
+                        )
+                    )
+            if "medical_records" in insp.get_table_names():
+                cols = {c["name"] for c in insp.get_columns("medical_records")}
+                if "appointment_id" not in cols:
+                    conn.execute(text("ALTER TABLE medical_records ADD COLUMN appointment_id UUID"))
+                if "lab_order_id" not in cols:
+                    conn.execute(text("ALTER TABLE medical_records ADD COLUMN lab_order_id UUID"))
+                if "radiology_order_id" not in cols:
+                    conn.execute(text("ALTER TABLE medical_records ADD COLUMN radiology_order_id UUID"))
+    except Exception as exc:
+        logger.warning("appointment-linked clinical migration skipped: %s", exc)
+
+
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         logger.info("→ %s %s", request.method, request.url.path)
@@ -350,6 +389,7 @@ async def lifespan(_: FastAPI):
     _migrate_hospital_users_shift_id()
     _migrate_departments_optional_wing()
     Base.metadata.create_all(bind=engine)
+    _migrate_appointment_linked_clinical()
     _migrate_ot_rooms_and_surgery_links()
     yield
 

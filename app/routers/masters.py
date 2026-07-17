@@ -160,8 +160,7 @@ def create_department(
     hospital_id: UUID = Depends(get_hospital_uuid),
     actor: dict = Depends(require_hospital_admin),
 ):
-    if payload.wing_id:
-        _get_or_404(db, Wing, payload.wing_id, hospital_id, "Wing")
+    _get_or_404(db, Wing, payload.wing_id, hospital_id, "Wing")
     dept = Department(hospital_id=hospital_id, **payload.model_dump())
     db.add(dept)
     db.flush()
@@ -184,10 +183,14 @@ def update_department(
 ):
     dept = _get_or_404(db, Department, department_id, hospital_id, "Department")
     updates = payload.model_dump(exclude_unset=True)
+    if "wing_id" in updates and updates["wing_id"] is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wing is required for department")
     if "wing_id" in updates and updates["wing_id"] is not None:
         _get_or_404(db, Wing, updates["wing_id"], hospital_id, "Wing")
     for key, value in updates.items():
         setattr(dept, key, value)
+    if dept.wing_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wing is required for department")
     _audit(db, hospital_id, actor, "update", "department", dept.id, f"Updated department '{dept.name}'")
     db.commit()
     db.refresh(dept)

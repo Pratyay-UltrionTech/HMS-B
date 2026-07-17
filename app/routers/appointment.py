@@ -18,11 +18,19 @@ from app.schemas_appointment import (
     AppointmentListItem,
     BookAppointmentRequest,
     DoctorAvailability,
+    LeaveBlock,
     QueueGroup,
     RescheduleRequest,
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
+from app.utils.doctor_leave import (
+    fmt_time_hhmm,
+    get_shift_bounds,
+    leave_for_slot,
+    list_leaves_for_date,
+    slot_duration_minutes,
+)
 
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
@@ -152,12 +160,14 @@ def check_doctor_availability(
 ):
     doctor = (
         db.query(HospitalUser)
-        .options(joinedload(HospitalUser.role))
+        .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift))
         .filter(HospitalUser.id == doctor_id, HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
         .first()
     )
     if not doctor or not _is_doctor(doctor):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor not found")
+
+    shift_start, shift_end, _ = get_shift_bounds(doctor)
 
     holiday = _check_holiday(db, hospital_id, on_date)
     if holiday:
@@ -168,7 +178,16 @@ def check_doctor_availability(
             available=False,
             reason=f"Hospital holiday: {holiday.name}",
             booked_slots=[],
+            leave_blocks=[],
+            shift_start=fmt_time_hhmm(shift_start),
+            shift_end=fmt_time_hhmm(shift_end),
         )
+
+    leaves = list_leaves_for_date(db, hospital_id, doctor_id, on_date)
+    leave_blocks = [
+        LeaveBlock(start=fmt_time_hhmm(lv.start_time), end=fmt_time_hhmm(lv.end_time), reason=lv.reason)
+        for lv in leaves
+    ]
 
     booked = (
         db.query(Appointment)
@@ -189,6 +208,9 @@ def check_doctor_availability(
         available=True,
         reason=None,
         booked_slots=slots,
+        leave_blocks=leave_blocks,
+        shift_start=fmt_time_hhmm(shift_start),
+        shift_end=fmt_time_hhmm(shift_end),
     )
 
 
@@ -223,6 +245,16 @@ def book_appointment(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Doctor already has an appointment at this time slot",
+        )
+
+    slot_min = slot_duration_minutes(db, hospital_id)
+    on_leave = leave_for_slot(
+        db, hospital_id, payload.doctor_id, payload.appointment_date, payload.appointment_time, slot_min
+    )
+    if on_leave:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Doctor is on leave from {fmt_time_hhmm(on_leave.start_time)} to {fmt_time_hhmm(on_leave.end_time)}",
         )
 
     purpose = (payload.purpose or payload.visit_type or "Consultation").strip()
@@ -461,6 +493,14 @@ def reschedule_appointment(
 
     if _slot_conflict(db, hospital_id, appt.doctor_id, payload.appointment_date, payload.appointment_time, appt.id):
         raise HTTPException(status_code=409, detail="Doctor already has an appointment at this time slot")
+
+    slot_min = slot_duration_minutes(db, hospital_id)
+    on_leave = leave_for_slot(db, hospital_id, appt.doctor_id, payload.appointment_date, payload.appointment_time, slot_min)
+    if on_leave:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Doctor is on leave from {fmt_time_hhmm(on_leave.start_time)} to {fmt_time_hhmm(on_leave.end_time)}",
+        )
 
     appt.appointment_date = payload.appointment_date
     appt.appointment_time = payload.appointment_time

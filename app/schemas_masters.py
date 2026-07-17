@@ -35,7 +35,7 @@ class WingResponse(BaseModel):
 
 # ── Departments ────────────────────────────────────────────────────────────────
 class DepartmentCreate(BaseModel):
-    wing_id: UUID | None = None
+    wing_id: UUID
     name: str = Field(min_length=1, max_length=255)
     code: str | None = Field(default=None, max_length=32)
     description: str | None = None
@@ -230,7 +230,7 @@ class OtRoomCreate(BaseModel):
 
 class OtRoomUpdate(BaseModel):
     wing_id: UUID | None = None
-    department_id: UUID | None = None
+    department_id: UUID
     code: str | None = Field(default=None, min_length=1, max_length=64)
     name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None

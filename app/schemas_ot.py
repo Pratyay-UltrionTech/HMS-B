@@ -125,3 +125,15 @@ class OtDashboardResponse(BaseModel):
     ongoing: int
     scheduled: int
     cancelled: int
+
+
+class OtCalendarEntry(BaseModel):
+    id: UUID
+    ot_room_id: UUID
+    ot_room_label: str
+    scheduled_at: datetime
+    ends_at: datetime
+    surgery_type: str
+    status: OtSurgeryStatus
+    patient_name: str | None = None
+    surgeon_name: str | None = None

@@ -422,6 +422,25 @@ class Appointment(Base):
     doctor: Mapped["HospitalUser"] = relationship()
 
 
+class DoctorLeave(Base):
+    __tablename__ = "doctor_leaves"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    doctor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    leave_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    start_time: Mapped[time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    doctor: Mapped["HospitalUser"] = relationship()
+
+
 class Bed(Base):
     __tablename__ = "beds"
     __table_args__ = (UniqueConstraint("hospital_id", "room_id", "bed_code", name="uq_bed_hospital_room_code"),)
@@ -525,6 +544,15 @@ class MedicalRecord(Base):
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    lab_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_orders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    radiology_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("radiology_orders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     report_type: Mapped[str] = mapped_column(String(64), nullable=False)  # Blood Report, X-Ray, MRI, ECG, Other
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -594,6 +622,9 @@ class LabOrder(Base):
     )
     doctor_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
     )
     ordered_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     ordered_by_role: Mapped[str] = mapped_column(String(64), nullable=False, default="")
@@ -714,6 +745,9 @@ class RadiologyOrder(Base):
     )
     doctor_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
     )
     scan_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("radiology_scan_catalog.id", ondelete="SET NULL"), nullable=True

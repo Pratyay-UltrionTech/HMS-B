@@ -52,6 +52,7 @@ def _order_to_response(order: RadiologyOrder) -> RadOrderResponse:
         order_no=order.order_no,
         patient_id=order.patient_id,
         doctor_id=order.doctor_id,
+        appointment_id=order.appointment_id,
         scan_id=order.scan_id,
         scan_code=order.scan_code,
         scan_name=order.scan_name,
@@ -354,6 +355,7 @@ def create_orders(
             order_no=_next_order_no(db, hospital_id),
             patient_id=patient.id,
             doctor_id=doctor.id if doctor else None,
+            appointment_id=payload.appointment_id,
             scan_id=scan.id,
             scan_code=scan.scan_code,
             scan_name=scan.scan_name,
@@ -522,7 +524,12 @@ def upload_report(
         summary=f"Uploaded radiology report for {order.order_no}",
     )
     db.commit()
-    return _order_to_response(_get_order(db, order_id, hospital_id))
+    order = _get_order(db, order_id, hospital_id)
+    from app.utils.medical_record_sync import sync_radiology_order_medical_record
+
+    sync_radiology_order_medical_record(db, order)
+    db.commit()
+    return _order_to_response(order)
 
 
 @router.get("/orders/{order_id}/report-view")

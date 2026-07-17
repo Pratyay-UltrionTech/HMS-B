@@ -99,6 +99,8 @@ class PrescriptionCreate(BaseModel):
     dosage: str = Field(min_length=1)
     advice: str | None = None
     follow_up_date: date | None = None
+    test_ids: list[UUID] = Field(default_factory=list)
+    scan_ids: list[UUID] = Field(default_factory=list)
 
 
 class PrescriptionResponse(BaseModel):
@@ -123,6 +125,7 @@ class PrescriptionResponse(BaseModel):
 
 class MedicalRecordCreate(BaseModel):
     patient_id: UUID
+    appointment_id: UUID | None = None
     report_type: str = Field(min_length=1, max_length=64)
     title: str = Field(min_length=1, max_length=255)
     notes: str | None = None
@@ -135,6 +138,9 @@ class MedicalRecordResponse(BaseModel):
     hospital_id: UUID
     doctor_id: UUID
     patient_id: UUID
+    appointment_id: UUID | None = None
+    lab_order_id: UUID | None = None
+    radiology_order_id: UUID | None = None
     report_type: str
     title: str
     notes: str | None
@@ -166,3 +172,31 @@ class HospitalClinicProfile(BaseModel):
     email: str
     slogan: str | None = None
     website: str | None = None
+
+
+class DoctorScheduleContext(BaseModel):
+    doctor_id: UUID
+    shift_name: str | None = None
+    shift_start: str
+    shift_end: str
+    slot_duration_minutes: int = 15
+    uses_default_shift: bool = False
+
+
+class DoctorLeaveCreate(BaseModel):
+    leave_date: date
+    start_time: time
+    end_time: time
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class DoctorLeaveResponse(BaseModel):
+    id: UUID
+    doctor_id: UUID
+    leave_date: date
+    start_time: time
+    end_time: time
+    reason: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

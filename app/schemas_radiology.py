@@ -47,6 +47,7 @@ class RadScanResponse(BaseModel):
 class RadOrderCreate(BaseModel):
     patient_id: UUID
     doctor_id: UUID | None = None
+    appointment_id: UUID | None = None
     scan_ids: list[UUID] = Field(min_length=1)
     clinical_notes: str | None = None
 
@@ -74,6 +75,7 @@ class RadOrderResponse(BaseModel):
     order_no: str
     patient_id: UUID
     doctor_id: UUID | None
+    appointment_id: UUID | None = None
     scan_id: UUID | None
     scan_code: str
     scan_name: str

@@ -60,6 +60,7 @@ def _order_to_response(order: LabOrder) -> LabOrderResponse:
         order_no=order.order_no,
         patient_id=order.patient_id,
         doctor_id=order.doctor_id,
+        appointment_id=order.appointment_id,
         ordered_by_name=order.ordered_by_name,
         ordered_by_role=order.ordered_by_role,
         status=order.status,
@@ -378,6 +379,7 @@ def create_order(
         order_no=_next_order_no(db, hospital_id),
         patient_id=patient.id,
         doctor_id=doctor.id if doctor else None,
+        appointment_id=payload.appointment_id,
         ordered_by_name=_actor_name(user),
         ordered_by_role=_actor_role(user),
         status=LabOrderStatus.ordered,
@@ -553,7 +555,12 @@ def save_results(
         summary=f"Saved lab results for {order.order_no} ({len(payload.results)} parameters)",
     )
     db.commit()
-    return _order_to_response(_get_order(db, order_id, hospital_id))
+    order = _get_order(db, order_id, hospital_id)
+    from app.utils.medical_record_sync import sync_lab_order_medical_record
+
+    sync_lab_order_medical_record(db, order)
+    db.commit()
+    return _order_to_response(order)
 
 
 @router.get("/orders/{order_id}/report")

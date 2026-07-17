@@ -49,6 +49,7 @@ class LabTestResponse(BaseModel):
 class LabOrderCreate(BaseModel):
     patient_id: UUID
     doctor_id: UUID | None = None
+    appointment_id: UUID | None = None
     test_ids: list[UUID] = Field(min_length=1)
     clinical_notes: str | None = None
 
@@ -84,6 +85,7 @@ class LabOrderResponse(BaseModel):
     order_no: str
     patient_id: UUID
     doctor_id: UUID | None
+    appointment_id: UUID | None = None
     ordered_by_name: str
     ordered_by_role: str
     status: LabOrderStatus

@@ -41,6 +41,12 @@ class AppointmentListItem(BaseModel):
     doctor_name: str | None = None
 
 
+class LeaveBlock(BaseModel):
+    start: str
+    end: str
+    reason: str | None = None
+
+
 class DoctorAvailability(BaseModel):
     doctor_id: UUID
     doctor_name: str
@@ -48,6 +54,9 @@ class DoctorAvailability(BaseModel):
     available: bool
     reason: str | None = None
     booked_slots: list[str] = []
+    leave_blocks: list[LeaveBlock] = []
+    shift_start: str | None = None
+    shift_end: str | None = None
 
 
 class QueueGroup(BaseModel):

@@ -12,6 +12,9 @@ from app.schemas_doctors import (
     AppointmentCreate,
     AppointmentResponse,
     AppointmentUpdate,
+    DoctorLeaveCreate,
+    DoctorLeaveResponse,
+    DoctorScheduleContext,
     DoctorSummary,
     HospitalClinicProfile,
     MedicalRecordCreate,
@@ -29,18 +32,36 @@ from app.routers.ot import _surgery_to_response as _ot_surgery_to_response
 from app.models import (
     Appointment,
     AppointmentStatus,
+    DoctorLeave,
     Hospital,
     HospitalUser,
+    LabItemStatus,
     LabOrder,
+    LabOrderItem,
+    LabOrderStatus,
+    LabSampleType,
+    LabTestCatalog,
     MedicalRecord,
     OtSurgery,
     Patient,
     PatientStatus,
     Prescription,
     RadiologyOrder,
+    RadiologyOrderStatus,
+    RadiologyScanCatalog,
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
+from app.utils.doctor_leave import (
+    appointments_blocking_leave,
+    fmt_time_hhmm,
+    get_shift_bounds,
+    leave_blocks_overlap_existing,
+    leave_for_slot,
+    list_leaves_in_range,
+    slot_duration_minutes,
+    time_to_minutes,
+)
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
 
@@ -75,7 +96,7 @@ def _resolve_doctor_id(user: dict, doctor_id: UUID | None, hospital_id: UUID, db
 def _get_doctor(db: Session, doctor_id: UUID, hospital_id: UUID) -> HospitalUser:
     doctor = (
         db.query(HospitalUser)
-        .options(joinedload(HospitalUser.role))
+        .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift))
         .filter(HospitalUser.id == doctor_id, HospitalUser.hospital_id == hospital_id)
         .first()
     )
@@ -160,6 +181,9 @@ def _record_response(r: MedicalRecord) -> MedicalRecordResponse:
         hospital_id=r.hospital_id,
         doctor_id=r.doctor_id,
         patient_id=r.patient_id,
+        appointment_id=r.appointment_id,
+        lab_order_id=r.lab_order_id,
+        radiology_order_id=r.radiology_order_id,
         report_type=r.report_type,
         title=r.title,
         notes=r.notes,
@@ -475,21 +499,26 @@ def get_patient_history(
             joinedload(LabOrder.items),
             joinedload(LabOrder.results),
         )
-        .filter(LabOrder.hospital_id == hospital_id, LabOrder.patient_id == patient_id)
+        .filter(LabOrder.doctor_id == resolved, LabOrder.patient_id == patient_id)
         .order_by(LabOrder.ordered_at.desc())
         .all()
     )
     radiology_orders = (
         db.query(RadiologyOrder)
         .options(joinedload(RadiologyOrder.patient), joinedload(RadiologyOrder.doctor))
-        .filter(RadiologyOrder.hospital_id == hospital_id, RadiologyOrder.patient_id == patient_id)
+        .filter(RadiologyOrder.doctor_id == resolved, RadiologyOrder.patient_id == patient_id)
         .order_by(RadiologyOrder.ordered_at.desc())
         .all()
     )
     ot_surgeries = (
         db.query(OtSurgery)
-        .options(joinedload(OtSurgery.patient), joinedload(OtSurgery.surgeon))
-        .filter(OtSurgery.hospital_id == hospital_id, OtSurgery.patient_id == patient_id)
+        .options(
+            joinedload(OtSurgery.patient),
+            joinedload(OtSurgery.surgeon),
+            joinedload(OtSurgery.department),
+            joinedload(OtSurgery.ot_room_ref),
+        )
+        .filter(OtSurgery.surgeon_id == resolved, OtSurgery.patient_id == patient_id)
         .order_by(OtSurgery.scheduled_at.desc())
         .all()
     )
@@ -526,6 +555,14 @@ def create_appointment(
     patient = db.query(Patient).filter(Patient.id == payload.patient_id, Patient.hospital_id == hospital_id).first()
     if not patient:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
+    slot_min = slot_duration_minutes(db, hospital_id)
+    on_leave = leave_for_slot(db, hospital_id, resolved, payload.appointment_date, payload.appointment_time, slot_min)
+    if on_leave:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Doctor is on leave from {fmt_time_hhmm(on_leave.start_time)} to {fmt_time_hhmm(on_leave.end_time)}",
+        )
 
     appt = Appointment(
         hospital_id=hospital_id,
@@ -615,6 +652,155 @@ def get_calendar(
     return [_appointment_response(a) for a in rows]
 
 
+# ── Schedule / Leave ─────────────────────────────────────────────────────────────
+
+
+def _leave_response(leave: DoctorLeave) -> DoctorLeaveResponse:
+    return DoctorLeaveResponse(
+        id=leave.id,
+        doctor_id=leave.doctor_id,
+        leave_date=leave.leave_date,
+        start_time=leave.start_time,
+        end_time=leave.end_time,
+        reason=leave.reason,
+        created_at=leave.created_at,
+    )
+
+
+@router.get("/{doctor_id}/schedule-context", response_model=DoctorScheduleContext)
+def get_schedule_context(
+    doctor_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
+    doctor = _get_doctor(db, resolved, hospital_id)
+    shift_start, shift_end, shift_name = get_shift_bounds(doctor)
+    uses_default = doctor.shift is None or not doctor.shift.is_active
+    return DoctorScheduleContext(
+        doctor_id=resolved,
+        shift_name=shift_name,
+        shift_start=fmt_time_hhmm(shift_start),
+        shift_end=fmt_time_hhmm(shift_end),
+        slot_duration_minutes=slot_duration_minutes(db, hospital_id),
+        uses_default_shift=uses_default,
+    )
+
+
+@router.get("/{doctor_id}/leaves", response_model=list[DoctorLeaveResponse])
+def list_doctor_leaves(
+    doctor_id: UUID,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
+    start = date_from or date.today()
+    end = date_to or start
+    if end < start:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="date_to must be on or after date_from")
+    rows = list_leaves_in_range(db, hospital_id, resolved, start, end)
+    return [_leave_response(r) for r in rows]
+
+
+@router.post("/{doctor_id}/leaves", response_model=DoctorLeaveResponse, status_code=status.HTTP_201_CREATED)
+def create_doctor_leave(
+    doctor_id: UUID,
+    payload: DoctorLeaveCreate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
+    doctor = _get_doctor(db, resolved, hospital_id)
+    shift_start, shift_end, _ = get_shift_bounds(doctor)
+    if payload.start_time >= payload.end_time:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="End time must be after start time")
+    s0, s1 = time_to_minutes(shift_start), time_to_minutes(shift_end)
+    a0, a1 = time_to_minutes(payload.start_time), time_to_minutes(payload.end_time)
+    if a0 < s0 or a1 > s1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Leave must be within your shift ({fmt_time_hhmm(shift_start)}–{fmt_time_hhmm(shift_end)})",
+        )
+
+    slot_min = slot_duration_minutes(db, hospital_id)
+    blocked = appointments_blocking_leave(
+        db, hospital_id, resolved, payload.leave_date, payload.start_time, payload.end_time, slot_min
+    )
+    if blocked:
+        times = ", ".join(fmt_time_hhmm(a.appointment_time) for a in blocked[:3])
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot mark leave: existing appointment(s) at {times}",
+        )
+
+    overlap = leave_blocks_overlap_existing(
+        db, hospital_id, resolved, payload.leave_date, payload.start_time, payload.end_time
+    )
+    if overlap:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Leave overlaps an existing leave block")
+
+    leave = DoctorLeave(
+        hospital_id=hospital_id,
+        doctor_id=resolved,
+        leave_date=payload.leave_date,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        reason=payload.reason.strip() if payload.reason else None,
+    )
+    db.add(leave)
+    db.flush()
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="create",
+        entity_type="doctor_leave",
+        entity_id=leave.id,
+        summary=f"Marked leave on {payload.leave_date} {fmt_time_hhmm(payload.start_time)}–{fmt_time_hhmm(payload.end_time)}",
+    )
+    db.commit()
+    db.refresh(leave)
+    return _leave_response(leave)
+
+
+@router.delete("/{doctor_id}/leaves/{leave_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_doctor_leave(
+    doctor_id: UUID,
+    leave_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
+    leave = (
+        db.query(DoctorLeave)
+        .filter(
+            DoctorLeave.id == leave_id,
+            DoctorLeave.doctor_id == resolved,
+            DoctorLeave.hospital_id == hospital_id,
+        )
+        .first()
+    )
+    if not leave:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Leave not found")
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="delete",
+        entity_type="doctor_leave",
+        entity_id=leave.id,
+        summary=f"Removed leave on {leave.leave_date}",
+    )
+    db.delete(leave)
+    db.commit()
+
+
 @router.put("/{doctor_id}/appointments/{appointment_id}", response_model=AppointmentResponse)
 def update_appointment(
     doctor_id: UUID,
@@ -673,6 +859,11 @@ def create_prescription(
     patient = db.query(Patient).filter(Patient.id == payload.patient_id, Patient.hospital_id == hospital_id).first()
     if not patient:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+    if (payload.test_ids or payload.scan_ids) and not payload.appointment_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Select a visit when ordering laboratory or radiology with this prescription",
+        )
     if payload.appointment_id:
         appt = (
             db.query(Appointment)
@@ -686,20 +877,116 @@ def create_prescription(
         if not appt:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
 
+    body_text = payload.medicines.strip()
+    investigation_lines: list[str] = []
+
+    tests: list[LabTestCatalog] = []
+    if payload.test_ids:
+        tests = (
+            db.query(LabTestCatalog)
+            .filter(
+                LabTestCatalog.hospital_id == hospital_id,
+                LabTestCatalog.id.in_(payload.test_ids),
+                LabTestCatalog.is_active.is_(True),
+            )
+            .all()
+        )
+        if len(tests) != len(set(payload.test_ids)):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lab test selection")
+        test_names = ", ".join(t.test_name for t in tests)
+        investigation_lines.append(f"Laboratory tests prescribed: {test_names}")
+
+    scans: list[RadiologyScanCatalog] = []
+    if payload.scan_ids:
+        scans = (
+            db.query(RadiologyScanCatalog)
+            .filter(
+                RadiologyScanCatalog.hospital_id == hospital_id,
+                RadiologyScanCatalog.id.in_(payload.scan_ids),
+                RadiologyScanCatalog.is_active.is_(True),
+            )
+            .all()
+        )
+        if len(scans) != len(set(payload.scan_ids)):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid radiology scan selection")
+        scan_names = ", ".join(s.scan_name for s in scans)
+        investigation_lines.append(f"Radiology prescribed: {scan_names}")
+
+    if investigation_lines:
+        body_text = (body_text + "\n\n" if body_text else "") + "\n".join(investigation_lines)
+
     rx = Prescription(
         hospital_id=hospital_id,
         doctor_id=resolved,
         patient_id=payload.patient_id,
         appointment_id=payload.appointment_id,
-        symptoms=payload.symptoms.strip(),
+        symptoms=body_text,
         diagnosis=payload.diagnosis.strip(),
-        medicines=payload.medicines.strip(),
+        medicines=body_text,
         dosage=payload.dosage.strip(),
         advice=payload.advice.strip() if payload.advice else None,
         follow_up_date=payload.follow_up_date,
     )
     db.add(rx)
     db.flush()
+
+    if tests:
+        sample_type = tests[0].sample_type
+        for t in tests:
+            if t.sample_type == LabSampleType.blood:
+                sample_type = LabSampleType.blood
+                break
+        lab_count = db.query(func.count(LabOrder.id)).filter(LabOrder.hospital_id == hospital_id).scalar() or 0
+        lab_order = LabOrder(
+            hospital_id=hospital_id,
+            order_no=f"LAB{int(lab_count) + 1:04d}",
+            patient_id=patient.id,
+            doctor_id=resolved,
+            appointment_id=payload.appointment_id,
+            ordered_by_name=str(user.get("name") or "Doctor"),
+            ordered_by_role=str(user.get("staff_role_name") or user.get("role") or "doctor"),
+            status=LabOrderStatus.ordered,
+            clinical_notes=f"Ordered with prescription {rx.id}: {payload.diagnosis.strip()[:200]}",
+            sample_type=sample_type,
+        )
+        db.add(lab_order)
+        db.flush()
+        for t in tests:
+            db.add(
+                LabOrderItem(
+                    hospital_id=hospital_id,
+                    order_id=lab_order.id,
+                    test_id=t.id,
+                    test_code=t.test_code,
+                    test_name=t.test_name,
+                    department=t.department,
+                    price=t.price,
+                    status=LabItemStatus.pending,
+                )
+            )
+
+    if scans:
+        rad_base = db.query(func.count(RadiologyOrder.id)).filter(RadiologyOrder.hospital_id == hospital_id).scalar() or 0
+        for idx, scan in enumerate(scans):
+            db.add(
+                RadiologyOrder(
+                    hospital_id=hospital_id,
+                    order_no=f"RAD{int(rad_base) + idx + 1:04d}",
+                    patient_id=patient.id,
+                    doctor_id=resolved,
+                    appointment_id=payload.appointment_id,
+                    scan_id=scan.id,
+                    scan_code=scan.scan_code,
+                    scan_name=scan.scan_name,
+                    category=scan.category,
+                    price=scan.price,
+                    ordered_by_name=str(user.get("name") or "Doctor"),
+                    ordered_by_role=str(user.get("staff_role_name") or user.get("role") or "doctor"),
+                    status=RadiologyOrderStatus.ordered,
+                    clinical_notes=f"Ordered with prescription {rx.id}: {payload.diagnosis.strip()[:200]}",
+                )
+            )
+
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -762,7 +1049,8 @@ def prescription_pdf(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found")
 
     hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
-    html = _prescription_html(rx, hospital)
+    lab_names, rad_names = _prescription_investigation_names(db, rx)
+    html = _prescription_html(rx, hospital, lab_names=lab_names, rad_names=rad_names)
     # Return printable HTML; browser "Save as PDF" / print works without extra deps
     return StreamingResponse(
         BytesIO(html.encode("utf-8")),
@@ -771,7 +1059,86 @@ def prescription_pdf(
     )
 
 
-def _prescription_html(rx: Prescription, hospital: Hospital | None = None) -> str:
+def _prescription_investigation_names(db: Session, rx: Prescription) -> tuple[list[str], list[str]]:
+    """Resolve lab/radiology ordered with this prescription (for PDF)."""
+    rx_id = str(rx.id)
+    lab_q = (
+        db.query(LabOrder)
+        .options(joinedload(LabOrder.items))
+        .filter(
+            LabOrder.hospital_id == rx.hospital_id,
+            LabOrder.patient_id == rx.patient_id,
+            LabOrder.doctor_id == rx.doctor_id,
+        )
+    )
+    rad_q = (
+        db.query(RadiologyOrder)
+        .filter(
+            RadiologyOrder.hospital_id == rx.hospital_id,
+            RadiologyOrder.patient_id == rx.patient_id,
+            RadiologyOrder.doctor_id == rx.doctor_id,
+        )
+    )
+    if rx.appointment_id:
+        lab_q = lab_q.filter(LabOrder.appointment_id == rx.appointment_id)
+        rad_q = rad_q.filter(RadiologyOrder.appointment_id == rx.appointment_id)
+
+    lab_orders = lab_q.order_by(LabOrder.ordered_at.desc()).all()
+    rad_orders = rad_q.order_by(RadiologyOrder.ordered_at.desc()).all()
+
+    def linked(notes: str | None, ordered_at) -> bool:
+        n = (notes or "").lower()
+        if rx_id.lower() in n:
+            return True
+        if "ordered with prescription" in n and rx.diagnosis and rx.diagnosis.strip().lower()[:80] in n:
+            return True
+        if ordered_at and rx.created_at:
+            delta = abs((ordered_at - rx.created_at).total_seconds())
+            return delta <= 300  # same create window (±5 min)
+        return False
+
+    lab_names: list[str] = []
+    for o in lab_orders:
+        if not linked(o.clinical_notes, o.ordered_at):
+            # If appointment-linked and only one Rx timing match is weak, still include
+            # orders created the same calendar day when notes say "Ordered with prescription"
+            notes = (o.clinical_notes or "").lower()
+            same_day = (
+                o.ordered_at
+                and rx.created_at
+                and o.ordered_at.date() == rx.created_at.date()
+                and "ordered with prescription" in notes
+            )
+            if not same_day:
+                continue
+        for item in o.items or []:
+            if item.test_name and item.test_name not in lab_names:
+                lab_names.append(item.test_name)
+
+    rad_names: list[str] = []
+    for o in rad_orders:
+        if not linked(o.clinical_notes, o.ordered_at):
+            notes = (o.clinical_notes or "").lower()
+            same_day = (
+                o.ordered_at
+                and rx.created_at
+                and o.ordered_at.date() == rx.created_at.date()
+                and "ordered with prescription" in notes
+            )
+            if not same_day:
+                continue
+        if o.scan_name and o.scan_name not in rad_names:
+            rad_names.append(o.scan_name)
+
+    return lab_names, rad_names
+
+
+def _prescription_html(
+    rx: Prescription,
+    hospital: Hospital | None = None,
+    lab_names: list[str] | None = None,
+    rad_names: list[str] | None = None,
+) -> str:
     follow = rx.follow_up_date.strftime("%d %b %Y") if rx.follow_up_date else "—"
     created = rx.created_at.strftime("%d %b %Y") if rx.created_at else ""
     doctor = rx.doctor
@@ -798,6 +1165,17 @@ def _prescription_html(rx: Prescription, hospital: Hospital | None = None) -> st
     if not body or body == "—":
         parts = [p for p in [rx.symptoms, rx.dosage, rx.advice] if p and str(p).strip() and str(p).strip() != "—"]
         body = "\n\n".join(parts) if parts else "—"
+
+    body_lower = body.lower()
+    extra_lines: list[str] = []
+    if lab_names and "laboratory tests prescribed" not in body_lower and "lab tests prescribed" not in body_lower:
+        extra_lines.append(f"Laboratory tests prescribed: {', '.join(lab_names)}")
+    if rad_names and "radiology prescribed" not in body_lower:
+        extra_lines.append(f"Radiology prescribed: {', '.join(rad_names)}")
+    if extra_lines:
+        body = (body if body != "—" else "") + ("\n\n" if body and body != "—" else "") + "\n".join(extra_lines)
+        if not body.strip():
+            body = "—"
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"/><title>Prescription</title>
@@ -899,6 +1277,7 @@ def create_medical_record(
         hospital_id=hospital_id,
         doctor_id=resolved,
         patient_id=payload.patient_id,
+        appointment_id=payload.appointment_id,
         report_type=payload.report_type.strip(),
         title=payload.title.strip(),
         notes=payload.notes.strip() if payload.notes else None,

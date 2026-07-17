@@ -1,4 +1,4 @@
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
 from uuid import UUID
 
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
 from app.models import Department, Hospital, HospitalUser, OtRoom, OtSurgery, OtSurgeryStatus, Patient
 from app.schemas_ot import (
+    OtCalendarEntry,
     OtCompleteRequest,
     OtDashboardResponse,
     OtNotesRequest,
@@ -20,6 +21,7 @@ from app.schemas_ot import (
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
+from app.utils.medical_record_sync import sync_ot_surgery_medical_record
 
 router = APIRouter(prefix="/ot", tags=["ot"])
 
@@ -127,6 +129,111 @@ def _get_surgery(db: Session, surgery_id: UUID, hospital_id: UUID) -> OtSurgery:
     return item
 
 
+def _surgery_end(item: OtSurgery) -> datetime:
+    start = item.scheduled_at
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return start + timedelta(minutes=int(item.duration_minutes or 60))
+
+
+def _sync_time_based_status(item: OtSurgery, now: datetime | None = None) -> None:
+    """Move scheduled surgeries into in_progress while inside the booked window."""
+    if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled):
+        return
+    now = now or datetime.now(timezone.utc)
+    start = item.scheduled_at
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    end = _surgery_end(item)
+    if item.status in (OtSurgeryStatus.scheduled, OtSurgeryStatus.confirmed) and start <= now < end:
+        item.status = OtSurgeryStatus.in_progress
+        if not item.started_at:
+            item.started_at = start
+
+
+def _ot_room_conflict(
+    db: Session,
+    hospital_id: UUID,
+    ot_room_id: UUID,
+    start: datetime,
+    end: datetime,
+    exclude_id: UUID | None = None,
+) -> bool:
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    rows = (
+        db.query(OtSurgery)
+        .filter(
+            OtSurgery.hospital_id == hospital_id,
+            OtSurgery.ot_room_id == ot_room_id,
+            OtSurgery.status.notin_([OtSurgeryStatus.cancelled]),
+        )
+        .all()
+    )
+    for item in rows:
+        if exclude_id and item.id == exclude_id:
+            continue
+        s = item.scheduled_at
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc)
+        e = s + timedelta(minutes=int(item.duration_minutes or 60))
+        if s < end and start < e:
+            return True
+    return False
+
+
+@router.get("/calendar", response_model=list[OtCalendarEntry])
+def ot_calendar(
+    date_from: date = Query(...),
+    date_to: date = Query(...),
+    ot_room_id: UUID | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    if date_to < date_from:
+        raise HTTPException(status_code=400, detail="date_to must be on or after date_from")
+    start = datetime.combine(date_from, time.min).replace(tzinfo=timezone.utc)
+    end = datetime.combine(date_to, time.max).replace(tzinfo=timezone.utc)
+    q = (
+        db.query(OtSurgery)
+        .options(joinedload(OtSurgery.patient), joinedload(OtSurgery.surgeon), joinedload(OtSurgery.ot_room_ref))
+        .filter(
+            OtSurgery.hospital_id == hospital_id,
+            OtSurgery.scheduled_at <= end,
+            OtSurgery.status != OtSurgeryStatus.cancelled,
+        )
+    )
+    if ot_room_id:
+        q = q.filter(OtSurgery.ot_room_id == ot_room_id)
+    rows = q.order_by(OtSurgery.scheduled_at.asc()).all()
+    out: list[OtCalendarEntry] = []
+    for item in rows:
+        ends = _surgery_end(item)
+        if ends < start:
+            continue
+        room = item.ot_room_ref
+        if not item.ot_room_id and not room:
+            continue
+        label = _room_label(room) if room else (item.ot_room or "OT")
+        out.append(
+            OtCalendarEntry(
+                id=item.id,
+                ot_room_id=item.ot_room_id or room.id,
+                ot_room_label=label,
+                scheduled_at=item.scheduled_at,
+                ends_at=ends,
+                surgery_type=item.surgery_type,
+                status=item.status,
+                patient_name=item.patient.name if item.patient else None,
+                surgeon_name=item.surgeon.name if item.surgeon else None,
+            )
+        )
+    return out
+
+
 @router.get("/dashboard", response_model=OtDashboardResponse)
 def dashboard(
     db: Session = Depends(get_db),
@@ -179,11 +286,7 @@ def list_surgeries(
         except ValueError:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status")
     if schedule_only:
-        q = q.filter(
-            OtSurgery.status.in_(
-                [OtSurgeryStatus.scheduled, OtSurgeryStatus.confirmed, OtSurgeryStatus.in_progress]
-            )
-        )
+        q = q.filter(OtSurgery.status.notin_([OtSurgeryStatus.completed, OtSurgeryStatus.cancelled]))
     if ongoing_only:
         q = q.filter(OtSurgery.status == OtSurgeryStatus.in_progress)
     if history_only:
@@ -205,6 +308,10 @@ def list_surgeries(
             )
         )
     rows = q.order_by(OtSurgery.scheduled_at.desc()).limit(300).all()
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        _sync_time_based_status(r, now)
+    db.commit()
     return [_surgery_to_response(r) for r in rows]
 
 
@@ -252,6 +359,16 @@ def create_surgery(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
 
     ot_room = _resolve_ot_room(db, hospital_id, payload.ot_room_id, payload.department_id)
+
+    start = payload.scheduled_at
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    end = start + timedelta(minutes=int(payload.duration_minutes or 60))
+    if _ot_room_conflict(db, hospital_id, ot_room.id, start, end):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="OT room is already booked for this time range",
+        )
 
     item = OtSurgery(
         hospital_id=hospital_id,
@@ -360,7 +477,7 @@ def reschedule_surgery(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     item = _get_surgery(db, surgery_id, hospital_id)
-    if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled, OtSurgeryStatus.in_progress):
+    if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot reschedule this surgery")
     item.scheduled_at = payload.scheduled_at
     if payload.ot_room_id:
@@ -434,9 +551,17 @@ def complete_surgery(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     item = _get_surgery(db, surgery_id, hospital_id)
-    if item.status != OtSurgeryStatus.in_progress:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only ongoing surgeries can be completed")
     now = datetime.now(timezone.utc)
+    _sync_time_based_status(item, now)
+    if item.status in (OtSurgeryStatus.scheduled, OtSurgeryStatus.confirmed):
+        start = item.scheduled_at
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if now >= start:
+            item.status = OtSurgeryStatus.in_progress
+            item.started_at = item.started_at or start
+    if item.status != OtSurgeryStatus.in_progress:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Surgery is not ongoing yet")
     item.status = OtSurgeryStatus.completed
     item.completed_at = now
     if payload:
@@ -471,8 +596,6 @@ def cancel_surgery(
     item = _get_surgery(db, surgery_id, hospital_id)
     if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Surgery cannot be cancelled")
-    if item.status == OtSurgeryStatus.in_progress:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Complete ongoing surgery instead of cancelling")
     item.status = OtSurgeryStatus.cancelled
     write_audit(
         db,
@@ -496,11 +619,9 @@ def save_notes(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     item = _get_surgery(db, surgery_id, hospital_id)
-    if item.status not in (OtSurgeryStatus.in_progress, OtSurgeryStatus.completed):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Notes can be recorded only for ongoing or completed surgeries",
-        )
+    if item.status == OtSurgeryStatus.cancelled:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot add notes to a cancelled surgery")
+    _sync_time_based_status(item)
     item.pre_op_diagnosis = payload.pre_op_diagnosis.strip()
     item.procedure_performed = payload.procedure_performed.strip()
     item.findings = payload.findings.strip() if payload.findings else None
@@ -534,6 +655,7 @@ def save_notes(
         entity_id=item.id,
         summary=f"Saved operation notes for {item.surgery_no}",
     )
+    sync_ot_surgery_medical_record(db, item)
     db.commit()
     return _surgery_to_response(_get_surgery(db, surgery_id, hospital_id))
 
