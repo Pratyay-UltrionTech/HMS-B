@@ -22,7 +22,11 @@ class Settings(BaseSettings):
     super_admin_email: str = "ultriohms@ultriontech.com"
     super_admin_password: str = "UltrionHMS"
 
-    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    cors_origins: str = (
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "https://hms.ultriontech.com,"
+        "https://ashy-plant-02ffd7210.azurestaticapps.net"
+    )
 
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
