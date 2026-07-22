@@ -13,7 +13,9 @@ from app.models import (
     Holiday,
     HospitalUser,
     Patient,
+    PatientStatus,
 )
+from app.routers.registration import _age_from_dob, _display_name, _next_uhid
 from app.schemas_appointment import (
     AppointmentListItem,
     BookAppointmentRequest,
@@ -214,6 +216,66 @@ def check_doctor_availability(
     )
 
 
+def _resolve_or_register_patient(
+    db: Session,
+    hospital_id: UUID,
+    user: dict,
+    payload: BookAppointmentRequest,
+) -> Patient:
+    """Use existing patient_id, or find/create by mobile from new-patient fields."""
+    if payload.patient_id is not None:
+        patient = (
+            db.query(Patient)
+            .filter(Patient.id == payload.patient_id, Patient.hospital_id == hospital_id)
+            .first()
+        )
+        if not patient:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+        return patient
+
+    mobile = (payload.mobile or "").strip()
+    existing = (
+        db.query(Patient)
+        .filter(Patient.hospital_id == hospital_id, Patient.mobile == mobile)
+        .first()
+    )
+    if existing:
+        return existing
+
+    first = (payload.first_name or "").strip()
+    last = (payload.last_name or "").strip()
+    age = payload.age if payload.age is not None else _age_from_dob(payload.date_of_birth)
+    uhid = _next_uhid(db, hospital_id)
+    patient = Patient(
+        hospital_id=hospital_id,
+        uhid=uhid,
+        first_name=first,
+        last_name=last,
+        name=_display_name(first, last),
+        mobile=mobile,
+        email=str(payload.email).lower() if payload.email else None,
+        age=age,
+        date_of_birth=payload.date_of_birth,
+        gender=(payload.gender or "").strip(),
+        address=payload.address.strip() if payload.address else None,
+        emergency_contact=payload.emergency_contact.strip() if payload.emergency_contact else None,
+        blood_group=payload.blood_group,
+        status=PatientStatus.active,
+    )
+    db.add(patient)
+    db.flush()
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="create",
+        entity_type="patient",
+        entity_id=patient.id,
+        summary=f"Auto-registered patient {patient.uhid} {patient.name} via appointment booking",
+    )
+    return patient
+
+
 @router.post("", response_model=AppointmentListItem, status_code=status.HTTP_201_CREATED)
 def book_appointment(
     payload: BookAppointmentRequest,
@@ -221,9 +283,7 @@ def book_appointment(
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
-    patient = db.query(Patient).filter(Patient.id == payload.patient_id, Patient.hospital_id == hospital_id).first()
-    if not patient:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+    patient = _resolve_or_register_patient(db, hospital_id, user, payload)
 
     doctor = (
         db.query(HospitalUser)
@@ -261,7 +321,7 @@ def book_appointment(
     appt = Appointment(
         hospital_id=hospital_id,
         doctor_id=payload.doctor_id,
-        patient_id=payload.patient_id,
+        patient_id=patient.id,
         appointment_date=payload.appointment_date,
         appointment_time=payload.appointment_time,
         purpose=purpose,

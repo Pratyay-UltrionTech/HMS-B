@@ -1,19 +1,54 @@
 from datetime import date, datetime, time
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 from app.models import AppointmentStatus
+from app.utils.phone import OptionalPhoneNumber, PhoneNumber
 
 
 class BookAppointmentRequest(BaseModel):
-    patient_id: UUID
+    """Book with an existing patient_id, or pass new-patient fields to auto-register."""
+
+    patient_id: UUID | None = None
+    # Auto-register fields (used when patient_id is omitted)
+    first_name: str | None = Field(default=None, min_length=1, max_length=128)
+    last_name: str | None = Field(default=None, min_length=1, max_length=128)
+    mobile: PhoneNumber | None = None
+    gender: str | None = Field(default=None, min_length=1, max_length=32)
+    date_of_birth: date | None = None
+    age: int | None = Field(default=None, ge=0, le=150)
+    email: EmailStr | None = None
+    address: str | None = None
+    emergency_contact: OptionalPhoneNumber = None
+    blood_group: str | None = Field(default=None, max_length=16)
+
     doctor_id: UUID
     appointment_date: date
     appointment_time: time
     visit_type: str = Field(default="OPD", min_length=1, max_length=64)
     purpose: str | None = Field(default=None, max_length=255)
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def require_patient_or_new_details(self):
+        if self.patient_id is not None:
+            return self
+        missing = [
+            name
+            for name, val in (
+                ("first_name", self.first_name),
+                ("last_name", self.last_name),
+                ("mobile", self.mobile),
+                ("gender", self.gender),
+            )
+            if not (val and str(val).strip())
+        ]
+        if missing:
+            raise ValueError(
+                "Provide patient_id for an existing patient, or first_name, last_name, mobile, and gender to auto-register"
+            )
+        return self
 
 
 class RescheduleRequest(BaseModel):
