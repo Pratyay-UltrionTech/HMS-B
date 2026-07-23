@@ -97,6 +97,11 @@ def _patient_item(db: Session, patient: Patient) -> DmsPatientItem:
         status=patient.status.value if hasattr(patient.status, "value") else str(patient.status),
         last_visit=last_appt.appointment_date if last_appt else None,
         created_at=patient.created_at,
+        emergency_contact=getattr(patient, "emergency_contact", None),
+        emergency_contact_name=getattr(patient, "emergency_contact_name", None),
+        emergency_contact_relation=getattr(patient, "emergency_contact_relation", None),
+        has_insurance=bool(getattr(patient, "has_insurance", False)),
+        insurance_provider=getattr(patient, "insurance_provider", None),
     )
 
 
@@ -726,15 +731,96 @@ def _build_patient_file(db: Session, patient: Patient, hospital_id: UUID) -> Dms
         )
     ]
 
-    billing_documents: list[DmsBillingItem] = [
+    billing_documents: list[DmsBillingItem] = []
+    from app.utils.billing import build_ledger_entries, patient_ledger_totals
+    from app.models import BillingInvoice, BillingInvoiceStatus, BillingReceipt, BillingReceiptStatus
+
+    fin = patient_ledger_totals(db, hospital_id, patient.id)
+    ledger_rows = build_ledger_entries(db, hospital_id, patient.id)
+    billing_documents.append(
         DmsBillingItem(
-            id="stub",
-            doc_type="info",
-            title="Billing module not configured",
-            status="pending",
-            note="Bills, invoices, and receipts will appear here once Billing is enabled.",
+            id="summary",
+            doc_type="summary",
+            title="Financial summary",
+            amount=fin["outstanding"],
+            status="outstanding" if fin["outstanding"] > 0 else "settled",
+            note=f"Charges ₹{fin['total_charges']:.2f} · Paid ₹{fin['total_paid']:.2f} · Outstanding ₹{fin['outstanding']:.2f}",
         )
-    ]
+    )
+    for e in ledger_rows[:40]:
+        billing_documents.append(
+            DmsBillingItem(
+                id=str(e["ref_id"]),
+                doc_type=e["entry_type"],
+                title=e["description"],
+                amount=e["debit"] if e["entry_type"] == "charge" else e["credit"],
+                status=e["status"] or "recorded",
+                created_at=e.get("occurred_at"),
+                note=None,
+            )
+        )
+    if len(billing_documents) == 1:
+        billing_documents.append(
+            DmsBillingItem(
+                id="empty",
+                doc_type="info",
+                title="No billing activity yet",
+                status="info",
+                note="Charges appear when appointments, lab, or radiology orders are created.",
+            )
+        )
+
+    invoices: list[DmsBillingItem] = []
+    for inv in (
+        db.query(BillingInvoice)
+        .filter(
+            BillingInvoice.hospital_id == hospital_id,
+            BillingInvoice.patient_id == patient.id,
+            BillingInvoice.status != BillingInvoiceStatus.cancelled,
+        )
+        .order_by(BillingInvoice.created_at.desc())
+        .limit(50)
+        .all()
+    ):
+        invoices.append(
+            DmsBillingItem(
+                id=str(inv.id),
+                doc_type="invoice",
+                title=inv.invoice_number,
+                amount=float(inv.grand_total),
+                status=inv.status.value,
+                created_at=datetime.combine(inv.invoice_date, time.min).replace(tzinfo=timezone.utc)
+                if inv.invoice_date
+                else inv.created_at,
+                note=f"/api/billing/invoices/{inv.id}/print",
+            )
+        )
+
+    receipts: list[DmsBillingItem] = []
+    for rcpt in (
+        db.query(BillingReceipt)
+        .filter(
+            BillingReceipt.hospital_id == hospital_id,
+            BillingReceipt.patient_id == patient.id,
+            BillingReceipt.status != BillingReceiptStatus.cancelled,
+        )
+        .order_by(BillingReceipt.created_at.desc())
+        .limit(50)
+        .all()
+    ):
+        receipts.append(
+            DmsBillingItem(
+                id=str(rcpt.id),
+                doc_type="receipt",
+                title=rcpt.receipt_number,
+                amount=float(rcpt.amount),
+                status=rcpt.status.value,
+                created_at=datetime.combine(rcpt.payment_date, time.min).replace(tzinfo=timezone.utc)
+                if rcpt.payment_date
+                else rcpt.created_at,
+                note=f"/api/billing/receipts/{rcpt.id}/print",
+            )
+        )
 
     return DmsPatientFile(
         patient=_patient_item(db, patient),
@@ -746,6 +832,8 @@ def _build_patient_file(db: Session, patient: Patient, hospital_id: UUID) -> Dms
         ot_records=ot_records,
         admissions=admissions,
         billing_documents=billing_documents,
+        invoices=invoices,
+        receipts=receipts,
     )
 
 
@@ -805,6 +893,8 @@ def _complete_file_html(file: DmsPatientFile, hospital: Hospital | None) -> str:
   <h1>{esc(hosp)}</h1>
   <p class="meta">Complete Patient Medical File · Generated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M')} UTC</p>
   <p><strong>{esc(p.name)}</strong> ({esc(p.uhid)}) · {esc(p.mobile)} · {esc(p.care_status)} · Age {p.age if p.age is not None else '—'}</p>
+  <p class="meta">Insurance: {'Yes — ' + esc(p.insurance_provider) if p.has_insurance else 'No'}
+  · Emergency: {esc(p.emergency_contact_name)}{(' (' + esc(p.emergency_contact_relation) + ')') if p.emergency_contact_relation else ''}{(' · ' + esc(p.emergency_contact)) if p.emergency_contact else ''}</p>
 
   <h2>Clinical Timeline</h2>
   <ul class="timeline">{timeline_html or '<li>No events</li>'}</ul>

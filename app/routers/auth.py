@@ -28,7 +28,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         token = create_access_token({"sub": email, "role": "super_admin"})
         return LoginResponse(access_token=token, role="super_admin", name="Super Admin")
 
-    hospital = db.query(Hospital).filter(Hospital.email == email, Hospital.is_active.is_(True)).first()
+    hospital = (
+        db.query(Hospital)
+        .filter(Hospital.email.ilike(email), Hospital.is_active.is_(True))
+        .first()
+    )
     if hospital and verify_password(payload.password, hospital.password_hash):
         logger.info("Hospital admin login success for %s (%s)", email, hospital.hospital_id)
         token = create_access_token(
@@ -60,7 +64,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     staff = (
         db.query(HospitalUser)
         .options(joinedload(HospitalUser.role).joinedload(StaffRole.permissions))
-        .filter(HospitalUser.email == email, HospitalUser.is_active.is_(True))
+        .filter(HospitalUser.email.ilike(email), HospitalUser.is_active.is_(True))
         .first()
     )
     if staff and verify_password(payload.password, staff.password_hash):

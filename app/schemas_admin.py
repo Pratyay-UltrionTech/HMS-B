@@ -21,6 +21,7 @@ BASIC_MODULE_KEYS = [
     "dms",
     "equipment",
     "mis",
+    "billing",
 ]
 
 BASIC_MODULE_LABELS = {
@@ -36,6 +37,7 @@ BASIC_MODULE_LABELS = {
     "dms": "Document Management",
     "equipment": "Equipment Management",
     "mis": "MIS Reports",
+    "billing": "Billing",
 }
 
 
@@ -118,7 +120,13 @@ class HospitalUserCreate(BaseModel):
     phone: PhoneNumber
     email: EmailStr
     password: str = Field(min_length=4, max_length=128)
+    department_id: UUID | None = None  # used to validate shift belongs to department
     shift_id: UUID | None = None
+    specialization: str | None = Field(default=None, max_length=255)
+    medical_registration_number: str | None = Field(default=None, max_length=64)
+    qualification: str | None = Field(default=None, max_length=255)
+    years_of_experience: int | None = Field(default=None, ge=0, le=80)
+    consultation_room: str | None = Field(default=None, max_length=128)
     custom_values: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
 
@@ -129,7 +137,13 @@ class HospitalUserUpdate(BaseModel):
     phone: PhoneNumber | None = None
     email: EmailStr | None = None
     password: str | None = Field(default=None, min_length=4, max_length=128)
+    department_id: UUID | None = None  # used to validate shift belongs to department
     shift_id: UUID | None = None
+    specialization: str | None = Field(default=None, max_length=255)
+    medical_registration_number: str | None = Field(default=None, max_length=64)
+    qualification: str | None = Field(default=None, max_length=255)
+    years_of_experience: int | None = Field(default=None, ge=0, le=80)
+    consultation_room: str | None = Field(default=None, max_length=128)
     custom_values: dict[str, Any] | None = None
     is_active: bool | None = None
 
@@ -142,11 +156,17 @@ class HospitalUserResponse(BaseModel):
     name: str
     phone: str
     email: EmailStr
+    specialization: str | None = None
+    medical_registration_number: str | None = None
+    qualification: str | None = None
+    years_of_experience: int | None = None
+    consultation_room: str | None = None
     custom_values: dict[str, Any]
     is_active: bool
     created_at: datetime
     role_name: str | None = None
     shift_name: str | None = None
+    shift_department_id: UUID | None = None
     shift_department_name: str | None = None
     shift_start_time: str | None = None
     shift_end_time: str | None = None

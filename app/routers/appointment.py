@@ -10,16 +10,20 @@ from app.models import (
     Appointment,
     AppointmentStatus,
     AppointmentType,
+    ConsultationPricing,
+    Department,
     Holiday,
     HospitalUser,
     Patient,
     PatientStatus,
+    Wing,
 )
 from app.routers.registration import _age_from_dob, _display_name, _next_uhid
 from app.schemas_appointment import (
     AppointmentListItem,
     BookAppointmentRequest,
     DoctorAvailability,
+    FeePreviewResponse,
     LeaveBlock,
     QueueGroup,
     RescheduleRequest,
@@ -41,6 +45,134 @@ def _is_doctor(user: HospitalUser) -> bool:
     return bool(user.role and "doctor" in (user.role.name or "").lower())
 
 
+def _doctor_fallback_fee(doctor: HospitalUser) -> float:
+    cv = doctor.custom_values or {}
+    for key in ("consultation_fee", "consultationFee", "fee", "consult_fee", "Consultation Fee"):
+        val = cv.get(key)
+        if val is None or val == "":
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _is_follow_up_type(appt_type: AppointmentType | None) -> bool:
+    if not appt_type:
+        return False
+    if getattr(appt_type, "is_follow_up", False):
+        return True
+    normalized = (appt_type.name or "").lower().replace(" ", "").replace("-", "").replace("_", "")
+    return "followup" in normalized or normalized in ("fu", "follow")
+
+
+def _find_pricing(
+    db: Session,
+    hospital_id: UUID,
+    wing_id: UUID,
+    department_id: UUID,
+    doctor_id: UUID,
+    appointment_type_id: UUID,
+) -> ConsultationPricing | None:
+    return (
+        db.query(ConsultationPricing)
+        .filter(
+            ConsultationPricing.hospital_id == hospital_id,
+            ConsultationPricing.wing_id == wing_id,
+            ConsultationPricing.department_id == department_id,
+            ConsultationPricing.doctor_id == doctor_id,
+            ConsultationPricing.appointment_type_id == appointment_type_id,
+            ConsultationPricing.is_active.is_(True),
+        )
+        .first()
+    )
+
+
+def _last_completed_visit(
+    db: Session,
+    hospital_id: UUID,
+    patient_id: UUID,
+    doctor_id: UUID,
+    before_date: date,
+) -> Appointment | None:
+    return (
+        db.query(Appointment)
+        .filter(
+            Appointment.hospital_id == hospital_id,
+            Appointment.patient_id == patient_id,
+            Appointment.doctor_id == doctor_id,
+            Appointment.status == AppointmentStatus.completed,
+            Appointment.appointment_date <= before_date,
+        )
+        .order_by(Appointment.appointment_date.desc(), Appointment.appointment_time.desc())
+        .first()
+    )
+
+
+def resolve_consultation_fee(
+    db: Session,
+    hospital_id: UUID,
+    *,
+    doctor: HospitalUser,
+    appt_type: AppointmentType | None,
+    wing_id: UUID | None,
+    department_id: UUID | None,
+    patient_id: UUID | None,
+    appointment_date: date,
+) -> dict:
+    """Resolve fee + follow-up eligibility. Returns snapshot-ready values."""
+    pricing = None
+    if wing_id and department_id and appt_type:
+        pricing = _find_pricing(db, hospital_id, wing_id, department_id, doctor.id, appt_type.id)
+
+    base_fee = float(pricing.consultation_fee) if pricing else _doctor_fallback_fee(doctor)
+    followup_free_days = pricing.followup_free_days if pricing else None
+    is_follow_up = _is_follow_up_type(appt_type)
+
+    eligibility: str | None = None
+    message: str | None = None
+    last_visit_date: date | None = None
+    final_fee = base_fee
+
+    if is_follow_up:
+        if not patient_id:
+            eligibility = "no_prior_visit"
+            message = "Follow-up selected — prior completed visit required to check free eligibility"
+        else:
+            prior = _last_completed_visit(db, hospital_id, patient_id, doctor.id, appointment_date)
+            if prior is None:
+                eligibility = "no_prior_visit"
+                message = "No prior completed visit with this doctor — standard fee applies"
+            else:
+                last_visit_date = prior.appointment_date
+                if followup_free_days is not None:
+                    days_since = (appointment_date - prior.appointment_date).days
+                    if days_since <= followup_free_days:
+                        final_fee = 0.0
+                        eligibility = "eligible"
+                        message = f"Eligible for free follow-up (within {followup_free_days} days)"
+                    else:
+                        eligibility = "expired"
+                        message = f"Follow-up period expired ({days_since} days since last visit; free within {followup_free_days} days)"
+                else:
+                    eligibility = "no_free_period"
+                    message = "Follow-up type — free period not configured; standard fee applies"
+
+    return {
+        "consultation_fee": final_fee,
+        "base_fee": base_fee,
+        "pricing_found": pricing is not None,
+        "followup_free_days": followup_free_days,
+        "is_follow_up": is_follow_up,
+        "followup_eligibility": eligibility,
+        "followup_message": message,
+        "last_completed_visit_date": last_visit_date,
+        "appointment_type_name": appt_type.name if appt_type else None,
+        "doctor_name": doctor.name,
+    }
+
+
 def _to_item(a: Appointment) -> AppointmentListItem:
     return AppointmentListItem(
         id=a.id,
@@ -51,6 +183,11 @@ def _to_item(a: Appointment) -> AppointmentListItem:
         appointment_time=a.appointment_time,
         purpose=a.purpose,
         visit_type=getattr(a, "visit_type", None) or "OPD",
+        appointment_type_id=getattr(a, "appointment_type_id", None),
+        wing_id=getattr(a, "wing_id", None),
+        department_id=getattr(a, "department_id", None),
+        consultation_fee=float(getattr(a, "consultation_fee", None) or 0),
+        followup_eligibility=getattr(a, "followup_eligibility", None),
         status=a.status,
         notes=a.notes,
         queue_token=getattr(a, "queue_token", None),
@@ -129,10 +266,49 @@ def list_doctors(
         .all()
     )
     return [
-        {"id": str(d.id), "name": d.name, "phone": d.phone, "email": d.email}
+        {
+            "id": str(d.id),
+            "name": d.name,
+            "phone": d.phone,
+            "email": d.email,
+            "specialization": d.specialization,
+            "qualification": d.qualification,
+            "medical_registration_number": d.medical_registration_number,
+            "years_of_experience": d.years_of_experience,
+            "consultation_room": d.consultation_room,
+        }
         for d in users
         if _is_doctor(d)
     ]
+
+
+@router.get("/wings")
+def list_booking_wings(
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    rows = (
+        db.query(Wing)
+        .filter(Wing.hospital_id == hospital_id, Wing.is_active.is_(True))
+        .order_by(Wing.name.asc())
+        .all()
+    )
+    return [{"id": str(w.id), "name": w.name} for w in rows]
+
+
+@router.get("/departments")
+def list_booking_departments(
+    wing_id: UUID | None = Query(default=None),
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    q = db.query(Department).filter(Department.hospital_id == hospital_id, Department.is_active.is_(True))
+    if wing_id:
+        q = q.filter(or_(Department.wing_id == wing_id, Department.wing_id.is_(None)))
+    rows = q.order_by(Department.name.asc()).all()
+    return [{"id": str(d.id), "name": d.name, "wing_id": str(d.wing_id) if d.wing_id else None} for d in rows]
 
 
 @router.get("/visit-types")
@@ -148,8 +324,87 @@ def list_visit_types(
         .all()
     )
     if not types:
-        return [{"name": "OPD", "slot_duration_minutes": 15}, {"name": "Follow-up", "slot_duration_minutes": 10}, {"name": "Emergency", "slot_duration_minutes": 20}]
-    return [{"name": t.name, "slot_duration_minutes": t.slot_duration_minutes, "id": str(t.id)} for t in types]
+        return [
+            {"name": "OPD", "slot_duration_minutes": 15, "is_follow_up": False},
+            {"name": "Follow-up", "slot_duration_minutes": 10, "is_follow_up": True},
+            {"name": "Emergency", "slot_duration_minutes": 20, "is_follow_up": False},
+        ]
+    return [
+        {
+            "name": t.name,
+            "slot_duration_minutes": t.slot_duration_minutes,
+            "id": str(t.id),
+            "is_follow_up": bool(getattr(t, "is_follow_up", False) or _is_follow_up_type(t)),
+        }
+        for t in types
+    ]
+
+
+@router.get("/fee-preview", response_model=FeePreviewResponse)
+def fee_preview(
+    doctor_id: UUID = Query(...),
+    appointment_type_id: UUID = Query(...),
+    wing_id: UUID = Query(...),
+    department_id: UUID = Query(...),
+    patient_id: UUID | None = Query(default=None),
+    appointment_date: date | None = Query(default=None, alias="date"),
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    doctor = (
+        db.query(HospitalUser)
+        .options(joinedload(HospitalUser.role))
+        .filter(HospitalUser.id == doctor_id, HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
+        .first()
+    )
+    if not doctor or not _is_doctor(doctor):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor not found")
+
+    appt_type = (
+        db.query(AppointmentType)
+        .filter(
+            AppointmentType.id == appointment_type_id,
+            AppointmentType.hospital_id == hospital_id,
+            AppointmentType.is_active.is_(True),
+        )
+        .first()
+    )
+    if not appt_type:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment type not found")
+
+    wing = db.query(Wing).filter(Wing.id == wing_id, Wing.hospital_id == hospital_id).first()
+    if not wing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Wing not found")
+    dept = (
+        db.query(Department)
+        .filter(Department.id == department_id, Department.hospital_id == hospital_id)
+        .first()
+    )
+    if not dept:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+
+    if patient_id:
+        patient = (
+            db.query(Patient)
+            .filter(Patient.id == patient_id, Patient.hospital_id == hospital_id)
+            .first()
+        )
+        if not patient:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
+    on_date = appointment_date or date.today()
+    result = resolve_consultation_fee(
+        db,
+        hospital_id,
+        doctor=doctor,
+        appt_type=appt_type,
+        wing_id=wing_id,
+        department_id=department_id,
+        patient_id=patient_id,
+        appointment_date=on_date,
+    )
+    return FeePreviewResponse(**result)
 
 
 @router.get("/availability", response_model=DoctorAvailability)
@@ -318,14 +573,71 @@ def book_appointment(
         )
 
     purpose = (payload.purpose or payload.visit_type or "Consultation").strip()
+
+    appt_type: AppointmentType | None = None
+    if payload.appointment_type_id:
+        appt_type = (
+            db.query(AppointmentType)
+            .filter(
+                AppointmentType.id == payload.appointment_type_id,
+                AppointmentType.hospital_id == hospital_id,
+            )
+            .first()
+        )
+        if not appt_type:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Appointment type not found")
+    else:
+        # Resolve by visit_type name for backward compatibility
+        appt_type = (
+            db.query(AppointmentType)
+            .filter(
+                AppointmentType.hospital_id == hospital_id,
+                AppointmentType.name == payload.visit_type.strip(),
+                AppointmentType.is_active.is_(True),
+            )
+            .first()
+        )
+
+    wing_id = payload.wing_id
+    department_id = payload.department_id
+    if wing_id:
+        wing = db.query(Wing).filter(Wing.id == wing_id, Wing.hospital_id == hospital_id).first()
+        if not wing:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wing not found")
+    if department_id:
+        dept = (
+            db.query(Department)
+            .filter(Department.id == department_id, Department.hospital_id == hospital_id)
+            .first()
+        )
+        if not dept:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Department not found")
+
+    fee_info = resolve_consultation_fee(
+        db,
+        hospital_id,
+        doctor=doctor,
+        appt_type=appt_type,
+        wing_id=wing_id,
+        department_id=department_id,
+        patient_id=patient.id,
+        appointment_date=payload.appointment_date,
+    )
+
+    visit_type_label = (appt_type.name if appt_type else payload.visit_type).strip()
     appt = Appointment(
         hospital_id=hospital_id,
         doctor_id=payload.doctor_id,
         patient_id=patient.id,
         appointment_date=payload.appointment_date,
         appointment_time=payload.appointment_time,
-        purpose=purpose,
-        visit_type=payload.visit_type.strip(),
+        purpose=purpose if payload.purpose else visit_type_label,
+        visit_type=visit_type_label,
+        appointment_type_id=appt_type.id if appt_type else None,
+        wing_id=wing_id,
+        department_id=department_id,
+        consultation_fee=float(fee_info["consultation_fee"]),
+        followup_eligibility=fee_info.get("followup_eligibility"),
         status=AppointmentStatus.scheduled,
         notes=payload.notes.strip() if payload.notes else None,
     )
@@ -338,7 +650,24 @@ def book_appointment(
         action="create",
         entity_type="appointment",
         entity_id=appt.id,
-        summary=f"Booked {patient.name} with {doctor.name} on {payload.appointment_date} {payload.appointment_time}",
+        summary=(
+            f"Booked {patient.name} with {doctor.name} on {payload.appointment_date} "
+            f"{payload.appointment_time} fee={appt.consultation_fee}"
+        ),
+    )
+    from app.models import BillingSourceType
+    from app.utils.billing import ensure_charge
+
+    ensure_charge(
+        db,
+        hospital_id=hospital_id,
+        patient_id=patient.id,
+        source_type=BillingSourceType.consultation,
+        source_id=appt.id,
+        description=f"Consultation — {doctor.name} ({visit_type_label})",
+        charge_amount=float(appt.consultation_fee or 0),
+        created_by_name=str(user.get("name") or "Staff"),
+        notes=fee_info.get("followup_eligibility"),
     )
     db.commit()
     return _to_item(_load_appt(db, appt.id, hospital_id))
@@ -470,6 +799,7 @@ def check_in(
     if appt.status == AppointmentStatus.waiting:
         return _to_item(appt)
 
+    # Scheduled → In Progress (stored as waiting)
     appt.status = AppointmentStatus.waiting
     appt.checked_in_at = datetime.now(timezone.utc)
     if not appt.queue_token:
@@ -481,7 +811,7 @@ def check_in(
         action="update",
         entity_type="appointment",
         entity_id=appt.id,
-        summary=f"Checked in {appt.patient.name if appt.patient else 'patient'} (token #{appt.queue_token})",
+        summary=f"Checked in {appt.patient.name if appt.patient else 'patient'} → In Progress (token #{appt.queue_token})",
     )
     db.commit()
     return _to_item(_load_appt(db, appointment_id, hospital_id))
@@ -494,10 +824,13 @@ def complete_appointment(
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
+    from app.utils.appointment_lifecycle import complete_appointment_record, status_display_label
+
     appt = _load_appt(db, appointment_id, hospital_id)
-    if appt.status == AppointmentStatus.cancelled:
-        raise HTTPException(status_code=400, detail="Cancelled appointment cannot be completed")
-    appt.status = AppointmentStatus.completed
+    ok, blockers = complete_appointment_record(db, hospital_id, appt)
+    if not ok:
+        detail = blockers[0] if len(blockers) == 1 else "Cannot complete yet: " + "; ".join(blockers)
+        raise HTTPException(status_code=400, detail=detail)
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -505,7 +838,7 @@ def complete_appointment(
         action="update",
         entity_type="appointment",
         entity_id=appt.id,
-        summary=f"Completed appointment for {appt.patient.name if appt.patient else 'patient'}",
+        summary=f"Completed appointment for {appt.patient.name if appt.patient else 'patient'} ({status_display_label(appt.status)})",
     )
     db.commit()
     return _to_item(_load_appt(db, appointment_id, hospital_id))
@@ -519,9 +852,16 @@ def cancel_appointment(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     appt = _load_appt(db, appointment_id, hospital_id)
-    if appt.status == AppointmentStatus.completed:
-        raise HTTPException(status_code=400, detail="Completed appointment cannot be cancelled")
+    if appt.status in {AppointmentStatus.completed, AppointmentStatus.no_show}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel appointment with status {appt.status.value}",
+        )
     appt.status = AppointmentStatus.cancelled
+    from app.models import BillingSourceType
+    from app.utils.billing import cancel_charge_for_source
+
+    cancel_charge_for_source(db, hospital_id, BillingSourceType.consultation, appt.id)
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -530,6 +870,34 @@ def cancel_appointment(
         entity_type="appointment",
         entity_id=appt.id,
         summary=f"Cancelled appointment for {appt.patient.name if appt.patient else 'patient'}",
+    )
+    db.commit()
+    return _to_item(_load_appt(db, appointment_id, hospital_id))
+
+
+@router.post("/{appointment_id}/no-show", response_model=AppointmentListItem)
+def mark_no_show(
+    appointment_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Staff action: mark as No Show. Does not auto-apply — requires review."""
+    appt = _load_appt(db, appointment_id, hospital_id)
+    if appt.status != AppointmentStatus.scheduled:
+        raise HTTPException(
+            status_code=400,
+            detail="Only Scheduled appointments (not checked in) can be marked No Show",
+        )
+    appt.status = AppointmentStatus.no_show
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="appointment",
+        entity_id=appt.id,
+        summary=f"Marked no-show for {appt.patient.name if appt.patient else 'patient'}",
     )
     db.commit()
     return _to_item(_load_appt(db, appointment_id, hospital_id))
@@ -544,7 +912,7 @@ def reschedule_appointment(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     appt = _load_appt(db, appointment_id, hospital_id)
-    if appt.status in {AppointmentStatus.cancelled, AppointmentStatus.completed}:
+    if appt.status in {AppointmentStatus.cancelled, AppointmentStatus.completed, AppointmentStatus.no_show}:
         raise HTTPException(status_code=400, detail="Cannot reschedule this appointment")
 
     holiday = _check_holiday(db, hospital_id, payload.appointment_date)

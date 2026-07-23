@@ -122,8 +122,57 @@ class AppointmentType(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slot_duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_follow_up: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class ConsultationPricing(Base):
+    """Wing + Department + Doctor + Appointment Type → consultation fee."""
+
+    __tablename__ = "consultation_pricing"
+    __table_args__ = (
+        UniqueConstraint(
+            "hospital_id",
+            "wing_id",
+            "department_id",
+            "doctor_id",
+            "appointment_type_id",
+            name="uq_consultation_pricing_combo",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    wing_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wings.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    doctor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    appointment_type_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointment_types.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    consultation_fee: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    followup_free_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    wing: Mapped["Wing"] = relationship()
+    department: Mapped["Department"] = relationship()
+    doctor: Mapped["HospitalUser"] = relationship()
+    appointment_type: Mapped["AppointmentType"] = relationship()
 
 
 class Ward(Base):
@@ -143,6 +192,8 @@ class Ward(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     ward_type: Mapped[WardType] = mapped_column(Enum(WardType, name="ward_type"), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    admission_fee: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    bed_charge_per_day: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -188,6 +239,7 @@ class OtRoom(Base):
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    base_ot_charge: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -299,6 +351,12 @@ class HospitalUser(Base):
     phone: Mapped[str] = mapped_column(String(32), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # First-class doctor profile fields (nullable for non-doctor staff)
+    specialization: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    medical_registration_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    qualification: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    years_of_experience: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    consultation_room: Mapped[str | None] = mapped_column(String(128), nullable=True)
     custom_values: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -366,8 +424,15 @@ class Patient(Base):
     date_of_birth: Mapped[date | None] = mapped_column(Date, nullable=True)
     gender: Mapped[str | None] = mapped_column(String(32), nullable=True)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # emergency_contact retains the phone number (backward compatible)
     emergency_contact: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    emergency_contact_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    emergency_contact_relation: Mapped[str | None] = mapped_column(String(32), nullable=True)
     blood_group: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    has_insurance: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    insurance_provider: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Future-ready bag: policy_number, subscriber_id, corporate, tpa, etc.
+    insurance_details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[PatientStatus] = mapped_column(
         Enum(PatientStatus, name="patient_status"),
         nullable=False,
@@ -408,6 +473,18 @@ class Appointment(Base):
     appointment_time: Mapped[time] = mapped_column(Time, nullable=False)
     purpose: Mapped[str] = mapped_column(String(255), nullable=False)
     visit_type: Mapped[str] = mapped_column(String(64), nullable=False, default="OPD")
+    appointment_type_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointment_types.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    wing_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wings.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Snapshot of fee at booking time — never recalculate historically
+    consultation_fee: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    followup_eligibility: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[AppointmentStatus] = mapped_column(
         Enum(AppointmentStatus, name="appointment_status"),
         nullable=False,
@@ -420,6 +497,7 @@ class Appointment(Base):
 
     patient: Mapped["Patient"] = relationship(back_populates="appointments")
     doctor: Mapped["HospitalUser"] = relationship()
+    appointment_type: Mapped["AppointmentType | None"] = relationship()
 
 
 class DoctorLeave(Base):
@@ -435,7 +513,8 @@ class DoctorLeave(Base):
     leave_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
-    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    leave_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     doctor: Mapped["HospitalUser"] = relationship()
@@ -581,6 +660,25 @@ class LabOrderStatus(str, enum.Enum):
     cancelled = "cancelled"
 
 
+class LabOrderSource(str, enum.Enum):
+    doctor_prescribed = "doctor_prescribed"
+    self_requested = "self_requested"
+
+
+class LabPrescriptionRequestStatus(str, enum.Enum):
+    pending = "pending"
+    partially_processed = "partially_processed"
+    completed = "completed"
+    cancelled = "cancelled"
+
+
+class LabRequestItemStatus(str, enum.Enum):
+    pending = "pending"
+    ordered = "ordered"
+    unavailable = "unavailable"
+    cancelled = "cancelled"
+
+
 class LabItemStatus(str, enum.Enum):
     pending = "pending"
     processing = "processing"
@@ -608,6 +706,53 @@ class LabTestCatalog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class LabTestPanel(Base):
+    """Grouped lab panel (e.g. Lipid Panel) containing multiple catalogue tests."""
+
+    __tablename__ = "lab_test_panels"
+    __table_args__ = (UniqueConstraint("hospital_id", "panel_code", name="uq_lab_panel_code"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    panel_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    panel_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    tests: Mapped[list["LabPanelTest"]] = relationship(
+        back_populates="panel", cascade="all, delete-orphan", order_by="LabPanelTest.sort_order"
+    )
+
+
+class LabPanelTest(Base):
+    """Many-to-many: panel ↔ catalogue test."""
+
+    __tablename__ = "lab_panel_tests"
+    __table_args__ = (UniqueConstraint("panel_id", "test_id", name="uq_lab_panel_test"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    panel_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_test_panels.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    test_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_test_catalog.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    panel: Mapped["LabTestPanel"] = relationship(back_populates="tests")
+    test: Mapped["LabTestCatalog"] = relationship()
+
+
 class LabOrder(Base):
     __tablename__ = "lab_orders"
     __table_args__ = (UniqueConstraint("hospital_id", "order_no", name="uq_lab_order_no"),)
@@ -625,6 +770,20 @@ class LabOrder(Base):
     )
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    prescription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("prescriptions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    prescription_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("lab_prescription_requests.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    order_source: Mapped[LabOrderSource] = mapped_column(
+        Enum(LabOrderSource, name="lab_order_source"),
+        nullable=False,
+        default=LabOrderSource.self_requested,
     )
     ordered_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     ordered_by_role: Mapped[str] = mapped_column(String(64), nullable=False, default="")
@@ -645,6 +804,10 @@ class LabOrder(Base):
 
     patient: Mapped["Patient"] = relationship(back_populates="lab_orders")
     doctor: Mapped["HospitalUser | None"] = relationship()
+    prescription: Mapped["Prescription | None"] = relationship()
+    prescription_request: Mapped["LabPrescriptionRequest | None"] = relationship(
+        back_populates="lab_order", foreign_keys=[prescription_request_id]
+    )
     items: Mapped[list["LabOrderItem"]] = relationship(
         back_populates="order", cascade="all, delete-orphan", order_by="LabOrderItem.created_at"
     )
@@ -666,6 +829,10 @@ class LabOrderItem(Base):
     test_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("lab_test_catalog.id", ondelete="SET NULL"), nullable=True
     )
+    panel_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_test_panels.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    panel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     test_code: Mapped[str] = mapped_column(String(32), nullable=False)
     test_name: Mapped[str] = mapped_column(String(255), nullable=False)
     department: Mapped[str] = mapped_column(String(128), nullable=False, default="")
@@ -678,6 +845,94 @@ class LabOrderItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     order: Mapped["LabOrder"] = relationship(back_populates="items")
+    panel: Mapped["LabTestPanel | None"] = relationship()
+
+
+class LabPrescriptionRequest(Base):
+    """Outstanding doctor-prescribed laboratory work awaiting lab confirmation."""
+
+    __tablename__ = "lab_prescription_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    prescription_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("prescriptions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    doctor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    status: Mapped[LabPrescriptionRequestStatus] = mapped_column(
+        Enum(LabPrescriptionRequestStatus, name="lab_prescription_request_status"),
+        nullable=False,
+        default=LabPrescriptionRequestStatus.pending,
+    )
+    prescribed_test_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    prescribed_panel_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    clinical_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Denormalized link (avoids circular FK with lab_orders.prescription_request_id)
+    lab_order_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    patient: Mapped["Patient"] = relationship()
+    doctor: Mapped["HospitalUser"] = relationship()
+    prescription: Mapped["Prescription"] = relationship()
+    items: Mapped[list["LabPrescriptionRequestItem"]] = relationship(
+        back_populates="request",
+        cascade="all, delete-orphan",
+        order_by="LabPrescriptionRequestItem.sort_order",
+        foreign_keys="LabPrescriptionRequestItem.request_id",
+    )
+    lab_order: Mapped["LabOrder | None"] = relationship(
+        back_populates="prescription_request",
+        foreign_keys="LabOrder.prescription_request_id",
+        uselist=False,
+    )
+
+
+class LabPrescriptionRequestItem(Base):
+    __tablename__ = "lab_prescription_request_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_prescription_requests.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    test_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_test_catalog.id", ondelete="SET NULL"), nullable=True
+    )
+    panel_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_test_panels.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    panel_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    test_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    test_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    department: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[LabRequestItemStatus] = mapped_column(
+        Enum(LabRequestItemStatus, name="lab_request_item_status"),
+        nullable=False,
+        default=LabRequestItemStatus.pending,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    request: Mapped["LabPrescriptionRequest"] = relationship(
+        back_populates="items", foreign_keys=[request_id]
+    )
 
 
 class LabResult(Base):
@@ -828,6 +1083,8 @@ class OtSurgery(Base):
         UUID(as_uuid=True), ForeignKey("ot_rooms.id", ondelete="SET NULL"), nullable=True, index=True
     )
     ot_room: Mapped[str] = mapped_column(String(64), nullable=False, default="OT-1")
+    # Snapshot of OT room base charge at booking time (billing must not change if room rate changes later)
+    ot_charge_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     anaesthetist: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -1093,3 +1350,212 @@ class EquipmentRequest(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ── Billing foundation ─────────────────────────────────────────────────────────
+class BillingSourceType(str, enum.Enum):
+    consultation = "consultation"
+    laboratory = "laboratory"
+    radiology = "radiology"
+    ot = "ot"
+    bed = "bed"
+    admission = "admission"
+    other = "other"
+    adjustment = "adjustment"
+
+
+class BillingChargeStatus(str, enum.Enum):
+    pending = "pending"
+    paid = "paid"
+    partially_paid = "partially_paid"
+    cancelled = "cancelled"
+
+
+class BillingPaymentMethod(str, enum.Enum):
+    cash = "cash"
+    card = "card"
+    upi = "upi"
+    bank_transfer = "bank_transfer"
+    other = "other"
+
+
+class BillingCharge(Base):
+    """Unified patient charge / billable transaction (ledger debit)."""
+
+    __tablename__ = "billing_charges"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_type: Mapped[BillingSourceType] = mapped_column(
+        Enum(BillingSourceType, name="billing_source_type"), nullable=False, index=True
+    )
+    source_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    description: Mapped[str] = mapped_column(String(512), nullable=False)
+    charge_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    discount_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    discount_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    net_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    amount_paid: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    status: Mapped[BillingChargeStatus] = mapped_column(
+        Enum(BillingChargeStatus, name="billing_charge_status"),
+        nullable=False,
+        default=BillingChargeStatus.pending,
+        index=True,
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    patient: Mapped["Patient"] = relationship()
+
+
+class BillingPayment(Base):
+    """Lightweight patient payment (ledger credit). Manual entry only."""
+
+    __tablename__ = "billing_payments"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    payment_method: Mapped[BillingPaymentMethod] = mapped_column(
+        Enum(BillingPaymentMethod, name="billing_payment_method"),
+        nullable=False,
+        default=BillingPaymentMethod.cash,
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    received_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    patient: Mapped["Patient"] = relationship()
+
+
+class BillingInvoiceStatus(str, enum.Enum):
+    draft = "draft"
+    generated = "generated"
+    paid = "paid"
+    cancelled = "cancelled"
+
+
+class BillingReceiptStatus(str, enum.Enum):
+    issued = "issued"
+    cancelled = "cancelled"
+
+
+class BillingInvoice(Base):
+    """Hospital-scoped patient invoice generated from ledger charges (line snapshots)."""
+
+    __tablename__ = "billing_invoices"
+    __table_args__ = (UniqueConstraint("hospital_id", "invoice_number", name="uq_billing_invoice_number"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    invoice_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    invoice_date: Mapped[date] = mapped_column(Date, nullable=False)
+    subtotal: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    discount_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    tax_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    grand_total: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    status: Mapped[BillingInvoiceStatus] = mapped_column(
+        Enum(BillingInvoiceStatus, name="billing_invoice_status"),
+        nullable=False,
+        default=BillingInvoiceStatus.generated,
+        index=True,
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    patient: Mapped["Patient"] = relationship()
+    lines: Mapped[list["BillingInvoiceLine"]] = relationship(
+        back_populates="invoice", cascade="all, delete-orphan", order_by="BillingInvoiceLine.sort_order"
+    )
+
+
+class BillingInvoiceLine(Base):
+    """Immutable snapshot of a charge (or manual line) on an invoice."""
+
+    __tablename__ = "billing_invoice_lines"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    invoice_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_invoices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    charge_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_charges.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, default="other")
+    description: Mapped[str] = mapped_column(String(512), nullable=False)
+    quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    invoice: Mapped["BillingInvoice"] = relationship(back_populates="lines")
+
+
+class BillingReceipt(Base):
+    """Payment receipt document (hospital-scoped numbering)."""
+
+    __tablename__ = "billing_receipts"
+    __table_args__ = (UniqueConstraint("hospital_id", "receipt_number", name="uq_billing_receipt_number"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_payments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    linked_invoice_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_invoices.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    receipt_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    payment_method: Mapped[BillingPaymentMethod] = mapped_column(
+        Enum(BillingPaymentMethod, name="billing_payment_method", create_type=False),
+        nullable=False,
+        default=BillingPaymentMethod.cash,
+    )
+    amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    reference_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[BillingReceiptStatus] = mapped_column(
+        Enum(BillingReceiptStatus, name="billing_receipt_status"),
+        nullable=False,
+        default=BillingReceiptStatus.issued,
+        index=True,
+    )
+    collected_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    patient: Mapped["Patient"] = relationship()
+

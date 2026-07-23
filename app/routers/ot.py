@@ -75,6 +75,8 @@ def _surgery_to_response(item: OtSurgery) -> OtSurgeryResponse:
         department_id=item.department_id,
         ot_room_id=item.ot_room_id,
         ot_room=item.ot_room,
+        ot_charge_amount=float(getattr(item, "ot_charge_amount", 0) or 0),
+        ot_room_rate=float(getattr(room, "base_ot_charge", 0) or 0) if room else None,
         scheduled_at=item.scheduled_at,
         duration_minutes=item.duration_minutes,
         anaesthetist=item.anaesthetist,
@@ -382,6 +384,7 @@ def create_surgery(
         department_id=payload.department_id,
         ot_room_id=ot_room.id,
         ot_room=_room_label(ot_room),
+        ot_charge_amount=float(getattr(ot_room, "base_ot_charge", 0) or 0),
         scheduled_at=payload.scheduled_at,
         duration_minutes=payload.duration_minutes,
         anaesthetist=payload.anaesthetist.strip() if payload.anaesthetist else None,
@@ -392,6 +395,21 @@ def create_surgery(
     )
     db.add(item)
     db.flush()
+
+    from app.models import BillingSourceType
+    from app.utils.billing import ensure_charge
+
+    ensure_charge(
+        db,
+        hospital_id=hospital_id,
+        patient_id=patient.id,
+        source_type=BillingSourceType.ot,
+        source_id=item.id,
+        description=f"OT Charge — {item.surgery_no} · {_room_label(ot_room)}"[:512],
+        charge_amount=float(item.ot_charge_amount or 0),
+        created_by_name=_actor_name(user),
+    )
+
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -597,6 +615,12 @@ def cancel_surgery(
     if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Surgery cannot be cancelled")
     item.status = OtSurgeryStatus.cancelled
+
+    from app.models import BillingSourceType
+    from app.utils.billing import cancel_charge_for_source
+
+    cancel_charge_for_source(db, hospital_id, BillingSourceType.ot, item.id)
+
     write_audit(
         db,
         hospital_id=hospital_id,

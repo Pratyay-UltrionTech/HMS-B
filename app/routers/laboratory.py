@@ -9,24 +9,38 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.models import (
+    Appointment,
     Hospital,
     HospitalUser,
     LabItemStatus,
     LabOrder,
     LabOrderItem,
+    LabOrderSource,
     LabOrderStatus,
+    LabPanelTest,
+    LabPrescriptionRequest,
+    LabPrescriptionRequestItem,
+    LabPrescriptionRequestStatus,
+    LabRequestItemStatus,
     LabResult,
     LabSampleType,
     LabTestCatalog,
+    LabTestPanel,
     Patient,
 )
 from app.schemas_laboratory import (
     ItemStatusUpdate,
+    LabCatalogueSeedResult,
     LabDashboardResponse,
     LabOrderCreate,
     LabOrderItemResponse,
     LabOrderResponse,
+    LabPanelCreate,
+    LabPanelResponse,
+    LabPanelUpdate,
+    LabPrescriptionRequestResponse,
     LabReportSaveRequest,
+    LabRequestCancelBody,
     LabResultResponse,
     LabTestCreate,
     LabTestResponse,
@@ -35,6 +49,20 @@ from app.schemas_laboratory import (
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
+from app.utils.catalogue_templates import get_template_pack
+from app.utils.lab_panels import (
+    DEFAULT_PANEL_SEEDS,
+    panel_to_response_dict,
+    prefer_sample_type,
+    resolve_lab_selection,
+)
+from app.utils.lab_prescription_requests import (
+    ACTIVE_REQUEST_STATUSES,
+    assert_request_fulfillable,
+    get_prescription_request,
+    request_to_response_dict,
+    sync_request_after_order_change,
+)
 
 router = APIRouter(prefix="/laboratory", tags=["laboratory"])
 
@@ -54,6 +82,8 @@ def _next_order_no(db: Session, hospital_id: UUID) -> str:
 
 def _order_to_response(order: LabOrder) -> LabOrderResponse:
     items = order.items or []
+    panel_names = sorted({i.panel_name for i in items if i.panel_name})
+    source = getattr(order, "order_source", None) or LabOrderSource.self_requested
     return LabOrderResponse(
         id=order.id,
         hospital_id=order.hospital_id,
@@ -61,6 +91,9 @@ def _order_to_response(order: LabOrder) -> LabOrderResponse:
         patient_id=order.patient_id,
         doctor_id=order.doctor_id,
         appointment_id=order.appointment_id,
+        prescription_id=getattr(order, "prescription_id", None),
+        prescription_request_id=getattr(order, "prescription_request_id", None),
+        order_source=source,
         ordered_by_name=order.ordered_by_name,
         ordered_by_role=order.ordered_by_role,
         status=order.status,
@@ -76,9 +109,70 @@ def _order_to_response(order: LabOrder) -> LabOrderResponse:
         patient_mobile=order.patient.mobile if order.patient else None,
         doctor_name=order.doctor.name if order.doctor else None,
         test_names=", ".join(i.test_code for i in items) if items else None,
+        panel_names=", ".join(panel_names) if panel_names else None,
         items=[LabOrderItemResponse.model_validate(i) for i in items],
         results=[LabResultResponse.model_validate(r) for r in (order.results or [])],
     )
+
+
+def _enrich_request_response(db: Session, req: LabPrescriptionRequest) -> LabPrescriptionRequestResponse:
+    data = request_to_response_dict(req)
+    if req.appointment_id:
+        appt = (
+            db.query(Appointment)
+            .filter(Appointment.id == req.appointment_id, Appointment.hospital_id == req.hospital_id)
+            .first()
+        )
+        if appt:
+            data["appointment_label"] = (
+                f"{appt.appointment_date} {str(appt.appointment_time)[:5] if appt.appointment_time else ''}"
+                f" — {appt.purpose or 'Visit'}"
+            ).strip()
+    # Normalize UUID lists from JSONB
+    data["prescribed_test_ids"] = [UUID(str(x)) for x in (req.prescribed_test_ids or [])]
+    data["prescribed_panel_ids"] = [UUID(str(x)) for x in (req.prescribed_panel_ids or [])]
+    return LabPrescriptionRequestResponse.model_validate(data)
+
+
+def _get_panel(db: Session, panel_id: UUID, hospital_id: UUID) -> LabTestPanel:
+    panel = (
+        db.query(LabTestPanel)
+        .options(joinedload(LabTestPanel.tests).joinedload(LabPanelTest.test))
+        .filter(LabTestPanel.id == panel_id, LabTestPanel.hospital_id == hospital_id)
+        .first()
+    )
+    if not panel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lab panel not found")
+    return panel
+
+
+def _set_panel_tests(db: Session, panel: LabTestPanel, hospital_id: UUID, test_ids: list[UUID]) -> None:
+    unique_ids = list(dict.fromkeys(test_ids))
+    if unique_ids:
+        tests = (
+            db.query(LabTestCatalog)
+            .filter(
+                LabTestCatalog.hospital_id == hospital_id,
+                LabTestCatalog.id.in_(unique_ids),
+            )
+            .all()
+        )
+        if len(tests) != len(unique_ids):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="One or more panel tests are invalid for this hospital",
+            )
+    db.query(LabPanelTest).filter(LabPanelTest.panel_id == panel.id).delete(synchronize_session=False)
+    db.flush()
+    for idx, tid in enumerate(unique_ids):
+        db.add(
+            LabPanelTest(
+                hospital_id=hospital_id,
+                panel_id=panel.id,
+                test_id=tid,
+                sort_order=idx,
+            )
+        )
 
 
 def _get_order(db: Session, order_id: UUID, hospital_id: UUID) -> LabOrder:
@@ -137,6 +231,47 @@ def dashboard(
     cancelled = base.filter(LabOrder.status == LabOrderStatus.cancelled).count()
     sample_collected = base.filter(LabOrder.status == LabOrderStatus.sample_collected).count()
     in_progress = base.filter(LabOrder.status == LabOrderStatus.in_progress).count()
+    panels_count = (
+        db.query(func.count(LabTestPanel.id))
+        .filter(LabTestPanel.hospital_id == hospital_id, LabTestPanel.is_active.is_(True))
+        .scalar()
+        or 0
+    )
+    tests_count = (
+        db.query(func.count(LabTestCatalog.id))
+        .filter(LabTestCatalog.hospital_id == hospital_id, LabTestCatalog.is_active.is_(True))
+        .scalar()
+        or 0
+    )
+    top_panels_rows = (
+        db.query(LabOrderItem.panel_name, func.count(LabOrderItem.id))
+        .filter(
+            LabOrderItem.hospital_id == hospital_id,
+            LabOrderItem.panel_name.isnot(None),
+            LabOrderItem.panel_name != "",
+        )
+        .group_by(LabOrderItem.panel_name)
+        .order_by(func.count(LabOrderItem.id).desc())
+        .limit(5)
+        .all()
+    )
+    pending_req_q = db.query(LabPrescriptionRequest).filter(
+        LabPrescriptionRequest.hospital_id == hospital_id,
+        LabPrescriptionRequest.status.in_(list(ACTIVE_REQUEST_STATUSES)),
+    )
+    pending_doctor_requests = pending_req_q.count()
+    pending_req_rows = (
+        pending_req_q.options(
+            joinedload(LabPrescriptionRequest.patient),
+            joinedload(LabPrescriptionRequest.doctor),
+            joinedload(LabPrescriptionRequest.items),
+        )
+        .order_by(LabPrescriptionRequest.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    doctor_prescribed_orders = base.filter(LabOrder.order_source == LabOrderSource.doctor_prescribed).count()
+    self_requested_orders = base.filter(LabOrder.order_source == LabOrderSource.self_requested).count()
     return LabDashboardResponse(
         todays_orders=todays,
         pending=pending,
@@ -144,6 +279,14 @@ def dashboard(
         cancelled=cancelled,
         sample_collected=sample_collected,
         in_progress=in_progress,
+        panels_count=int(panels_count),
+        tests_count=int(tests_count),
+        seeded_tests_estimate=len(get_template_pack("standard").get("lab_tests") or []),
+        top_panels=[{"panel_name": name, "order_items": int(cnt)} for name, cnt in top_panels_rows],
+        pending_doctor_requests=int(pending_doctor_requests),
+        doctor_prescribed_orders=int(doctor_prescribed_orders),
+        self_requested_orders=int(self_requested_orders),
+        pending_requests=[_enrich_request_response(db, r) for r in pending_req_rows],
     )
 
 
@@ -167,6 +310,134 @@ def list_tests(
             | (LabTestCatalog.department.ilike(term))
         )
     return q.order_by(LabTestCatalog.test_code.asc()).all()
+
+
+def _seed_lab_tests_from_pack(
+    db: Session,
+    hospital_id: UUID,
+    *,
+    pack_id: str = "standard",
+) -> tuple[list[str], int]:
+    """Create missing lab tests from a template pack. Never overwrites existing rows/prices."""
+    pack = get_template_pack(pack_id)
+    added_codes: list[str] = []
+    already = 0
+    for seed in pack.get("lab_tests") or []:
+        code = str(seed["test_code"]).strip().upper()
+        exists = (
+            db.query(LabTestCatalog.id)
+            .filter(LabTestCatalog.hospital_id == hospital_id, LabTestCatalog.test_code == code)
+            .first()
+        )
+        if exists:
+            already += 1
+            continue
+        sample = seed.get("sample_type") or LabSampleType.blood
+        if isinstance(sample, str):
+            sample = LabSampleType(sample)
+        db.add(
+            LabTestCatalog(
+                hospital_id=hospital_id,
+                test_code=code,
+                test_name=str(seed["test_name"]).strip(),
+                department=str(seed.get("department") or "Laboratory").strip(),
+                price=float(seed.get("price") or 0),
+                sample_type=sample,
+                tat_hours=int(seed.get("tat_hours") or 24),
+                description=(str(seed["description"]).strip() if seed.get("description") else None),
+                is_active=True,
+            )
+        )
+        added_codes.append(code)
+    return added_codes, already
+
+
+def _seed_lab_panels_for_hospital(
+    db: Session,
+    hospital_id: UUID,
+) -> tuple[list[LabTestPanel], int]:
+    """Create missing default panels by matching catalogue codes/names. Skips existing panel codes."""
+    catalog = (
+        db.query(LabTestCatalog)
+        .filter(LabTestCatalog.hospital_id == hospital_id, LabTestCatalog.is_active.is_(True))
+        .all()
+    )
+    created: list[LabTestPanel] = []
+    already = 0
+    for seed in DEFAULT_PANEL_SEEDS:
+        code = seed["panel_code"].upper()
+        exists = (
+            db.query(LabTestPanel.id)
+            .filter(LabTestPanel.hospital_id == hospital_id, LabTestPanel.panel_code == code)
+            .first()
+        )
+        if exists:
+            already += 1
+            continue
+        match_keys = {m.upper() for m in seed["match"]}
+        matched_ids: list[UUID] = []
+        for t in catalog:
+            keys = {t.test_code.upper(), t.test_name.upper()}
+            if keys & match_keys or any(
+                m in t.test_code.upper() or m in t.test_name.upper() for m in match_keys if len(m) >= 3
+            ):
+                if t.id not in matched_ids:
+                    matched_ids.append(t.id)
+        if not matched_ids:
+            continue
+        panel = LabTestPanel(
+            hospital_id=hospital_id,
+            panel_code=code,
+            panel_name=seed["panel_name"],
+            description=seed.get("description"),
+            is_active=True,
+        )
+        db.add(panel)
+        db.flush()
+        _set_panel_tests(db, panel, hospital_id, matched_ids)
+        created.append(panel)
+    return created, already
+
+
+@router.post("/catalogue/seed-standard", response_model=LabCatalogueSeedResult)
+def seed_standard_lab_catalogue(
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Idempotent hospital-scoped seed of standard pathology tests + panels. Preserves existing pricing."""
+    added_codes, tests_existed = _seed_lab_tests_from_pack(db, hospital_id, pack_id="standard")
+    if added_codes:
+        db.flush()
+    created_panels, panels_existed = _seed_lab_panels_for_hospital(db, hospital_id)
+    if added_codes or created_panels:
+        write_audit(
+            db,
+            hospital_id=hospital_id,
+            actor=user,
+            action="create",
+            entity_type="lab_catalogue",
+            entity_id=None,
+            summary=(
+                f"Loaded standard lab catalogue: "
+                f"{len(added_codes)} test(s), {len(created_panels)} panel(s) added"
+            ),
+            details={
+                "template_pack": "standard",
+                "tests_added": added_codes,
+                "panels_added": [p.panel_code for p in created_panels],
+            },
+        )
+        db.commit()
+    return LabCatalogueSeedResult(
+        template_pack="standard",
+        tests_added=len(added_codes),
+        tests_already_existed=tests_existed,
+        panels_added=len(created_panels),
+        panels_already_existed=panels_existed,
+        created_test_codes=added_codes,
+        created_panel_codes=[p.panel_code for p in created_panels],
+    )
 
 
 @router.post("/tests", response_model=LabTestResponse, status_code=status.HTTP_201_CREATED)
@@ -289,6 +560,298 @@ def delete_test(
     db.commit()
 
 
+# ── Panels ─────────────────────────────────────────────────────────────────────
+@router.get("/panels", response_model=list[LabPanelResponse])
+def list_panels(
+    active_only: bool = Query(default=False),
+    search: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    q = (
+        db.query(LabTestPanel)
+        .options(joinedload(LabTestPanel.tests).joinedload(LabPanelTest.test))
+        .filter(LabTestPanel.hospital_id == hospital_id)
+    )
+    if active_only:
+        q = q.filter(LabTestPanel.is_active.is_(True))
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        q = q.filter(
+            (LabTestPanel.panel_name.ilike(term)) | (LabTestPanel.panel_code.ilike(term))
+        )
+    rows = q.order_by(LabTestPanel.panel_code.asc()).all()
+    return [LabPanelResponse.model_validate(panel_to_response_dict(p)) for p in rows]
+
+
+@router.post("/panels/seed-defaults", response_model=list[LabPanelResponse])
+def seed_default_panels(
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Optional: create common panels by matching existing catalogue codes/names. Skips existing codes."""
+    created, _already = _seed_lab_panels_for_hospital(db, hospital_id)
+    if created:
+        write_audit(
+            db,
+            hospital_id=hospital_id,
+            actor=user,
+            action="create",
+            entity_type="lab_panel",
+            entity_id=created[0].id,
+            summary=f"Seeded {len(created)} default lab panel(s)",
+        )
+        db.commit()
+    return [
+        LabPanelResponse.model_validate(panel_to_response_dict(_get_panel(db, p.id, hospital_id)))
+        for p in created
+    ]
+
+
+@router.get("/panels/{panel_id}", response_model=LabPanelResponse)
+def get_panel(
+    panel_id: UUID,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    return LabPanelResponse.model_validate(panel_to_response_dict(_get_panel(db, panel_id, hospital_id)))
+
+
+@router.post("/panels", response_model=LabPanelResponse, status_code=status.HTTP_201_CREATED)
+def create_panel(
+    payload: LabPanelCreate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    code = payload.panel_code.strip().upper()
+    exists = (
+        db.query(LabTestPanel.id)
+        .filter(LabTestPanel.hospital_id == hospital_id, LabTestPanel.panel_code == code)
+        .first()
+    )
+    if exists:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Panel code already exists")
+
+    panel = LabTestPanel(
+        hospital_id=hospital_id,
+        panel_code=code,
+        panel_name=payload.panel_name.strip(),
+        description=payload.description.strip() if payload.description else None,
+        is_active=payload.is_active,
+    )
+    db.add(panel)
+    db.flush()
+    _set_panel_tests(db, panel, hospital_id, payload.test_ids)
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="create",
+        entity_type="lab_panel",
+        entity_id=panel.id,
+        summary=f"Created lab panel {panel.panel_code} — {panel.panel_name}",
+        details={"test_count": len(payload.test_ids)},
+    )
+    db.commit()
+    return LabPanelResponse.model_validate(panel_to_response_dict(_get_panel(db, panel.id, hospital_id)))
+
+
+@router.put("/panels/{panel_id}", response_model=LabPanelResponse)
+def update_panel(
+    panel_id: UUID,
+    payload: LabPanelUpdate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    panel = _get_panel(db, panel_id, hospital_id)
+    data = payload.model_dump(exclude_unset=True)
+    test_ids = data.pop("test_ids", None)
+    if "panel_code" in data and data["panel_code"]:
+        data["panel_code"] = data["panel_code"].strip().upper()
+        clash = (
+            db.query(LabTestPanel.id)
+            .filter(
+                LabTestPanel.hospital_id == hospital_id,
+                LabTestPanel.panel_code == data["panel_code"],
+                LabTestPanel.id != panel_id,
+            )
+            .first()
+        )
+        if clash:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Panel code already exists")
+    if "panel_name" in data and isinstance(data["panel_name"], str):
+        data["panel_name"] = data["panel_name"].strip()
+    if "description" in data and isinstance(data["description"], str):
+        data["description"] = data["description"].strip() or None
+    for k, v in data.items():
+        setattr(panel, k, v)
+    if test_ids is not None:
+        _set_panel_tests(db, panel, hospital_id, test_ids)
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="lab_panel",
+        entity_id=panel.id,
+        summary=f"Updated lab panel {panel.panel_code}",
+    )
+    db.commit()
+    return LabPanelResponse.model_validate(panel_to_response_dict(_get_panel(db, panel_id, hospital_id)))
+
+
+@router.delete("/panels/{panel_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_panel(
+    panel_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    panel = _get_panel(db, panel_id, hospital_id)
+    code = panel.panel_code
+    db.delete(panel)
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="delete",
+        entity_type="lab_panel",
+        entity_id=panel_id,
+        summary=f"Deleted lab panel {code}",
+    )
+    db.commit()
+
+
+# ── Prescription lab requests ──────────────────────────────────────────────────
+@router.get("/prescription-requests", response_model=list[LabPrescriptionRequestResponse])
+def list_prescription_requests(
+    patient_id: UUID | None = Query(default=None),
+    status_filter: LabPrescriptionRequestStatus | None = Query(default=None, alias="status"),
+    pending_only: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    q = (
+        db.query(LabPrescriptionRequest)
+        .options(
+            joinedload(LabPrescriptionRequest.patient),
+            joinedload(LabPrescriptionRequest.doctor),
+            joinedload(LabPrescriptionRequest.items),
+        )
+        .filter(LabPrescriptionRequest.hospital_id == hospital_id)
+    )
+    if patient_id:
+        q = q.filter(LabPrescriptionRequest.patient_id == patient_id)
+    if pending_only:
+        q = q.filter(LabPrescriptionRequest.status.in_(list(ACTIVE_REQUEST_STATUSES)))
+    elif status_filter:
+        q = q.filter(LabPrescriptionRequest.status == status_filter)
+    rows = q.order_by(LabPrescriptionRequest.created_at.desc()).limit(200).all()
+    return [_enrich_request_response(db, r) for r in rows]
+
+
+@router.get("/prescription-requests/{request_id}", response_model=LabPrescriptionRequestResponse)
+def get_prescription_request(
+    request_id: UUID,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    return _enrich_request_response(db, get_prescription_request(db, request_id, hospital_id))
+
+
+@router.post("/prescription-requests/{request_id}/cancel", response_model=LabPrescriptionRequestResponse)
+def cancel_prescription_request(
+    request_id: UUID,
+    payload: LabRequestCancelBody,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    req = get_prescription_request(db, request_id, hospital_id)
+    if req.status == LabPrescriptionRequestStatus.completed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed requests cannot be cancelled")
+    if req.lab_order_id:
+        linked = db.query(LabOrder).filter(LabOrder.id == req.lab_order_id).first()
+        if linked and linked.status not in {LabOrderStatus.cancelled, LabOrderStatus.completed}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cancel or complete order {linked.order_no} before cancelling this request",
+            )
+    req.status = LabPrescriptionRequestStatus.cancelled
+    req.cancel_reason = payload.reason.strip() if payload.reason else None
+    for item in req.items or []:
+        if item.status == LabRequestItemStatus.pending:
+            item.status = LabRequestItemStatus.cancelled
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="lab_prescription_request",
+        entity_id=req.id,
+        summary=f"Cancelled doctor lab request for {req.patient.name if req.patient else 'patient'}",
+    )
+    db.commit()
+    if req.appointment_id:
+        from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+        sync_appointment_after_clinical_change(db, hospital_id, req.appointment_id)
+        db.commit()
+    return _enrich_request_response(db, get_prescription_request(db, request_id, hospital_id))
+
+
+@router.post(
+    "/prescription-requests/{request_id}/items/{item_id}/unavailable",
+    response_model=LabPrescriptionRequestResponse,
+)
+def mark_request_item_unavailable(
+    request_id: UUID,
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    req = get_prescription_request(db, request_id, hospital_id)
+    if req.status in {LabPrescriptionRequestStatus.cancelled, LabPrescriptionRequestStatus.completed}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request is closed")
+    item = next((i for i in (req.items or []) if i.id == item_id), None)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request item not found")
+    if item.status != LabRequestItemStatus.pending:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending items can be marked unavailable")
+    item.status = LabRequestItemStatus.unavailable
+    pending_left = [i for i in (req.items or []) if i.status == LabRequestItemStatus.pending]
+    if not pending_left and not req.lab_order_id:
+        # All remaining items unavailable and nothing ordered → cancel request
+        all_unavail = all(i.status == LabRequestItemStatus.unavailable for i in (req.items or []))
+        if all_unavail:
+            req.status = LabPrescriptionRequestStatus.cancelled
+            req.cancel_reason = req.cancel_reason or "All prescribed tests marked unavailable"
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="lab_prescription_request",
+        entity_id=req.id,
+        summary=f"Marked {item.test_code} unavailable on doctor lab request",
+    )
+    db.commit()
+    if req.appointment_id:
+        from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+        sync_appointment_after_clinical_change(db, hospital_id, req.appointment_id)
+        db.commit()
+    return _enrich_request_response(db, get_prescription_request(db, request_id, hospital_id))
+
+
 # ── Orders ─────────────────────────────────────────────────────────────────────
 @router.get("/orders", response_model=list[LabOrderResponse])
 def list_orders(
@@ -355,52 +918,110 @@ def create_order(
         if not doctor:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor not found")
 
-    tests = (
-        db.query(LabTestCatalog)
-        .filter(
-            LabTestCatalog.hospital_id == hospital_id,
-            LabTestCatalog.id.in_(payload.test_ids),
-            LabTestCatalog.is_active.is_(True),
-        )
-        .all()
-    )
-    if len(tests) != len(set(payload.test_ids)):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="One or more tests are invalid or inactive")
+    rx_request: LabPrescriptionRequest | None = None
+    order_source = LabOrderSource.self_requested
+    prescription_id = None
+    appointment_id = payload.appointment_id
+    clinical_notes = payload.clinical_notes.strip() if payload.clinical_notes else None
+    item_rows: list[tuple] = []  # (test_id, panel_id, panel_name, code, name, dept, price)
 
-    # Prefer blood if mixed, else first test sample type
-    sample_type = tests[0].sample_type
-    for t in tests:
-        if t.sample_type == LabSampleType.blood:
-            sample_type = LabSampleType.blood
-            break
+    if payload.prescription_request_id:
+        rx_request = get_prescription_request(db, payload.prescription_request_id, hospital_id)
+        if rx_request.patient_id != patient.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Prescription request does not belong to the selected patient",
+            )
+        # Doctor-prescribed: reject silent modification of tests/panels
+        if payload.test_ids or payload.panel_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Doctor-prescribed orders cannot add or change tests; fulfill the prescription as written",
+            )
+        fulfill_items = assert_request_fulfillable(db, rx_request)
+        order_source = LabOrderSource.doctor_prescribed
+        prescription_id = rx_request.prescription_id
+        appointment_id = rx_request.appointment_id or appointment_id
+        doctor = rx_request.doctor or doctor
+        if not clinical_notes:
+            clinical_notes = rx_request.clinical_notes
+        for it in fulfill_items:
+            item_rows.append(
+                (it.test_id, it.panel_id, it.panel_name, it.test_code, it.test_name, it.department, it.price)
+            )
+        sample_type = LabSampleType.blood
+        test_ids = [i.test_id for i in fulfill_items if i.test_id]
+        if test_ids:
+            cats = db.query(LabTestCatalog).filter(LabTestCatalog.id.in_(test_ids)).all()
+            if cats:
+                sample_type = cats[0].sample_type
+                for c in cats:
+                    if c.sample_type == LabSampleType.blood:
+                        sample_type = LabSampleType.blood
+                        break
+    else:
+        tests_resolved = resolve_lab_selection(
+            db,
+            hospital_id,
+            payload.test_ids,
+            payload.panel_ids,
+        )
+        sample_type = prefer_sample_type(tests_resolved)
+        for r in tests_resolved:
+            t = r.test
+            item_rows.append(
+                (
+                    t.id,
+                    r.panel.id if r.panel else None,
+                    r.panel.panel_name if r.panel else None,
+                    t.test_code,
+                    t.test_name,
+                    t.department,
+                    t.price,
+                )
+            )
 
     order = LabOrder(
         hospital_id=hospital_id,
         order_no=_next_order_no(db, hospital_id),
         patient_id=patient.id,
         doctor_id=doctor.id if doctor else None,
-        appointment_id=payload.appointment_id,
+        appointment_id=appointment_id,
+        prescription_id=prescription_id,
+        prescription_request_id=rx_request.id if rx_request else None,
+        order_source=order_source,
         ordered_by_name=_actor_name(user),
         ordered_by_role=_actor_role(user),
         status=LabOrderStatus.ordered,
-        clinical_notes=payload.clinical_notes.strip() if payload.clinical_notes else None,
+        clinical_notes=clinical_notes,
         sample_type=sample_type,
     )
     db.add(order)
     db.flush()
-    for t in tests:
+    for test_id, panel_id, panel_name, code, name, dept, price in item_rows:
         db.add(
             LabOrderItem(
                 hospital_id=hospital_id,
                 order_id=order.id,
-                test_id=t.id,
-                test_code=t.test_code,
-                test_name=t.test_name,
-                department=t.department,
-                price=t.price,
+                test_id=test_id,
+                panel_id=panel_id,
+                panel_name=panel_name,
+                test_code=code,
+                test_name=name,
+                department=dept,
+                price=price,
                 status=LabItemStatus.pending,
             )
         )
+
+    if rx_request:
+        for it in rx_request.items or []:
+            if it.status == LabRequestItemStatus.pending:
+                it.status = LabRequestItemStatus.ordered
+        rx_request.lab_order_id = order.id
+        rx_request.status = LabPrescriptionRequestStatus.partially_processed
+
+    panel_labels = sorted({row[2] for row in item_rows if row[2]})
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -408,10 +1029,35 @@ def create_order(
         action="create",
         entity_type="lab_order",
         entity_id=order.id,
-        summary=f"Lab order {order.order_no} for {patient.name} ({len(tests)} tests)",
-        details={"doctor": doctor.name if doctor else None, "tests": [t.test_code for t in tests]},
+        summary=f"Lab order {order.order_no} for {patient.name} ({len(item_rows)} tests) [{order_source.value}]",
+        details={
+            "doctor": doctor.name if doctor else None,
+            "tests": [row[3] for row in item_rows],
+            "panels": panel_labels,
+            "prescription_request_id": str(rx_request.id) if rx_request else None,
+        },
+    )
+    from app.models import BillingSourceType
+    from app.utils.billing import ensure_charge
+
+    lab_total = round(sum(float(row[6] or 0) for row in item_rows), 2)
+    desc_bits = panel_labels or [row[4] for row in item_rows[:3]]
+    ensure_charge(
+        db,
+        hospital_id=hospital_id,
+        patient_id=patient.id,
+        source_type=BillingSourceType.laboratory,
+        source_id=order.id,
+        description=f"Lab {order.order_no} — {', '.join(desc_bits)}"[:512],
+        charge_amount=lab_total,
+        created_by_name=_actor_name(user),
     )
     db.commit()
+    if appointment_id:
+        from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+        sync_appointment_after_clinical_change(db, hospital_id, appointment_id)
+        db.commit()
     return _order_to_response(_get_order(db, order.id, hospital_id))
 
 
@@ -426,6 +1072,11 @@ def cancel_order(
     if order.status == LabOrderStatus.completed:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed orders cannot be cancelled")
     order.status = LabOrderStatus.cancelled
+    sync_request_after_order_change(db, order)
+    from app.models import BillingSourceType
+    from app.utils.billing import cancel_charge_for_source
+
+    cancel_charge_for_source(db, hospital_id, BillingSourceType.laboratory, order.id)
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -436,6 +1087,11 @@ def cancel_order(
         summary=f"Cancelled lab order {order.order_no}",
     )
     db.commit()
+    if order.appointment_id:
+        from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+        sync_appointment_after_clinical_change(db, hospital_id, order.appointment_id)
+        db.commit()
     return _order_to_response(_get_order(db, order_id, hospital_id))
 
 
@@ -457,6 +1113,7 @@ def collect_sample(
     if payload.sample_type:
         order.sample_type = payload.sample_type
     order.status = LabOrderStatus.sample_collected
+    sync_request_after_order_change(db, order)
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -504,7 +1161,13 @@ def update_item_status(
         summary=f"{item.test_code} → {payload.status.value} ({order.order_no})",
     )
     db.commit()
-    return _order_to_response(_get_order(db, order_id, hospital_id))
+    order = _get_order(db, order_id, hospital_id)
+    if order.status == LabOrderStatus.completed and order.appointment_id:
+        from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+        sync_appointment_after_clinical_change(db, hospital_id, order.appointment_id)
+        db.commit()
+    return _order_to_response(order)
 
 
 # ── Reports ────────────────────────────────────────────────────────────────────
@@ -545,6 +1208,7 @@ def save_results(
     elif order.status in {LabOrderStatus.ordered, LabOrderStatus.sample_collected}:
         order.status = LabOrderStatus.in_progress
 
+    sync_request_after_order_change(db, order)
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -557,8 +1221,11 @@ def save_results(
     db.commit()
     order = _get_order(db, order_id, hospital_id)
     from app.utils.medical_record_sync import sync_lab_order_medical_record
+    from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
 
     sync_lab_order_medical_record(db, order)
+    if order.status == LabOrderStatus.completed:
+        sync_appointment_after_clinical_change(db, hospital_id, order.appointment_id)
     db.commit()
     return _order_to_response(order)
 
@@ -591,6 +1258,8 @@ def _report_html(order: LabOrder, hospital: Hospital | None) -> str:
     if not rows:
         rows = "<tr><td colspan='4'>No results entered yet.</td></tr>"
     tests = ", ".join(f"{i.test_name} ({i.test_code})" for i in (order.items or []))
+    panels = sorted({i.panel_name for i in (order.items or []) if i.panel_name})
+    panel_line = f"<p><strong>Panels:</strong> {', '.join(panels)}</p>" if panels else ""
     collected = order.collected_at.strftime("%d %b %Y %H:%M") if order.collected_at else "—"
     ordered = order.ordered_at.strftime("%d %b %Y %H:%M") if order.ordered_at else "—"
     return f"""<!DOCTYPE html>
@@ -609,6 +1278,7 @@ def _report_html(order: LabOrder, hospital: Hospital | None) -> str:
   <p><strong>Patient:</strong> {order.patient.name if order.patient else '—'}
      ({order.patient.uhid if order.patient else ''}) · Age: {order.patient.age if order.patient and order.patient.age is not None else '—'}</p>
   <p><strong>Referred by:</strong> {order.doctor.name if order.doctor else order.ordered_by_name} · <strong>Ordered:</strong> {ordered}</p>
+  {panel_line}
   <p><strong>Tests:</strong> {tests}</p>
   <p><strong>Sample:</strong> {(order.sample_type.value if order.sample_type else '—').title()} · Collected: {collected} by {order.collected_by or '—'}</p>
   <table>

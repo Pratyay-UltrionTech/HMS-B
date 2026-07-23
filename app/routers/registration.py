@@ -32,9 +32,11 @@ from app.schemas_registration import (
     PrescriptionSummary,
     ReportSummary,
     VisitSummary,
+    validate_emergency_contact_bundle,
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
+from app.utils.billing import build_ledger_entries, patient_ledger_totals
 
 router = APIRouter(prefix="/registration", tags=["registration"])
 
@@ -141,7 +143,12 @@ def register_patient(
         gender=payload.gender.strip(),
         address=payload.address.strip() if payload.address else None,
         emergency_contact=payload.emergency_contact.strip() if payload.emergency_contact else None,
+        emergency_contact_name=payload.emergency_contact_name,
+        emergency_contact_relation=payload.emergency_contact_relation,
         blood_group=payload.blood_group,
+        has_insurance=bool(payload.has_insurance),
+        insurance_provider=payload.insurance_provider if payload.has_insurance else None,
+        insurance_details=None,
         status=PatientStatus.active,
     )
     db.add(patient)
@@ -244,7 +251,12 @@ def get_patient_profile(
         date_of_birth=patient.date_of_birth,
         address=patient.address,
         emergency_contact=patient.emergency_contact,
+        emergency_contact_name=getattr(patient, "emergency_contact_name", None),
+        emergency_contact_relation=getattr(patient, "emergency_contact_relation", None),
         blood_group=patient.blood_group,
+        has_insurance=bool(getattr(patient, "has_insurance", False)),
+        insurance_provider=getattr(patient, "insurance_provider", None),
+        insurance_details=getattr(patient, "insurance_details", None),
         status=patient.status,
         created_at=patient.created_at,
         visits=[
@@ -297,7 +309,19 @@ def get_patient_profile(
             )
             for a in admissions
         ],
-        bills=[],
+        bills=[
+            {
+                "id": str(e["ref_id"]),
+                "type": e["entry_type"],
+                "description": e["description"],
+                "debit": e["debit"],
+                "credit": e["credit"],
+                "status": e["status"],
+                "occurred_at": e["occurred_at"].isoformat() if e.get("occurred_at") else None,
+            }
+            for e in build_ledger_entries(db, hospital_id, patient_id)[:50]
+        ],
+        financial_summary=patient_ledger_totals(db, hospital_id, patient_id),
     )
 
 
@@ -344,10 +368,32 @@ def update_patient(
         patient.address = data["address"].strip() if data["address"] else None
     if "emergency_contact" in data:
         patient.emergency_contact = data["emergency_contact"].strip() if data["emergency_contact"] else None
+    if "emergency_contact_name" in data:
+        patient.emergency_contact_name = data["emergency_contact_name"]
+    if "emergency_contact_relation" in data:
+        patient.emergency_contact_relation = data["emergency_contact_relation"]
     if "blood_group" in data:
         patient.blood_group = data["blood_group"]
+    if "has_insurance" in data and data["has_insurance"] is not None:
+        patient.has_insurance = bool(data["has_insurance"])
+        if not patient.has_insurance:
+            patient.insurance_provider = None
+    if "insurance_provider" in data:
+        if getattr(patient, "has_insurance", False):
+            patient.insurance_provider = data["insurance_provider"]
+        else:
+            patient.insurance_provider = None
     if "status" in data and data["status"] is not None:
         patient.status = data["status"]
+
+    try:
+        validate_emergency_contact_bundle(
+            name=patient.emergency_contact_name,
+            relation=patient.emergency_contact_relation,
+            phone=patient.emergency_contact,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
     write_audit(
         db,
@@ -496,6 +542,19 @@ def admit_patient(
     patient.status = PatientStatus.admitted
     db.add(admission)
     db.flush()
+
+    from app.utils.billing import ensure_admission_charge
+
+    ensure_admission_charge(
+        db,
+        hospital_id=hospital_id,
+        patient_id=patient_id,
+        admission_id=admission.id,
+        ward_name=bed.ward.name if bed.ward else None,
+        admission_fee=float(getattr(bed.ward, "admission_fee", 0) or 0) if bed.ward else 0.0,
+        created_by_name=user.get("name") or "System",
+    )
+
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -542,7 +601,12 @@ def discharge_patient(
 ):
     admission = (
         db.query(Admission)
-        .options(joinedload(Admission.bed), joinedload(Admission.patient))
+        .options(
+            joinedload(Admission.bed),
+            joinedload(Admission.patient),
+            joinedload(Admission.ward),
+            joinedload(Admission.room),
+        )
         .filter(Admission.id == admission_id, Admission.hospital_id == hospital_id)
         .first()
     )
@@ -557,6 +621,24 @@ def discharge_patient(
         admission.bed.is_occupied = False
     if admission.patient:
         admission.patient.status = PatientStatus.active
+
+    from app.utils.billing import ensure_bed_charge_for_admission
+
+    ward = admission.ward
+    ensure_bed_charge_for_admission(
+        db,
+        hospital_id=hospital_id,
+        patient_id=admission.patient_id,
+        admission_id=admission.id,
+        admitted_at=admission.admitted_at,
+        discharged_at=admission.discharged_at,
+        ward_name=ward.name if ward else None,
+        room_code=admission.room.room_code if admission.room else None,
+        bed_code=admission.bed.bed_code if admission.bed else None,
+        bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
+        created_by_name=user.get("name") or "System",
+    )
+
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -583,4 +665,17 @@ def list_doctors_for_registration(
         .all()
     )
     doctors = [u for u in users if u.role and "doctor" in (u.role.name or "").lower()]
-    return [{"id": str(d.id), "name": d.name, "phone": d.phone, "email": d.email} for d in doctors]
+    return [
+        {
+            "id": str(d.id),
+            "name": d.name,
+            "phone": d.phone,
+            "email": d.email,
+            "specialization": d.specialization,
+            "qualification": d.qualification,
+            "medical_registration_number": d.medical_registration_number,
+            "years_of_experience": d.years_of_experience,
+            "consultation_room": d.consultation_room,
+        }
+        for d in doctors
+    ]

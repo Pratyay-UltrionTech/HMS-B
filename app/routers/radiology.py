@@ -17,6 +17,7 @@ from app.models import (
     RadiologyScanCatalog,
 )
 from app.schemas_radiology import (
+    RadCatalogueSeedResult,
     RadDashboardResponse,
     RadOrderCreate,
     RadOrderResponse,
@@ -28,6 +29,7 @@ from app.schemas_radiology import (
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
+from app.utils.catalogue_templates import get_template_pack
 
 router = APIRouter(prefix="/radiology", tags=["radiology"])
 
@@ -116,12 +118,20 @@ def dashboard(
         RadiologyOrder.status.in_([RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed]),
         (RadiologyOrder.findings.is_(None)) | (RadiologyOrder.findings == ""),
     ).count()
+    scans_count = (
+        db.query(func.count(RadiologyScanCatalog.id))
+        .filter(RadiologyScanCatalog.hospital_id == hospital_id, RadiologyScanCatalog.is_active.is_(True))
+        .scalar()
+        or 0
+    )
     return RadDashboardResponse(
         todays_orders=todays,
         pending_scans=pending,
         completed_scans=completed,
         reports_pending=reports_pending,
         cancelled_orders=cancelled,
+        scans_count=int(scans_count),
+        seeded_scans_estimate=len(get_template_pack("standard").get("radiology_scans") or []),
     )
 
 
@@ -145,6 +155,60 @@ def list_scans(
             | (RadiologyScanCatalog.category.ilike(term))
         )
     return q.order_by(RadiologyScanCatalog.scan_code.asc()).all()
+
+
+@router.post("/catalogue/seed-standard", response_model=RadCatalogueSeedResult)
+def seed_standard_radiology_catalogue(
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Idempotent hospital-scoped seed of standard radiology scans. Preserves existing pricing."""
+    pack = get_template_pack("standard")
+    added_codes: list[str] = []
+    already = 0
+    for seed in pack.get("radiology_scans") or []:
+        code = str(seed["scan_code"]).strip().upper()
+        exists = (
+            db.query(RadiologyScanCatalog.id)
+            .filter(RadiologyScanCatalog.hospital_id == hospital_id, RadiologyScanCatalog.scan_code == code)
+            .first()
+        )
+        if exists:
+            already += 1
+            continue
+        db.add(
+            RadiologyScanCatalog(
+                hospital_id=hospital_id,
+                scan_code=code,
+                scan_name=str(seed["scan_name"]).strip(),
+                category=str(seed.get("category") or "General").strip(),
+                department=str(seed.get("department") or "Radiology").strip(),
+                price=float(seed.get("price") or 0),
+                duration_minutes=int(seed.get("duration_minutes") or 30),
+                description=(str(seed["description"]).strip() if seed.get("description") else None),
+                is_active=True,
+            )
+        )
+        added_codes.append(code)
+    if added_codes:
+        write_audit(
+            db,
+            hospital_id=hospital_id,
+            actor=user,
+            action="create",
+            entity_type="radiology_catalogue",
+            entity_id=None,
+            summary=f"Loaded standard radiology catalogue: {len(added_codes)} scan(s) added",
+            details={"template_pack": "standard", "scans_added": added_codes},
+        )
+        db.commit()
+    return RadCatalogueSeedResult(
+        template_pack="standard",
+        added=len(added_codes),
+        already_existed=already,
+        created_codes=added_codes,
+    )
 
 
 @router.post("/scans", response_model=RadScanResponse, status_code=status.HTTP_201_CREATED)
@@ -369,6 +433,19 @@ def create_orders(
         db.add(order)
         db.flush()
         created_ids.append(order.id)
+        from app.models import BillingSourceType
+        from app.utils.billing import ensure_charge
+
+        ensure_charge(
+            db,
+            hospital_id=hospital_id,
+            patient_id=patient.id,
+            source_type=BillingSourceType.radiology,
+            source_id=order.id,
+            description=f"Radiology {order.order_no} — {scan.scan_name}",
+            charge_amount=float(scan.price or 0),
+            created_by_name=_actor_name(user),
+        )
         write_audit(
             db,
             hospital_id=hospital_id,
@@ -379,6 +456,11 @@ def create_orders(
             summary=f"Radiology order {order.order_no} for {patient.name}: {scan.scan_name}",
         )
     db.commit()
+    if payload.appointment_id:
+        from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+        sync_appointment_after_clinical_change(db, hospital_id, payload.appointment_id)
+        db.commit()
     return [_order_to_response(_get_order(db, oid, hospital_id)) for oid in created_ids]
 
 
@@ -393,6 +475,10 @@ def cancel_order(
     if order.status == RadiologyOrderStatus.completed:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed orders cannot be cancelled")
     order.status = RadiologyOrderStatus.cancelled
+    from app.models import BillingSourceType
+    from app.utils.billing import cancel_charge_for_source
+
+    cancel_charge_for_source(db, hospital_id, BillingSourceType.radiology, order.id)
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -403,6 +489,11 @@ def cancel_order(
         summary=f"Cancelled radiology order {order.order_no}",
     )
     db.commit()
+    if order.appointment_id:
+        from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+        sync_appointment_after_clinical_change(db, hospital_id, order.appointment_id)
+        db.commit()
     return _order_to_response(_get_order(db, order_id, hospital_id))
 
 
@@ -481,6 +572,11 @@ def complete_scan(
         summary=f"Completed scan for {order.order_no} (report may still be pending)",
     )
     db.commit()
+    if order.appointment_id:
+        from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+        sync_appointment_after_clinical_change(db, hospital_id, order.appointment_id)
+        db.commit()
     return _order_to_response(_get_order(db, order_id, hospital_id))
 
 
@@ -526,8 +622,11 @@ def upload_report(
     db.commit()
     order = _get_order(db, order_id, hospital_id)
     from app.utils.medical_record_sync import sync_radiology_order_medical_record
+    from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
 
     sync_radiology_order_medical_record(db, order)
+    if order.status == RadiologyOrderStatus.completed:
+        sync_appointment_after_clinical_change(db, hospital_id, order.appointment_id)
     db.commit()
     return _order_to_response(order)
 
@@ -576,7 +675,7 @@ def download_file(
         return StreamingResponse(
             BytesIO(raw),
             media_type=mime,
-            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+            headers={"Content-Disposition": f'inline; filename="{name}"'},
         )
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid file data")
 
@@ -585,6 +684,35 @@ def _report_html(order: RadiologyOrder, hospital: Hospital | None) -> str:
     hosp = hospital.name if hospital else "Hospital"
     report_date = order.report_date.isoformat() if order.report_date else "—"
     ordered = order.ordered_at.strftime("%d %b %Y %H:%M") if order.ordered_at else "—"
+
+    def esc(s: str | None) -> str:
+        return (s or "—").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    image_block = ""
+    if order.image_file_data and str(order.image_file_data).startswith("data:image"):
+        image_block = f"""
+  <div class="box">
+    <div class="label">Scan Image</div>
+    <div class="value" style="text-align:center">
+      <img src="{order.image_file_data}" alt="{esc(order.image_file_name or order.scan_name)}"
+           style="max-width:100%;max-height:640px;border-radius:8px;border:1px solid #e2e8f0"/>
+    </div>
+  </div>"""
+    elif order.image_file_data and str(order.image_file_data).startswith("data:"):
+        image_block = f"""
+  <div class="box">
+    <div class="label">Scan Image</div>
+    <div class="value">
+      <p>Image on file: {esc(order.image_file_name or 'scan file')} — open via Download Image in HMS.</p>
+    </div>
+  </div>"""
+    else:
+        image_block = """
+  <div class="box">
+    <div class="label">Scan Image</div>
+    <div class="value" style="color:#94a3b8">No scan image uploaded for this order.</div>
+  </div>"""
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"/><title>{order.order_no} Radiology Report</title>
 <style>
@@ -594,16 +722,16 @@ def _report_html(order: RadiologyOrder, hospital: Hospital | None) -> str:
   .box {{ border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; margin: 12px 0; background: #f8fafc; }}
   .label {{ font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #64748b; }}
   .value {{ margin-top: 6px; white-space: pre-wrap; font-size: 14px; }}
-  @media print {{ body {{ margin: 16px; }} }}
+  @media print {{ body {{ margin: 16px; }} img {{ max-height: 480px !important; }} }}
 </style></head><body>
-  <h1>{hosp}</h1>
-  <p class="meta">Radiology Report · {order.order_no} · {order.scan_name} ({order.scan_code})</p>
-  <p><strong>Patient:</strong> {order.patient.name if order.patient else '—'}
-     ({order.patient.uhid if order.patient else ''}) · Age: {order.patient.age if order.patient and order.patient.age is not None else '—'}</p>
-  <p><strong>Referred by:</strong> {order.doctor.name if order.doctor else order.ordered_by_name} · Ordered: {ordered}</p>
-  <p><strong>Report Date:</strong> {report_date} · <strong>Uploaded by:</strong> {order.report_uploaded_by or '—'}</p>
-  <div class="box"><div class="label">Findings</div><div class="value">{order.findings or '—'}</div></div>
-  <div class="box"><div class="label">Impression</div><div class="value">{order.impression or '—'}</div></div>
-  <div class="box"><div class="label">Remarks</div><div class="value">{order.remarks or '—'}</div></div>
-  <script>window.onload=function(){{window.print();}}</script>
+  <h1>{esc(hosp)}</h1>
+  <p class="meta">Radiology Report · {esc(order.order_no)} · {esc(order.scan_name)} ({esc(order.scan_code)})</p>
+  <p><strong>Patient:</strong> {esc(order.patient.name if order.patient else None)}
+     ({esc(order.patient.uhid if order.patient else None)}) · Age: {order.patient.age if order.patient and order.patient.age is not None else '—'}</p>
+  <p><strong>Referred by:</strong> {esc(order.doctor.name if order.doctor else order.ordered_by_name)} · Ordered: {ordered}</p>
+  <p><strong>Report Date:</strong> {report_date} · <strong>Uploaded by:</strong> {esc(order.report_uploaded_by)}</p>
+  {image_block}
+  <div class="box"><div class="label">Findings</div><div class="value">{esc(order.findings)}</div></div>
+  <div class="box"><div class="label">Impression</div><div class="value">{esc(order.impression)}</div></div>
+  <div class="box"><div class="label">Remarks</div><div class="value">{esc(order.remarks)}</div></div>
 </body></html>"""

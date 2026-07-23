@@ -12,6 +12,9 @@ from app.models import (
     Appointment,
     AppointmentStatus,
     Bed,
+    BillingCharge,
+    BillingChargeStatus,
+    BillingSourceType,
     Department,
     HospitalUser,
     Patient,
@@ -76,6 +79,78 @@ def _consultation_fee(doctor: HospitalUser) -> float:
             continue
     return 0.0
 
+
+def _sum_billing_charges(
+    db: Session,
+    hospital_id: UUID,
+    *,
+    date_from: date,
+    date_to: date,
+    doctor_id: UUID | None = None,
+) -> float:
+    """Sum non-cancelled billing charge net amounts for the period.
+
+    When doctor_id is set, only consultation charges linked to that doctor's
+    appointments in the period are counted (commercial data attributed to doctor).
+    """
+    q = db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0)).filter(
+        BillingCharge.hospital_id == hospital_id,
+        BillingCharge.status != BillingChargeStatus.cancelled,
+        BillingCharge.created_at >= _day_start(date_from),
+        BillingCharge.created_at <= _day_end(date_to),
+    )
+    if doctor_id is not None:
+        appt_ids = [
+            r[0]
+            for r in db.query(Appointment.id)
+            .filter(
+                Appointment.hospital_id == hospital_id,
+                Appointment.doctor_id == doctor_id,
+                Appointment.appointment_date >= date_from,
+                Appointment.appointment_date <= date_to,
+            )
+            .all()
+        ]
+        if not appt_ids:
+            return 0.0
+        q = q.filter(
+            BillingCharge.source_type == BillingSourceType.consultation,
+            BillingCharge.source_id.in_(appt_ids),
+        )
+    return float(q.scalar() or 0.0)
+
+
+def _doctor_consultation_billing_revenue(
+    db: Session,
+    hospital_id: UUID,
+    doctor_id: UUID,
+    date_from: date,
+    date_to: date,
+) -> float:
+    appt_ids = [
+        r[0]
+        for r in db.query(Appointment.id)
+        .filter(
+            Appointment.hospital_id == hospital_id,
+            Appointment.doctor_id == doctor_id,
+            Appointment.appointment_date >= date_from,
+            Appointment.appointment_date <= date_to,
+        )
+        .all()
+    ]
+    if not appt_ids:
+        return 0.0
+    total = (
+        db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
+        .filter(
+            BillingCharge.hospital_id == hospital_id,
+            BillingCharge.status != BillingChargeStatus.cancelled,
+            BillingCharge.source_type == BillingSourceType.consultation,
+            BillingCharge.source_id.in_(appt_ids),
+        )
+        .scalar()
+    )
+    return float(total or 0.0)
 
 def _ward_ids_for_department(db: Session, hospital_id: UUID, department_id: UUID | None) -> list[UUID] | None:
     if not department_id:
@@ -323,7 +398,7 @@ def appointment_reports(
         MetricRow(metric="Completed Appointments", count=completed),
         MetricRow(metric="Cancelled Appointments", count=cancelled),
         MetricRow(metric="No Shows", count=no_show),
-        MetricRow(metric="Waiting / Checked In", count=waiting),
+        MetricRow(metric="In Progress / Checked In", count=waiting),
         MetricRow(metric="Scheduled", count=scheduled),
     ]
 
@@ -443,12 +518,12 @@ def doctor_reports(
         appts = aq.all()
         completed = [a for a in appts if a.status == AppointmentStatus.completed]
         patients_seen = len({a.patient_id for a in appts if a.status not in {AppointmentStatus.cancelled, AppointmentStatus.no_show}})
-        fee = _consultation_fee(d)
-        revenue = fee * len(completed)
+        billing_rev = _doctor_consultation_billing_revenue(db, hospital_id, d.id, df, dt)
+        # Prefer actual billing charges; fall back to fee × completed for legacy data
+        revenue = billing_rev if billing_rev > 0 else (_consultation_fee(d) * len(completed))
 
         # Optional avg consult time from appointment type slot isn't on appointment — use None or 15 default when completed
         avg_mins = 15.0 if completed else None
-
         rows.append(
             DoctorPerfRow(
                 doctor_id=d.id,
@@ -534,24 +609,27 @@ def daily_summary(
         or 0
     )
 
-    # Revenue from completed appointments today × doctor consultation fee
-    completed = (
-        db.query(Appointment)
-        .options(joinedload(Appointment.doctor))
-        .filter(
-            Appointment.hospital_id == hospital_id,
-            Appointment.appointment_date == day,
-            Appointment.status == AppointmentStatus.completed,
+    # Revenue from billing charges (commercial ledger); fall back to fee × completed
+    billing_rev = _sum_billing_charges(db, hospital_id, date_from=day, date_to=day, doctor_id=doctor_id)
+    if billing_rev > 0:
+        revenue = billing_rev
+    else:
+        completed = (
+            db.query(Appointment)
+            .options(joinedload(Appointment.doctor))
+            .filter(
+                Appointment.hospital_id == hospital_id,
+                Appointment.appointment_date == day,
+                Appointment.status == AppointmentStatus.completed,
+            )
+            .all()
         )
-        .all()
-    )
-    if doctor_id:
-        completed = [a for a in completed if a.doctor_id == doctor_id]
-    revenue = 0.0
-    for a in completed:
-        if a.doctor:
-            revenue += _consultation_fee(a.doctor)
-
+        if doctor_id:
+            completed = [a for a in completed if a.doctor_id == doctor_id]
+        revenue = 0.0
+        for a in completed:
+            if a.doctor:
+                revenue += _consultation_fee(a.doctor)
     metrics = [
         MetricRow(metric="New Patients", count=int(new_patients)),
         MetricRow(metric="Appointments", count=int(appointments)),

@@ -27,6 +27,9 @@ class BookAppointmentRequest(BaseModel):
     appointment_date: date
     appointment_time: time
     visit_type: str = Field(default="OPD", min_length=1, max_length=64)
+    appointment_type_id: UUID | None = None
+    wing_id: UUID | None = None
+    department_id: UUID | None = None
     purpose: str | None = Field(default=None, max_length=255)
     notes: str | None = None
 
@@ -65,6 +68,11 @@ class AppointmentListItem(BaseModel):
     appointment_time: time
     purpose: str
     visit_type: str
+    appointment_type_id: UUID | None = None
+    wing_id: UUID | None = None
+    department_id: UUID | None = None
+    consultation_fee: float = 0.0
+    followup_eligibility: str | None = None
     status: AppointmentStatus
     notes: str | None
     queue_token: int | None
@@ -73,6 +81,28 @@ class AppointmentListItem(BaseModel):
     patient_name: str | None = None
     patient_uhid: str | None = None
     patient_mobile: str | None = None
+    doctor_name: str | None = None
+
+
+class FeePreviewRequest(BaseModel):
+    doctor_id: UUID
+    appointment_type_id: UUID
+    wing_id: UUID
+    department_id: UUID
+    patient_id: UUID | None = None
+    appointment_date: date | None = None
+
+
+class FeePreviewResponse(BaseModel):
+    consultation_fee: float
+    base_fee: float
+    pricing_found: bool
+    followup_free_days: int | None = None
+    is_follow_up: bool = False
+    followup_eligibility: str | None = None
+    followup_message: str | None = None
+    last_completed_visit_date: date | None = None
+    appointment_type_name: str | None = None
     doctor_name: str | None = None
 
 

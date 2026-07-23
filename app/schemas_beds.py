@@ -75,6 +75,8 @@ class AdmissionDetail(BaseModel):
     discharge_notes: str | None = None
     admitted_at: datetime
     discharged_at: datetime | None = None
+    admission_fee: float = 0
+    bed_charge_per_day: float = 0
 
 
 class OccupancyReport(BaseModel):
@@ -89,6 +91,8 @@ class WardRoomOption(BaseModel):
     id: UUID
     name: str
     ward_type: str | None = None
+    admission_fee: float = 0
+    bed_charge_per_day: float = 0
 
 
 class RoomOption(BaseModel):

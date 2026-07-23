@@ -60,6 +60,7 @@ def _sync_all_beds(db: Session, hospital_id: UUID) -> None:
 
 
 def _admission_detail(a: Admission) -> AdmissionDetail:
+    ward = a.ward
     return AdmissionDetail(
         id=a.id,
         patient_id=a.patient_id,
@@ -69,7 +70,7 @@ def _admission_detail(a: Admission) -> AdmissionDetail:
         ward_id=a.ward_id,
         room_id=a.room_id,
         bed_id=a.bed_id,
-        ward_name=a.ward.name if a.ward else None,
+        ward_name=ward.name if ward else None,
         room_code=a.room.room_code if a.room else None,
         bed_code=a.bed.bed_code if a.bed else None,
         doctor_id=a.doctor_id,
@@ -79,6 +80,8 @@ def _admission_detail(a: Admission) -> AdmissionDetail:
         discharge_notes=getattr(a, "discharge_notes", None),
         admitted_at=a.admitted_at,
         discharged_at=a.discharged_at,
+        admission_fee=float(getattr(ward, "admission_fee", 0) or 0) if ward else 0.0,
+        bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
     )
 
 
@@ -237,7 +240,16 @@ def list_wards(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     wards = db.query(Ward).filter(Ward.hospital_id == hospital_id, Ward.is_active.is_(True)).order_by(Ward.name.asc()).all()
-    return [WardRoomOption(id=w.id, name=w.name, ward_type=w.ward_type.value if w.ward_type else None) for w in wards]
+    return [
+        WardRoomOption(
+            id=w.id,
+            name=w.name,
+            ward_type=w.ward_type.value if w.ward_type else None,
+            admission_fee=float(getattr(w, "admission_fee", 0) or 0),
+            bed_charge_per_day=float(getattr(w, "bed_charge_per_day", 0) or 0),
+        )
+        for w in wards
+    ]
 
 
 @router.get("/rooms", response_model=list[RoomOption])
@@ -347,7 +359,21 @@ def list_doctors(
         .filter(HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
         .all()
     )
-    return [{"id": str(d.id), "name": d.name, "phone": d.phone, "email": d.email} for d in users if _is_doctor(d)]
+    return [
+        {
+            "id": str(d.id),
+            "name": d.name,
+            "phone": d.phone,
+            "email": d.email,
+            "specialization": d.specialization,
+            "qualification": d.qualification,
+            "medical_registration_number": d.medical_registration_number,
+            "years_of_experience": d.years_of_experience,
+            "consultation_room": d.consultation_room,
+        }
+        for d in users
+        if _is_doctor(d)
+    ]
 
 
 @router.post("/admit", response_model=AdmissionDetail, status_code=status.HTTP_201_CREATED)
@@ -403,6 +429,20 @@ def admit_patient(
     patient.status = PatientStatus.admitted
     db.add(admission)
     db.flush()
+
+    from app.utils.billing import ensure_admission_charge
+
+    ward = bed.ward or db.query(Ward).filter(Ward.id == admission.ward_id).first()
+    ensure_admission_charge(
+        db,
+        hospital_id=hospital_id,
+        patient_id=patient.id,
+        admission_id=admission.id,
+        ward_name=ward.name if ward else None,
+        admission_fee=float(getattr(ward, "admission_fee", 0) or 0) if ward else 0.0,
+        created_by_name=user.get("name") or "System",
+    )
+
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -516,6 +556,23 @@ def discharge_patient(
         admission.bed.is_occupied = False
     if admission.patient:
         admission.patient.status = PatientStatus.active
+
+    from app.utils.billing import ensure_bed_charge_for_admission
+
+    ward = admission.ward
+    ensure_bed_charge_for_admission(
+        db,
+        hospital_id=hospital_id,
+        patient_id=admission.patient_id,
+        admission_id=admission.id,
+        admitted_at=admission.admitted_at,
+        discharged_at=discharged_at,
+        ward_name=ward.name if ward else None,
+        room_code=admission.room.room_code if admission.room else None,
+        bed_code=admission.bed.bed_code if admission.bed else None,
+        bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
+        created_by_name=user.get("name") or "System",
+    )
 
     write_audit(
         db,

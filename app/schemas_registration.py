@@ -1,7 +1,8 @@
 from datetime import date, datetime
+from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 from app.utils.phone import OptionalPhoneNumber, PhoneNumber
 
@@ -9,6 +10,36 @@ from app.models import AdmissionStatus, PatientStatus
 
 
 BLOOD_GROUPS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-", "Unknown"]
+
+EMERGENCY_RELATIONS = ("Father", "Mother", "Spouse", "Sibling", "Child", "Friend", "Other")
+EmergencyRelation = Literal["Father", "Mother", "Spouse", "Sibling", "Child", "Friend", "Other"]
+
+
+def _normalize_optional_text(value: str | None, *, max_len: int | None = None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if max_len is not None and len(cleaned) > max_len:
+        raise ValueError(f"must be at most {max_len} characters")
+    return cleaned
+
+
+def validate_emergency_contact_bundle(
+    *,
+    name: str | None,
+    relation: str | None,
+    phone: str | None,
+) -> None:
+    """If any emergency field is present, phone is required."""
+    name_n = _normalize_optional_text(name)
+    relation_n = _normalize_optional_text(relation)
+    phone_n = phone.strip() if isinstance(phone, str) and phone.strip() else phone
+    if relation_n and relation_n not in EMERGENCY_RELATIONS:
+        raise ValueError(f"emergency_contact_relation must be one of: {', '.join(EMERGENCY_RELATIONS)}")
+    if (name_n or relation_n or phone_n) and not phone_n:
+        raise ValueError("emergency_contact phone is required when any emergency contact field is entered")
 
 
 class PatientRegister(BaseModel):
@@ -21,7 +52,33 @@ class PatientRegister(BaseModel):
     email: EmailStr | None = None
     address: str | None = None
     emergency_contact: OptionalPhoneNumber = None
+    emergency_contact_name: str | None = Field(default=None, max_length=128)
+    emergency_contact_relation: EmergencyRelation | None = None
     blood_group: str | None = Field(default=None, max_length=16)
+    has_insurance: bool = False
+    insurance_provider: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def validate_emergency_and_insurance(self):
+        validate_emergency_contact_bundle(
+            name=self.emergency_contact_name,
+            relation=self.emergency_contact_relation,
+            phone=self.emergency_contact,
+        )
+        if not self.has_insurance:
+            object.__setattr__(self, "insurance_provider", None)
+        else:
+            object.__setattr__(
+                self,
+                "insurance_provider",
+                _normalize_optional_text(self.insurance_provider, max_len=255),
+            )
+        object.__setattr__(
+            self,
+            "emergency_contact_name",
+            _normalize_optional_text(self.emergency_contact_name, max_len=128),
+        )
+        return self
 
 
 class PatientRegisterUpdate(BaseModel):
@@ -34,8 +91,37 @@ class PatientRegisterUpdate(BaseModel):
     email: EmailStr | None = None
     address: str | None = None
     emergency_contact: OptionalPhoneNumber = None
+    emergency_contact_name: str | None = Field(default=None, max_length=128)
+    emergency_contact_relation: EmergencyRelation | None = None
     blood_group: str | None = Field(default=None, max_length=16)
+    has_insurance: bool | None = None
+    insurance_provider: str | None = Field(default=None, max_length=255)
     status: PatientStatus | None = None
+
+    @model_validator(mode="after")
+    def normalize_optional_fields(self):
+        # Emergency phone requirement is validated after merge with existing patient in the update router.
+        data = self.model_dump(exclude_unset=True)
+        if "emergency_contact_name" in data:
+            object.__setattr__(
+                self,
+                "emergency_contact_name",
+                _normalize_optional_text(self.emergency_contact_name, max_len=128),
+            )
+        if "emergency_contact_relation" in data and self.emergency_contact_relation is not None:
+            if self.emergency_contact_relation not in EMERGENCY_RELATIONS:
+                raise ValueError(
+                    f"emergency_contact_relation must be one of: {', '.join(EMERGENCY_RELATIONS)}"
+                )
+        if "insurance_provider" in data:
+            object.__setattr__(
+                self,
+                "insurance_provider",
+                _normalize_optional_text(self.insurance_provider, max_len=255),
+            )
+        if data.get("has_insurance") is False:
+            object.__setattr__(self, "insurance_provider", None)
+        return self
 
 
 class PatientDirectoryItem(BaseModel):
@@ -110,14 +196,20 @@ class PatientProfile(BaseModel):
     date_of_birth: date | None
     address: str | None
     emergency_contact: str | None
+    emergency_contact_name: str | None = None
+    emergency_contact_relation: str | None = None
     blood_group: str | None
+    has_insurance: bool = False
+    insurance_provider: str | None = None
+    insurance_details: dict | None = None
     status: PatientStatus
     created_at: datetime
     visits: list[VisitSummary] = []
     prescriptions: list[PrescriptionSummary] = []
     medical_reports: list[ReportSummary] = []
     admissions: list[AdmissionSummary] = []
-    bills: list[dict] = []  # placeholder until billing module
+    bills: list[dict] = []
+    financial_summary: dict | None = None
 
 
 class AdmitPatientRequest(BaseModel):

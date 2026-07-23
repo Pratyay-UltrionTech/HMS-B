@@ -7,8 +7,10 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import (
     AppointmentType,
+    ConsultationPricing,
     Department,
     Holiday,
+    HospitalUser,
     OtRoom,
     Room,
     ShiftType,
@@ -20,6 +22,9 @@ from app.schemas_masters import (
     AppointmentTypeCreate,
     AppointmentTypeResponse,
     AppointmentTypeUpdate,
+    ConsultationPricingCreate,
+    ConsultationPricingResponse,
+    ConsultationPricingUpdate,
     DepartmentCreate,
     DepartmentResponse,
     DepartmentUpdate,
@@ -690,4 +695,228 @@ def delete_supplier(
 ):
     supplier = _get_or_404(db, Supplier, supplier_id, hospital_id, "Supplier")
     db.delete(supplier)
+    db.commit()
+
+
+# ── Consultation pricing ───────────────────────────────────────────────────────
+def _pricing_to_response(
+    row: ConsultationPricing,
+    wing_name: str | None = None,
+    dept_name: str | None = None,
+    doctor_name: str | None = None,
+    type_name: str | None = None,
+) -> ConsultationPricingResponse:
+    data = ConsultationPricingResponse.model_validate(row)
+    data.wing_name = wing_name
+    data.department_name = dept_name
+    data.doctor_name = doctor_name
+    data.appointment_type_name = type_name
+    return data
+
+
+def _validate_pricing_refs(
+    db: Session,
+    hospital_id: UUID,
+    wing_id: UUID,
+    department_id: UUID,
+    doctor_id: UUID,
+    appointment_type_id: UUID,
+) -> None:
+    wing = db.query(Wing).filter(Wing.id == wing_id, Wing.hospital_id == hospital_id).first()
+    if not wing:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wing not found")
+    dept = (
+        db.query(Department)
+        .filter(Department.id == department_id, Department.hospital_id == hospital_id)
+        .first()
+    )
+    if not dept:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Department not found")
+    doctor = (
+        db.query(HospitalUser)
+        .filter(HospitalUser.id == doctor_id, HospitalUser.hospital_id == hospital_id)
+        .first()
+    )
+    if not doctor:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Doctor not found")
+    appt_type = (
+        db.query(AppointmentType)
+        .filter(AppointmentType.id == appointment_type_id, AppointmentType.hospital_id == hospital_id)
+        .first()
+    )
+    if not appt_type:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Appointment type not found")
+
+
+@router.get("/consultation-pricing", response_model=list[ConsultationPricingResponse])
+def list_consultation_pricing(
+    wing_id: UUID | None = None,
+    department_id: UUID | None = None,
+    doctor_id: UUID | None = None,
+    appointment_type_id: UUID | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+):
+    q = (
+        db.query(ConsultationPricing, Wing.name, Department.name, HospitalUser.name, AppointmentType.name)
+        .join(Wing, ConsultationPricing.wing_id == Wing.id)
+        .join(Department, ConsultationPricing.department_id == Department.id)
+        .join(HospitalUser, ConsultationPricing.doctor_id == HospitalUser.id)
+        .join(AppointmentType, ConsultationPricing.appointment_type_id == AppointmentType.id)
+        .filter(ConsultationPricing.hospital_id == hospital_id)
+    )
+    if wing_id:
+        q = q.filter(ConsultationPricing.wing_id == wing_id)
+    if department_id:
+        q = q.filter(ConsultationPricing.department_id == department_id)
+    if doctor_id:
+        q = q.filter(ConsultationPricing.doctor_id == doctor_id)
+    if appointment_type_id:
+        q = q.filter(ConsultationPricing.appointment_type_id == appointment_type_id)
+    if active_only:
+        q = q.filter(ConsultationPricing.is_active.is_(True))
+    rows = q.order_by(HospitalUser.name, AppointmentType.name).all()
+    return [
+        _pricing_to_response(row, wing_name, dept_name, doctor_name, type_name)
+        for row, wing_name, dept_name, doctor_name, type_name in rows
+    ]
+
+
+@router.post("/consultation-pricing", response_model=ConsultationPricingResponse, status_code=status.HTTP_201_CREATED)
+def create_consultation_pricing(
+    payload: ConsultationPricingCreate,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    actor: dict = Depends(require_hospital_admin),
+):
+    _validate_pricing_refs(
+        db,
+        hospital_id,
+        payload.wing_id,
+        payload.department_id,
+        payload.doctor_id,
+        payload.appointment_type_id,
+    )
+    existing = (
+        db.query(ConsultationPricing)
+        .filter(
+            ConsultationPricing.hospital_id == hospital_id,
+            ConsultationPricing.wing_id == payload.wing_id,
+            ConsultationPricing.department_id == payload.department_id,
+            ConsultationPricing.doctor_id == payload.doctor_id,
+            ConsultationPricing.appointment_type_id == payload.appointment_type_id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pricing already exists for this wing, department, doctor, and appointment type",
+        )
+    item = ConsultationPricing(hospital_id=hospital_id, **payload.model_dump())
+    db.add(item)
+    db.flush()
+    _audit(
+        db,
+        hospital_id,
+        actor,
+        "create",
+        "consultation_pricing",
+        item.id,
+        f"Created consultation pricing fee={payload.consultation_fee}",
+    )
+    db.commit()
+    db.refresh(item)
+    wing = db.query(Wing).filter(Wing.id == item.wing_id).first()
+    dept = db.query(Department).filter(Department.id == item.department_id).first()
+    doctor = db.query(HospitalUser).filter(HospitalUser.id == item.doctor_id).first()
+    appt_type = db.query(AppointmentType).filter(AppointmentType.id == item.appointment_type_id).first()
+    return _pricing_to_response(
+        item,
+        wing.name if wing else None,
+        dept.name if dept else None,
+        doctor.name if doctor else None,
+        appt_type.name if appt_type else None,
+    )
+
+
+@router.put("/consultation-pricing/{item_id}", response_model=ConsultationPricingResponse)
+def update_consultation_pricing(
+    item_id: UUID,
+    payload: ConsultationPricingUpdate,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    actor: dict = Depends(require_hospital_admin),
+):
+    item = _get_or_404(db, ConsultationPricing, item_id, hospital_id, "Consultation pricing")
+    data = payload.model_dump(exclude_unset=True)
+    wing_id = data.get("wing_id", item.wing_id)
+    department_id = data.get("department_id", item.department_id)
+    doctor_id = data.get("doctor_id", item.doctor_id)
+    appointment_type_id = data.get("appointment_type_id", item.appointment_type_id)
+    _validate_pricing_refs(db, hospital_id, wing_id, department_id, doctor_id, appointment_type_id)
+    conflict = (
+        db.query(ConsultationPricing)
+        .filter(
+            ConsultationPricing.hospital_id == hospital_id,
+            ConsultationPricing.wing_id == wing_id,
+            ConsultationPricing.department_id == department_id,
+            ConsultationPricing.doctor_id == doctor_id,
+            ConsultationPricing.appointment_type_id == appointment_type_id,
+            ConsultationPricing.id != item_id,
+        )
+        .first()
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pricing already exists for this wing, department, doctor, and appointment type",
+        )
+    # Allow clearing followup_free_days by sending null explicitly
+    for key, value in data.items():
+        setattr(item, key, value)
+    db.flush()
+    _audit(
+        db,
+        hospital_id,
+        actor,
+        "update",
+        "consultation_pricing",
+        item.id,
+        f"Updated consultation pricing fee={item.consultation_fee}",
+    )
+    db.commit()
+    db.refresh(item)
+    wing = db.query(Wing).filter(Wing.id == item.wing_id).first()
+    dept = db.query(Department).filter(Department.id == item.department_id).first()
+    doctor = db.query(HospitalUser).filter(HospitalUser.id == item.doctor_id).first()
+    appt_type = db.query(AppointmentType).filter(AppointmentType.id == item.appointment_type_id).first()
+    return _pricing_to_response(
+        item,
+        wing.name if wing else None,
+        dept.name if dept else None,
+        doctor.name if doctor else None,
+        appt_type.name if appt_type else None,
+    )
+
+
+@router.delete("/consultation-pricing/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_consultation_pricing(
+    item_id: UUID,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    actor: dict = Depends(require_hospital_admin),
+):
+    item = _get_or_404(db, ConsultationPricing, item_id, hospital_id, "Consultation pricing")
+    _audit(
+        db,
+        hospital_id,
+        actor,
+        "delete",
+        "consultation_pricing",
+        item.id,
+        "Deleted consultation pricing",
+    )
+    db.delete(item)
     db.commit()

@@ -22,13 +22,20 @@ def sync_lab_order_medical_record(db: Session, order: LabOrder) -> None:
         .first()
     )
     test_names = ", ".join(i.test_name for i in (order.items or [])) or "Laboratory tests"
+    panel_names = sorted({i.panel_name for i in (order.items or []) if i.panel_name})
+    title_bits = f"Lab Report — {order.order_no}"
+    if panel_names:
+        title_bits = f"Lab Report — {order.order_no} ({', '.join(panel_names)})"
     lines = []
     for r in order.results or []:
         lines.append(f"{r.parameter_name}: {r.result_value} {r.unit or ''}".strip())
     notes = "\n".join(lines) if lines else order.clinical_notes
+    if panel_names:
+        panel_line = f"Panels: {', '.join(panel_names)}\nTests: {test_names}"
+        notes = f"{panel_line}\n\n{notes}" if notes else panel_line
 
     if existing:
-        existing.title = f"Lab Report — {order.order_no}"
+        existing.title = title_bits
         existing.notes = notes
         existing.appointment_id = order.appointment_id
         return
@@ -41,7 +48,7 @@ def sync_lab_order_medical_record(db: Session, order: LabOrder) -> None:
             appointment_id=order.appointment_id,
             lab_order_id=order.id,
             report_type="Blood Report",
-            title=f"Lab Report — {order.order_no}",
+            title=title_bits,
             notes=notes,
             file_name=None,
             file_data=None,

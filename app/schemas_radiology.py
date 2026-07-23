@@ -11,7 +11,7 @@ class RadScanCreate(BaseModel):
     scan_name: str = Field(min_length=1, max_length=255)
     category: str = Field(min_length=1, max_length=128, default="General")
     department: str = Field(min_length=1, max_length=128, default="Radiology")
-    price: float = Field(ge=0, default=0)
+    price: float = Field(ge=0)
     duration_minutes: int = Field(ge=1, le=1440, default=30)
     description: str | None = None
     is_active: bool = True
@@ -114,3 +114,12 @@ class RadDashboardResponse(BaseModel):
     completed_scans: int
     reports_pending: int
     cancelled_orders: int
+    scans_count: int = 0
+    seeded_scans_estimate: int = 0
+
+
+class RadCatalogueSeedResult(BaseModel):
+    template_pack: str = "standard"
+    added: int = 0
+    already_existed: int = 0
+    created_codes: list[str] = []

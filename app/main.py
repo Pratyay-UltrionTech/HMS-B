@@ -7,7 +7,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import get_settings
 from app.database import Base, engine
-from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment
+from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment, billing
 import app.models  # noqa: F401 — register all ORM tables for create_all
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -74,8 +74,18 @@ def _migrate_patients_registration_fields() -> None:
             alters.append("ADD COLUMN date_of_birth DATE")
         if "emergency_contact" not in cols:
             alters.append("ADD COLUMN emergency_contact VARCHAR(64)")
+        if "emergency_contact_name" not in cols:
+            alters.append("ADD COLUMN emergency_contact_name VARCHAR(128)")
+        if "emergency_contact_relation" not in cols:
+            alters.append("ADD COLUMN emergency_contact_relation VARCHAR(32)")
         if "blood_group" not in cols:
             alters.append("ADD COLUMN blood_group VARCHAR(16)")
+        if "has_insurance" not in cols:
+            alters.append("ADD COLUMN has_insurance BOOLEAN NOT NULL DEFAULT FALSE")
+        if "insurance_provider" not in cols:
+            alters.append("ADD COLUMN insurance_provider VARCHAR(255)")
+        if "insurance_details" not in cols:
+            alters.append("ADD COLUMN insurance_details JSONB")
         if alters:
             logger.info("Migrating patients registration columns")
             with engine.begin() as conn:
@@ -174,6 +184,217 @@ def _migrate_appointments_extra_fields() -> None:
         logger.warning("appointments fields migration skipped: %s", exc)
 
 
+def _migrate_lab_prescription_requests() -> None:
+    """Lab order source / prescription links; request tables via create_all."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        tables = set(insp.get_table_names())
+        if "lab_orders" not in tables:
+            return
+        cols = {c["name"] for c in insp.get_columns("lab_orders")}
+        with engine.begin() as conn:
+            # Ensure enum type exists
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      CREATE TYPE lab_order_source AS ENUM ('doctor_prescribed', 'self_requested');
+                    EXCEPTION WHEN duplicate_object THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+            if "order_source" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE lab_orders ADD COLUMN order_source lab_order_source "
+                        "NOT NULL DEFAULT 'self_requested'"
+                    )
+                )
+            if "prescription_id" not in cols:
+                conn.execute(text("ALTER TABLE lab_orders ADD COLUMN prescription_id UUID"))
+            if "prescription_request_id" not in cols:
+                conn.execute(text("ALTER TABLE lab_orders ADD COLUMN prescription_request_id UUID"))
+        # Optional FKs
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        DO $$ BEGIN
+                          IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint WHERE conname = 'lab_orders_prescription_id_fkey'
+                          ) THEN
+                            ALTER TABLE lab_orders
+                              ADD CONSTRAINT lab_orders_prescription_id_fkey
+                              FOREIGN KEY (prescription_id) REFERENCES prescriptions(id) ON DELETE SET NULL;
+                          END IF;
+                          IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint WHERE conname = 'lab_orders_prescription_request_id_fkey'
+                          ) THEN
+                            ALTER TABLE lab_orders
+                              ADD CONSTRAINT lab_orders_prescription_request_id_fkey
+                              FOREIGN KEY (prescription_request_id)
+                              REFERENCES lab_prescription_requests(id) ON DELETE SET NULL;
+                          END IF;
+                        END $$;
+                        """
+                    )
+                )
+        except Exception as fk_exc:
+            logger.warning("lab order prescription FKs skipped: %s", fk_exc)
+    except Exception as exc:
+        logger.warning("lab prescription request migration skipped: %s", exc)
+
+
+def _migrate_lab_panels() -> None:
+    """Add panel provenance columns on lab_order_items (tables created via create_all)."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        if "lab_order_items" not in set(insp.get_table_names()):
+            return
+        cols = {c["name"] for c in insp.get_columns("lab_order_items")}
+        with engine.begin() as conn:
+            if "panel_id" not in cols:
+                conn.execute(text("ALTER TABLE lab_order_items ADD COLUMN panel_id UUID"))
+            if "panel_name" not in cols:
+                conn.execute(text("ALTER TABLE lab_order_items ADD COLUMN panel_name VARCHAR(255)"))
+        # Optional FK for existing DBs (ignore if already present / unsupported)
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        DO $$ BEGIN
+                          IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint WHERE conname = 'lab_order_items_panel_id_fkey'
+                          ) THEN
+                            ALTER TABLE lab_order_items
+                              ADD CONSTRAINT lab_order_items_panel_id_fkey
+                              FOREIGN KEY (panel_id) REFERENCES lab_test_panels(id) ON DELETE SET NULL;
+                          END IF;
+                        END $$;
+                        """
+                    )
+                )
+        except Exception as fk_exc:
+            logger.warning("lab_order_items panel_id FK skipped: %s", fk_exc)
+    except Exception as exc:
+        logger.warning("lab panels migration skipped: %s", exc)
+
+
+def _migrate_consultation_pricing() -> None:
+    """Add appointment type / fee snapshot columns and pricing-related flags."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        tables = set(insp.get_table_names())
+
+        if "appointment_types" in tables:
+            at_cols = {c["name"] for c in insp.get_columns("appointment_types")}
+            with engine.begin() as conn:
+                if "is_follow_up" not in at_cols:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE appointment_types "
+                            "ADD COLUMN is_follow_up BOOLEAN NOT NULL DEFAULT FALSE"
+                        )
+                    )
+                if "updated_at" not in at_cols:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE appointment_types "
+                            "ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+                        )
+                    )
+                # Mark existing Follow-up named types
+                conn.execute(
+                    text(
+                        """
+                        UPDATE appointment_types
+                        SET is_follow_up = TRUE
+                        WHERE is_follow_up = FALSE
+                          AND (
+                            LOWER(REPLACE(REPLACE(REPLACE(name, ' ', ''), '-', ''), '_', ''))
+                            LIKE '%followup%'
+                            OR LOWER(name) IN ('fu', 'follow')
+                          )
+                        """
+                    )
+                )
+
+        if "appointments" in tables:
+            cols = {c["name"] for c in inspect(engine).get_columns("appointments")}
+            with engine.begin() as conn:
+                if "appointment_type_id" not in cols:
+                    conn.execute(text("ALTER TABLE appointments ADD COLUMN appointment_type_id UUID"))
+                    conn.execute(
+                        text(
+                            """
+                            ALTER TABLE appointments
+                            ADD CONSTRAINT fk_appointments_appointment_type_id
+                            FOREIGN KEY (appointment_type_id) REFERENCES appointment_types(id)
+                            ON DELETE SET NULL
+                            """
+                        )
+                    )
+                    conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS ix_appointments_appointment_type_id "
+                            "ON appointments (appointment_type_id)"
+                        )
+                    )
+                if "wing_id" not in cols:
+                    conn.execute(text("ALTER TABLE appointments ADD COLUMN wing_id UUID"))
+                    conn.execute(
+                        text(
+                            """
+                            ALTER TABLE appointments
+                            ADD CONSTRAINT fk_appointments_wing_id
+                            FOREIGN KEY (wing_id) REFERENCES wings(id) ON DELETE SET NULL
+                            """
+                        )
+                    )
+                    conn.execute(
+                        text("CREATE INDEX IF NOT EXISTS ix_appointments_wing_id ON appointments (wing_id)")
+                    )
+                if "department_id" not in cols:
+                    conn.execute(text("ALTER TABLE appointments ADD COLUMN department_id UUID"))
+                    conn.execute(
+                        text(
+                            """
+                            ALTER TABLE appointments
+                            ADD CONSTRAINT fk_appointments_department_id
+                            FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL
+                            """
+                        )
+                    )
+                    conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS ix_appointments_department_id "
+                            "ON appointments (department_id)"
+                        )
+                    )
+                if "consultation_fee" not in cols:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE appointments "
+                            "ADD COLUMN consultation_fee DOUBLE PRECISION NOT NULL DEFAULT 0"
+                        )
+                    )
+                if "followup_eligibility" not in cols:
+                    conn.execute(
+                        text("ALTER TABLE appointments ADD COLUMN followup_eligibility VARCHAR(64)")
+                    )
+    except Exception as exc:
+        logger.warning("consultation pricing migration skipped: %s", exc)
+
+
 def _migrate_admissions_discharge_notes() -> None:
     """Add discharge_notes to admissions if missing."""
     from sqlalchemy import inspect, text
@@ -218,6 +439,36 @@ def _migrate_hospital_users_shift_id() -> None:
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_hospital_users_shift_id ON hospital_users (shift_id)"))
     except Exception as exc:
         logger.warning("hospital_users shift_id migration skipped: %s", exc)
+
+
+def _migrate_hospital_users_doctor_profile() -> None:
+    """Add first-class doctor profile columns to hospital_users if missing."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        if "hospital_users" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("hospital_users")}
+        alters: list[str] = []
+        if "specialization" not in cols:
+            alters.append("ADD COLUMN specialization VARCHAR(255)")
+        if "medical_registration_number" not in cols:
+            alters.append("ADD COLUMN medical_registration_number VARCHAR(64)")
+        if "qualification" not in cols:
+            alters.append("ADD COLUMN qualification VARCHAR(255)")
+        if "years_of_experience" not in cols:
+            alters.append("ADD COLUMN years_of_experience INTEGER")
+        if "consultation_room" not in cols:
+            alters.append("ADD COLUMN consultation_room VARCHAR(128)")
+        if not alters:
+            return
+        logger.info("Migrating hospital_users doctor profile columns")
+        with engine.begin() as conn:
+            for clause in alters:
+                conn.execute(text(f"ALTER TABLE hospital_users {clause}"))
+    except Exception as exc:
+        logger.warning("hospital_users doctor profile migration skipped: %s", exc)
 
 
 def _migrate_departments_optional_wing() -> None:
@@ -332,6 +583,115 @@ def _migrate_ot_rooms_and_surgery_links() -> None:
         logger.warning("ot room/surgery link migration skipped: %s", exc)
 
 
+def _migrate_ward_and_ot_pricing() -> None:
+    """Add ward admission/bed rates, OT room base charge, and surgery charge snapshot."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        tables = set(insp.get_table_names())
+
+        if "wards" in tables:
+            cols = {c["name"] for c in insp.get_columns("wards")}
+            alters: list[str] = []
+            if "admission_fee" not in cols:
+                alters.append("ADD COLUMN admission_fee DOUBLE PRECISION NOT NULL DEFAULT 0")
+            if "bed_charge_per_day" not in cols:
+                alters.append("ADD COLUMN bed_charge_per_day DOUBLE PRECISION NOT NULL DEFAULT 0")
+            if alters:
+                logger.info("Migrating wards pricing columns")
+                with engine.begin() as conn:
+                    for clause in alters:
+                        conn.execute(text(f"ALTER TABLE wards {clause}"))
+
+        if "ot_rooms" in tables:
+            cols = {c["name"] for c in insp.get_columns("ot_rooms")}
+            if "base_ot_charge" not in cols:
+                logger.info("Adding base_ot_charge to ot_rooms")
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE ot_rooms ADD COLUMN base_ot_charge DOUBLE PRECISION NOT NULL DEFAULT 0"
+                        )
+                    )
+
+        if "ot_surgeries" in tables:
+            cols = {c["name"] for c in insp.get_columns("ot_surgeries")}
+            if "ot_charge_amount" not in cols:
+                logger.info("Adding ot_charge_amount snapshot to ot_surgeries")
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE ot_surgeries ADD COLUMN ot_charge_amount DOUBLE PRECISION NOT NULL DEFAULT 0"
+                        )
+                    )
+    except Exception as exc:
+        logger.warning("ward/OT pricing migration skipped: %s", exc)
+
+
+def _migrate_billing_invoices_receipts() -> None:
+    """Ensure invoice/receipt tables exist (create_all + enum safety for Postgres)."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        tables = set(insp.get_table_names())
+        with engine.begin() as conn:
+            for enum_name, values in (
+                ("billing_invoice_status", ("draft", "generated", "paid", "cancelled")),
+                ("billing_receipt_status", ("issued", "cancelled")),
+            ):
+                conn.execute(
+                    text(
+                        f"""
+                        DO $$ BEGIN
+                            CREATE TYPE {enum_name} AS ENUM ({", ".join(repr(v) for v in values)});
+                        EXCEPTION
+                            WHEN duplicate_object THEN null;
+                        END $$;
+                        """
+                    )
+                )
+        # create_all in lifespan creates tables; re-run for late enum creation
+        from app.models import Base as ModelsBase
+
+        ModelsBase.metadata.create_all(
+            bind=engine,
+            tables=[
+                t
+                for name, t in ModelsBase.metadata.tables.items()
+                if name in ("billing_invoices", "billing_invoice_lines", "billing_receipts")
+            ],
+        )
+        logger.info(
+            "Billing invoices/receipts ready (tables present: %s)",
+            {n for n in ("billing_invoices", "billing_invoice_lines", "billing_receipts") if n in tables or True},
+        )
+    except Exception as exc:
+        logger.warning("billing invoices/receipts migration skipped: %s", exc)
+
+
+def _migrate_doctor_leaves_type_and_reason() -> None:
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    try:
+        insp = inspect(engine)
+        if "doctor_leaves" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("doctor_leaves")}
+        with engine.begin() as conn:
+            if "leave_type" not in cols:
+                conn.execute(text("ALTER TABLE doctor_leaves ADD COLUMN leave_type VARCHAR(32)"))
+            try:
+                conn.execute(text("ALTER TABLE doctor_leaves ALTER COLUMN reason TYPE VARCHAR(500)"))
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning("doctor_leaves leave_type/reason migration skipped: %s", exc)
+
+
 def _migrate_appointment_linked_clinical() -> None:
     """Link lab/radiology orders and medical records to appointments."""
     from sqlalchemy import inspect, text
@@ -387,10 +747,17 @@ async def lifespan(_: FastAPI):
     _migrate_appointments_extra_fields()
     _migrate_admissions_discharge_notes()
     _migrate_hospital_users_shift_id()
+    _migrate_hospital_users_doctor_profile()
     _migrate_departments_optional_wing()
     Base.metadata.create_all(bind=engine)
     _migrate_appointment_linked_clinical()
+    _migrate_doctor_leaves_type_and_reason()
     _migrate_ot_rooms_and_surgery_links()
+    _migrate_ward_and_ot_pricing()
+    _migrate_billing_invoices_receipts()
+    _migrate_consultation_pricing()
+    _migrate_lab_panels()
+    _migrate_lab_prescription_requests()
     yield
 
 
@@ -425,6 +792,7 @@ app.include_router(radiology.router, prefix="/api")
 app.include_router(ot.router, prefix="/api")
 app.include_router(dms.router, prefix="/api")
 app.include_router(equipment.router, prefix="/api")
+app.include_router(billing.router, prefix="/api")
 
 
 @app.get("/")

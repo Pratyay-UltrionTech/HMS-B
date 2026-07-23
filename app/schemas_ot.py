@@ -81,6 +81,8 @@ class OtSurgeryResponse(BaseModel):
     department_id: UUID | None = None
     ot_room_id: UUID | None = None
     ot_room: str
+    ot_charge_amount: float = 0
+    ot_room_rate: float | None = None
     scheduled_at: datetime
     duration_minutes: int
     anaesthetist: str | None

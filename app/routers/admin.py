@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
-from app.models import AuditLog, HospitalUser, RoleCustomField, RolePermission, ShiftType, StaffRole
+from app.models import AuditLog, Department, HospitalUser, RoleCustomField, RolePermission, ShiftType, StaffRole
 from app.schemas_admin import (
     BASIC_MODULE_KEYS,
     BASIC_MODULE_LABELS,
@@ -263,6 +263,46 @@ def _get_shift(
     return shift
 
 
+def _get_department(db: Session, department_id: UUID, hospital_id: UUID) -> Department:
+    dept = (
+        db.query(Department)
+        .filter(Department.id == department_id, Department.hospital_id == hospital_id)
+        .first()
+    )
+    if not dept:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+    return dept
+
+
+def _validate_department_shift(
+    db: Session,
+    hospital_id: UUID,
+    *,
+    department_id: UUID | None,
+    shift_id: UUID | None,
+    require_active_shift: bool = True,
+) -> ShiftType | None:
+    """Ensure department and shift belong to this hospital and match each other when both are set."""
+    if department_id is not None:
+        _get_department(db, department_id, hospital_id)
+    if not shift_id:
+        return None
+    shift = _get_shift(db, shift_id, hospital_id, require_active=require_active_shift)
+    if department_id is not None and shift.department_id != department_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected shift does not belong to the selected department",
+        )
+    return shift
+
+
+def _clean_optional_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
 def _user_to_response(user: HospitalUser) -> HospitalUserResponse:
     shift = user.shift
     return HospitalUserResponse(
@@ -273,11 +313,17 @@ def _user_to_response(user: HospitalUser) -> HospitalUserResponse:
         name=user.name,
         phone=user.phone,
         email=user.email,
+        specialization=user.specialization,
+        medical_registration_number=user.medical_registration_number,
+        qualification=user.qualification,
+        years_of_experience=user.years_of_experience,
+        consultation_room=user.consultation_room,
         custom_values=user.custom_values or {},
         is_active=user.is_active,
         created_at=user.created_at,
         role_name=user.role.name if user.role else None,
         shift_name=shift.name if shift else None,
+        shift_department_id=shift.department_id if shift else None,
         shift_department_name=shift.department.name if shift and shift.department else None,
         shift_start_time=_fmt_shift_time(shift.start_time) if shift else None,
         shift_end_time=_fmt_shift_time(shift.end_time) if shift else None,
@@ -332,10 +378,16 @@ def create_user(
 
     shift_id = None
     shift_label = None
-    if payload.shift_id:
-        shift = _get_shift(db, payload.shift_id, hospital_id)
-        shift_id = shift.id
-        shift_label = shift.name
+    if payload.shift_id or payload.department_id:
+        shift = _validate_department_shift(
+            db,
+            hospital_id,
+            department_id=payload.department_id,
+            shift_id=payload.shift_id,
+        )
+        if shift:
+            shift_id = shift.id
+            shift_label = shift.name
 
     user = HospitalUser(
         hospital_id=hospital_id,
@@ -345,6 +397,11 @@ def create_user(
         phone=payload.phone.strip(),
         email=email,
         password_hash=hash_password(payload.password),
+        specialization=_clean_optional_str(payload.specialization),
+        medical_registration_number=_clean_optional_str(payload.medical_registration_number),
+        qualification=_clean_optional_str(payload.qualification),
+        years_of_experience=payload.years_of_experience,
+        consultation_room=_clean_optional_str(payload.consultation_room),
         custom_values=payload.custom_values or {},
         is_active=payload.is_active,
     )
@@ -377,15 +434,25 @@ def update_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    data = payload.model_dump(exclude_unset=True, exclude={"password"})
+    data = payload.model_dump(exclude_unset=True, exclude={"password", "department_id"})
+    raw = payload.model_dump(exclude_unset=True)
     if "role_id" in data and data["role_id"]:
         _get_role(db, data["role_id"], hospital_id)
-    if "shift_id" in data:
-        if data["shift_id"]:
-            same = user.shift_id == data["shift_id"]
-            _get_shift(db, data["shift_id"], hospital_id, require_active=not same)
-        else:
+    if "shift_id" in data or "department_id" in raw:
+        effective_shift_id = data["shift_id"] if "shift_id" in data else user.shift_id
+        if "shift_id" in data and not data["shift_id"]:
+            effective_shift_id = None
             data["shift_id"] = None
+        same_shift = effective_shift_id is not None and user.shift_id == effective_shift_id
+        dept_for_check = raw.get("department_id") if "department_id" in raw else None
+        if effective_shift_id is not None or "department_id" in raw:
+            _validate_department_shift(
+                db,
+                hospital_id,
+                department_id=dept_for_check,
+                shift_id=effective_shift_id,
+                require_active_shift=not same_shift,
+            )
     if "email" in data and data["email"]:
         data["email"] = str(data["email"]).strip().lower()
         clash = (
@@ -403,6 +470,14 @@ def update_user(
         data["name"] = data["name"].strip()
     if "phone" in data and data["phone"]:
         data["phone"] = data["phone"].strip()
+    for key in (
+        "specialization",
+        "medical_registration_number",
+        "qualification",
+        "consultation_room",
+    ):
+        if key in data:
+            data[key] = _clean_optional_str(data[key])
     for key, value in data.items():
         setattr(user, key, value)
     if payload.password:

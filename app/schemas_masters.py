@@ -130,6 +130,7 @@ class AppointmentTypeCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     slot_duration_minutes: int = Field(default=15, ge=5, le=480)
     description: str | None = None
+    is_follow_up: bool = False
     is_active: bool = True
 
 
@@ -137,6 +138,7 @@ class AppointmentTypeUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     slot_duration_minutes: int | None = Field(default=None, ge=5, le=480)
     description: str | None = None
+    is_follow_up: bool | None = None
     is_active: bool | None = None
 
 
@@ -146,8 +148,51 @@ class AppointmentTypeResponse(BaseModel):
     name: str
     slot_duration_minutes: int
     description: str | None
+    is_follow_up: bool = False
     is_active: bool
     created_at: datetime
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+# ── Consultation pricing ───────────────────────────────────────────────────────
+class ConsultationPricingCreate(BaseModel):
+    wing_id: UUID
+    department_id: UUID
+    doctor_id: UUID
+    appointment_type_id: UUID
+    consultation_fee: float = Field(ge=0)
+    followup_free_days: int | None = Field(default=None, ge=0, le=3650)
+    is_active: bool = True
+
+
+class ConsultationPricingUpdate(BaseModel):
+    wing_id: UUID | None = None
+    department_id: UUID | None = None
+    doctor_id: UUID | None = None
+    appointment_type_id: UUID | None = None
+    consultation_fee: float | None = Field(default=None, ge=0)
+    followup_free_days: int | None = Field(default=None, ge=0, le=3650)
+    is_active: bool | None = None
+
+
+class ConsultationPricingResponse(BaseModel):
+    id: UUID
+    hospital_id: UUID
+    wing_id: UUID
+    department_id: UUID
+    doctor_id: UUID
+    appointment_type_id: UUID
+    consultation_fee: float
+    followup_free_days: int | None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime | None = None
+    wing_name: str | None = None
+    department_name: str | None = None
+    doctor_name: str | None = None
+    appointment_type_name: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -159,6 +204,8 @@ class WardCreate(BaseModel):
     wing_id: UUID | None = None
     department_id: UUID | None = None
     description: str | None = None
+    admission_fee: float = Field(default=0, ge=0)
+    bed_charge_per_day: float = Field(default=0, ge=0)
     is_active: bool = True
 
 
@@ -168,6 +215,8 @@ class WardUpdate(BaseModel):
     wing_id: UUID | None = None
     department_id: UUID | None = None
     description: str | None = None
+    admission_fee: float | None = Field(default=None, ge=0)
+    bed_charge_per_day: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
 
 
@@ -179,6 +228,8 @@ class WardResponse(BaseModel):
     name: str
     ward_type: WardType
     description: str | None
+    admission_fee: float = 0
+    bed_charge_per_day: float = 0
     is_active: bool
     created_at: datetime
     wing_name: str | None = None
@@ -225,15 +276,17 @@ class OtRoomCreate(BaseModel):
     code: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=255)
     description: str | None = None
+    base_ot_charge: float = Field(default=0, ge=0)
     is_active: bool = True
 
 
 class OtRoomUpdate(BaseModel):
     wing_id: UUID | None = None
-    department_id: UUID
+    department_id: UUID | None = None
     code: str | None = Field(default=None, min_length=1, max_length=64)
     name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
+    base_ot_charge: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
 
 
@@ -245,6 +298,7 @@ class OtRoomResponse(BaseModel):
     code: str
     name: str
     description: str | None
+    base_ot_charge: float = 0
     is_active: bool
     created_at: datetime
     wing_name: str | None = None

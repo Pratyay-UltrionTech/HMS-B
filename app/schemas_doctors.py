@@ -17,6 +17,11 @@ class DoctorSummary(BaseModel):
     email: str
     phone: str
     role_name: str | None = None
+    specialization: str | None = None
+    medical_registration_number: str | None = None
+    qualification: str | None = None
+    years_of_experience: int | None = None
+    consultation_room: str | None = None
     custom_values: dict = {}
     is_active: bool
     patient_count: int = 0
@@ -51,6 +56,11 @@ class PatientResponse(BaseModel):
     last_visit: date | None = None
     last_diagnosis: str | None = None
     uhid: str | None = None
+    emergency_contact: str | None = None
+    emergency_contact_name: str | None = None
+    emergency_contact_relation: str | None = None
+    has_insurance: bool = False
+    insurance_provider: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -100,6 +110,7 @@ class PrescriptionCreate(BaseModel):
     advice: str | None = None
     follow_up_date: date | None = None
     test_ids: list[UUID] = Field(default_factory=list)
+    panel_ids: list[UUID] = Field(default_factory=list)
     scan_ids: list[UUID] = Field(default_factory=list)
 
 
@@ -161,6 +172,7 @@ class PatientHistoryResponse(BaseModel):
     lab_orders: list[LabOrderResponse] = []
     radiology_orders: list[RadOrderResponse] = []
     ot_surgeries: list[OtSurgeryResponse] = []
+    financial_summary: dict | None = None
 
 
 class HospitalClinicProfile(BaseModel):
@@ -183,11 +195,47 @@ class DoctorScheduleContext(BaseModel):
     uses_default_shift: bool = False
 
 
+LEAVE_TYPES = (
+    "Personal",
+    "Conference",
+    "Training",
+    "Vacation",
+    "Emergency",
+    "Medical",
+    "Other",
+)
+
+
 class DoctorLeaveCreate(BaseModel):
     leave_date: date
-    start_time: time
-    end_time: time
-    reason: str | None = Field(default=None, max_length=255)
+    start_time: time | None = None
+    end_time: time | None = None
+    leave_type: str | None = Field(default="Personal", max_length=32)
+    reason: str | None = Field(default=None, max_length=500)
+    full_day: bool = False
+
+
+class DoctorLeaveRangeCreate(BaseModel):
+    """Create leave for each day from start_date through end_date (inclusive)."""
+
+    start_date: date
+    end_date: date
+    leave_type: str = Field(default="Personal", max_length=32)
+    full_day: bool = True
+    start_time: time | None = None
+    end_time: time | None = None
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class LeaveConflictDay(BaseModel):
+    date: date
+    times: list[str]
+
+
+class LeaveConflictDetail(BaseModel):
+    code: str = "appointment_conflict"
+    message: str
+    conflicts: list[LeaveConflictDay]
 
 
 class DoctorLeaveResponse(BaseModel):
@@ -196,6 +244,7 @@ class DoctorLeaveResponse(BaseModel):
     leave_date: date
     start_time: time
     end_time: time
+    leave_type: str | None = None
     reason: str | None
     created_at: datetime
 

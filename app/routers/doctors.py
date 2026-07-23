@@ -13,10 +13,14 @@ from app.schemas_doctors import (
     AppointmentResponse,
     AppointmentUpdate,
     DoctorLeaveCreate,
+    DoctorLeaveRangeCreate,
     DoctorLeaveResponse,
     DoctorScheduleContext,
     DoctorSummary,
     HospitalClinicProfile,
+    LEAVE_TYPES,
+    LeaveConflictDay,
+    LeaveConflictDetail,
     MedicalRecordCreate,
     MedicalRecordResponse,
     PatientCreate,
@@ -39,6 +43,10 @@ from app.models import (
     LabOrder,
     LabOrderItem,
     LabOrderStatus,
+    LabPrescriptionRequest,
+    LabPrescriptionRequestItem,
+    LabPrescriptionRequestStatus,
+    LabRequestItemStatus,
     LabSampleType,
     LabTestCatalog,
     MedicalRecord,
@@ -52,6 +60,7 @@ from app.models import (
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
+from app.utils.lab_panels import resolve_lab_selection
 from app.utils.doctor_leave import (
     appointments_blocking_leave,
     fmt_time_hhmm,
@@ -118,6 +127,11 @@ def _patient_response(p: Patient, last_visit: date | None = None, last_diagnosis
         last_visit=last_visit,
         last_diagnosis=last_diagnosis,
         uhid=getattr(p, "uhid", None),
+        emergency_contact=getattr(p, "emergency_contact", None),
+        emergency_contact_name=getattr(p, "emergency_contact_name", None),
+        emergency_contact_relation=getattr(p, "emergency_contact_relation", None),
+        has_insurance=bool(getattr(p, "has_insurance", False)),
+        insurance_provider=getattr(p, "insurance_provider", None),
     )
 
 
@@ -267,6 +281,11 @@ def _doctor_summary(db: Session, doctor: HospitalUser, today: date) -> DoctorSum
         email=doctor.email,
         phone=doctor.phone,
         role_name=doctor.role.name if doctor.role else None,
+        specialization=doctor.specialization,
+        medical_registration_number=doctor.medical_registration_number,
+        qualification=doctor.qualification,
+        years_of_experience=doctor.years_of_experience,
+        consultation_room=doctor.consultation_room,
         custom_values=doctor.custom_values or {},
         is_active=doctor.is_active,
         patient_count=len(patient_ids),
@@ -525,6 +544,27 @@ def get_patient_history(
 
     last_appt = appointments[0] if appointments else None
     last_rx = prescriptions[0] if prescriptions else None
+
+    # Repair stale visit statuses (e.g. Rx written while appointment still "scheduled")
+    from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
+
+    dirty = False
+    for appt in appointments:
+        if appt.status in (AppointmentStatus.cancelled, AppointmentStatus.no_show, AppointmentStatus.completed):
+            continue
+        before = appt.status
+        sync_appointment_after_clinical_change(db, hospital_id, appt.id)
+        if appt.status != before:
+            dirty = True
+    if dirty:
+        db.commit()
+        for appt in appointments:
+            db.refresh(appt)
+
+    from app.utils.billing import build_ledger_entries, patient_ledger_totals
+
+    fin = patient_ledger_totals(db, hospital_id, patient_id)
+    recent = build_ledger_entries(db, hospital_id, patient_id)[:6]
     return PatientHistoryResponse(
         patient=_patient_response(
             patient,
@@ -537,6 +577,7 @@ def get_patient_history(
         lab_orders=[_lab_order_to_response(o) for o in lab_orders],
         radiology_orders=[_rad_order_to_response(o) for o in radiology_orders],
         ot_surgeries=[_ot_surgery_to_response(o) for o in ot_surgeries],
+        financial_summary={**fin, "recent_entries": recent},
     )
 
 
@@ -655,6 +696,16 @@ def get_calendar(
 # ── Schedule / Leave ─────────────────────────────────────────────────────────────
 
 
+def _normalize_leave_type(raw: str | None) -> str:
+    value = (raw or "Personal").strip()
+    for opt in LEAVE_TYPES:
+        if opt.lower() == value.lower():
+            return opt
+    if value:
+        return value[:32]
+    return "Personal"
+
+
 def _leave_response(leave: DoctorLeave) -> DoctorLeaveResponse:
     return DoctorLeaveResponse(
         id=leave.id,
@@ -662,9 +713,52 @@ def _leave_response(leave: DoctorLeave) -> DoctorLeaveResponse:
         leave_date=leave.leave_date,
         start_time=leave.start_time,
         end_time=leave.end_time,
+        leave_type=leave.leave_type or "Other",
         reason=leave.reason,
         created_at=leave.created_at,
     )
+
+
+def _conflict_http(blocked_by_date: dict[date, list[Appointment]]) -> HTTPException:
+    conflicts: list[LeaveConflictDay] = []
+    total = 0
+    for d in sorted(blocked_by_date.keys()):
+        times = [fmt_time_hhmm(a.appointment_time) for a in blocked_by_date[d]]
+        total += len(times)
+        conflicts.append(LeaveConflictDay(date=d, times=times))
+    detail = LeaveConflictDetail(
+        code="appointment_conflict",
+        message=f"Leave conflicts with {total} appointment{'s' if total != 1 else ''}.",
+        conflicts=conflicts,
+    )
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail.model_dump(mode="json"))
+
+
+def _resolve_leave_times(
+    doctor: HospitalUser,
+    *,
+    full_day: bool,
+    start_time,
+    end_time,
+) -> tuple:
+    shift_start, shift_end, _ = get_shift_bounds(doctor)
+    if full_day:
+        return shift_start, shift_end
+    if start_time is None or end_time is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="From time and To time are required for partial-day leave",
+        )
+    if start_time >= end_time:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="End time must be after start time")
+    s0, s1 = time_to_minutes(shift_start), time_to_minutes(shift_end)
+    a0, a1 = time_to_minutes(start_time), time_to_minutes(end_time)
+    if a0 < s0 or a1 > s1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Leave must be within your shift ({fmt_time_hhmm(shift_start)}–{fmt_time_hhmm(shift_end)})",
+        )
+    return start_time, end_time
 
 
 @router.get("/{doctor_id}/schedule-context", response_model=DoctorScheduleContext)
@@ -716,30 +810,29 @@ def create_doctor_leave(
 ):
     resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
     doctor = _get_doctor(db, resolved, hospital_id)
-    shift_start, shift_end, _ = get_shift_bounds(doctor)
-    if payload.start_time >= payload.end_time:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="End time must be after start time")
-    s0, s1 = time_to_minutes(shift_start), time_to_minutes(shift_end)
-    a0, a1 = time_to_minutes(payload.start_time), time_to_minutes(payload.end_time)
-    if a0 < s0 or a1 > s1:
+    if payload.leave_date < date.today():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Leave must be within your shift ({fmt_time_hhmm(shift_start)}–{fmt_time_hhmm(shift_end)})",
+            detail="Cannot create leave for past dates",
         )
+
+    start_time, end_time = _resolve_leave_times(
+        doctor,
+        full_day=payload.full_day,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+    )
+    leave_type = _normalize_leave_type(payload.leave_type)
 
     slot_min = slot_duration_minutes(db, hospital_id)
     blocked = appointments_blocking_leave(
-        db, hospital_id, resolved, payload.leave_date, payload.start_time, payload.end_time, slot_min
+        db, hospital_id, resolved, payload.leave_date, start_time, end_time, slot_min
     )
     if blocked:
-        times = ", ".join(fmt_time_hhmm(a.appointment_time) for a in blocked[:3])
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Cannot mark leave: existing appointment(s) at {times}",
-        )
+        raise _conflict_http({payload.leave_date: blocked})
 
     overlap = leave_blocks_overlap_existing(
-        db, hospital_id, resolved, payload.leave_date, payload.start_time, payload.end_time
+        db, hospital_id, resolved, payload.leave_date, start_time, end_time
     )
     if overlap:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Leave overlaps an existing leave block")
@@ -748,8 +841,9 @@ def create_doctor_leave(
         hospital_id=hospital_id,
         doctor_id=resolved,
         leave_date=payload.leave_date,
-        start_time=payload.start_time,
-        end_time=payload.end_time,
+        start_time=start_time,
+        end_time=end_time,
+        leave_type=leave_type,
         reason=payload.reason.strip() if payload.reason else None,
     )
     db.add(leave)
@@ -761,11 +855,104 @@ def create_doctor_leave(
         action="create",
         entity_type="doctor_leave",
         entity_id=leave.id,
-        summary=f"Marked leave on {payload.leave_date} {fmt_time_hhmm(payload.start_time)}–{fmt_time_hhmm(payload.end_time)}",
+        summary=(
+            f"Marked {leave_type} leave on {payload.leave_date} "
+            f"{fmt_time_hhmm(start_time)}–{fmt_time_hhmm(end_time)}"
+        ),
     )
     db.commit()
     db.refresh(leave)
     return _leave_response(leave)
+
+
+@router.post(
+    "/{doctor_id}/leaves/range",
+    response_model=list[DoctorLeaveResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_doctor_leave_range(
+    doctor_id: UUID,
+    payload: DoctorLeaveRangeCreate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Create leave for each day in [start_date, end_date] in one transaction."""
+    resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
+    doctor = _get_doctor(db, resolved, hospital_id)
+
+    if payload.end_date < payload.start_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="End date must be on or after start date",
+        )
+    if payload.start_date < date.today():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot create leave for past dates",
+        )
+
+    start_time, end_time = _resolve_leave_times(
+        doctor,
+        full_day=payload.full_day,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+    )
+    leave_type = _normalize_leave_type(payload.leave_type)
+    reason = payload.reason.strip() if payload.reason else None
+    slot_min = slot_duration_minutes(db, hospital_id)
+
+    blocked_by_date: dict[date, list[Appointment]] = {}
+    day = payload.start_date
+    while day <= payload.end_date:
+        blocked = appointments_blocking_leave(
+            db, hospital_id, resolved, day, start_time, end_time, slot_min
+        )
+        if blocked:
+            blocked_by_date[day] = blocked
+        day += timedelta(days=1)
+    if blocked_by_date:
+        raise _conflict_http(blocked_by_date)
+
+    created: list[DoctorLeave] = []
+    day = payload.start_date
+    while day <= payload.end_date:
+        overlap = leave_blocks_overlap_existing(db, hospital_id, resolved, day, start_time, end_time)
+        if overlap:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Leave overlaps an existing leave block on {day.isoformat()}",
+            )
+        leave = DoctorLeave(
+            hospital_id=hospital_id,
+            doctor_id=resolved,
+            leave_date=day,
+            start_time=start_time,
+            end_time=end_time,
+            leave_type=leave_type,
+            reason=reason,
+        )
+        db.add(leave)
+        created.append(leave)
+        day += timedelta(days=1)
+
+    db.flush()
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="create",
+        entity_type="doctor_leave",
+        entity_id=created[0].id if created else None,
+        summary=(
+            f"Marked {leave_type} leave {payload.start_date}–{payload.end_date} "
+            f"{fmt_time_hhmm(start_time)}–{fmt_time_hhmm(end_time)} ({len(created)} day(s))"
+        ),
+    )
+    db.commit()
+    for leave in created:
+        db.refresh(leave)
+    return [_leave_response(leave) for leave in created]
 
 
 @router.delete("/{doctor_id}/leaves/{leave_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -788,6 +975,11 @@ def delete_doctor_leave(
     )
     if not leave:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Leave not found")
+    if leave.leave_date < date.today():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Past leaves cannot be deleted",
+        )
     write_audit(
         db,
         hospital_id=hospital_id,
@@ -824,6 +1016,16 @@ def update_appointment(
     if not appt:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
     data = payload.model_dump(exclude_unset=True)
+    if "status" in data and data["status"] == AppointmentStatus.completed:
+        from app.utils.appointment_lifecycle import complete_appointment_record
+
+        ok, blockers = complete_appointment_record(db, hospital_id, appt)
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=blockers[0] if len(blockers) == 1 else "; ".join(blockers),
+            )
+        data.pop("status", None)
     for key, value in data.items():
         if key == "purpose" and value:
             setattr(appt, key, value.strip())
@@ -859,7 +1061,7 @@ def create_prescription(
     patient = db.query(Patient).filter(Patient.id == payload.patient_id, Patient.hospital_id == hospital_id).first()
     if not patient:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
-    if (payload.test_ids or payload.scan_ids) and not payload.appointment_id:
+    if (payload.test_ids or payload.panel_ids or payload.scan_ids) and not payload.appointment_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Select a visit when ordering laboratory or radiology with this prescription",
@@ -880,21 +1082,22 @@ def create_prescription(
     body_text = payload.medicines.strip()
     investigation_lines: list[str] = []
 
-    tests: list[LabTestCatalog] = []
-    if payload.test_ids:
-        tests = (
-            db.query(LabTestCatalog)
-            .filter(
-                LabTestCatalog.hospital_id == hospital_id,
-                LabTestCatalog.id.in_(payload.test_ids),
-                LabTestCatalog.is_active.is_(True),
-            )
-            .all()
+    tests_resolved = []
+    if payload.test_ids or payload.panel_ids:
+        tests_resolved = resolve_lab_selection(
+            db,
+            hospital_id,
+            payload.test_ids,
+            payload.panel_ids,
+            require_non_empty=True,
         )
-        if len(tests) != len(set(payload.test_ids)):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lab test selection")
-        test_names = ", ".join(t.test_name for t in tests)
-        investigation_lines.append(f"Laboratory tests prescribed: {test_names}")
+        panel_names = sorted({r.panel.panel_name for r in tests_resolved if r.panel})
+        test_names = ", ".join(r.test.test_name for r in tests_resolved)
+        bits = []
+        if panel_names:
+            bits.append(f"Panels: {', '.join(panel_names)}")
+        bits.append(f"Laboratory tests prescribed: {test_names}")
+        investigation_lines.append(" · ".join(bits))
 
     scans: list[RadiologyScanCatalog] = []
     if payload.scan_ids:
@@ -930,61 +1133,71 @@ def create_prescription(
     db.add(rx)
     db.flush()
 
-    if tests:
-        sample_type = tests[0].sample_type
-        for t in tests:
-            if t.sample_type == LabSampleType.blood:
-                sample_type = LabSampleType.blood
-                break
-        lab_count = db.query(func.count(LabOrder.id)).filter(LabOrder.hospital_id == hospital_id).scalar() or 0
-        lab_order = LabOrder(
+    if tests_resolved:
+        req = LabPrescriptionRequest(
             hospital_id=hospital_id,
-            order_no=f"LAB{int(lab_count) + 1:04d}",
+            prescription_id=rx.id,
             patient_id=patient.id,
             doctor_id=resolved,
             appointment_id=payload.appointment_id,
-            ordered_by_name=str(user.get("name") or "Doctor"),
-            ordered_by_role=str(user.get("staff_role_name") or user.get("role") or "doctor"),
-            status=LabOrderStatus.ordered,
-            clinical_notes=f"Ordered with prescription {rx.id}: {payload.diagnosis.strip()[:200]}",
-            sample_type=sample_type,
+            status=LabPrescriptionRequestStatus.pending,
+            prescribed_test_ids=[str(tid) for tid in (payload.test_ids or [])],
+            prescribed_panel_ids=[str(pid) for pid in (payload.panel_ids or [])],
+            clinical_notes=f"Prescribed with Rx: {payload.diagnosis.strip()[:200]}",
         )
-        db.add(lab_order)
+        db.add(req)
         db.flush()
-        for t in tests:
+        for idx, r in enumerate(tests_resolved):
+            t = r.test
             db.add(
-                LabOrderItem(
+                LabPrescriptionRequestItem(
                     hospital_id=hospital_id,
-                    order_id=lab_order.id,
+                    request_id=req.id,
                     test_id=t.id,
+                    panel_id=r.panel.id if r.panel else None,
+                    panel_name=r.panel.panel_name if r.panel else None,
                     test_code=t.test_code,
                     test_name=t.test_name,
                     department=t.department,
                     price=t.price,
-                    status=LabItemStatus.pending,
+                    sort_order=idx,
+                    status=LabRequestItemStatus.pending,
                 )
             )
 
     if scans:
+        from app.models import BillingSourceType
+        from app.utils.billing import ensure_charge
+
         rad_base = db.query(func.count(RadiologyOrder.id)).filter(RadiologyOrder.hospital_id == hospital_id).scalar() or 0
         for idx, scan in enumerate(scans):
-            db.add(
-                RadiologyOrder(
-                    hospital_id=hospital_id,
-                    order_no=f"RAD{int(rad_base) + idx + 1:04d}",
-                    patient_id=patient.id,
-                    doctor_id=resolved,
-                    appointment_id=payload.appointment_id,
-                    scan_id=scan.id,
-                    scan_code=scan.scan_code,
-                    scan_name=scan.scan_name,
-                    category=scan.category,
-                    price=scan.price,
-                    ordered_by_name=str(user.get("name") or "Doctor"),
-                    ordered_by_role=str(user.get("staff_role_name") or user.get("role") or "doctor"),
-                    status=RadiologyOrderStatus.ordered,
-                    clinical_notes=f"Ordered with prescription {rx.id}: {payload.diagnosis.strip()[:200]}",
-                )
+            rad_order = RadiologyOrder(
+                hospital_id=hospital_id,
+                order_no=f"RAD{int(rad_base) + idx + 1:04d}",
+                patient_id=patient.id,
+                doctor_id=resolved,
+                appointment_id=payload.appointment_id,
+                scan_id=scan.id,
+                scan_code=scan.scan_code,
+                scan_name=scan.scan_name,
+                category=scan.category,
+                price=scan.price,
+                ordered_by_name=str(user.get("name") or "Doctor"),
+                ordered_by_role=str(user.get("staff_role_name") or user.get("role") or "doctor"),
+                status=RadiologyOrderStatus.ordered,
+                clinical_notes=f"Ordered with prescription {rx.id}: {payload.diagnosis.strip()[:200]}",
+            )
+            db.add(rad_order)
+            db.flush()
+            ensure_charge(
+                db,
+                hospital_id=hospital_id,
+                patient_id=patient.id,
+                source_type=BillingSourceType.radiology,
+                source_id=rad_order.id,
+                description=f"Radiology {rad_order.order_no} — {scan.scan_name}",
+                charge_amount=float(scan.price or 0),
+                created_by_name=str(user.get("name") or "Doctor"),
             )
 
     write_audit(
@@ -996,6 +1209,25 @@ def create_prescription(
         entity_id=rx.id,
         summary=f"Prescription for {patient.name}: {payload.diagnosis.strip()[:80]}",
     )
+    db.flush()
+
+    if payload.appointment_id:
+        from app.utils.appointment_lifecycle import mark_in_progress, sync_appointment_after_clinical_change
+
+        appt_row = (
+            db.query(Appointment)
+            .filter(
+                Appointment.id == payload.appointment_id,
+                Appointment.hospital_id == hospital_id,
+            )
+            .first()
+        )
+        if appt_row:
+            # Writing a prescription means the visit has started clinical work
+            mark_in_progress(appt_row)
+            db.flush()
+            sync_appointment_after_clinical_change(db, hospital_id, payload.appointment_id)
+
     db.commit()
     rx = (
         db.query(Prescription)
@@ -1152,7 +1384,17 @@ def _prescription_html(
                     return str(val)
         return ""
 
-    qualification = cv_get("qualification", "qualifications", "degree", "specialization") or "Physician"
+    qualification = (
+        (doctor.qualification if doctor and doctor.qualification else None)
+        or (doctor.specialization if doctor and doctor.specialization else None)
+        or cv_get("qualification", "qualifications", "degree", "specialization")
+        or "Physician"
+    )
+    registration_no = (
+        (doctor.medical_registration_number if doctor and doctor.medical_registration_number else None)
+        or cv_get("registration_number", "medical_registration_number", "reg_no", "registration")
+        or ""
+    )
     doctor_name = doctor.name if doctor else "—"
     if doctor_name and not str(doctor_name).lower().startswith("dr"):
         doctor_name = f"Dr. {doctor_name}"
@@ -1241,6 +1483,7 @@ def _prescription_html(
         <p class="label">Doctor</p>
         <p class="strong">{doctor_name}</p>
         <p>{qualification}</p>
+        {f"<p>Reg. No: {registration_no}</p>" if registration_no else ""}
       </div>
       <div>
         <p class="label">Hospital</p>

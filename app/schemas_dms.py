@@ -18,6 +18,11 @@ class DmsPatientItem(BaseModel):
     status: str
     last_visit: date | None = None
     created_at: datetime
+    emergency_contact: str | None = None
+    emergency_contact_name: str | None = None
+    emergency_contact_relation: str | None = None
+    has_insurance: bool = False
+    insurance_provider: str | None = None
 
 
 class DmsTimelineEvent(BaseModel):
@@ -142,3 +147,5 @@ class DmsPatientFile(BaseModel):
     ot_records: list[DmsOtItem] = []
     admissions: list[DmsAdmissionItem] = []
     billing_documents: list[DmsBillingItem] = []
+    invoices: list[DmsBillingItem] = []
+    receipts: list[DmsBillingItem] = []
