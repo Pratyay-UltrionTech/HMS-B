@@ -30,9 +30,6 @@ from app.schemas_doctors import (
     PrescriptionCreate,
     PrescriptionResponse,
 )
-from app.routers.laboratory import _order_to_response as _lab_order_to_response
-from app.routers.radiology import _order_to_response as _rad_order_to_response
-from app.routers.ot import _surgery_to_response as _ot_surgery_to_response
 from app.models import (
     Appointment,
     AppointmentStatus,
@@ -42,6 +39,7 @@ from app.models import (
     LabItemStatus,
     LabOrder,
     LabOrderItem,
+    LabOrderSource,
     LabOrderStatus,
     LabPrescriptionRequest,
     LabPrescriptionRequestItem,
@@ -61,6 +59,9 @@ from app.models import (
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
 from app.utils.lab_panels import resolve_lab_selection
+from app.routers.laboratory import _next_order_no, _order_to_response as _lab_order_to_response
+from app.routers.radiology import _order_to_response as _rad_order_to_response
+from app.routers.ot import _surgery_to_response as _ot_surgery_to_response
 from app.utils.doctor_leave import (
     appointments_blocking_leave,
     fmt_time_hhmm,
@@ -1147,23 +1148,90 @@ def create_prescription(
         )
         db.add(req)
         db.flush()
+        req_items: list[LabPrescriptionRequestItem] = []
         for idx, r in enumerate(tests_resolved):
             t = r.test
+            item = LabPrescriptionRequestItem(
+                hospital_id=hospital_id,
+                request_id=req.id,
+                test_id=t.id,
+                panel_id=r.panel.id if r.panel else None,
+                panel_name=r.panel.panel_name if r.panel else None,
+                test_code=t.test_code,
+                test_name=t.test_name,
+                department=t.department,
+                price=t.price,
+                sort_order=idx,
+                status=LabRequestItemStatus.pending,
+            )
+            db.add(item)
+            req_items.append(item)
+        db.flush()
+
+        # Create lab order immediately (same as radiology) so it shows in Lab Orders / Overview
+        from app.models import BillingSourceType
+        from app.utils.billing import ensure_charge
+
+        sample_type = LabSampleType.blood
+        for r in tests_resolved:
+            if getattr(r.test, "sample_type", None) == LabSampleType.blood:
+                sample_type = LabSampleType.blood
+                break
+            if getattr(r.test, "sample_type", None):
+                sample_type = r.test.sample_type
+
+        lab_order = LabOrder(
+            hospital_id=hospital_id,
+            order_no=_next_order_no(db, hospital_id),
+            patient_id=patient.id,
+            doctor_id=resolved,
+            appointment_id=payload.appointment_id,
+            prescription_id=rx.id,
+            prescription_request_id=req.id,
+            order_source=LabOrderSource.doctor_prescribed,
+            ordered_by_name=str(user.get("name") or "Doctor"),
+            ordered_by_role=str(user.get("staff_role_name") or user.get("role") or "doctor"),
+            status=LabOrderStatus.ordered,
+            clinical_notes=f"Ordered with prescription {rx.id}: {payload.diagnosis.strip()[:200]}",
+            sample_type=sample_type,
+        )
+        db.add(lab_order)
+        db.flush()
+        for r in tests_resolved:
+            t = r.test
             db.add(
-                LabPrescriptionRequestItem(
+                LabOrderItem(
                     hospital_id=hospital_id,
-                    request_id=req.id,
+                    order_id=lab_order.id,
                     test_id=t.id,
                     panel_id=r.panel.id if r.panel else None,
                     panel_name=r.panel.panel_name if r.panel else None,
                     test_code=t.test_code,
                     test_name=t.test_name,
                     department=t.department,
-                    price=t.price,
-                    sort_order=idx,
-                    status=LabRequestItemStatus.pending,
+                    price=float(t.price or 0),
+                    status=LabItemStatus.pending,
                 )
             )
+        for it in req_items:
+            it.status = LabRequestItemStatus.ordered
+        req.lab_order_id = lab_order.id
+        req.status = LabPrescriptionRequestStatus.partially_processed
+        req.clinical_notes = f"Ordered with prescription {rx.id}: {payload.diagnosis.strip()[:200]}"
+
+        panel_labels = sorted({r.panel.panel_name for r in tests_resolved if r.panel})
+        lab_total = round(sum(float(r.test.price or 0) for r in tests_resolved), 2)
+        desc_bits = panel_labels or [r.test.test_name for r in tests_resolved[:3]]
+        ensure_charge(
+            db,
+            hospital_id=hospital_id,
+            patient_id=patient.id,
+            source_type=BillingSourceType.laboratory,
+            source_id=lab_order.id,
+            description=f"Lab {lab_order.order_no} — {', '.join(desc_bits)}"[:512],
+            charge_amount=lab_total,
+            created_by_name=str(user.get("name") or "Doctor"),
+        )
 
     if scans:
         from app.models import BillingSourceType
@@ -1294,6 +1362,20 @@ def prescription_pdf(
 def _prescription_investigation_names(db: Session, rx: Prescription) -> tuple[list[str], list[str]]:
     """Resolve lab/radiology ordered with this prescription (for PDF)."""
     rx_id = str(rx.id)
+    lab_names: list[str] = []
+
+    # Prefer explicit prescription-linked lab request / order items
+    reqs = (
+        db.query(LabPrescriptionRequest)
+        .options(joinedload(LabPrescriptionRequest.items))
+        .filter(LabPrescriptionRequest.prescription_id == rx.id)
+        .all()
+    )
+    for req in reqs:
+        for item in req.items or []:
+            if item.test_name and item.test_name not in lab_names:
+                lab_names.append(item.test_name)
+
     lab_q = (
         db.query(LabOrder)
         .options(joinedload(LabOrder.items))
@@ -1329,20 +1411,21 @@ def _prescription_investigation_names(db: Session, rx: Prescription) -> tuple[li
             return delta <= 300  # same create window (±5 min)
         return False
 
-    lab_names: list[str] = []
     for o in lab_orders:
-        if not linked(o.clinical_notes, o.ordered_at):
-            # If appointment-linked and only one Rx timing match is weak, still include
-            # orders created the same calendar day when notes say "Ordered with prescription"
-            notes = (o.clinical_notes or "").lower()
-            same_day = (
-                o.ordered_at
-                and rx.created_at
-                and o.ordered_at.date() == rx.created_at.date()
-                and "ordered with prescription" in notes
-            )
-            if not same_day:
-                continue
+        if o.prescription_id == rx.id or linked(o.clinical_notes, o.ordered_at):
+            for item in o.items or []:
+                if item.test_name and item.test_name not in lab_names:
+                    lab_names.append(item.test_name)
+            continue
+        notes = (o.clinical_notes or "").lower()
+        same_day = (
+            o.ordered_at
+            and rx.created_at
+            and o.ordered_at.date() == rx.created_at.date()
+            and "ordered with prescription" in notes
+        )
+        if not same_day:
+            continue
         for item in o.items or []:
             if item.test_name and item.test_name not in lab_names:
                 lab_names.append(item.test_name)
