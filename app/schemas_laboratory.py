@@ -57,6 +57,7 @@ class LabPanelCreate(BaseModel):
     panel_code: str = Field(min_length=1, max_length=32)
     panel_name: str = Field(min_length=1, max_length=255)
     description: str | None = None
+    price: float = Field(ge=0, default=0)
     is_active: bool = True
     test_ids: list[UUID] = Field(default_factory=list)
 
@@ -65,6 +66,7 @@ class LabPanelUpdate(BaseModel):
     panel_code: str | None = Field(default=None, min_length=1, max_length=32)
     panel_name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
+    price: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
     test_ids: list[UUID] | None = None
 
@@ -84,6 +86,7 @@ class LabPanelResponse(BaseModel):
     panel_code: str
     panel_name: str
     description: str | None
+    price: float = 0
     is_active: bool
     created_at: datetime
     updated_at: datetime | None = None

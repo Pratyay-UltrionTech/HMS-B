@@ -250,39 +250,71 @@ def _migrate_lab_prescription_requests() -> None:
 
 
 def _migrate_lab_panels() -> None:
-    """Add panel provenance columns on lab_order_items (tables created via create_all)."""
+    """Add panel provenance columns on lab_order_items and price on lab_test_panels."""
     from sqlalchemy import inspect, text
 
     try:
         insp = inspect(engine)
-        if "lab_order_items" not in set(insp.get_table_names()):
-            return
-        cols = {c["name"] for c in insp.get_columns("lab_order_items")}
-        with engine.begin() as conn:
-            if "panel_id" not in cols:
-                conn.execute(text("ALTER TABLE lab_order_items ADD COLUMN panel_id UUID"))
-            if "panel_name" not in cols:
-                conn.execute(text("ALTER TABLE lab_order_items ADD COLUMN panel_name VARCHAR(255)"))
-        # Optional FK for existing DBs (ignore if already present / unsupported)
-        try:
+        tables = set(insp.get_table_names())
+        if "lab_order_items" in tables:
+            cols = {c["name"] for c in insp.get_columns("lab_order_items")}
             with engine.begin() as conn:
+                if "panel_id" not in cols:
+                    conn.execute(text("ALTER TABLE lab_order_items ADD COLUMN panel_id UUID"))
+                if "panel_name" not in cols:
+                    conn.execute(text("ALTER TABLE lab_order_items ADD COLUMN panel_name VARCHAR(255)"))
+            # Optional FK for existing DBs (ignore if already present / unsupported)
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            """
+                            DO $$ BEGIN
+                              IF NOT EXISTS (
+                                SELECT 1 FROM pg_constraint WHERE conname = 'lab_order_items_panel_id_fkey'
+                              ) THEN
+                                ALTER TABLE lab_order_items
+                                  ADD CONSTRAINT lab_order_items_panel_id_fkey
+                                  FOREIGN KEY (panel_id) REFERENCES lab_test_panels(id) ON DELETE SET NULL;
+                              END IF;
+                            END $$;
+                            """
+                        )
+                    )
+            except Exception as fk_exc:
+                logger.warning("lab_order_items panel_id FK skipped: %s", fk_exc)
+
+        if "lab_test_panels" in tables:
+            panel_cols = {c["name"] for c in insp.get_columns("lab_test_panels")}
+            with engine.begin() as conn:
+                if "price" not in panel_cols:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE lab_test_panels "
+                            "ADD COLUMN price DOUBLE PRECISION NOT NULL DEFAULT 0"
+                        )
+                    )
+                # Backfill SHC panel prices from sum of member test prices (only where still 0)
                 conn.execute(
                     text(
                         """
-                        DO $$ BEGIN
-                          IF NOT EXISTS (
-                            SELECT 1 FROM pg_constraint WHERE conname = 'lab_order_items_panel_id_fkey'
-                          ) THEN
-                            ALTER TABLE lab_order_items
-                              ADD CONSTRAINT lab_order_items_panel_id_fkey
-                              FOREIGN KEY (panel_id) REFERENCES lab_test_panels(id) ON DELETE SET NULL;
-                          END IF;
-                        END $$;
+                        UPDATE lab_test_panels p
+                        SET price = COALESCE((
+                          SELECT SUM(COALESCE(t.price, 0))
+                          FROM lab_panel_tests pt
+                          JOIN lab_test_catalog t ON t.id = pt.test_id
+                          WHERE pt.panel_id = p.id
+                        ), 0)
+                        FROM hospitals h
+                        WHERE h.id = p.hospital_id
+                          AND p.price = 0
+                          AND (
+                            UPPER(h.hospital_id) LIKE '%SHC%'
+                            OR UPPER(h.name) LIKE '%SHC%'
+                          )
                         """
                     )
                 )
-        except Exception as fk_exc:
-            logger.warning("lab_order_items panel_id FK skipped: %s", fk_exc)
     except Exception as exc:
         logger.warning("lab panels migration skipped: %s", exc)
 

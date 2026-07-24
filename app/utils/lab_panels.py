@@ -150,6 +150,7 @@ def panel_to_response_dict(panel: LabTestPanel) -> dict:
         "panel_code": panel.panel_code,
         "panel_name": panel.panel_name,
         "description": panel.description,
+        "price": float(panel.price or 0),
         "is_active": panel.is_active,
         "created_at": panel.created_at,
         "updated_at": panel.updated_at,

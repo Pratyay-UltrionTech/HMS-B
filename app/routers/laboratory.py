@@ -385,11 +385,13 @@ def _seed_lab_panels_for_hospital(
                     matched_ids.append(t.id)
         if not matched_ids:
             continue
+        matched_price = sum(float(t.price or 0) for t in catalog if t.id in matched_ids)
         panel = LabTestPanel(
             hospital_id=hospital_id,
             panel_code=code,
             panel_name=seed["panel_name"],
             description=seed.get("description"),
+            price=float(matched_price),
             is_active=True,
         )
         db.add(panel)
@@ -641,6 +643,7 @@ def create_panel(
         panel_code=code,
         panel_name=payload.panel_name.strip(),
         description=payload.description.strip() if payload.description else None,
+        price=float(payload.price or 0),
         is_active=payload.is_active,
     )
     db.add(panel)
