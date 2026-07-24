@@ -213,6 +213,7 @@ def dashboard(
         BillingSourceType.admission,
         BillingSourceType.bed,
         BillingSourceType.ot,
+        BillingSourceType.pharmacy,
     ]
     outstanding_by_category: dict[str, float] = {k.value: 0.0 for k in category_keys}
     open_charges = (

@@ -22,6 +22,7 @@ BASIC_MODULE_KEYS = [
     "equipment",
     "mis",
     "billing",
+    "pharmacy",
 ]
 
 BASIC_MODULE_LABELS = {
@@ -38,6 +39,7 @@ BASIC_MODULE_LABELS = {
     "equipment": "Equipment Management",
     "mis": "MIS Reports",
     "billing": "Billing",
+    "pharmacy": "Pharmacy",
 }
 
 

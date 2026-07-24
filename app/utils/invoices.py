@@ -30,6 +30,7 @@ SOURCE_CATEGORY_LABELS: dict[str, str] = {
     "admission": "Admission Charges",
     "bed": "Bed Charges",
     "ot": "OT Charges",
+    "pharmacy": "Pharmacy Charges",
     "other": "Manual Charges",
     "adjustment": "Manual Charges",
 }

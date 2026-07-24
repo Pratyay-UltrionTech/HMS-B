@@ -137,6 +137,17 @@ class DmsBillingItem(BaseModel):
     note: str | None = None
 
 
+class DmsPharmacyItem(BaseModel):
+    id: UUID
+    invoice_number: str
+    customer_name: str
+    net_amount: float
+    payment_status: str
+    status: str
+    sale_date: date
+    item_count: int = 0
+
+
 class DmsPatientFile(BaseModel):
     patient: DmsPatientItem
     timeline: list[DmsTimelineEvent] = []
@@ -149,3 +160,4 @@ class DmsPatientFile(BaseModel):
     billing_documents: list[DmsBillingItem] = []
     invoices: list[DmsBillingItem] = []
     receipts: list[DmsBillingItem] = []
+    pharmacy_sales: list[DmsPharmacyItem] = []

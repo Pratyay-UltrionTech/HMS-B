@@ -7,7 +7,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import get_settings
 from app.database import Base, engine
-from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment, billing
+from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment, billing, pharmacy
 import app.models  # noqa: F401 — register all ORM tables for create_all
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -731,6 +731,26 @@ def _migrate_appointment_linked_clinical() -> None:
         logger.warning("appointment-linked clinical migration skipped: %s", exc)
 
 
+def _migrate_billing_source_type_pharmacy() -> None:
+    """Ensure Postgres enum billing_source_type includes pharmacy."""
+    from sqlalchemy import text
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TYPE billing_source_type ADD VALUE IF NOT EXISTS 'pharmacy';
+                    EXCEPTION WHEN others THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+    except Exception as exc:
+        logger.warning("billing_source_type pharmacy migration skipped: %s", exc)
+
+
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         logger.info("→ %s %s", request.method, request.url.path)
@@ -758,6 +778,7 @@ async def lifespan(_: FastAPI):
     _migrate_consultation_pricing()
     _migrate_lab_panels()
     _migrate_lab_prescription_requests()
+    _migrate_billing_source_type_pharmacy()
     yield
 
 
@@ -793,6 +814,7 @@ app.include_router(ot.router, prefix="/api")
 app.include_router(dms.router, prefix="/api")
 app.include_router(equipment.router, prefix="/api")
 app.include_router(billing.router, prefix="/api")
+app.include_router(pharmacy.router, prefix="/api")
 
 
 @app.get("/")

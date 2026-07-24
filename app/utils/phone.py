@@ -13,6 +13,9 @@ _NON_DIGIT = re.compile(r"\D+")
 
 def normalize_phone(value: str) -> str:
     digits = _NON_DIGIT.sub("", (value or "").strip())
+    # Accept +91 / 91-prefixed mobiles by keeping the last 10 digits
+    if len(digits) > 10:
+        digits = digits[-10:]
     if not _PHONE_RE.fullmatch(digits):
         raise ValueError("must be exactly 10 digits")
     return digits

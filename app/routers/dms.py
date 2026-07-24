@@ -20,6 +20,8 @@ from app.models import (
     PatientDocument,
     PatientDocumentCategory,
     PatientStatus,
+    PharmacySale,
+    PharmacySaleStatus,
     Prescription,
     RadiologyOrder,
 )
@@ -32,6 +34,7 @@ from app.schemas_dms import (
     DmsOtItem,
     DmsPatientFile,
     DmsPatientItem,
+    DmsPharmacyItem,
     DmsPrescriptionItem,
     DmsRadiologyItem,
     DmsTimelineEvent,
@@ -822,6 +825,30 @@ def _build_patient_file(db: Session, patient: Patient, hospital_id: UUID) -> Dms
             )
         )
 
+    pharmacy_sales = [
+        DmsPharmacyItem(
+            id=s.id,
+            invoice_number=s.invoice_number,
+            customer_name=s.customer_name,
+            net_amount=float(s.net_amount or 0),
+            payment_status=s.payment_status.value,
+            status=s.status.value,
+            sale_date=s.sale_date,
+            item_count=len(s.items or []),
+        )
+        for s in (
+            db.query(PharmacySale)
+            .options(joinedload(PharmacySale.items))
+            .filter(
+                PharmacySale.hospital_id == hospital_id,
+                PharmacySale.patient_id == patient.id,
+                PharmacySale.status != PharmacySaleStatus.cancelled,
+            )
+            .order_by(PharmacySale.sale_date.desc())
+            .all()
+        )
+    ]
+
     return DmsPatientFile(
         patient=_patient_item(db, patient),
         timeline=_build_timeline(db, patient, hospital_id),
@@ -834,6 +861,7 @@ def _build_patient_file(db: Session, patient: Patient, hospital_id: UUID) -> Dms
         billing_documents=billing_documents,
         invoices=invoices,
         receipts=receipts,
+        pharmacy_sales=pharmacy_sales,
     )
 
 
