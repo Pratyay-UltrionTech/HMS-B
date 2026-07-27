@@ -7,6 +7,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import get_settings
 from app.database import Base, engine
+from app.telemetry import (
+    instrument_fastapi_app,
+    instrument_http_clients,
+    instrument_sqlalchemy_engine,
+    setup_telemetry,
+)
 from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment, billing, pharmacy
 import app.models  # noqa: F401 — register all ORM tables for create_all
 
@@ -14,6 +20,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("hms.api")
 
 settings = get_settings()
+
+# Azure Monitor / Application Insights (no-op when connection string is unset)
+setup_telemetry()
 
 
 def _migrate_shift_types_for_department() -> None:
@@ -820,6 +829,11 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Trace all routers/endpoints; SQLAlchemy + outbound HTTP under Dependencies
+instrument_fastapi_app(app)
+instrument_sqlalchemy_engine(engine)
+instrument_http_clients()
 
 app.add_middleware(RequestLogMiddleware)
 app.add_middleware(
