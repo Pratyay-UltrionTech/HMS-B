@@ -4,7 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -72,22 +72,61 @@ def _get_patient(db: Session, patient_id: UUID, hospital_id: UUID) -> Patient:
     return patient
 
 
-def _patient_item(db: Session, patient: Patient) -> DmsPatientItem:
-    open_adm = (
-        db.query(Admission.id)
+def _bulk_open_admission_patient_ids(
+    db: Session, hospital_id: UUID, patient_ids: list[UUID]
+) -> set[UUID]:
+    """Patients with at least one open (admitted) admission — one query for the whole set."""
+    if not patient_ids:
+        return set()
+    rows = (
+        db.query(Admission.patient_id)
         .filter(
-            Admission.patient_id == patient.id,
-            Admission.hospital_id == patient.hospital_id,
+            Admission.hospital_id == hospital_id,
+            Admission.patient_id.in_(patient_ids),
             Admission.status == AdmissionStatus.admitted,
         )
-        .first()
+        .distinct()
+        .all()
     )
-    last_appt = (
-        db.query(Appointment)
-        .filter(Appointment.patient_id == patient.id, Appointment.hospital_id == patient.hospital_id)
-        .order_by(Appointment.appointment_date.desc())
-        .first()
+    return {r[0] for r in rows}
+
+
+def _bulk_last_visit_dates(
+    db: Session, hospital_id: UUID, patient_ids: list[UUID]
+) -> dict[UUID, date]:
+    """Latest appointment_date per patient — one windowed query (matches prior ORDER BY date DESC LIMIT 1)."""
+    if not patient_ids:
+        return {}
+    ranked = (
+        db.query(
+            Appointment.patient_id.label("patient_id"),
+            Appointment.appointment_date.label("appointment_date"),
+            func.row_number()
+            .over(
+                partition_by=Appointment.patient_id,
+                order_by=Appointment.appointment_date.desc(),
+            )
+            .label("rn"),
+        )
+        .filter(
+            Appointment.hospital_id == hospital_id,
+            Appointment.patient_id.in_(patient_ids),
+        )
+        .subquery()
     )
+    rows = (
+        db.query(ranked.c.patient_id, ranked.c.appointment_date)
+        .filter(ranked.c.rn == 1)
+        .all()
+    )
+    return {r[0]: r[1] for r in rows}
+
+
+def _patient_item_from_maps(
+    patient: Patient,
+    open_admission_ids: set[UUID],
+    last_visits: dict[UUID, date],
+) -> DmsPatientItem:
     return DmsPatientItem(
         id=patient.id,
         uhid=patient.uhid,
@@ -96,9 +135,9 @@ def _patient_item(db: Session, patient: Patient) -> DmsPatientItem:
         email=patient.email,
         gender=patient.gender,
         age=patient.age,
-        care_status=_care_status(patient, bool(open_adm)),
+        care_status=_care_status(patient, patient.id in open_admission_ids),
         status=patient.status.value if hasattr(patient.status, "value") else str(patient.status),
-        last_visit=last_appt.appointment_date if last_appt else None,
+        last_visit=last_visits.get(patient.id),
         created_at=patient.created_at,
         emergency_contact=getattr(patient, "emergency_contact", None),
         emergency_contact_name=getattr(patient, "emergency_contact_name", None),
@@ -106,6 +145,23 @@ def _patient_item(db: Session, patient: Patient) -> DmsPatientItem:
         has_insurance=bool(getattr(patient, "has_insurance", False)),
         insurance_provider=getattr(patient, "insurance_provider", None),
     )
+
+
+def _patient_item(db: Session, patient: Patient) -> DmsPatientItem:
+    """Single-patient helper (file/timeline callers). Uses the same bulk path for consistency."""
+    open_ids = _bulk_open_admission_patient_ids(db, patient.hospital_id, [patient.id])
+    last_visits = _bulk_last_visit_dates(db, patient.hospital_id, [patient.id])
+    return _patient_item_from_maps(patient, open_ids, last_visits)
+
+
+def _patient_items_bulk(db: Session, patients: list[Patient], hospital_id: UUID) -> list[DmsPatientItem]:
+    """Assemble DmsPatientItem list with 2 bulk queries instead of 2N."""
+    if not patients:
+        return []
+    ids = [p.id for p in patients]
+    open_ids = _bulk_open_admission_patient_ids(db, hospital_id, ids)
+    last_visits = _bulk_last_visit_dates(db, hospital_id, ids)
+    return [_patient_item_from_maps(p, open_ids, last_visits) for p in patients]
 
 
 def _lab_test_names(order: LabOrder) -> str | None:
@@ -161,7 +217,8 @@ def list_patients(
         q = q.filter(Patient.created_at <= end)
 
     patients = q.order_by(Patient.created_at.desc()).limit(500).all()
-    items = [_patient_item(db, p) for p in patients]
+    # Bulk enrich (open admissions + last visit) — preserves post-limit care_status filter semantics
+    items = _patient_items_bulk(db, patients, hospital_id)
     if care_status:
         key = care_status.strip().upper()
         items = [i for i in items if i.care_status.upper() == key]

@@ -792,6 +792,37 @@ def _migrate_billing_source_type_pharmacy() -> None:
         logger.warning("billing_source_type pharmacy migration skipped: %s", exc)
 
 
+def _migrate_performance_indexes() -> None:
+    """Composite indexes for bulk list endpoints (DMS, registration, doctors, billing)."""
+    from sqlalchemy import text
+
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS ix_admissions_hospital_patient_status ON admissions (hospital_id, patient_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_appointments_hospital_patient_date ON appointments (hospital_id, patient_id, appointment_date DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_appointments_doctor_patient_date ON appointments (doctor_id, patient_id, appointment_date DESC, appointment_time DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_appointments_hospital_doctor_date ON appointments (hospital_id, doctor_id, appointment_date)",
+        "CREATE INDEX IF NOT EXISTS ix_patients_hospital_created ON patients (hospital_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_prescriptions_doctor_patient_created ON prescriptions (doctor_id, patient_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_prescriptions_hospital_doctor ON prescriptions (hospital_id, doctor_id)",
+        "CREATE INDEX IF NOT EXISTS ix_billing_receipts_hospital_payment ON billing_receipts (hospital_id, payment_id)",
+        "CREATE INDEX IF NOT EXISTS ix_billing_charges_source ON billing_charges (hospital_id, source_type, source_id)",
+        "CREATE INDEX IF NOT EXISTS ix_equipment_items_hospital_category ON equipment_items (hospital_id, category_id)",
+        "CREATE INDEX IF NOT EXISTS ix_beds_hospital_ward_active ON beds (hospital_id, ward_id, is_active, is_occupied)",
+    ]
+    created = 0
+    try:
+        with engine.begin() as conn:
+            for stmt in indexes:
+                try:
+                    conn.execute(text(stmt))
+                    created += 1
+                except Exception as idx_exc:
+                    logger.warning("index skipped (%s): %s", stmt.split("ON")[0].strip(), idx_exc)
+        logger.info("Performance indexes ensured (%s/%s)", created, len(indexes))
+    except Exception as exc:
+        logger.warning("performance indexes migration skipped: %s", exc)
+
+
 class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         logger.info("→ %s %s", request.method, request.url.path)
@@ -820,6 +851,7 @@ async def lifespan(_: FastAPI):
     _migrate_lab_panels()
     _migrate_lab_prescription_requests()
     _migrate_billing_source_type_pharmacy()
+    _migrate_performance_indexes()
     yield
 
 

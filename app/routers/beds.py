@@ -2,7 +2,7 @@ from datetime import date, datetime, time, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
@@ -205,24 +205,40 @@ def occupancy_report(
 
     wards = db.query(Ward).filter(Ward.hospital_id == hospital_id, Ward.is_active.is_(True)).all()
     by_ward = []
-    for w in wards:
-        wt = db.query(func.count(Bed.id)).filter(Bed.hospital_id == hospital_id, Bed.ward_id == w.id, Bed.is_active.is_(True)).scalar() or 0
-        wo = (
-            db.query(func.count(Bed.id))
-            .filter(Bed.hospital_id == hospital_id, Bed.ward_id == w.id, Bed.is_active.is_(True), Bed.is_occupied.is_(True))
-            .scalar()
-            or 0
+    if wards:
+        ward_ids = [w.id for w in wards]
+        total_rows = (
+            db.query(Bed.ward_id, func.count(Bed.id))
+            .filter(Bed.hospital_id == hospital_id, Bed.ward_id.in_(ward_ids), Bed.is_active.is_(True))
+            .group_by(Bed.ward_id)
+            .all()
         )
-        by_ward.append(
-            {
-                "ward_id": str(w.id),
-                "ward_name": w.name,
-                "total": int(wt),
-                "occupied": int(wo),
-                "available": int(wt) - int(wo),
-                "occupancy_percent": round((wo / wt) * 100, 1) if wt else 0.0,
-            }
+        occ_rows = (
+            db.query(Bed.ward_id, func.count(Bed.id))
+            .filter(
+                Bed.hospital_id == hospital_id,
+                Bed.ward_id.in_(ward_ids),
+                Bed.is_active.is_(True),
+                Bed.is_occupied.is_(True),
+            )
+            .group_by(Bed.ward_id)
+            .all()
         )
+        totals_map = {wid: int(cnt) for wid, cnt in total_rows}
+        occ_map = {wid: int(cnt) for wid, cnt in occ_rows}
+        for w in wards:
+            wt = totals_map.get(w.id, 0)
+            wo = occ_map.get(w.id, 0)
+            by_ward.append(
+                {
+                    "ward_id": str(w.id),
+                    "ward_name": w.name,
+                    "total": wt,
+                    "occupied": wo,
+                    "available": wt - wo,
+                    "occupancy_percent": round((wo / wt) * 100, 1) if wt else 0.0,
+                }
+            )
 
     return OccupancyReport(
         total_beds=int(total),
@@ -331,19 +347,21 @@ def list_active_admissions(
         )
         .filter(Admission.hospital_id == hospital_id, Admission.status == AdmissionStatus.admitted)
     )
-    rows = q.order_by(Admission.admitted_at.desc()).all()
-    if search:
-        term = search.strip().lower()
-        rows = [
-            a
-            for a in rows
-            if a.patient
-            and (
-                term in (a.patient.name or "").lower()
-                or term in (a.patient.uhid or "").lower()
-                or term in (a.patient.mobile or "")
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        q = q.filter(
+            Admission.patient_id.in_(
+                db.query(Patient.id).filter(
+                    Patient.hospital_id == hospital_id,
+                    or_(
+                        Patient.name.ilike(term),
+                        Patient.uhid.ilike(term),
+                        Patient.mobile.ilike(term),
+                    ),
+                )
             )
-        ]
+        )
+    rows = q.order_by(Admission.admitted_at.desc()).all()
     return [_admission_detail(a) for a in rows]
 
 

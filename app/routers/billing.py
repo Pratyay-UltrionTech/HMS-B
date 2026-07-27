@@ -73,20 +73,69 @@ def _get_patient(db: Session, patient_id: UUID, hospital_id: UUID) -> Patient:
     return patient
 
 
-def _payment_response(db: Session, pay: BillingPayment, patient: Patient | None = None) -> BillingPaymentResponse:
+def _payment_response(
+    db: Session,
+    pay: BillingPayment,
+    patient: Patient | None = None,
+    *,
+    receipt: BillingReceipt | None = None,
+    resolve_receipt: bool = True,
+) -> BillingPaymentResponse:
     data = payment_to_dict(pay, patient)
-    receipt = (
-        db.query(BillingReceipt)
-        .filter(
-            BillingReceipt.hospital_id == pay.hospital_id,
-            BillingReceipt.payment_id == pay.id,
-            BillingReceipt.status != BillingReceiptStatus.cancelled,
+    if resolve_receipt and receipt is None:
+        receipt = (
+            db.query(BillingReceipt)
+            .filter(
+                BillingReceipt.hospital_id == pay.hospital_id,
+                BillingReceipt.payment_id == pay.id,
+                BillingReceipt.status != BillingReceiptStatus.cancelled,
+            )
+            .first()
         )
-        .first()
-    )
     data["receipt_id"] = receipt.id if receipt else None
     data["receipt_number"] = receipt.receipt_number if receipt else None
     return BillingPaymentResponse.model_validate(data)
+
+
+def _bulk_receipts_by_payment_id(
+    db: Session, hospital_id: UUID, payment_ids: list[UUID]
+) -> dict[UUID, BillingReceipt]:
+    """Map payment_id → non-cancelled receipt (one query for the set)."""
+    if not payment_ids:
+        return {}
+    rows = (
+        db.query(BillingReceipt)
+        .filter(
+            BillingReceipt.hospital_id == hospital_id,
+            BillingReceipt.payment_id.in_(payment_ids),
+            BillingReceipt.status != BillingReceiptStatus.cancelled,
+        )
+        .all()
+    )
+    out: dict[UUID, BillingReceipt] = {}
+    for r in rows:
+        if r.payment_id and r.payment_id not in out:
+            out[r.payment_id] = r
+    return out
+
+
+def _payment_responses_bulk(
+    db: Session,
+    hospital_id: UUID,
+    payments: list[BillingPayment],
+    patient: Patient | None = None,
+) -> list[BillingPaymentResponse]:
+    receipts = _bulk_receipts_by_payment_id(db, hospital_id, [p.id for p in payments])
+    return [
+        _payment_response(
+            db,
+            p,
+            patient,
+            receipt=receipts.get(p.id),
+            resolve_receipt=False,
+        )
+        for p in payments
+    ]
 
 
 def _get_invoice(db: Session, invoice_id: UUID, hospital_id: UUID) -> BillingInvoice:
@@ -302,7 +351,7 @@ def dashboard(
         total_invoiced=round(float(total_invoiced), 2),
         total_collected=round(float(total_collected), 2),
         recent_charges=[BillingChargeResponse.model_validate(charge_to_dict(c)) for c in recent_charges],
-        recent_payments=[_payment_response(db, p) for p in recent_payments],
+        recent_payments=_payment_responses_bulk(db, hospital_id, recent_payments),
     )
 
 
@@ -461,7 +510,7 @@ def list_payments(
     if patient_id:
         q = q.filter(BillingPayment.patient_id == patient_id)
     rows = q.order_by(BillingPayment.created_at.desc()).limit(300).all()
-    return [_payment_response(db, p) for p in rows]
+    return _payment_responses_bulk(db, hospital_id, rows)
 
 
 @router.post("/payments", response_model=BillingPaymentResponse, status_code=status.HTTP_201_CREATED)
@@ -819,7 +868,7 @@ def patient_ledger(
         charge_count=totals["charge_count"],
         payment_count=totals["payment_count"],
         charges=[BillingChargeResponse.model_validate(charge_to_dict(c, patient)) for c in charges],
-        payments=[_payment_response(db, p, patient) for p in payments],
+        payments=_payment_responses_bulk(db, hospital_id, payments, patient),
         invoices=[BillingInvoiceResponse.model_validate(invoice_to_dict(i, patient)) for i in invoices],
         receipts=[BillingReceiptResponse.model_validate(receipt_to_dict(r, patient)) for r in receipts],
         entries=entries,

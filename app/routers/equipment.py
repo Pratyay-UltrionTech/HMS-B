@@ -173,13 +173,17 @@ def list_categories(
         .all()
     )
     out: list[EquipCategoryResponse] = []
-    for r in rows:
-        count = (
-            db.query(func.count(EquipmentItem.id))
-            .filter(EquipmentItem.hospital_id == hospital_id, EquipmentItem.category_id == r.id)
-            .scalar()
-            or 0
+    cat_ids = [r.id for r in rows]
+    counts: dict = {}
+    if cat_ids:
+        count_rows = (
+            db.query(EquipmentItem.category_id, func.count(EquipmentItem.id))
+            .filter(EquipmentItem.hospital_id == hospital_id, EquipmentItem.category_id.in_(cat_ids))
+            .group_by(EquipmentItem.category_id)
+            .all()
         )
+        counts = {cid: int(cnt) for cid, cnt in count_rows}
+    for r in rows:
         out.append(
             EquipCategoryResponse(
                 id=r.id,
@@ -188,7 +192,7 @@ def list_categories(
                 description=r.description,
                 is_active=r.is_active,
                 created_at=r.created_at,
-                equipment_count=int(count),
+                equipment_count=counts.get(r.id, 0),
             )
         )
     return out

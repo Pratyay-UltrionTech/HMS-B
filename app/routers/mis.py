@@ -127,30 +127,39 @@ def _doctor_consultation_billing_revenue(
     date_from: date,
     date_to: date,
 ) -> float:
-    appt_ids = [
-        r[0]
-        for r in db.query(Appointment.id)
+    totals = _bulk_doctor_consultation_billing_revenue(db, hospital_id, [doctor_id], date_from, date_to)
+    return totals.get(doctor_id, 0.0)
+
+
+def _bulk_doctor_consultation_billing_revenue(
+    db: Session,
+    hospital_id: UUID,
+    doctor_ids: list[UUID],
+    date_from: date,
+    date_to: date,
+) -> dict[UUID, float]:
+    """Consultation charge totals keyed by doctor_id — one grouped query."""
+    if not doctor_ids:
+        return {}
+    rows = (
+        db.query(Appointment.doctor_id, func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
+        .join(
+            BillingCharge,
+            (BillingCharge.source_id == Appointment.id)
+            & (BillingCharge.hospital_id == hospital_id)
+            & (BillingCharge.status != BillingChargeStatus.cancelled)
+            & (BillingCharge.source_type == BillingSourceType.consultation),
+        )
         .filter(
             Appointment.hospital_id == hospital_id,
-            Appointment.doctor_id == doctor_id,
+            Appointment.doctor_id.in_(doctor_ids),
             Appointment.appointment_date >= date_from,
             Appointment.appointment_date <= date_to,
         )
+        .group_by(Appointment.doctor_id)
         .all()
-    ]
-    if not appt_ids:
-        return 0.0
-    total = (
-        db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
-        .filter(
-            BillingCharge.hospital_id == hospital_id,
-            BillingCharge.status != BillingChargeStatus.cancelled,
-            BillingCharge.source_type == BillingSourceType.consultation,
-            BillingCharge.source_id.in_(appt_ids),
-        )
-        .scalar()
     )
-    return float(total or 0.0)
+    return {r[0]: float(r[1] or 0.0) for r in rows}
 
 def _ward_ids_for_department(db: Session, hospital_id: UUID, department_id: UUID | None) -> list[UUID] | None:
     if not department_id:
@@ -500,29 +509,52 @@ def doctor_reports(
     if doctor_id:
         doctors = [d for d in doctors if d.id == doctor_id]
 
+    if not doctors:
+        return DoctorReportResponse(
+            doctors=[],
+            metrics=[
+                MetricRow(metric="Doctors", count=0),
+                MetricRow(metric="Total Patients Seen", count=0),
+                MetricRow(metric="Appointments Completed", count=0),
+                MetricRow(metric="Revenue Generated (₹)", count=0),
+            ],
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            filters=_filters_dict(df, dt, department_id, doctor_id, patient_id, status),
+        )
+
+    doctor_ids = [d.id for d in doctors]
+
+    aq = db.query(Appointment).filter(
+        Appointment.hospital_id == hospital_id,
+        Appointment.doctor_id.in_(doctor_ids),
+        Appointment.appointment_date >= df,
+        Appointment.appointment_date <= dt,
+    )
+    if patient_id:
+        aq = aq.filter(Appointment.patient_id == patient_id)
+    if status:
+        try:
+            aq = aq.filter(Appointment.status == AppointmentStatus(status))
+        except ValueError:
+            pass
+    all_appts = aq.all()
+
+    appts_by_doctor: dict[UUID, list[Appointment]] = {d.id: [] for d in doctors}
+    for a in all_appts:
+        appts_by_doctor.setdefault(a.doctor_id, []).append(a)
+
+    # Billing revenue is intentionally unfiltered by patient_id/status (matches prior per-doctor helper)
+    billing_by_doctor = _bulk_doctor_consultation_billing_revenue(db, hospital_id, doctor_ids, df, dt)
+
     rows: list[DoctorPerfRow] = []
     for d in doctors:
-        aq = db.query(Appointment).filter(
-            Appointment.hospital_id == hospital_id,
-            Appointment.doctor_id == d.id,
-            Appointment.appointment_date >= df,
-            Appointment.appointment_date <= dt,
-        )
-        if patient_id:
-            aq = aq.filter(Appointment.patient_id == patient_id)
-        if status:
-            try:
-                aq = aq.filter(Appointment.status == AppointmentStatus(status))
-            except ValueError:
-                pass
-        appts = aq.all()
+        appts = appts_by_doctor.get(d.id, [])
         completed = [a for a in appts if a.status == AppointmentStatus.completed]
-        patients_seen = len({a.patient_id for a in appts if a.status not in {AppointmentStatus.cancelled, AppointmentStatus.no_show}})
-        billing_rev = _doctor_consultation_billing_revenue(db, hospital_id, d.id, df, dt)
-        # Prefer actual billing charges; fall back to fee × completed for legacy data
+        patients_seen = len(
+            {a.patient_id for a in appts if a.status not in {AppointmentStatus.cancelled, AppointmentStatus.no_show}}
+        )
+        billing_rev = billing_by_doctor.get(d.id, 0.0)
         revenue = billing_rev if billing_rev > 0 else (_consultation_fee(d) * len(completed))
-
-        # Optional avg consult time from appointment type slot isn't on appointment — use None or 15 default when completed
         avg_mins = 15.0 if completed else None
         rows.append(
             DoctorPerfRow(

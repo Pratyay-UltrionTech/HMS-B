@@ -2,7 +2,7 @@ from datetime import time
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.models import (
@@ -538,13 +538,26 @@ def delete_room(
     db.commit()
 
 
-def _ot_room_response(db: Session, room: OtRoom) -> OtRoomResponse:
+def _ot_room_response(
+    db: Session,
+    room: OtRoom,
+    *,
+    wing_name: str | None = None,
+    department_name: str | None = None,
+    resolve_names: bool = True,
+) -> OtRoomResponse:
     data = OtRoomResponse.model_validate(room)
-    if room.wing_id:
-        wing = db.query(Wing).filter(Wing.id == room.wing_id).first()
-        data.wing_name = wing.name if wing else None
-    dept = db.query(Department).filter(Department.id == room.department_id).first()
-    data.department_name = dept.name if dept else None
+    if resolve_names:
+        if room.wing_id:
+            wing = db.query(Wing).filter(Wing.id == room.wing_id).first()
+            data.wing_name = wing.name if wing else None
+        else:
+            data.wing_name = None
+        dept = db.query(Department).filter(Department.id == room.department_id).first()
+        data.department_name = dept.name if dept else None
+    else:
+        data.wing_name = wing_name
+        data.department_name = department_name
     return data
 
 
@@ -557,13 +570,26 @@ def list_ot_rooms(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Readable by hospital admin and staff (used by OT booking)."""
-    q = db.query(OtRoom).filter(OtRoom.hospital_id == hospital_id)
+    q = (
+        db.query(OtRoom)
+        .options(joinedload(OtRoom.wing), joinedload(OtRoom.department))
+        .filter(OtRoom.hospital_id == hospital_id)
+    )
     if department_id is not None:
         q = q.filter(OtRoom.department_id == department_id)
     if active_only:
         q = q.filter(OtRoom.is_active.is_(True))
     rooms = q.order_by(OtRoom.code).all()
-    return [_ot_room_response(db, r) for r in rooms]
+    return [
+        _ot_room_response(
+            db,
+            r,
+            wing_name=r.wing.name if r.wing else None,
+            department_name=r.department.name if r.department else None,
+            resolve_names=False,
+        )
+        for r in rooms
+    ]
 
 
 @router.post("/ot-rooms", response_model=OtRoomResponse, status_code=status.HTTP_201_CREATED)

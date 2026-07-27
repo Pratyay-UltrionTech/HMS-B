@@ -69,6 +69,35 @@ def _last_visit(db: Session, patient_id: UUID) -> date | None:
     return row[0] if row else None
 
 
+def _bulk_last_visits(db: Session, patient_ids: list[UUID]) -> dict[UUID, date]:
+    """Latest non-cancelled appointment_date per patient — one query for the whole set."""
+    if not patient_ids:
+        return {}
+    ranked = (
+        db.query(
+            Appointment.patient_id.label("patient_id"),
+            Appointment.appointment_date.label("appointment_date"),
+            func.row_number()
+            .over(
+                partition_by=Appointment.patient_id,
+                order_by=Appointment.appointment_date.desc(),
+            )
+            .label("rn"),
+        )
+        .filter(
+            Appointment.patient_id.in_(patient_ids),
+            Appointment.status != AppointmentStatus.cancelled,
+        )
+        .subquery()
+    )
+    rows = (
+        db.query(ranked.c.patient_id, ranked.c.appointment_date)
+        .filter(ranked.c.rn == 1)
+        .all()
+    )
+    return {r[0]: r[1] for r in rows}
+
+
 def _age_from_dob(dob: date | None) -> int | None:
     if not dob:
         return None
@@ -76,7 +105,7 @@ def _age_from_dob(dob: date | None) -> int | None:
     return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
 
 
-def _to_directory(db: Session, p: Patient) -> PatientDirectoryItem:
+def _to_directory(p: Patient, last_visit: date | None = None) -> PatientDirectoryItem:
     return PatientDirectoryItem(
         id=p.id,
         uhid=p.uhid,
@@ -90,7 +119,7 @@ def _to_directory(db: Session, p: Patient) -> PatientDirectoryItem:
         date_of_birth=p.date_of_birth,
         blood_group=p.blood_group,
         status=p.status,
-        last_visit=_last_visit(db, p.id),
+        last_visit=last_visit,
         created_at=p.created_at,
     )
 
@@ -164,7 +193,7 @@ def register_patient(
     )
     db.commit()
     db.refresh(patient)
-    return _to_directory(db, patient)
+    return _to_directory(patient, last_visit=_last_visit(db, patient.id))
 
 
 @router.get("/patients", response_model=list[PatientDirectoryItem])
@@ -190,7 +219,8 @@ def list_patients(
             )
         )
     rows = q.order_by(Patient.created_at.desc()).all()
-    return [_to_directory(db, p) for p in rows]
+    visits = _bulk_last_visits(db, [p.id for p in rows])
+    return [_to_directory(p, last_visit=visits.get(p.id)) for p in rows]
 
 
 @router.get("/patients/{patient_id}", response_model=PatientProfile)
@@ -406,7 +436,7 @@ def update_patient(
     )
     db.commit()
     db.refresh(patient)
-    return _to_directory(db, patient)
+    return _to_directory(patient, last_visit=_last_visit(db, patient.id))
 
 
 @router.get("/beds", response_model=list[BedOption])

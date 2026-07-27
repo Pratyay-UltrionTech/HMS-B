@@ -115,23 +115,53 @@ def _order_to_response(order: LabOrder) -> LabOrderResponse:
     )
 
 
-def _enrich_request_response(db: Session, req: LabPrescriptionRequest) -> LabPrescriptionRequestResponse:
+def _enrich_request_response(
+    db: Session,
+    req: LabPrescriptionRequest,
+    *,
+    appointment: Appointment | None = None,
+    resolve_appointment: bool = True,
+) -> LabPrescriptionRequestResponse:
     data = request_to_response_dict(req)
-    if req.appointment_id:
+    appt = appointment
+    if resolve_appointment and appt is None and req.appointment_id:
         appt = (
             db.query(Appointment)
             .filter(Appointment.id == req.appointment_id, Appointment.hospital_id == req.hospital_id)
             .first()
         )
-        if appt:
-            data["appointment_label"] = (
-                f"{appt.appointment_date} {str(appt.appointment_time)[:5] if appt.appointment_time else ''}"
-                f" — {appt.purpose or 'Visit'}"
-            ).strip()
+    if appt:
+        data["appointment_label"] = (
+            f"{appt.appointment_date} {str(appt.appointment_time)[:5] if appt.appointment_time else ''}"
+            f" — {appt.purpose or 'Visit'}"
+        ).strip()
     # Normalize UUID lists from JSONB
     data["prescribed_test_ids"] = [UUID(str(x)) for x in (req.prescribed_test_ids or [])]
     data["prescribed_panel_ids"] = [UUID(str(x)) for x in (req.prescribed_panel_ids or [])]
     return LabPrescriptionRequestResponse.model_validate(data)
+
+
+def _enrich_request_responses_bulk(
+    db: Session, hospital_id: UUID, requests: list[LabPrescriptionRequest]
+) -> list[LabPrescriptionRequestResponse]:
+    appt_ids = [r.appointment_id for r in requests if r.appointment_id]
+    appts_by_id: dict[UUID, Appointment] = {}
+    if appt_ids:
+        rows = (
+            db.query(Appointment)
+            .filter(Appointment.hospital_id == hospital_id, Appointment.id.in_(appt_ids))
+            .all()
+        )
+        appts_by_id = {a.id: a for a in rows}
+    return [
+        _enrich_request_response(
+            db,
+            r,
+            appointment=appts_by_id.get(r.appointment_id) if r.appointment_id else None,
+            resolve_appointment=False,
+        )
+        for r in requests
+    ]
 
 
 def _get_panel(db: Session, panel_id: UUID, hospital_id: UUID) -> LabTestPanel:
@@ -286,7 +316,7 @@ def dashboard(
         pending_doctor_requests=int(pending_doctor_requests),
         doctor_prescribed_orders=int(doctor_prescribed_orders),
         self_requested_orders=int(self_requested_orders),
-        pending_requests=[_enrich_request_response(db, r) for r in pending_req_rows],
+        pending_requests=_enrich_request_responses_bulk(db, hospital_id, pending_req_rows),
     )
 
 
@@ -756,7 +786,7 @@ def list_prescription_requests(
     elif status_filter:
         q = q.filter(LabPrescriptionRequest.status == status_filter)
     rows = q.order_by(LabPrescriptionRequest.created_at.desc()).limit(200).all()
-    return [_enrich_request_response(db, r) for r in rows]
+    return _enrich_request_responses_bulk(db, hospital_id, rows)
 
 
 @router.get("/prescription-requests/{request_id}", response_model=LabPrescriptionRequestResponse)

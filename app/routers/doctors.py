@@ -228,13 +228,12 @@ def list_doctors(
     if user.get("role") == "hospital_staff":
         own_id = UUID(str(user["user_id"]))
         q = q.filter(HospitalUser.id == own_id)
+        doctors = q.all()
     else:
         # Admin: all staff whose role name contains "doctor"
         doctors = [u for u in q.all() if _is_doctor_role(u.role.name if u.role else None)]
-        return [_doctor_summary(db, d, today) for d in doctors]
 
-    users = q.all()
-    return [_doctor_summary(db, d, today) for d in users]
+    return _doctor_summaries_bulk(db, hospital_id, doctors, today)
 
 
 @router.get("/hospital-profile", response_model=HospitalClinicProfile)
@@ -259,39 +258,57 @@ def hospital_profile(
 
 
 def _doctor_summary(db: Session, doctor: HospitalUser, today: date) -> DoctorSummary:
-    patient_ids = (
-        db.query(Appointment.patient_id)
-        .filter(Appointment.doctor_id == doctor.id, Appointment.hospital_id == doctor.hospital_id)
-        .distinct()
+    summaries = _doctor_summaries_bulk(db, doctor.hospital_id, [doctor], today)
+    return summaries[0]
+
+
+def _doctor_summaries_bulk(
+    db: Session, hospital_id: UUID, doctors: list[HospitalUser], today: date
+) -> list[DoctorSummary]:
+    if not doctors:
+        return []
+    doctor_ids = [d.id for d in doctors]
+
+    patient_count_rows = (
+        db.query(Appointment.doctor_id, func.count(func.distinct(Appointment.patient_id)))
+        .filter(Appointment.hospital_id == hospital_id, Appointment.doctor_id.in_(doctor_ids))
+        .group_by(Appointment.doctor_id)
         .all()
     )
-    today_count = (
-        db.query(func.count(Appointment.id))
+    patient_counts = {r[0]: int(r[1]) for r in patient_count_rows}
+
+    today_count_rows = (
+        db.query(Appointment.doctor_id, func.count(Appointment.id))
         .filter(
-            Appointment.doctor_id == doctor.id,
-            Appointment.hospital_id == doctor.hospital_id,
+            Appointment.hospital_id == hospital_id,
+            Appointment.doctor_id.in_(doctor_ids),
             Appointment.appointment_date == today,
             Appointment.status != AppointmentStatus.cancelled,
         )
-        .scalar()
-        or 0
+        .group_by(Appointment.doctor_id)
+        .all()
     )
-    return DoctorSummary(
-        id=doctor.id,
-        name=doctor.name,
-        email=doctor.email,
-        phone=doctor.phone,
-        role_name=doctor.role.name if doctor.role else None,
-        specialization=doctor.specialization,
-        medical_registration_number=doctor.medical_registration_number,
-        qualification=doctor.qualification,
-        years_of_experience=doctor.years_of_experience,
-        consultation_room=doctor.consultation_room,
-        custom_values=doctor.custom_values or {},
-        is_active=doctor.is_active,
-        patient_count=len(patient_ids),
-        today_appointment_count=int(today_count),
-    )
+    today_counts = {r[0]: int(r[1]) for r in today_count_rows}
+
+    return [
+        DoctorSummary(
+            id=doctor.id,
+            name=doctor.name,
+            email=doctor.email,
+            phone=doctor.phone,
+            role_name=doctor.role.name if doctor.role else None,
+            specialization=doctor.specialization,
+            medical_registration_number=doctor.medical_registration_number,
+            qualification=doctor.qualification,
+            years_of_experience=doctor.years_of_experience,
+            consultation_room=doctor.consultation_room,
+            custom_values=doctor.custom_values or {},
+            is_active=doctor.is_active,
+            patient_count=patient_counts.get(doctor.id, 0),
+            today_appointment_count=today_counts.get(doctor.id, 0),
+        )
+        for doctor in doctors
+    ]
 
 
 # ── Patients ───────────────────────────────────────────────────────────────────
@@ -424,33 +441,70 @@ def list_doctor_patients(
         term = f"%{search.strip()}%"
         q = q.filter(or_(Patient.name.ilike(term), Patient.mobile.ilike(term)))
     patients = q.order_by(Patient.name.asc()).all()
+    if not patients:
+        return []
 
-    results: list[PatientResponse] = []
-    for p in patients:
-        last_appt = (
-            db.query(Appointment)
-            .filter(
-                Appointment.patient_id == p.id,
-                Appointment.doctor_id == resolved,
-                Appointment.status != AppointmentStatus.cancelled,
+    patient_ids = [p.id for p in patients]
+
+    # Latest non-cancelled appointment per patient for this doctor
+    appt_ranked = (
+        db.query(
+            Appointment.patient_id.label("patient_id"),
+            Appointment.appointment_date.label("appointment_date"),
+            func.row_number()
+            .over(
+                partition_by=Appointment.patient_id,
+                order_by=(Appointment.appointment_date.desc(), Appointment.appointment_time.desc()),
             )
-            .order_by(Appointment.appointment_date.desc(), Appointment.appointment_time.desc())
-            .first()
+            .label("rn"),
         )
-        last_rx = (
-            db.query(Prescription)
-            .filter(Prescription.patient_id == p.id, Prescription.doctor_id == resolved)
-            .order_by(Prescription.created_at.desc())
-            .first()
+        .filter(
+            Appointment.patient_id.in_(patient_ids),
+            Appointment.doctor_id == resolved,
+            Appointment.status != AppointmentStatus.cancelled,
         )
-        results.append(
-            _patient_response(
-                p,
-                last_visit=last_appt.appointment_date if last_appt else None,
-                last_diagnosis=last_rx.diagnosis if last_rx else None,
+        .subquery()
+    )
+    last_visits = {
+        r[0]: r[1]
+        for r in db.query(appt_ranked.c.patient_id, appt_ranked.c.appointment_date)
+        .filter(appt_ranked.c.rn == 1)
+        .all()
+    }
+
+    # Latest prescription diagnosis per patient for this doctor
+    rx_ranked = (
+        db.query(
+            Prescription.patient_id.label("patient_id"),
+            Prescription.diagnosis.label("diagnosis"),
+            func.row_number()
+            .over(
+                partition_by=Prescription.patient_id,
+                order_by=Prescription.created_at.desc(),
             )
+            .label("rn"),
         )
-    return results
+        .filter(
+            Prescription.patient_id.in_(patient_ids),
+            Prescription.doctor_id == resolved,
+        )
+        .subquery()
+    )
+    last_diagnoses = {
+        r[0]: r[1]
+        for r in db.query(rx_ranked.c.patient_id, rx_ranked.c.diagnosis)
+        .filter(rx_ranked.c.rn == 1)
+        .all()
+    }
+
+    return [
+        _patient_response(
+            p,
+            last_visit=last_visits.get(p.id),
+            last_diagnosis=last_diagnoses.get(p.id),
+        )
+        for p in patients
+    ]
 
 
 @router.get("/{doctor_id}/patients/{patient_id}", response_model=PatientHistoryResponse)
