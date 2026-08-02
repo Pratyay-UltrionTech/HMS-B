@@ -454,6 +454,9 @@ class Patient(Base):
     dms_documents: Mapped[list["PatientDocument"]] = relationship(
         back_populates="patient", cascade="all, delete-orphan"
     )
+    ipd_form_submissions: Mapped[list["IpdFormSubmission"]] = relationship(
+        back_populates="patient", cascade="all, delete-orphan"
+    )
 
 
 class Appointment(Base):
@@ -580,6 +583,56 @@ class Admission(Base):
     room: Mapped["Room"] = relationship()
     bed: Mapped["Bed"] = relationship()
     doctor: Mapped["HospitalUser | None"] = relationship()
+
+
+class IpdFormSubmissionStatus(str, enum.Enum):
+    draft = "draft"
+    final = "final"
+
+
+class IpdFormSubmission(Base):
+    """Filled IPD clinical/consent forms attached to a patient admission record."""
+
+    __tablename__ = "ipd_form_submissions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    form_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    form_title: Mapped[str] = mapped_column(String(255), nullable=False)
+    form_data: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    html_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[IpdFormSubmissionStatus] = mapped_column(
+        Enum(IpdFormSubmissionStatus, name="ipd_form_submission_status"),
+        nullable=False,
+        default=IpdFormSubmissionStatus.draft,
+    )
+    filled_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    filled_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    filled_by_role: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    medical_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("medical_records.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    patient_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patient_documents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    patient: Mapped["Patient"] = relationship(back_populates="ipd_form_submissions")
+    admission: Mapped["Admission | None"] = relationship()
+    filled_by: Mapped["HospitalUser | None"] = relationship()
 
 
 class Prescription(Base):

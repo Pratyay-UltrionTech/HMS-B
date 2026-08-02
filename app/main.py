@@ -13,7 +13,7 @@ from app.telemetry import (
     instrument_sqlalchemy_engine,
     setup_telemetry,
 )
-from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment, billing, pharmacy
+from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment, billing, pharmacy, ipd
 import app.models  # noqa: F401 — register all ORM tables for create_all
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -893,6 +893,7 @@ app.include_router(dms.router, prefix="/api")
 app.include_router(equipment.router, prefix="/api")
 app.include_router(billing.router, prefix="/api")
 app.include_router(pharmacy.router, prefix="/api")
+app.include_router(ipd.router, prefix="/api")
 
 
 @app.get("/")

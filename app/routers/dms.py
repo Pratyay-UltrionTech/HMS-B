@@ -13,6 +13,8 @@ from app.models import (
     AdmissionStatus,
     Appointment,
     Hospital,
+    IpdFormSubmission,
+    IpdFormSubmissionStatus,
     LabOrder,
     MedicalRecord,
     OtSurgery,
@@ -436,6 +438,9 @@ def _build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[D
         .order_by(MedicalRecord.created_at.desc())
         .all()
     ):
+        # IPD forms are already listed via PatientDocument / ipd_form source.
+        if (r.report_type or "").strip().lower() == "ipd form":
+            continue
         cat = PatientDocumentCategory.other
         rt = (r.report_type or "").lower()
         if "consent" in rt:
@@ -463,6 +468,37 @@ def _build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[D
                 source="medical_record",
                 doctor_name=r.doctor.name if r.doctor else None,
                 report_type=r.report_type,
+            )
+        )
+    for s in (
+        db.query(IpdFormSubmission)
+        .filter(
+            IpdFormSubmission.hospital_id == hospital_id,
+            IpdFormSubmission.patient_id == patient_id,
+            IpdFormSubmission.status == IpdFormSubmissionStatus.final,
+        )
+        .order_by(IpdFormSubmission.updated_at.desc())
+        .all()
+    ):
+        # Prefer the mirrored DMS document when present; otherwise expose the submission itself.
+        if s.patient_document_id:
+            continue
+        cat = PatientDocumentCategory.consent if "consent" in (s.form_title or "").lower() else PatientDocumentCategory.other
+        docs.append(
+            DmsDocumentResponse(
+                id=s.id,
+                patient_id=s.patient_id,
+                category=cat,
+                title=s.form_title,
+                notes=f"IPD form · {s.form_id}",
+                file_name=f"{s.form_id}.html" if s.html_snapshot else None,
+                has_file=bool(s.html_snapshot),
+                uploaded_by_name=s.filled_by_name,
+                uploaded_by_role=s.filled_by_role or "staff",
+                created_at=s.updated_at or s.created_at,
+                source="ipd_form",
+                doctor_name=s.filled_by_name or None,
+                report_type="IPD Form",
             )
         )
     docs.sort(key=lambda x: x.created_at, reverse=True)
@@ -668,6 +704,28 @@ def _build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dm
                 occurred_at=d.created_at,
                 source_module="dms",
                 entity_id=str(d.id),
+            )
+        )
+
+    for s in (
+        db.query(IpdFormSubmission)
+        .filter(
+            IpdFormSubmission.hospital_id == hospital_id,
+            IpdFormSubmission.patient_id == patient.id,
+            IpdFormSubmission.status == IpdFormSubmissionStatus.final,
+        )
+        .all()
+    ):
+        events.append(
+            DmsTimelineEvent(
+                id=f"ipd-form-{s.id}",
+                event_type="ipd_form",
+                title=f"IPD Form — {s.form_title}",
+                detail=f"Filled by {s.filled_by_name or 'Staff'}",
+                occurred_at=s.updated_at or s.created_at,
+                source_module="ipd",
+                entity_id=str(s.id),
+                view_path=f"/api/ipd/form-submissions/{s.id}/view" if s.html_snapshot else None,
             )
         )
 
