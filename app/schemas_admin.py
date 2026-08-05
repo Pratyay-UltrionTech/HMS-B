@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
@@ -176,6 +176,53 @@ class HospitalUserResponse(BaseModel):
     shift_end_time: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+# ── Daily shift roster ──────────────────────────────────────────────────────────
+class ShiftRosterEntry(BaseModel):
+    user_id: UUID
+    name: str
+    phone: str
+    role_id: UUID
+    role_name: str | None = None
+    shift_id: UUID | None = None
+    shift_name: str | None = None
+    department_id: UUID | None = None
+    department_name: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    status: str  # on_duty | off | leave
+    is_override: bool = False
+    notes: str | None = None
+    default_shift_id: UUID | None = None
+
+
+class ShiftRosterResponse(BaseModel):
+    roster_date: date
+    hospital_name: str
+    holiday_name: str | None = None
+    entries: list[ShiftRosterEntry]
+
+
+class ShiftRosterAssign(BaseModel):
+    roster_date: date
+    user_id: UUID
+    shift_id: UUID | None = None
+    status: str = Field(default="on_duty", pattern="^(on_duty|off|leave)$")
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class ShiftRosterSeed(BaseModel):
+    roster_date: date
+    overwrite: bool = False
+
+
+class ShiftRosterSnapshot(BaseModel):
+    roster_date: date
+    hospital_name: str
+    holiday_name: str | None = None
+    text: str
+    entries_count: int
 
 
 class PermissionOut(BaseModel):

@@ -189,6 +189,12 @@ def _migrate_appointments_extra_fields() -> None:
                 conn.execute(text("ALTER TABLE appointments ADD COLUMN queue_token INTEGER"))
             if "checked_in_at" not in cols:
                 conn.execute(text("ALTER TABLE appointments ADD COLUMN checked_in_at TIMESTAMPTZ"))
+            if "booking_kind" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE appointments ADD COLUMN booking_kind VARCHAR(32) NOT NULL DEFAULT 'future'"
+                    )
+                )
     except Exception as exc:
         logger.warning("appointments fields migration skipped: %s", exc)
 
@@ -792,6 +798,32 @@ def _migrate_billing_source_type_pharmacy() -> None:
         logger.warning("billing_source_type pharmacy migration skipped: %s", exc)
 
 
+def _migrate_org_contact_fields() -> None:
+    """Add head_name / desk_phone / mobile to wings, departments, ot_rooms, wards."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        specs = [
+            ("wings", ["head_name VARCHAR(255)", "desk_phone VARCHAR(32)", "mobile VARCHAR(32)"]),
+            ("departments", ["head_name VARCHAR(255)", "desk_phone VARCHAR(32)", "mobile VARCHAR(32)"]),
+            ("ot_rooms", ["head_name VARCHAR(255)", "desk_phone VARCHAR(32)", "mobile VARCHAR(32)"]),
+            ("wards", ["head_name VARCHAR(255)", "desk_phone VARCHAR(32)", "mobile VARCHAR(32)"]),
+        ]
+        with engine.begin() as conn:
+            for table, clauses in specs:
+                if table not in insp.get_table_names():
+                    continue
+                cols = {c["name"] for c in insp.get_columns(table)}
+                for clause in clauses:
+                    col = clause.split()[0]
+                    if col not in cols:
+                        logger.info("Adding %s.%s", table, col)
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {clause}"))
+    except Exception as exc:
+        logger.warning("org contact fields migration skipped: %s", exc)
+
+
 def _migrate_performance_indexes() -> None:
     """Composite indexes for bulk list endpoints (DMS, registration, doctors, billing)."""
     from sqlalchemy import text
@@ -833,6 +865,11 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    import asyncio
+
+    from app.database import SessionLocal
+    from app.utils.appointment_lifecycle import auto_cancel_missed_appointments
+
     _migrate_shift_types_for_department()
     _migrate_rooms_bed_count()
     _migrate_patients_registration_fields()
@@ -851,8 +888,30 @@ async def lifespan(_: FastAPI):
     _migrate_lab_panels()
     _migrate_lab_prescription_requests()
     _migrate_billing_source_type_pharmacy()
+    _migrate_org_contact_fields()
     _migrate_performance_indexes()
-    yield
+
+    async def _missed_appointment_loop() -> None:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                db = SessionLocal()
+                try:
+                    auto_cancel_missed_appointments(db)
+                finally:
+                    db.close()
+            except Exception as exc:
+                logger.warning("missed appointment auto-cancel loop: %s", exc)
+
+    miss_task = asyncio.create_task(_missed_appointment_loop())
+    try:
+        yield
+    finally:
+        miss_task.cancel()
+        try:
+            await miss_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(

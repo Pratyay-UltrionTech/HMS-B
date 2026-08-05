@@ -1,8 +1,9 @@
-"""Appointment lifecycle helpers: In Progress (waiting), completion deps, auto-sync."""
+"""Appointment lifecycle helpers: Checked in (waiting), completion deps, auto-cancel."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     Appointment,
     AppointmentStatus,
+    BillingSourceType,
     LabOrder,
     LabOrderStatus,
     LabPrescriptionRequest,
@@ -19,8 +21,13 @@ from app.models import (
     RadiologyOrderStatus,
 )
 
-# DB value `waiting` = lifecycle "In Progress" (checked in / clinical work underway)
+logger = logging.getLogger(__name__)
+
+# DB value `waiting` = Checked in / in queue
 IN_PROGRESS = AppointmentStatus.waiting
+
+# Future bookings not checked in by scheduled time + grace → auto-cancelled
+NO_SHOW_GRACE_MINUTES = 15
 
 TERMINAL = {
     AppointmentStatus.completed,
@@ -50,11 +57,63 @@ def status_display_label(status: AppointmentStatus | str | None) -> str:
     raw = status.value if isinstance(status, AppointmentStatus) else (status or "")
     return {
         "scheduled": "Scheduled",
-        "waiting": "In Progress",
+        "waiting": "Checked in",
         "completed": "Completed",
         "cancelled": "Cancelled",
         "no_show": "No Show",
     }.get(raw, raw.replace("_", " ").title() or "Unknown")
+
+
+def appointment_local_dt(appt: Appointment) -> datetime:
+    return datetime.combine(appt.appointment_date, appt.appointment_time)
+
+
+def auto_cancel_missed_appointments(
+    db: Session,
+    hospital_id: UUID | None = None,
+    *,
+    grace_minutes: int = NO_SHOW_GRACE_MINUTES,
+    now: datetime | None = None,
+) -> int:
+    """
+    Auto-cancel Scheduled (future) appointments past scheduled time + grace
+    when the patient has not checked in. Returns count cancelled.
+    """
+    from app.utils.billing import cancel_charge_for_source
+
+    now = now or datetime.now()
+    cutoff = now - timedelta(minutes=grace_minutes)
+
+    q = db.query(Appointment).filter(Appointment.status == AppointmentStatus.scheduled)
+    if hospital_id is not None:
+        q = q.filter(Appointment.hospital_id == hospital_id)
+    # Narrow to today and earlier to avoid scanning far-future rows
+    q = q.filter(Appointment.appointment_date <= now.date())
+
+    cancelled = 0
+    note = (
+        f"Auto-cancelled: patient did not check in within {grace_minutes} minutes of the scheduled time."
+    )
+    for appt in q.all():
+        appt_dt = appointment_local_dt(appt)
+        if appt_dt > cutoff:
+            continue
+        appt.status = AppointmentStatus.cancelled
+        existing = (appt.notes or "").strip()
+        if note not in existing:
+            appt.notes = f"{existing}\n{note}".strip() if existing else note
+        try:
+            cancel_charge_for_source(
+                db, appt.hospital_id, BillingSourceType.consultation, appt.id
+            )
+        except Exception as exc:
+            logger.warning("auto-cancel billing cleanup failed for %s: %s", appt.id, exc)
+        cancelled += 1
+
+    if cancelled:
+        db.commit()
+        logger.info("Auto-cancelled %s missed appointment(s)", cancelled)
+    return cancelled
 
 
 def get_open_clinical_blockers(db: Session, hospital_id: UUID, appointment_id: UUID) -> list[str]:

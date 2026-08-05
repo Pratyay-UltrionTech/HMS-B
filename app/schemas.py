@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -81,9 +81,18 @@ class HospitalDashboardResponse(BaseModel):
     beds_total: int
     beds_occupied: int
     modules_available: int
+    # Applied filters (echo)
+    filter_date: date | None = None
+    filter_date_from: date | None = None
+    filter_date_to: date | None = None
+    filter_doctor_id: UUID | None = None
+    filter_wing_id: UUID | None = None
     # Operations
     patients_registered_today: int = 0
     occupied_beds_pct: int = 0
+    appointments_scheduled: int = 0
+    appointments_in_progress: int = 0
+    appointments_completed: int = 0
     # Clinical
     lab_orders_today: int = 0
     radiology_orders_today: int = 0
@@ -97,6 +106,15 @@ class HospitalDashboardResponse(BaseModel):
     upcoming_appointments: list[HospitalDashboardListItem] = []
     pending_lab_orders: list[HospitalDashboardListItem] = []
     pending_radiology_reports: list[HospitalDashboardListItem] = []
+    # Card drill-down details
+    appointments_detail: list[HospitalDashboardListItem] = []
+    admissions_detail: list[HospitalDashboardListItem] = []
+    beds_detail: list[HospitalDashboardListItem] = []
+    lab_orders_detail: list[HospitalDashboardListItem] = []
+    radiology_orders_detail: list[HospitalDashboardListItem] = []
+    ot_surgeries_detail: list[HospitalDashboardListItem] = []
+    charges_detail: list[HospitalDashboardListItem] = []
+    collections_detail: list[HospitalDashboardListItem] = []
 
 
 class RoleDashboardMetric(BaseModel):

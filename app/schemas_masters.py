@@ -11,6 +11,9 @@ class WingCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     code: str | None = Field(default=None, max_length=32)
     description: str | None = None
+    head_name: str | None = Field(default=None, max_length=255)
+    desk_phone: str | None = Field(default=None, max_length=32)
+    mobile: str | None = Field(default=None, max_length=32)
     is_active: bool = True
 
 
@@ -18,6 +21,9 @@ class WingUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     code: str | None = None
     description: str | None = None
+    head_name: str | None = Field(default=None, max_length=255)
+    desk_phone: str | None = Field(default=None, max_length=32)
+    mobile: str | None = Field(default=None, max_length=32)
     is_active: bool | None = None
 
 
@@ -27,6 +33,9 @@ class WingResponse(BaseModel):
     name: str
     code: str | None
     description: str | None
+    head_name: str | None = None
+    desk_phone: str | None = None
+    mobile: str | None = None
     is_active: bool
     created_at: datetime
 
@@ -39,6 +48,9 @@ class DepartmentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     code: str | None = Field(default=None, max_length=32)
     description: str | None = None
+    head_name: str | None = Field(default=None, max_length=255)
+    desk_phone: str | None = Field(default=None, max_length=32)
+    mobile: str | None = Field(default=None, max_length=32)
     is_active: bool = True
 
 
@@ -47,6 +59,9 @@ class DepartmentUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     code: str | None = None
     description: str | None = None
+    head_name: str | None = Field(default=None, max_length=255)
+    desk_phone: str | None = Field(default=None, max_length=32)
+    mobile: str | None = Field(default=None, max_length=32)
     is_active: bool | None = None
 
 
@@ -57,6 +72,9 @@ class DepartmentResponse(BaseModel):
     name: str
     code: str | None
     description: str | None
+    head_name: str | None = None
+    desk_phone: str | None = None
+    mobile: str | None = None
     is_active: bool
     created_at: datetime
     wing_name: str | None = None
@@ -204,6 +222,9 @@ class WardCreate(BaseModel):
     wing_id: UUID | None = None
     department_id: UUID | None = None
     description: str | None = None
+    head_name: str | None = Field(default=None, max_length=255)
+    desk_phone: str | None = Field(default=None, max_length=32)
+    mobile: str | None = Field(default=None, max_length=32)
     admission_fee: float = Field(default=0, ge=0)
     bed_charge_per_day: float = Field(default=0, ge=0)
     is_active: bool = True
@@ -215,6 +236,9 @@ class WardUpdate(BaseModel):
     wing_id: UUID | None = None
     department_id: UUID | None = None
     description: str | None = None
+    head_name: str | None = Field(default=None, max_length=255)
+    desk_phone: str | None = Field(default=None, max_length=32)
+    mobile: str | None = Field(default=None, max_length=32)
     admission_fee: float | None = Field(default=None, ge=0)
     bed_charge_per_day: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
@@ -228,6 +252,9 @@ class WardResponse(BaseModel):
     name: str
     ward_type: WardType
     description: str | None
+    head_name: str | None = None
+    desk_phone: str | None = None
+    mobile: str | None = None
     admission_fee: float = 0
     bed_charge_per_day: float = 0
     is_active: bool
@@ -276,6 +303,9 @@ class OtRoomCreate(BaseModel):
     code: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=255)
     description: str | None = None
+    head_name: str | None = Field(default=None, max_length=255)
+    desk_phone: str | None = Field(default=None, max_length=32)
+    mobile: str | None = Field(default=None, max_length=32)
     base_ot_charge: float = Field(default=0, ge=0)
     is_active: bool = True
 
@@ -286,6 +316,9 @@ class OtRoomUpdate(BaseModel):
     code: str | None = Field(default=None, min_length=1, max_length=64)
     name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
+    head_name: str | None = Field(default=None, max_length=255)
+    desk_phone: str | None = Field(default=None, max_length=32)
+    mobile: str | None = Field(default=None, max_length=32)
     base_ot_charge: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
 
@@ -298,6 +331,9 @@ class OtRoomResponse(BaseModel):
     code: str
     name: str
     description: str | None
+    head_name: str | None = None
+    desk_phone: str | None = None
+    mobile: str | None = None
     base_ot_charge: float = 0
     is_active: bool
     created_at: datetime

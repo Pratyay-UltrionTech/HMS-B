@@ -1,5 +1,6 @@
 import re
-from datetime import datetime
+from collections import defaultdict
+from datetime import date, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -7,7 +8,18 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
-from app.models import AuditLog, Department, HospitalUser, RoleCustomField, RolePermission, ShiftType, StaffRole
+from app.models import (
+    AuditLog,
+    Department,
+    Holiday,
+    Hospital,
+    HospitalUser,
+    RoleCustomField,
+    RolePermission,
+    ShiftType,
+    StaffDailyShift,
+    StaffRole,
+)
 from app.schemas_admin import (
     BASIC_MODULE_KEYS,
     BASIC_MODULE_LABELS,
@@ -20,6 +32,11 @@ from app.schemas_admin import (
     RolePermissionResponse,
     RoleResponse,
     RoleUpdate,
+    ShiftRosterAssign,
+    ShiftRosterEntry,
+    ShiftRosterResponse,
+    ShiftRosterSeed,
+    ShiftRosterSnapshot,
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_current_user, get_hospital_uuid, require_hospital_admin
@@ -564,3 +581,323 @@ def list_audit_logs(
             | (AuditLog.actor_role_label.ilike(term))
         )
     return query.order_by(AuditLog.created_at.desc()).limit(limit).all()
+
+
+# ── Daily shift roster ──────────────────────────────────────────────────────────
+def _fmt_time(value) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M")
+    return str(value)[:5]
+
+
+def _holiday_name_for(db: Session, hospital_id: UUID, roster_date: date) -> str | None:
+    row = (
+        db.query(Holiday)
+        .filter(Holiday.hospital_id == hospital_id, Holiday.holiday_date == roster_date)
+        .order_by(Holiday.name)
+        .first()
+    )
+    return row.name if row else None
+
+
+def _build_roster_entries(db: Session, hospital_id: UUID, roster_date: date) -> list[ShiftRosterEntry]:
+    users = (
+        db.query(HospitalUser)
+        .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift).joinedload(ShiftType.department))
+        .filter(HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
+        .order_by(HospitalUser.name)
+        .all()
+    )
+    overrides = {
+        row.user_id: row
+        for row in db.query(StaffDailyShift)
+        .options(joinedload(StaffDailyShift.shift).joinedload(ShiftType.department))
+        .filter(StaffDailyShift.hospital_id == hospital_id, StaffDailyShift.roster_date == roster_date)
+        .all()
+    }
+    shift_ids = {o.shift_id for o in overrides.values() if o.shift_id}
+    shift_ids |= {u.shift_id for u in users if u.shift_id}
+    shifts_by_id: dict[UUID, ShiftType] = {}
+    if shift_ids:
+        for s in (
+            db.query(ShiftType)
+            .options(joinedload(ShiftType.department))
+            .filter(ShiftType.id.in_(shift_ids))
+            .all()
+        ):
+            shifts_by_id[s.id] = s
+
+    entries: list[ShiftRosterEntry] = []
+    for user in users:
+        override = overrides.get(user.id)
+        if override:
+            status_val = override.status or "on_duty"
+            shift = shifts_by_id.get(override.shift_id) if override.shift_id else None
+            if status_val in ("off", "leave"):
+                shift = None
+            entries.append(
+                ShiftRosterEntry(
+                    user_id=user.id,
+                    name=user.name,
+                    phone=user.phone,
+                    role_id=user.role_id,
+                    role_name=user.role.name if user.role else None,
+                    shift_id=shift.id if shift else None,
+                    shift_name=shift.name if shift else None,
+                    department_id=shift.department_id if shift else None,
+                    department_name=shift.department.name if shift and shift.department else None,
+                    start_time=_fmt_time(shift.start_time) if shift else None,
+                    end_time=_fmt_time(shift.end_time) if shift else None,
+                    status=status_val,
+                    is_override=True,
+                    notes=override.notes,
+                    default_shift_id=user.shift_id,
+                )
+            )
+        else:
+            shift = shifts_by_id.get(user.shift_id) if user.shift_id else None
+            entries.append(
+                ShiftRosterEntry(
+                    user_id=user.id,
+                    name=user.name,
+                    phone=user.phone,
+                    role_id=user.role_id,
+                    role_name=user.role.name if user.role else None,
+                    shift_id=shift.id if shift else None,
+                    shift_name=shift.name if shift else None,
+                    department_id=shift.department_id if shift else None,
+                    department_name=shift.department.name if shift and shift.department else None,
+                    start_time=_fmt_time(shift.start_time) if shift else None,
+                    end_time=_fmt_time(shift.end_time) if shift else None,
+                    status="on_duty" if shift else "off",
+                    is_override=False,
+                    notes=None,
+                    default_shift_id=user.shift_id,
+                )
+            )
+    return entries
+
+
+def _format_roster_snapshot(
+    hospital_name: str,
+    roster_date: date,
+    holiday_name: str | None,
+    entries: list[ShiftRosterEntry],
+) -> str:
+    date_label = roster_date.strftime("%d %b %Y")
+    lines = [
+        f"*{hospital_name}*",
+        f"📅 Daily Shift Roster — {date_label}",
+    ]
+    if holiday_name:
+        lines.append(f"🏖 Holiday: {holiday_name}")
+    lines.append("")
+
+    on_duty = [e for e in entries if e.status == "on_duty" and e.shift_id]
+    off_leave = [e for e in entries if e.status in ("off", "leave") or not e.shift_id]
+
+    by_dept: dict[str, list[ShiftRosterEntry]] = defaultdict(list)
+    for e in on_duty:
+        by_dept[e.department_name or "Unassigned"].append(e)
+
+    for dept in sorted(by_dept.keys()):
+        lines.append(f"*{dept}*")
+        by_shift: dict[str, list[ShiftRosterEntry]] = defaultdict(list)
+        for e in by_dept[dept]:
+            time_bit = ""
+            if e.start_time and e.end_time:
+                time_bit = f" ({e.start_time}-{e.end_time})"
+            key = f"{e.shift_name or 'Shift'}{time_bit}"
+            by_shift[key].append(e)
+        for shift_label in sorted(by_shift.keys()):
+            lines.append(f"• {shift_label}")
+            for e in sorted(by_shift[shift_label], key=lambda x: x.name.lower()):
+                role = f" ({e.role_name})" if e.role_name else ""
+                lines.append(f"  - {e.name}{role}")
+        lines.append("")
+
+    if off_leave:
+        lines.append("*Off / Leave / Unassigned*")
+        for e in sorted(off_leave, key=lambda x: x.name.lower()):
+            status_label = {"leave": "Leave", "off": "Off"}.get(e.status, "Unassigned")
+            if e.status == "on_duty" and not e.shift_id:
+                status_label = "Unassigned"
+            role = f" ({e.role_name})" if e.role_name else ""
+            note = f" — {e.notes}" if e.notes else ""
+            lines.append(f"- {e.name}{role} — {status_label}{note}")
+        lines.append("")
+
+    lines.append(f"_Total staff: {len(entries)}_")
+    lines.append("_Shared from Ultrion HMS_")
+    return "\n".join(lines).strip() + "\n"
+
+
+@router.get("/shift-roster", response_model=ShiftRosterResponse)
+def get_shift_roster(
+    roster_date: date = Query(..., description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+):
+    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    entries = _build_roster_entries(db, hospital_id, roster_date)
+    return ShiftRosterResponse(
+        roster_date=roster_date,
+        hospital_name=hospital.name if hospital else "Hospital",
+        holiday_name=_holiday_name_for(db, hospital_id, roster_date),
+        entries=entries,
+    )
+
+
+@router.put("/shift-roster", response_model=ShiftRosterEntry)
+def assign_shift_roster(
+    payload: ShiftRosterAssign,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    _: dict = Depends(require_hospital_admin),
+):
+    user = (
+        db.query(HospitalUser)
+        .options(joinedload(HospitalUser.role))
+        .filter(HospitalUser.id == payload.user_id, HospitalUser.hospital_id == hospital_id)
+        .first()
+    )
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff user not found")
+
+    status_val = payload.status
+    shift_id = payload.shift_id
+    if status_val in ("off", "leave"):
+        shift_id = None
+    elif shift_id:
+        shift = (
+            db.query(ShiftType)
+            .filter(ShiftType.id == shift_id, ShiftType.hospital_id == hospital_id)
+            .first()
+        )
+        if not shift:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Shift type not found")
+        if not shift.is_active:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Shift type is inactive")
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="shift_id is required when status is on_duty",
+        )
+
+    row = (
+        db.query(StaffDailyShift)
+        .filter(
+            StaffDailyShift.hospital_id == hospital_id,
+            StaffDailyShift.user_id == payload.user_id,
+            StaffDailyShift.roster_date == payload.roster_date,
+        )
+        .first()
+    )
+    if row:
+        row.shift_id = shift_id
+        row.status = status_val
+        row.notes = payload.notes
+    else:
+        row = StaffDailyShift(
+            hospital_id=hospital_id,
+            user_id=payload.user_id,
+            roster_date=payload.roster_date,
+            shift_id=shift_id,
+            status=status_val,
+            notes=payload.notes,
+        )
+        db.add(row)
+    db.commit()
+
+    entries = _build_roster_entries(db, hospital_id, payload.roster_date)
+    for e in entries:
+        if e.user_id == payload.user_id:
+            return e
+    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load assignment")
+
+
+@router.post("/shift-roster/seed", response_model=ShiftRosterResponse)
+def seed_shift_roster(
+    payload: ShiftRosterSeed,
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    _: dict = Depends(require_hospital_admin),
+):
+    """Copy each staff member's default shift into the daily roster for the date."""
+    users = (
+        db.query(HospitalUser)
+        .filter(HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
+        .all()
+    )
+    existing = {
+        row.user_id: row
+        for row in db.query(StaffDailyShift)
+        .filter(StaffDailyShift.hospital_id == hospital_id, StaffDailyShift.roster_date == payload.roster_date)
+        .all()
+    }
+    for user in users:
+        if user.id in existing and not payload.overwrite:
+            continue
+        status_val = "on_duty" if user.shift_id else "off"
+        if user.id in existing:
+            row = existing[user.id]
+            row.shift_id = user.shift_id
+            row.status = status_val
+            row.notes = None
+        else:
+            db.add(
+                StaffDailyShift(
+                    hospital_id=hospital_id,
+                    user_id=user.id,
+                    roster_date=payload.roster_date,
+                    shift_id=user.shift_id,
+                    status=status_val,
+                    notes=None,
+                )
+            )
+    db.commit()
+    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    entries = _build_roster_entries(db, hospital_id, payload.roster_date)
+    return ShiftRosterResponse(
+        roster_date=payload.roster_date,
+        hospital_name=hospital.name if hospital else "Hospital",
+        holiday_name=_holiday_name_for(db, hospital_id, payload.roster_date),
+        entries=entries,
+    )
+
+
+@router.delete("/shift-roster", status_code=status.HTTP_204_NO_CONTENT)
+def clear_shift_roster_overrides(
+    roster_date: date = Query(...),
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+    _: dict = Depends(require_hospital_admin),
+):
+    """Remove day-specific overrides so staff fall back to default shifts."""
+    db.query(StaffDailyShift).filter(
+        StaffDailyShift.hospital_id == hospital_id,
+        StaffDailyShift.roster_date == roster_date,
+    ).delete(synchronize_session=False)
+    db.commit()
+
+
+@router.get("/shift-roster/snapshot", response_model=ShiftRosterSnapshot)
+def get_shift_roster_snapshot(
+    roster_date: date = Query(...),
+    db: Session = Depends(get_db),
+    hospital_id: UUID = Depends(get_hospital_uuid),
+):
+    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    hospital_name = hospital.name if hospital else "Hospital"
+    holiday_name = _holiday_name_for(db, hospital_id, roster_date)
+    entries = _build_roster_entries(db, hospital_id, roster_date)
+    text = _format_roster_snapshot(hospital_name, roster_date, holiday_name, entries)
+    return ShiftRosterSnapshot(
+        roster_date=roster_date,
+        hospital_name=hospital_name,
+        holiday_name=holiday_name,
+        text=text,
+        entries_count=len(entries),
+    )

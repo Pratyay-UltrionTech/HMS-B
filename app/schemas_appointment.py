@@ -32,6 +32,8 @@ class BookAppointmentRequest(BaseModel):
     department_id: UUID | None = None
     purpose: str | None = Field(default=None, max_length=255)
     notes: str | None = None
+    # walk_in → Checked in (waiting); future → Scheduled
+    booking_kind: str = Field(default="future", pattern="^(walk_in|future)$")
 
     @model_validator(mode="after")
     def require_patient_or_new_details(self):
@@ -74,6 +76,7 @@ class AppointmentListItem(BaseModel):
     consultation_fee: float = 0.0
     followup_eligibility: str | None = None
     status: AppointmentStatus
+    booking_kind: str = "future"
     notes: str | None
     queue_token: int | None
     checked_in_at: datetime | None

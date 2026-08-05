@@ -26,11 +26,13 @@ from app.models import (
     LabOrderStatus,
     LabPrescriptionRequest,
     LabPrescriptionRequestStatus,
+    OtRoom,
     OtSurgery,
     OtSurgeryStatus,
     Patient,
     RadiologyOrder,
     RadiologyOrderStatus,
+    Ward,
 )
 from app.schemas import (
     DoctorRecentRevenueItem,
@@ -1172,6 +1174,11 @@ def list_hospitals(
 
 @router.get("/me/dashboard", response_model=HospitalDashboardResponse)
 def hospital_dashboard(
+    date_from: date | None = Query(default=None, description="Range start (defaults to today)"),
+    date_to: date | None = Query(default=None, description="Range end (defaults to date_from)"),
+    on_date: date | None = Query(default=None, description="Legacy single-day filter; sets both ends"),
+    doctor_id: UUID | None = Query(default=None, description="Filter by doctor"),
+    wing_id: UUID | None = Query(default=None, description="Filter by block/wing"),
     db: Session = Depends(get_db),
     hospital_id=Depends(get_hospital_context),
     _: dict = Depends(require_hospital_user),
@@ -1192,80 +1199,117 @@ def hospital_dashboard(
     patient_count = int(
         db.query(func.count(Patient.id)).filter(Patient.hospital_id == hospital_id).scalar() or 0
     )
+
     today = date.today()
-    start = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
+    if on_date and not date_from and not date_to:
+        range_from = on_date
+        range_to = on_date
+    else:
+        range_from = date_from or today
+        range_to = date_to or range_from
+    if range_to < range_from:
+        range_from, range_to = range_to, range_from
+
+    start = _day_start(range_from)
+    end = _day_end(range_to)
+
+    # ── Appointments (date range / doctor / block) ─────────────────────────────
+    appt_base = db.query(Appointment).filter(
+        Appointment.hospital_id == hospital_id,
+        Appointment.appointment_date >= range_from,
+        Appointment.appointment_date <= range_to,
+        Appointment.status != AppointmentStatus.cancelled,
+    )
+    if doctor_id:
+        appt_base = appt_base.filter(Appointment.doctor_id == doctor_id)
+    if wing_id:
+        appt_base = appt_base.filter(Appointment.wing_id == wing_id)
 
     appointments_today = int(
-        db.query(func.count(Appointment.id))
-        .filter(Appointment.hospital_id == hospital_id, Appointment.appointment_date == today)
+        appt_base.with_entities(func.count(Appointment.id)).scalar() or 0
+    )
+    appointments_scheduled = int(
+        appt_base.filter(Appointment.status == AppointmentStatus.scheduled)
+        .with_entities(func.count(Appointment.id))
         .scalar()
         or 0
     )
-    active_admissions = int(
-        db.query(func.count(Admission.id))
-        .filter(
-            Admission.hospital_id == hospital_id,
-            Admission.status == AdmissionStatus.admitted,
-        )
+    appointments_in_progress = int(
+        appt_base.filter(Appointment.status == AppointmentStatus.waiting)
+        .with_entities(func.count(Appointment.id))
         .scalar()
         or 0
     )
-    beds_total = int(
-        db.query(func.count(Bed.id))
-        .filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True))
+    appointments_completed = int(
+        appt_base.filter(Appointment.status == AppointmentStatus.completed)
+        .with_entities(func.count(Appointment.id))
         .scalar()
         or 0
     )
+
+    # ── Admissions (doctor / block via ward) ───────────────────────────────────
+    adm_q = db.query(Admission).filter(
+        Admission.hospital_id == hospital_id,
+        Admission.status == AdmissionStatus.admitted,
+    )
+    if doctor_id:
+        adm_q = adm_q.filter(Admission.doctor_id == doctor_id)
+    if wing_id:
+        adm_q = adm_q.join(Ward, Ward.id == Admission.ward_id).filter(Ward.wing_id == wing_id)
+    active_admissions = int(adm_q.with_entities(func.count(Admission.id)).scalar() or 0)
+
+    # ── Beds (block via ward) ──────────────────────────────────────────────────
+    beds_q = db.query(Bed).filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True))
+    if wing_id:
+        beds_q = beds_q.join(Ward, Ward.id == Bed.ward_id).filter(Ward.wing_id == wing_id)
+    beds_total = int(beds_q.with_entities(func.count(Bed.id)).scalar() or 0)
     beds_occupied = int(
-        db.query(func.count(Bed.id))
-        .filter(
-            Bed.hospital_id == hospital_id,
-            Bed.is_active.is_(True),
-            Bed.is_occupied.is_(True),
-        )
-        .scalar()
-        or 0
+        beds_q.filter(Bed.is_occupied.is_(True)).with_entities(func.count(Bed.id)).scalar() or 0
     )
     occupied_pct = int(round((beds_occupied / beds_total) * 100)) if beds_total else 0
+
     patients_registered_today = int(
         db.query(func.count(Patient.id))
         .filter(Patient.hospital_id == hospital_id, Patient.created_at >= start, Patient.created_at <= end)
         .scalar()
         or 0
     )
-    lab_orders_today = int(
-        db.query(func.count(LabOrder.id))
-        .filter(
-            LabOrder.hospital_id == hospital_id,
-            LabOrder.ordered_at >= start,
-            LabOrder.ordered_at <= end,
-            LabOrder.status != LabOrderStatus.cancelled,
-        )
-        .scalar()
-        or 0
+
+    # ── Lab / Radiology / OT ───────────────────────────────────────────────────
+    lab_q = db.query(LabOrder).filter(
+        LabOrder.hospital_id == hospital_id,
+        LabOrder.ordered_at >= start,
+        LabOrder.ordered_at <= end,
+        LabOrder.status != LabOrderStatus.cancelled,
     )
-    radiology_orders_today = int(
-        db.query(func.count(RadiologyOrder.id))
-        .filter(
-            RadiologyOrder.hospital_id == hospital_id,
-            RadiologyOrder.ordered_at >= start,
-            RadiologyOrder.ordered_at <= end,
-            RadiologyOrder.status != RadiologyOrderStatus.cancelled,
-        )
-        .scalar()
-        or 0
+    if doctor_id:
+        lab_q = lab_q.filter(LabOrder.doctor_id == doctor_id)
+    lab_orders_today = int(lab_q.with_entities(func.count(LabOrder.id)).scalar() or 0)
+
+    rad_q = db.query(RadiologyOrder).filter(
+        RadiologyOrder.hospital_id == hospital_id,
+        RadiologyOrder.ordered_at >= start,
+        RadiologyOrder.ordered_at <= end,
+        RadiologyOrder.status != RadiologyOrderStatus.cancelled,
     )
-    ot_surgeries_today = int(
-        db.query(func.count(OtSurgery.id))
-        .filter(
-            OtSurgery.hospital_id == hospital_id,
-            OtSurgery.scheduled_at >= start,
-            OtSurgery.scheduled_at <= end,
-        )
-        .scalar()
-        or 0
+    if doctor_id:
+        rad_q = rad_q.filter(RadiologyOrder.doctor_id == doctor_id)
+    radiology_orders_today = int(rad_q.with_entities(func.count(RadiologyOrder.id)).scalar() or 0)
+
+    ot_q = db.query(OtSurgery).filter(
+        OtSurgery.hospital_id == hospital_id,
+        OtSurgery.scheduled_at >= start,
+        OtSurgery.scheduled_at <= end,
+        OtSurgery.status != OtSurgeryStatus.cancelled,
     )
+    if doctor_id:
+        ot_q = ot_q.filter(OtSurgery.surgeon_id == doctor_id)
+    if wing_id:
+        ot_q = ot_q.outerjoin(OtRoom, OtRoom.id == OtSurgery.ot_room_id).filter(
+            OtRoom.wing_id == wing_id
+        )
+    ot_surgeries_today = int(ot_q.with_entities(func.count(OtSurgery.id)).scalar() or 0)
+
     charges_today = float(
         db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
         .filter(
@@ -1279,7 +1323,11 @@ def hospital_dashboard(
     )
     collections_today = float(
         db.query(func.coalesce(func.sum(BillingPayment.amount), 0.0))
-        .filter(BillingPayment.hospital_id == hospital_id, BillingPayment.payment_date == today)
+        .filter(
+            BillingPayment.hospital_id == hospital_id,
+            BillingPayment.payment_date >= range_from,
+            BillingPayment.payment_date <= range_to,
+        )
         .scalar()
         or 0
     )
@@ -1299,36 +1347,85 @@ def hospital_dashboard(
         or 0
     )
 
+    # ── Detail / list payloads ─────────────────────────────────────────────────
     recent_registrations = (
         db.query(Patient)
-        .filter(Patient.hospital_id == hospital_id)
+        .filter(
+            Patient.hospital_id == hospital_id,
+            Patient.created_at >= start,
+            Patient.created_at <= end,
+        )
         .order_by(Patient.created_at.desc())
-        .limit(8)
+        .limit(50)
         .all()
     )
-    upcoming_appts = (
+    if not recent_registrations:
+        recent_registrations = (
+            db.query(Patient)
+            .filter(Patient.hospital_id == hospital_id)
+            .order_by(Patient.created_at.desc())
+            .limit(8)
+            .all()
+        )
+
+    appt_detail_q = (
         db.query(Appointment)
         .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
         .filter(
             Appointment.hospital_id == hospital_id,
-            Appointment.appointment_date >= today,
-            Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.no_show, AppointmentStatus.completed]),
+            Appointment.appointment_date >= range_from,
+            Appointment.appointment_date <= range_to,
+            Appointment.status != AppointmentStatus.cancelled,
         )
-        .order_by(Appointment.appointment_date.asc(), Appointment.appointment_time.asc())
+    )
+    if doctor_id:
+        appt_detail_q = appt_detail_q.filter(Appointment.doctor_id == doctor_id)
+    if wing_id:
+        appt_detail_q = appt_detail_q.filter(Appointment.wing_id == wing_id)
+    appointments_detail_rows = (
+        appt_detail_q.order_by(
+            Appointment.appointment_date.asc(), Appointment.appointment_time.asc()
+        )
+        .limit(100)
+        .all()
+    )
+
+    upcoming_q = (
+        db.query(Appointment)
+        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .filter(
+            Appointment.hospital_id == hospital_id,
+            Appointment.appointment_date >= range_from,
+            Appointment.appointment_date <= range_to,
+            Appointment.status.notin_(
+                [AppointmentStatus.cancelled, AppointmentStatus.no_show, AppointmentStatus.completed]
+            ),
+        )
+    )
+    if doctor_id:
+        upcoming_q = upcoming_q.filter(Appointment.doctor_id == doctor_id)
+    if wing_id:
+        upcoming_q = upcoming_q.filter(Appointment.wing_id == wing_id)
+    upcoming_appts = (
+        upcoming_q.order_by(Appointment.appointment_date.asc(), Appointment.appointment_time.asc())
         .limit(8)
         .all()
     )
+
     pending_lab = (
         db.query(LabOrder)
         .options(joinedload(LabOrder.patient))
         .filter(
             LabOrder.hospital_id == hospital_id,
-            LabOrder.status.in_([LabOrderStatus.ordered, LabOrderStatus.sample_collected, LabOrderStatus.in_progress]),
+            LabOrder.status.in_(
+                [LabOrderStatus.ordered, LabOrderStatus.sample_collected, LabOrderStatus.in_progress]
+            ),
         )
-        .order_by(LabOrder.ordered_at.asc())
-        .limit(8)
-        .all()
     )
+    if doctor_id:
+        pending_lab = pending_lab.filter(LabOrder.doctor_id == doctor_id)
+    pending_lab = pending_lab.order_by(LabOrder.ordered_at.asc()).limit(8).all()
+
     pending_rad = (
         db.query(RadiologyOrder)
         .options(joinedload(RadiologyOrder.patient))
@@ -1337,10 +1434,109 @@ def hospital_dashboard(
             RadiologyOrder.status.in_([RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed]),
             RadiologyOrder.report_file_data.is_(None),
         )
-        .order_by(RadiologyOrder.ordered_at.desc())
-        .limit(8)
+    )
+    if doctor_id:
+        pending_rad = pending_rad.filter(RadiologyOrder.doctor_id == doctor_id)
+    pending_rad = pending_rad.order_by(RadiologyOrder.ordered_at.desc()).limit(8).all()
+
+    adm_detail_q = (
+        db.query(Admission)
+        .options(
+            joinedload(Admission.patient),
+            joinedload(Admission.ward),
+            joinedload(Admission.bed),
+            joinedload(Admission.doctor),
+        )
+        .filter(Admission.hospital_id == hospital_id, Admission.status == AdmissionStatus.admitted)
+    )
+    if doctor_id:
+        adm_detail_q = adm_detail_q.filter(Admission.doctor_id == doctor_id)
+    if wing_id:
+        adm_detail_q = adm_detail_q.join(Ward, Ward.id == Admission.ward_id).filter(Ward.wing_id == wing_id)
+    admissions_detail_rows = adm_detail_q.order_by(Admission.admitted_at.desc()).limit(100).all()
+
+    beds_detail_q = (
+        db.query(Bed)
+        .options(joinedload(Bed.ward), joinedload(Bed.room))
+        .filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True), Bed.is_occupied.is_(True))
+    )
+    if wing_id:
+        beds_detail_q = beds_detail_q.join(Ward, Ward.id == Bed.ward_id).filter(Ward.wing_id == wing_id)
+    beds_detail_rows = beds_detail_q.order_by(Bed.ward_id.asc(), Bed.bed_code.asc()).limit(100).all()
+
+    lab_detail_q = (
+        db.query(LabOrder)
+        .options(joinedload(LabOrder.patient))
+        .filter(
+            LabOrder.hospital_id == hospital_id,
+            LabOrder.ordered_at >= start,
+            LabOrder.ordered_at <= end,
+            LabOrder.status != LabOrderStatus.cancelled,
+        )
+    )
+    if doctor_id:
+        lab_detail_q = lab_detail_q.filter(LabOrder.doctor_id == doctor_id)
+    lab_detail_rows = lab_detail_q.order_by(LabOrder.ordered_at.desc()).limit(100).all()
+
+    rad_detail_q = (
+        db.query(RadiologyOrder)
+        .options(joinedload(RadiologyOrder.patient))
+        .filter(
+            RadiologyOrder.hospital_id == hospital_id,
+            RadiologyOrder.ordered_at >= start,
+            RadiologyOrder.ordered_at <= end,
+            RadiologyOrder.status != RadiologyOrderStatus.cancelled,
+        )
+    )
+    if doctor_id:
+        rad_detail_q = rad_detail_q.filter(RadiologyOrder.doctor_id == doctor_id)
+    rad_detail_rows = rad_detail_q.order_by(RadiologyOrder.ordered_at.desc()).limit(100).all()
+
+    ot_detail_q = (
+        db.query(OtSurgery)
+        .options(joinedload(OtSurgery.patient), joinedload(OtSurgery.surgeon))
+        .filter(
+            OtSurgery.hospital_id == hospital_id,
+            OtSurgery.scheduled_at >= start,
+            OtSurgery.scheduled_at <= end,
+            OtSurgery.status != OtSurgeryStatus.cancelled,
+        )
+    )
+    if doctor_id:
+        ot_detail_q = ot_detail_q.filter(OtSurgery.surgeon_id == doctor_id)
+    if wing_id:
+        ot_detail_q = ot_detail_q.outerjoin(OtRoom, OtRoom.id == OtSurgery.ot_room_id).filter(
+            OtRoom.wing_id == wing_id
+        )
+    ot_detail_rows = ot_detail_q.order_by(OtSurgery.scheduled_at.asc()).limit(100).all()
+
+    charges_detail_rows = (
+        db.query(BillingCharge)
+        .options(joinedload(BillingCharge.patient))
+        .filter(
+            BillingCharge.hospital_id == hospital_id,
+            BillingCharge.status != BillingChargeStatus.cancelled,
+            BillingCharge.created_at >= start,
+            BillingCharge.created_at <= end,
+        )
+        .order_by(BillingCharge.created_at.desc())
+        .limit(100)
         .all()
     )
+    collections_detail_rows = (
+        db.query(BillingPayment)
+        .options(joinedload(BillingPayment.patient))
+        .filter(
+            BillingPayment.hospital_id == hospital_id,
+            BillingPayment.payment_date >= range_from,
+            BillingPayment.payment_date <= range_to,
+        )
+        .order_by(BillingPayment.created_at.desc())
+        .limit(100)
+        .all()
+    )
+
+    from app.utils.appointment_lifecycle import status_display_label
 
     return HospitalDashboardResponse(
         id=hospital.id,
@@ -1361,8 +1557,16 @@ def hospital_dashboard(
         beds_total=beds_total,
         beds_occupied=beds_occupied,
         modules_available=len(BASIC_MODULE_KEYS),
+        filter_date=range_from if range_from == range_to else None,
+        filter_date_from=range_from,
+        filter_date_to=range_to,
+        filter_doctor_id=doctor_id,
+        filter_wing_id=wing_id,
         patients_registered_today=patients_registered_today,
         occupied_beds_pct=occupied_pct,
+        appointments_scheduled=appointments_scheduled,
+        appointments_in_progress=appointments_in_progress,
+        appointments_completed=appointments_completed,
         lab_orders_today=lab_orders_today,
         radiology_orders_today=radiology_orders_today,
         ot_surgeries_today=ot_surgeries_today,
@@ -1386,7 +1590,7 @@ def hospital_dashboard(
                 title=a.patient.name if a.patient else "Patient",
                 subtitle=a.doctor.name if a.doctor else None,
                 meta=_fmt_date(a.appointment_date),
-                status=a.status.value if a.status else None,
+                status=status_display_label(a.status),
                 time=_fmt_time(a.appointment_time),
             )
             for a in upcoming_appts
@@ -1412,6 +1616,94 @@ def hospital_dashboard(
                 time=_fmt_time(o.ordered_at) if o.ordered_at else None,
             )
             for o in pending_rad
+        ],
+        appointments_detail=[
+            HospitalDashboardListItem(
+                id=str(a.id),
+                title=a.patient.name if a.patient else "Patient",
+                subtitle=a.doctor.name if a.doctor else None,
+                meta=f"{_fmt_date(a.appointment_date)} · {a.purpose}" if a.purpose else _fmt_date(a.appointment_date),
+                status=status_display_label(a.status),
+                time=_fmt_time(a.appointment_time),
+            )
+            for a in appointments_detail_rows
+        ],
+        admissions_detail=[
+            HospitalDashboardListItem(
+                id=str(a.id),
+                title=a.patient.name if a.patient else "Patient",
+                subtitle=a.ward.name if a.ward else None,
+                meta=f"Bed {a.bed.bed_code}" if a.bed else None,
+                status=a.status.value if a.status else None,
+                time=_fmt_date(a.admitted_at.date() if a.admitted_at else None),
+            )
+            for a in admissions_detail_rows
+        ],
+        beds_detail=[
+            HospitalDashboardListItem(
+                id=str(b.id),
+                title=f"Bed {b.bed_code}",
+                subtitle=b.ward.name if b.ward else None,
+                meta=(b.room.name or b.room.room_code) if b.room else None,
+                status="occupied",
+                time=None,
+            )
+            for b in beds_detail_rows
+        ],
+        lab_orders_detail=[
+            HospitalDashboardListItem(
+                id=str(o.id),
+                title=o.order_no,
+                subtitle=o.patient.name if o.patient else None,
+                meta=o.status.value.replace("_", " ") if o.status else None,
+                status=o.status.value if o.status else None,
+                time=_fmt_time(o.ordered_at) if o.ordered_at else None,
+            )
+            for o in lab_detail_rows
+        ],
+        radiology_orders_detail=[
+            HospitalDashboardListItem(
+                id=str(o.id),
+                title=o.scan_name or o.order_no,
+                subtitle=o.patient.name if o.patient else None,
+                meta=o.order_no,
+                status=o.status.value if o.status else None,
+                time=_fmt_time(o.ordered_at) if o.ordered_at else None,
+            )
+            for o in rad_detail_rows
+        ],
+        ot_surgeries_detail=[
+            HospitalDashboardListItem(
+                id=str(s.id),
+                title=s.surgery_type or s.surgery_no,
+                subtitle=s.patient.name if s.patient else None,
+                meta=s.surgeon.name if s.surgeon else s.ot_room,
+                status=s.status.value if s.status else None,
+                time=_fmt_time(s.scheduled_at) if s.scheduled_at else None,
+            )
+            for s in ot_detail_rows
+        ],
+        charges_detail=[
+            HospitalDashboardListItem(
+                id=str(c.id),
+                title=c.description[:80] if c.description else "Charge",
+                subtitle=c.patient.name if c.patient else None,
+                meta=f"₹{int(round(c.net_amount)):,}",
+                status=c.status.value if c.status else None,
+                time=_fmt_time(c.created_at) if c.created_at else None,
+            )
+            for c in charges_detail_rows
+        ],
+        collections_detail=[
+            HospitalDashboardListItem(
+                id=str(p.id),
+                title=p.patient.name if p.patient else "Payment",
+                subtitle=p.payment_method.value if p.payment_method else None,
+                meta=f"₹{int(round(p.amount)):,}",
+                status="paid",
+                time=_fmt_time(p.created_at) if p.created_at else None,
+            )
+            for p in collections_detail_rows
         ],
     )
 

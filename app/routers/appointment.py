@@ -151,13 +151,13 @@ def resolve_consultation_fee(
                     if days_since <= followup_free_days:
                         final_fee = 0.0
                         eligibility = "eligible"
-                        message = f"Eligible for free follow-up (within {followup_free_days} days)"
+                        message = f"Eligible for free follow-up (valid upto {followup_free_days} days)"
                     else:
                         eligibility = "expired"
-                        message = f"Follow-up period expired ({days_since} days since last visit; free within {followup_free_days} days)"
+                        message = f"Follow-up validity expired ({days_since} days since last visit; valid upto {followup_free_days} days)"
                 else:
                     eligibility = "no_free_period"
-                    message = "Follow-up type — free period not configured; standard fee applies"
+                    message = "Follow-up type — validity not configured; standard fee applies"
 
     return {
         "consultation_fee": final_fee,
@@ -189,6 +189,7 @@ def _to_item(a: Appointment) -> AppointmentListItem:
         consultation_fee=float(getattr(a, "consultation_fee", None) or 0),
         followup_eligibility=getattr(a, "followup_eligibility", None),
         status=a.status,
+        booking_kind=getattr(a, "booking_kind", None) or "future",
         notes=a.notes,
         queue_token=getattr(a, "queue_token", None),
         checked_in_at=getattr(a, "checked_in_at", None),
@@ -198,6 +199,25 @@ def _to_item(a: Appointment) -> AppointmentListItem:
         patient_mobile=a.patient.mobile if a.patient else None,
         doctor_name=a.doctor.name if a.doctor else None,
     )
+
+
+def _assert_not_past_slot(appointment_date: date, appointment_time: time, *, label: str = "Appointment") -> None:
+    now = datetime.now()
+    appt_dt = datetime.combine(appointment_date, appointment_time)
+    if appt_dt < now.replace(second=0, microsecond=0):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{label} cannot be booked for a past date or time",
+        )
+
+
+def _run_missed_auto_cancel(db: Session, hospital_id: UUID) -> None:
+    from app.utils.appointment_lifecycle import auto_cancel_missed_appointments
+
+    try:
+        auto_cancel_missed_appointments(db, hospital_id)
+    except Exception:
+        db.rollback()
 
 
 def _load_appt(db: Session, appt_id: UUID, hospital_id: UUID) -> Appointment:
@@ -556,6 +576,21 @@ def book_appointment(
             detail=f"Cannot book on holiday: {holiday.name}",
         )
 
+    booking_kind = (payload.booking_kind or "future").strip().lower()
+    if booking_kind not in ("walk_in", "future"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="booking_kind must be walk_in or future")
+
+    today = date.today()
+    if booking_kind == "walk_in":
+        if payload.appointment_date != today:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Walk-in appointments can only be booked for today",
+            )
+        _assert_not_past_slot(payload.appointment_date, payload.appointment_time, label="Walk-in")
+    else:
+        _assert_not_past_slot(payload.appointment_date, payload.appointment_time, label="Future booking")
+
     if _slot_conflict(db, hospital_id, payload.doctor_id, payload.appointment_date, payload.appointment_time):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -625,6 +660,7 @@ def book_appointment(
     )
 
     visit_type_label = (appt_type.name if appt_type else payload.visit_type).strip()
+    initial_status = AppointmentStatus.waiting if booking_kind == "walk_in" else AppointmentStatus.scheduled
     appt = Appointment(
         hospital_id=hospital_id,
         doctor_id=payload.doctor_id,
@@ -638,9 +674,13 @@ def book_appointment(
         department_id=department_id,
         consultation_fee=float(fee_info["consultation_fee"]),
         followup_eligibility=fee_info.get("followup_eligibility"),
-        status=AppointmentStatus.scheduled,
+        status=initial_status,
+        booking_kind=booking_kind,
         notes=payload.notes.strip() if payload.notes else None,
     )
+    if booking_kind == "walk_in":
+        appt.checked_in_at = datetime.now(timezone.utc)
+        appt.queue_token = _next_queue_token(db, hospital_id, payload.doctor_id, payload.appointment_date)
     db.add(appt)
     db.flush()
     write_audit(
@@ -651,7 +691,8 @@ def book_appointment(
         entity_type="appointment",
         entity_id=appt.id,
         summary=(
-            f"Booked {patient.name} with {doctor.name} on {payload.appointment_date} "
+            f"Booked ({'Walk-in → Checked in' if booking_kind == 'walk_in' else 'Future → Scheduled'}) "
+            f"{patient.name} with {doctor.name} on {payload.appointment_date} "
             f"{payload.appointment_time} fee={appt.consultation_fee}"
         ),
     )
@@ -680,6 +721,7 @@ def todays_appointments(
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
+    _run_missed_auto_cancel(db, hospital_id)
     today = date.today()
     q = (
         db.query(Appointment)
@@ -706,6 +748,8 @@ def calendar_view(
     if (date_to - date_from).days > 62:
         raise HTTPException(status_code=400, detail="Range cannot exceed 62 days")
 
+    _run_missed_auto_cancel(db, hospital_id)
+
     q = (
         db.query(Appointment)
         .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
@@ -729,6 +773,7 @@ def doctor_queue(
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
+    _run_missed_auto_cancel(db, hospital_id)
     day = on_date or date.today()
     rows = (
         db.query(Appointment)
@@ -764,6 +809,7 @@ def appointment_history(
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
+    _run_missed_auto_cancel(db, hospital_id)
     q = (
         db.query(Appointment)
         .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
@@ -918,6 +964,8 @@ def reschedule_appointment(
     holiday = _check_holiday(db, hospital_id, payload.appointment_date)
     if holiday:
         raise HTTPException(status_code=400, detail=f"Cannot reschedule to holiday: {holiday.name}")
+
+    _assert_not_past_slot(payload.appointment_date, payload.appointment_time, label="Reschedule")
 
     if _slot_conflict(db, hospital_id, appt.doctor_id, payload.appointment_date, payload.appointment_time, appt.id):
         raise HTTPException(status_code=409, detail="Doctor already has an appointment at this time slot")
