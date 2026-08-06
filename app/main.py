@@ -13,7 +13,7 @@ from app.telemetry import (
     instrument_sqlalchemy_engine,
     setup_telemetry,
 )
-from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment, billing, pharmacy, ipd
+from app.routers import auth, hospitals, masters, admin, doctors, registration, appointment, beds, mis, analytics, laboratory, radiology, ot, dms, equipment, billing, pharmacy, ipd, vitals
 import app.models  # noqa: F401 — register all ORM tables for create_all
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -824,6 +824,24 @@ def _migrate_org_contact_fields() -> None:
         logger.warning("org contact fields migration skipped: %s", exc)
 
 
+def _migrate_prescription_signature() -> None:
+    """Add signature_data column to prescriptions if missing."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        if "prescriptions" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("prescriptions")}
+        if "signature_data" in cols:
+            return
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE prescriptions ADD COLUMN signature_data TEXT"))
+        logger.info("Added prescriptions.signature_data")
+    except Exception as exc:
+        logger.warning("prescription signature migration skipped: %s", exc)
+
+
 def _migrate_performance_indexes() -> None:
     """Composite indexes for bulk list endpoints (DMS, registration, doctors, billing)."""
     from sqlalchemy import text
@@ -889,6 +907,7 @@ async def lifespan(_: FastAPI):
     _migrate_lab_prescription_requests()
     _migrate_billing_source_type_pharmacy()
     _migrate_org_contact_fields()
+    _migrate_prescription_signature()
     _migrate_performance_indexes()
 
     async def _missed_appointment_loop() -> None:
@@ -953,6 +972,7 @@ app.include_router(equipment.router, prefix="/api")
 app.include_router(billing.router, prefix="/api")
 app.include_router(pharmacy.router, prefix="/api")
 app.include_router(ipd.router, prefix="/api")
+app.include_router(vitals.router, prefix="/api")
 
 
 @app.get("/")

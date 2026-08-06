@@ -660,7 +660,7 @@ def book_appointment(
     )
 
     visit_type_label = (appt_type.name if appt_type else payload.visit_type).strip()
-    initial_status = AppointmentStatus.waiting if booking_kind == "walk_in" else AppointmentStatus.scheduled
+    # Stays Scheduled until vitals are recorded → Checked in; Rx → Completed
     appt = Appointment(
         hospital_id=hospital_id,
         doctor_id=payload.doctor_id,
@@ -674,13 +674,10 @@ def book_appointment(
         department_id=department_id,
         consultation_fee=float(fee_info["consultation_fee"]),
         followup_eligibility=fee_info.get("followup_eligibility"),
-        status=initial_status,
+        status=AppointmentStatus.scheduled,
         booking_kind=booking_kind,
         notes=payload.notes.strip() if payload.notes else None,
     )
-    if booking_kind == "walk_in":
-        appt.checked_in_at = datetime.now(timezone.utc)
-        appt.queue_token = _next_queue_token(db, hospital_id, payload.doctor_id, payload.appointment_date)
     db.add(appt)
     db.flush()
     write_audit(
@@ -691,7 +688,7 @@ def book_appointment(
         entity_type="appointment",
         entity_id=appt.id,
         summary=(
-            f"Booked ({'Walk-in → Checked in' if booking_kind == 'walk_in' else 'Future → Scheduled'}) "
+            f"Booked ({'Walk-in' if booking_kind == 'walk_in' else 'Future'} → Scheduled) "
             f"{patient.name} with {doctor.name} on {payload.appointment_date} "
             f"{payload.appointment_time} fee={appt.consultation_fee}"
         ),

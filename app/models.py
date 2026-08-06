@@ -700,6 +700,7 @@ class Prescription(Base):
     dosage: Mapped[str] = mapped_column(Text, nullable=False)
     advice: Mapped[str | None] = mapped_column(Text, nullable=True)
     follow_up_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    signature_data: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     patient: Mapped["Patient"] = relationship(back_populates="prescriptions")
@@ -2179,4 +2180,32 @@ class PharmacyRxRequestItem(Base):
 
     request: Mapped["PharmacyRxRequest"] = relationship(back_populates="items")
     medicine: Mapped["Medicine | None"] = relationship()
+
+
+class VitalReading(Base):
+    """OPD vital sign captured for a visit (e.g. BP, Pulse, Temperature)."""
+
+    __tablename__ = "vital_readings"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    appointment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)  # e.g. BP, Pulse
+    suitable_range: Mapped[str] = mapped_column(String(128), nullable=False)  # e.g. 90-120
+    result: Mapped[str] = mapped_column(String(128), nullable=False)
+    recorded_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    appointment: Mapped["Appointment"] = relationship()
+    patient: Mapped["Patient"] = relationship()
 

@@ -55,6 +55,7 @@ from app.models import (
     RadiologyOrder,
     RadiologyOrderStatus,
     RadiologyScanCatalog,
+    VitalReading,
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
@@ -62,6 +63,7 @@ from app.utils.lab_panels import resolve_lab_selection
 from app.routers.laboratory import _next_order_no, _order_to_response as _lab_order_to_response
 from app.routers.radiology import _order_to_response as _rad_order_to_response
 from app.routers.ot import _surgery_to_response as _ot_surgery_to_response
+from app.routers.vitals import _reading_response as _vital_reading_response
 from app.utils.doctor_leave import (
     appointments_blocking_leave,
     fmt_time_hhmm,
@@ -171,6 +173,7 @@ def _appointment_response(a: Appointment) -> AppointmentResponse:
 
 
 def _prescription_response(p: Prescription) -> PrescriptionResponse:
+    sig = getattr(p, "signature_data", None)
     return PrescriptionResponse(
         id=p.id,
         hospital_id=p.hospital_id,
@@ -183,6 +186,8 @@ def _prescription_response(p: Prescription) -> PrescriptionResponse:
         dosage=p.dosage,
         advice=p.advice,
         follow_up_date=p.follow_up_date,
+        signature_data=sig,
+        has_signature=bool(sig),
         created_at=p.created_at,
         patient_name=p.patient.name if p.patient else None,
         patient_mobile=p.patient.mobile if p.patient else None,
@@ -596,20 +601,33 @@ def get_patient_history(
         .order_by(OtSurgery.scheduled_at.desc())
         .all()
     )
+    vitals = (
+        db.query(VitalReading)
+        .options(
+            joinedload(VitalReading.patient),
+            joinedload(VitalReading.appointment).joinedload(Appointment.doctor),
+        )
+        .filter(VitalReading.hospital_id == hospital_id, VitalReading.patient_id == patient_id)
+        .order_by(VitalReading.recorded_at.desc())
+        .all()
+    )
+
+    # Align visit status: no vitals → Scheduled; vitals without Rx stay Checked in
+    from app.routers.vitals import _revert_checked_in_without_vitals
+
+    _revert_checked_in_without_vitals(db, hospital_id, appointments)
 
     last_appt = appointments[0] if appointments else None
     last_rx = prescriptions[0] if prescriptions else None
 
-    # Repair stale visit statuses (e.g. Rx written while appointment still "scheduled")
-    from app.utils.appointment_lifecycle import sync_appointment_after_clinical_change
-
+    # If a prescription exists for the visit, ensure status is Completed
     dirty = False
     for appt in appointments:
         if appt.status in (AppointmentStatus.cancelled, AppointmentStatus.no_show, AppointmentStatus.completed):
             continue
-        before = appt.status
-        sync_appointment_after_clinical_change(db, hospital_id, appt.id)
-        if appt.status != before:
+        has_rx = any(p.appointment_id == appt.id for p in prescriptions)
+        if has_rx:
+            appt.status = AppointmentStatus.completed
             dirty = True
     if dirty:
         db.commit()
@@ -632,6 +650,7 @@ def get_patient_history(
         lab_orders=[_lab_order_to_response(o) for o in lab_orders],
         radiology_orders=[_rad_order_to_response(o) for o in radiology_orders],
         ot_surgeries=[_ot_surgery_to_response(o) for o in ot_surgeries],
+        vitals=[_vital_reading_response(v) for v in vitals],
         financial_summary={**fin, "recent_entries": recent},
     )
 
@@ -740,7 +759,6 @@ def get_calendar(
             Appointment.hospital_id == hospital_id,
             Appointment.appointment_date >= start,
             Appointment.appointment_date <= end,
-            Appointment.status != AppointmentStatus.cancelled,
         )
         .order_by(Appointment.appointment_date.asc(), Appointment.appointment_time.asc())
         .all()
@@ -1184,6 +1202,7 @@ def create_prescription(
         dosage=payload.dosage.strip(),
         advice=payload.advice.strip() if payload.advice else None,
         follow_up_date=payload.follow_up_date,
+        signature_data=(payload.signature_data.strip() if payload.signature_data else None),
     )
     db.add(rx)
     db.flush()
@@ -1334,7 +1353,10 @@ def create_prescription(
     db.flush()
 
     if payload.appointment_id:
-        from app.utils.appointment_lifecycle import mark_in_progress, sync_appointment_after_clinical_change
+        from app.utils.appointment_lifecycle import (
+            TERMINAL,
+            mark_in_progress,
+        )
 
         appt_row = (
             db.query(Appointment)
@@ -1344,11 +1366,12 @@ def create_prescription(
             )
             .first()
         )
-        if appt_row:
-            # Writing a prescription means the visit has started clinical work
-            mark_in_progress(appt_row)
-            db.flush()
-            sync_appointment_after_clinical_change(db, hospital_id, payload.appointment_id)
+        if appt_row and appt_row.status not in TERMINAL:
+            # Saving a prescription closes the doctor visit (lab/rad can continue independently)
+            if appt_row.status == AppointmentStatus.scheduled:
+                mark_in_progress(appt_row)
+                db.flush()
+            appt_row.status = AppointmentStatus.completed
 
     db.commit()
     rx = (
@@ -1598,7 +1621,6 @@ def _prescription_html(
     </div>
     <div class="body">
       <div class="line"><label>Patient Name:</label><div class="fill">{patient.name if patient else "—"}</div></div>
-      <div class="line"><label>Address:</label><div class="fill">{(patient.address if patient and patient.address else "—")}</div></div>
       <div class="row">
         <div class="line"><label>Age:</label><div class="fill">{patient.age if patient and patient.age is not None else "—"}</div></div>
         <div class="line"><label>Date:</label><div class="fill">{created}</div></div>
@@ -1609,7 +1631,10 @@ def _prescription_html(
         <div class="rx-content">{body}</div>
       </div>
       <div class="line"><label>Follow-up:</label><div class="fill">{follow}</div></div>
-      <div class="sign"><div class="sign-line">SIGNATURE</div></div>
+      <div class="sign">
+        {f'<img src="{rx.signature_data}" alt="Signature" style="max-height:64px;max-width:200px;display:block;margin-left:auto;margin-bottom:4px"/>' if getattr(rx, "signature_data", None) else ""}
+        <div class="sign-line">SIGNATURE</div>
+      </div>
     </div>
     <div class="footer">
       <div>
