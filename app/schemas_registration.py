@@ -31,13 +31,25 @@ def validate_emergency_contact_bundle(
     name: str | None,
     relation: str | None,
     phone: str | None,
+    required: bool = True,
 ) -> None:
-    """If any emergency field is present, phone is required."""
+    """Validate emergency contact fields. When required=True, name, relation, and phone are mandatory."""
     name_n = _normalize_optional_text(name)
     relation_n = _normalize_optional_text(relation)
     phone_n = phone.strip() if isinstance(phone, str) and phone.strip() else phone
     if relation_n and relation_n not in EMERGENCY_RELATIONS:
         raise ValueError(f"emergency_contact_relation must be one of: {', '.join(EMERGENCY_RELATIONS)}")
+    if required:
+        missing = []
+        if not name_n:
+            missing.append("emergency_contact_name")
+        if not relation_n:
+            missing.append("emergency_contact_relation")
+        if not phone_n:
+            missing.append("emergency_contact")
+        if missing:
+            raise ValueError("Emergency contact name, relation, and phone are required")
+        return
     if (name_n or relation_n or phone_n) and not phone_n:
         raise ValueError("emergency_contact phone is required when any emergency contact field is entered")
 
@@ -51,9 +63,9 @@ class PatientRegister(BaseModel):
     mobile: PhoneNumber
     email: EmailStr | None = None
     address: str | None = None
-    emergency_contact: OptionalPhoneNumber = None
-    emergency_contact_name: str | None = Field(default=None, max_length=128)
-    emergency_contact_relation: EmergencyRelation | None = None
+    emergency_contact: PhoneNumber
+    emergency_contact_name: str = Field(min_length=1, max_length=128)
+    emergency_contact_relation: EmergencyRelation
     blood_group: str | None = Field(default=None, max_length=16)
     has_insurance: bool = False
     insurance_provider: str | None = Field(default=None, max_length=255)
@@ -64,7 +76,10 @@ class PatientRegister(BaseModel):
             name=self.emergency_contact_name,
             relation=self.emergency_contact_relation,
             phone=self.emergency_contact,
+            required=True,
         )
+        if self.mobile and self.emergency_contact and self.mobile == self.emergency_contact:
+            raise ValueError("Emergency contact number must be different from patient mobile number")
         if not self.has_insurance:
             object.__setattr__(self, "insurance_provider", None)
         else:
@@ -76,7 +91,7 @@ class PatientRegister(BaseModel):
         object.__setattr__(
             self,
             "emergency_contact_name",
-            _normalize_optional_text(self.emergency_contact_name, max_len=128),
+            self.emergency_contact_name.strip(),
         )
         return self
 

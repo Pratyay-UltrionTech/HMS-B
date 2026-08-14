@@ -369,6 +369,8 @@ class HospitalUser(Base):
     qualification: Mapped[str | None] = mapped_column(String(255), nullable=True)
     years_of_experience: Mapped[int | None] = mapped_column(Integer, nullable=True)
     consultation_room: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # When True, doctor can see patient/dashboard financial summaries
+    show_financial_details: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     custom_values: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

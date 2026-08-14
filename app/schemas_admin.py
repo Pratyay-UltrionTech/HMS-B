@@ -133,6 +133,7 @@ class HospitalUserCreate(BaseModel):
     qualification: str | None = Field(default=None, max_length=255)
     years_of_experience: int | None = Field(default=None, ge=0, le=80)
     consultation_room: str | None = Field(default=None, max_length=128)
+    show_financial_details: bool = True
     custom_values: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
 
@@ -150,6 +151,7 @@ class HospitalUserUpdate(BaseModel):
     qualification: str | None = Field(default=None, max_length=255)
     years_of_experience: int | None = Field(default=None, ge=0, le=80)
     consultation_room: str | None = Field(default=None, max_length=128)
+    show_financial_details: bool | None = None
     custom_values: dict[str, Any] | None = None
     is_active: bool | None = None
 
@@ -167,6 +169,7 @@ class HospitalUserResponse(BaseModel):
     qualification: str | None = None
     years_of_experience: int | None = None
     consultation_room: str | None = None
+    show_financial_details: bool = True
     custom_values: dict[str, Any]
     is_active: bool
     created_at: datetime

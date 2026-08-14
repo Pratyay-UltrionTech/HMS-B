@@ -421,9 +421,16 @@ def update_patient(
             name=patient.emergency_contact_name,
             relation=patient.emergency_contact_relation,
             phone=patient.emergency_contact,
+            required=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+
+    if patient.mobile and patient.emergency_contact and patient.mobile == patient.emergency_contact:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Emergency contact number must be different from patient mobile number",
+        )
 
     write_audit(
         db,

@@ -29,6 +29,7 @@ from app.schemas_doctors import (
     PatientUpdate,
     PrescriptionCreate,
     PrescriptionResponse,
+    PrescriptionUpdate,
 )
 from app.models import (
     Appointment,
@@ -172,7 +173,7 @@ def _appointment_response(a: Appointment) -> AppointmentResponse:
     )
 
 
-def _prescription_response(p: Prescription) -> PrescriptionResponse:
+def _prescription_response(p: Prescription, appointment_status: AppointmentStatus | None = None) -> PrescriptionResponse:
     sig = getattr(p, "signature_data", None)
     return PrescriptionResponse(
         id=p.id,
@@ -192,7 +193,30 @@ def _prescription_response(p: Prescription) -> PrescriptionResponse:
         patient_name=p.patient.name if p.patient else None,
         patient_mobile=p.patient.mobile if p.patient else None,
         doctor_name=p.doctor.name if p.doctor else None,
+        appointment_status=appointment_status,
     )
+
+
+def _appointment_status_map(
+    db: Session, hospital_id: UUID, appointment_ids: list[UUID]
+) -> dict[UUID, AppointmentStatus]:
+    ids = [i for i in appointment_ids if i]
+    if not ids:
+        return {}
+    rows = (
+        db.query(Appointment.id, Appointment.status)
+        .filter(Appointment.hospital_id == hospital_id, Appointment.id.in_(ids))
+        .all()
+    )
+    return {row[0]: row[1] for row in rows}
+
+
+def _assert_prescription_editable(appt: Appointment | None) -> None:
+    if appt is not None and appt.status == AppointmentStatus.completed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot edit a prescription after the visit is marked completed",
+        )
 
 
 def _record_response(r: MedicalRecord) -> MedicalRecordResponse:
@@ -307,6 +331,7 @@ def _doctor_summaries_bulk(
             qualification=doctor.qualification,
             years_of_experience=doctor.years_of_experience,
             consultation_room=doctor.consultation_room,
+            show_financial_details=bool(getattr(doctor, "show_financial_details", True)),
             custom_values=doctor.custom_values or {},
             is_active=doctor.is_active,
             patient_count=patient_counts.get(doctor.id, 0),
@@ -620,24 +645,14 @@ def get_patient_history(
     last_appt = appointments[0] if appointments else None
     last_rx = prescriptions[0] if prescriptions else None
 
-    # If a prescription exists for the visit, ensure status is Completed
-    dirty = False
-    for appt in appointments:
-        if appt.status in (AppointmentStatus.cancelled, AppointmentStatus.no_show, AppointmentStatus.completed):
-            continue
-        has_rx = any(p.appointment_id == appt.id for p in prescriptions)
-        if has_rx:
-            appt.status = AppointmentStatus.completed
-            dirty = True
-    if dirty:
-        db.commit()
-        for appt in appointments:
-            db.refresh(appt)
-
     from app.utils.billing import build_ledger_entries, patient_ledger_totals
 
-    fin = patient_ledger_totals(db, hospital_id, patient_id)
-    recent = build_ledger_entries(db, hospital_id, patient_id)[:6]
+    doctor = _get_doctor(db, resolved, hospital_id)
+    financial_summary = None
+    if bool(getattr(doctor, "show_financial_details", True)):
+        fin = patient_ledger_totals(db, hospital_id, patient_id)
+        recent = build_ledger_entries(db, hospital_id, patient_id)[:6]
+        financial_summary = {**fin, "recent_entries": recent}
     return PatientHistoryResponse(
         patient=_patient_response(
             patient,
@@ -645,13 +660,16 @@ def get_patient_history(
             last_diagnosis=last_rx.diagnosis if last_rx else None,
         ),
         appointments=[_appointment_response(a) for a in appointments],
-        prescriptions=[_prescription_response(p) for p in prescriptions],
+        prescriptions=[
+            _prescription_response(p, next((a.status for a in appointments if a.id == p.appointment_id), None))
+            for p in prescriptions
+        ],
         medical_records=[_record_response(r) for r in records],
         lab_orders=[_lab_order_to_response(o) for o in lab_orders],
         radiology_orders=[_rad_order_to_response(o) for o in radiology_orders],
         ot_surgeries=[_ot_surgery_to_response(o) for o in ot_surgeries],
         vitals=[_vital_reading_response(v) for v in vitals],
-        financial_summary={**fin, "recent_entries": recent},
+        financial_summary=financial_summary,
     )
 
 
@@ -1090,14 +1108,17 @@ def update_appointment(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
     data = payload.model_dump(exclude_unset=True)
     if "status" in data and data["status"] == AppointmentStatus.completed:
-        from app.utils.appointment_lifecycle import complete_appointment_record
+        from app.utils.appointment_lifecycle import TERMINAL, mark_in_progress
 
-        ok, blockers = complete_appointment_record(db, hospital_id, appt)
-        if not ok:
+        # Doctor closes the consultation manually (lab/radiology may continue independently).
+        if appt.status in TERMINAL:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=blockers[0] if len(blockers) == 1 else "; ".join(blockers),
+                detail=f"Appointment is already {appt.status.value}",
             )
+        if appt.status == AppointmentStatus.scheduled:
+            mark_in_progress(appt)
+        appt.status = AppointmentStatus.completed
         data.pop("status", None)
     for key, value in data.items():
         if key == "purpose" and value:
@@ -1366,14 +1387,97 @@ def create_prescription(
             )
             .first()
         )
-        if appt_row and appt_row.status not in TERMINAL:
-            # Saving a prescription closes the doctor visit (lab/rad can continue independently)
-            if appt_row.status == AppointmentStatus.scheduled:
-                mark_in_progress(appt_row)
-                db.flush()
-            appt_row.status = AppointmentStatus.completed
+        # Prescription does not auto-complete the visit — doctor marks Completed manually.
+        # If still Scheduled, move to Checked in so the visit stays open for more Rx.
+        if appt_row and appt_row.status not in TERMINAL and appt_row.status == AppointmentStatus.scheduled:
+            mark_in_progress(appt_row)
 
     db.commit()
+    rx = (
+        db.query(Prescription)
+        .options(joinedload(Prescription.patient), joinedload(Prescription.doctor))
+        .filter(Prescription.id == rx.id)
+        .first()
+    )
+    return _prescription_response(rx)
+
+
+@router.put("/{doctor_id}/prescriptions/{prescription_id}", response_model=PrescriptionResponse)
+def update_prescription(
+    doctor_id: UUID,
+    prescription_id: UUID,
+    payload: PrescriptionUpdate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
+    rx = (
+        db.query(Prescription)
+        .options(joinedload(Prescription.patient), joinedload(Prescription.doctor))
+        .filter(
+            Prescription.id == prescription_id,
+            Prescription.doctor_id == resolved,
+            Prescription.hospital_id == hospital_id,
+        )
+        .first()
+    )
+    if not rx:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found")
+
+    current_appt = None
+    if rx.appointment_id:
+        current_appt = (
+            db.query(Appointment)
+            .filter(Appointment.id == rx.appointment_id, Appointment.hospital_id == hospital_id)
+            .first()
+        )
+    _assert_prescription_editable(current_appt)
+
+    data = payload.model_dump(exclude_unset=True)
+    if "appointment_id" in data and data["appointment_id"] is not None:
+        appt = (
+            db.query(Appointment)
+            .filter(
+                Appointment.id == data["appointment_id"],
+                Appointment.hospital_id == hospital_id,
+                Appointment.patient_id == rx.patient_id,
+            )
+            .first()
+        )
+        if not appt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Visit not found for this patient",
+            )
+        if appt.doctor_id != resolved and user.get("role") != "hospital_admin":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Visit does not belong to this doctor",
+            )
+        _assert_prescription_editable(appt)
+
+    for key, value in data.items():
+        if key in {"symptoms", "diagnosis", "medicines", "dosage"} and isinstance(value, str):
+            setattr(rx, key, value.strip())
+        elif key == "advice":
+            setattr(rx, key, value.strip() if isinstance(value, str) and value.strip() else None)
+        elif key == "signature_data":
+            setattr(rx, key, value if value else None)
+        else:
+            setattr(rx, key, value)
+
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="prescription",
+        entity_id=rx.id,
+        summary=f"Updated prescription for {rx.patient.name if rx.patient else 'patient'}: {(rx.diagnosis or '')[:80]}",
+    )
+    db.commit()
+    db.refresh(rx)
     rx = (
         db.query(Prescription)
         .options(joinedload(Prescription.patient), joinedload(Prescription.doctor))
@@ -1400,7 +1504,8 @@ def list_prescriptions(
     if patient_id:
         q = q.filter(Prescription.patient_id == patient_id)
     rows = q.order_by(Prescription.created_at.desc()).all()
-    return [_prescription_response(p) for p in rows]
+    status_map = _appointment_status_map(db, hospital_id, [p.appointment_id for p in rows if p.appointment_id])
+    return [_prescription_response(p, status_map.get(p.appointment_id) if p.appointment_id else None) for p in rows]
 
 
 @router.get("/{doctor_id}/prescriptions/{prescription_id}/pdf")

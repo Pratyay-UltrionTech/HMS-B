@@ -508,6 +508,8 @@ def _migrate_hospital_users_doctor_profile() -> None:
             alters.append("ADD COLUMN years_of_experience INTEGER")
         if "consultation_room" not in cols:
             alters.append("ADD COLUMN consultation_room VARCHAR(128)")
+        if "show_financial_details" not in cols:
+            alters.append("ADD COLUMN show_financial_details BOOLEAN NOT NULL DEFAULT TRUE")
         if not alters:
             return
         logger.info("Migrating hospital_users doctor profile columns")

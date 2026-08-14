@@ -28,6 +28,7 @@ class BookAppointmentRequest(BaseModel):
     appointment_time: time
     visit_type: str = Field(default="OPD", min_length=1, max_length=64)
     appointment_type_id: UUID | None = None
+    # Optional — when omitted, resolved from doctor's consultation pricing / shift
     wing_id: UUID | None = None
     department_id: UUID | None = None
     purpose: str | None = Field(default=None, max_length=255)
@@ -46,14 +47,29 @@ class BookAppointmentRequest(BaseModel):
                 ("last_name", self.last_name),
                 ("mobile", self.mobile),
                 ("gender", self.gender),
+                ("date_of_birth", self.date_of_birth),
+                ("age", self.age),
+                ("emergency_contact", self.emergency_contact),
             )
-            if not (val and str(val).strip())
+            if val is None or (isinstance(val, str) and not val.strip())
         ]
         if missing:
             raise ValueError(
-                "Provide patient_id for an existing patient, or first_name, last_name, mobile, and gender to auto-register"
+                "Provide patient_id for an existing patient, or first_name, last_name, mobile, "
+                "gender, date_of_birth, age, and emergency_contact to auto-register"
             )
+        if self.mobile and self.emergency_contact and self.mobile == self.emergency_contact:
+            raise ValueError("Emergency contact number must be different from patient mobile number")
         return self
+
+
+class FeePreviewRequest(BaseModel):
+    doctor_id: UUID
+    appointment_type_id: UUID
+    wing_id: UUID | None = None
+    department_id: UUID | None = None
+    patient_id: UUID | None = None
+    appointment_date: date | None = None
 
 
 class RescheduleRequest(BaseModel):
@@ -87,15 +103,6 @@ class AppointmentListItem(BaseModel):
     doctor_name: str | None = None
 
 
-class FeePreviewRequest(BaseModel):
-    doctor_id: UUID
-    appointment_type_id: UUID
-    wing_id: UUID
-    department_id: UUID
-    patient_id: UUID | None = None
-    appointment_date: date | None = None
-
-
 class FeePreviewResponse(BaseModel):
     consultation_fee: float
     base_fee: float
@@ -107,6 +114,8 @@ class FeePreviewResponse(BaseModel):
     last_completed_visit_date: date | None = None
     appointment_type_name: str | None = None
     doctor_name: str | None = None
+    wing_id: UUID | None = None
+    department_id: UUID | None = None
 
 
 class LeaveBlock(BaseModel):

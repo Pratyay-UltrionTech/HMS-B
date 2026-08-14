@@ -246,11 +246,11 @@ def sync_appointment_after_clinical_change(
     appointment_id: UUID | None,
 ) -> Appointment | None:
     """
-    Re-evaluate appointment after prescription / lab / radiology changes.
+    Re-evaluate appointment after lab / radiology changes.
 
     Rules:
-    - Open lab/rad → stay (or become) In Progress
-    - No open lab/rad AND (has Rx OR had linked orders) → Completed
+    - Open lab/rad → stay (or become) In Progress (Checked in)
+    - Completion is manual (doctor marks Completed) — do not auto-complete from Rx/orders
     """
     if not appointment_id:
         return None
@@ -266,12 +266,4 @@ def sync_appointment_after_clinical_change(
     blockers = get_open_clinical_blockers(db, hospital_id, appt.id)
     if blockers:
         mark_in_progress(appt)
-        return appt
-
-    has_rx = has_prescription_for_appointment(db, hospital_id, appt.id)
-    linked = has_linked_orders(db, hospital_id, appt.id)
-
-    if has_rx or linked:
-        complete_appointment_record(db, hospital_id, appt)
-
     return appt

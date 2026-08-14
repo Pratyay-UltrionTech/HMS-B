@@ -156,3 +156,4 @@ class RoleDashboardResponse(BaseModel):
     patients_this_month: int | None = None
     average_revenue_per_patient: float | None = None
     recent_revenue: list[DoctorRecentRevenueItem] | None = None
+    show_financial_details: bool | None = None

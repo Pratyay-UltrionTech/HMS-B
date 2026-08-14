@@ -206,12 +206,12 @@ def create_vitals(
     created: list[VitalReading] = []
     for item in payload.items:
         name = item.name.strip()
-        suitable = item.suitable_range.strip()
         result = item.result.strip()
-        if not name or not suitable or not result:
+        suitable = (item.suitable_range or "").strip()
+        if not name or not result:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Each vital needs name, suitable range, and result",
+                detail="Each vital needs name and result",
             )
         row = VitalReading(
             hospital_id=hospital_id,

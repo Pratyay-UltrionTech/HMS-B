@@ -275,7 +275,13 @@ def _build_doctor_dashboard(db: Session, hospital_id: UUID, user: dict) -> RoleD
                 )
             )
 
-    practice = _doctor_practice_performance(db, hospital_id, doctor_id)
+    practice = None
+    show_financial = True
+    if doctor_id:
+        doctor_row = db.query(HospitalUser).filter(HospitalUser.id == doctor_id, HospitalUser.hospital_id == hospital_id).first()
+        show_financial = bool(getattr(doctor_row, "show_financial_details", True)) if doctor_row else True
+        if show_financial:
+            practice = _doctor_practice_performance(db, hospital_id, doctor_id)
 
     return RoleDashboardResponse(
         persona="doctor",
@@ -327,11 +333,12 @@ def _build_doctor_dashboard(db: Session, hospital_id: UUID, user: dict) -> RoleD
             {"id": "rx", "label": "Create Prescription", "module": "doctors", "section": "patients"},
             {"id": "calendar", "label": "Open Calendar", "module": "doctors", "section": "calendar"},
         ],
-        today_revenue=practice["today_revenue"],
-        month_revenue=practice["month_revenue"],
-        patients_this_month=practice["patients_this_month"],
-        average_revenue_per_patient=practice["average_revenue_per_patient"],
-        recent_revenue=practice["recent_revenue"],
+        today_revenue=practice["today_revenue"] if practice else None,
+        month_revenue=practice["month_revenue"] if practice else None,
+        patients_this_month=practice["patients_this_month"] if practice else None,
+        average_revenue_per_patient=practice["average_revenue_per_patient"] if practice else None,
+        recent_revenue=practice["recent_revenue"] if practice else None,
+        show_financial_details=show_financial,
     )
 
 

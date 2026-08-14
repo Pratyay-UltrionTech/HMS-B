@@ -23,6 +23,7 @@ class DoctorSummary(BaseModel):
     qualification: str | None = None
     years_of_experience: int | None = None
     consultation_room: str | None = None
+    show_financial_details: bool = True
     custom_values: dict = {}
     is_active: bool
     patient_count: int = 0
@@ -116,6 +117,17 @@ class PrescriptionCreate(BaseModel):
     scan_ids: list[UUID] = Field(default_factory=list)
 
 
+class PrescriptionUpdate(BaseModel):
+    appointment_id: UUID | None = None
+    symptoms: str | None = Field(default=None, min_length=1)
+    diagnosis: str | None = Field(default=None, min_length=1)
+    medicines: str | None = Field(default=None, min_length=1)
+    dosage: str | None = Field(default=None, min_length=1)
+    advice: str | None = None
+    follow_up_date: date | None = None
+    signature_data: str | None = None
+
+
 class PrescriptionResponse(BaseModel):
     id: UUID
     hospital_id: UUID
@@ -134,6 +146,7 @@ class PrescriptionResponse(BaseModel):
     patient_name: str | None = None
     patient_mobile: str | None = None
     doctor_name: str | None = None
+    appointment_status: AppointmentStatus | None = None
 
     model_config = {"from_attributes": True}
 

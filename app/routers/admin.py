@@ -335,6 +335,7 @@ def _user_to_response(user: HospitalUser) -> HospitalUserResponse:
         qualification=user.qualification,
         years_of_experience=user.years_of_experience,
         consultation_room=user.consultation_room,
+        show_financial_details=bool(getattr(user, "show_financial_details", True)),
         custom_values=user.custom_values or {},
         is_active=user.is_active,
         created_at=user.created_at,
@@ -419,6 +420,7 @@ def create_user(
         qualification=_clean_optional_str(payload.qualification),
         years_of_experience=payload.years_of_experience,
         consultation_room=_clean_optional_str(payload.consultation_room),
+        show_financial_details=bool(payload.show_financial_details),
         custom_values=payload.custom_values or {},
         is_active=payload.is_active,
     )

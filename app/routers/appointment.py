@@ -16,6 +16,7 @@ from app.models import (
     HospitalUser,
     Patient,
     PatientStatus,
+    ShiftType,
     Wing,
 )
 from app.routers.registration import _age_from_dob, _display_name, _next_uhid
@@ -87,6 +88,60 @@ def _find_pricing(
         )
         .first()
     )
+
+
+def resolve_wing_department_for_doctor(
+    db: Session,
+    hospital_id: UUID,
+    doctor_id: UUID,
+    appointment_type_id: UUID | None = None,
+) -> tuple[UUID | None, UUID | None]:
+    """Auto-pick wing/department from doctor's consultation pricing (or shift)."""
+    q = db.query(ConsultationPricing).filter(
+        ConsultationPricing.hospital_id == hospital_id,
+        ConsultationPricing.doctor_id == doctor_id,
+        ConsultationPricing.is_active.is_(True),
+    )
+    if appointment_type_id:
+        priced = q.filter(ConsultationPricing.appointment_type_id == appointment_type_id).first()
+        if priced:
+            return priced.wing_id, priced.department_id
+    priced = q.first()
+    if priced:
+        return priced.wing_id, priced.department_id
+
+    doctor = (
+        db.query(HospitalUser)
+        .options(joinedload(HospitalUser.shift).joinedload(ShiftType.department))
+        .filter(HospitalUser.id == doctor_id, HospitalUser.hospital_id == hospital_id)
+        .first()
+    )
+    if doctor and doctor.shift is not None:
+        dept = doctor.shift.department
+        if dept is not None:
+            return dept.wing_id, dept.id
+        if doctor.shift.department_id:
+            return None, doctor.shift.department_id
+
+    wing = (
+        db.query(Wing)
+        .filter(Wing.hospital_id == hospital_id, Wing.is_active.is_(True))
+        .order_by(Wing.name.asc())
+        .first()
+    )
+    dept_q = db.query(Department).filter(Department.hospital_id == hospital_id, Department.is_active.is_(True))
+    if wing:
+        dept = (
+            dept_q.filter(or_(Department.wing_id == wing.id, Department.wing_id.is_(None)))
+            .order_by(Department.name.asc())
+            .first()
+        )
+        if dept:
+            return wing.id, dept.id
+    dept = dept_q.order_by(Department.name.asc()).first()
+    if dept:
+        return dept.wing_id or (wing.id if wing else None), dept.id
+    return (wing.id if wing else None), None
 
 
 def _last_completed_visit(
@@ -170,6 +225,8 @@ def resolve_consultation_fee(
         "last_completed_visit_date": last_visit_date,
         "appointment_type_name": appt_type.name if appt_type else None,
         "doctor_name": doctor.name,
+        "wing_id": wing_id,
+        "department_id": department_id,
     }
 
 
@@ -364,8 +421,8 @@ def list_visit_types(
 def fee_preview(
     doctor_id: UUID = Query(...),
     appointment_type_id: UUID = Query(...),
-    wing_id: UUID = Query(...),
-    department_id: UUID = Query(...),
+    wing_id: UUID | None = Query(default=None),
+    department_id: UUID | None = Query(default=None),
     patient_id: UUID | None = Query(default=None),
     appointment_date: date | None = Query(default=None, alias="date"),
     db: Session = Depends(get_db),
@@ -393,16 +450,25 @@ def fee_preview(
     if not appt_type:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment type not found")
 
-    wing = db.query(Wing).filter(Wing.id == wing_id, Wing.hospital_id == hospital_id).first()
-    if not wing:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Wing not found")
-    dept = (
-        db.query(Department)
-        .filter(Department.id == department_id, Department.hospital_id == hospital_id)
-        .first()
-    )
-    if not dept:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+    if not wing_id or not department_id:
+        auto_wing, auto_dept = resolve_wing_department_for_doctor(
+            db, hospital_id, doctor_id, appointment_type_id
+        )
+        wing_id = wing_id or auto_wing
+        department_id = department_id or auto_dept
+
+    if wing_id:
+        wing = db.query(Wing).filter(Wing.id == wing_id, Wing.hospital_id == hospital_id).first()
+        if not wing:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Wing not found")
+    if department_id:
+        dept = (
+            db.query(Department)
+            .filter(Department.id == department_id, Department.hospital_id == hospital_id)
+            .first()
+        )
+        if not dept:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
 
     if patient_id:
         patient = (
@@ -491,6 +557,30 @@ def check_doctor_availability(
     )
 
 
+def _patient_mobile_digits(mobile: str | None) -> str:
+    digits = "".join(ch for ch in (mobile or "") if ch.isdigit())
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def _find_patient_by_mobile(db: Session, hospital_id: UUID, mobile: str) -> Patient | None:
+    """Match patient by last 10 digits so +91 / formatting differences still resolve."""
+    want = _patient_mobile_digits(mobile)
+    if not want:
+        return None
+    exact = (
+        db.query(Patient)
+        .filter(Patient.hospital_id == hospital_id, Patient.mobile == mobile)
+        .first()
+    )
+    if exact:
+        return exact
+    # Fallback scan within hospital (patient lists are typically modest)
+    for row in db.query(Patient).filter(Patient.hospital_id == hospital_id).all():
+        if _patient_mobile_digits(row.mobile) == want:
+            return row
+    return None
+
+
 def _resolve_or_register_patient(
     db: Session,
     hospital_id: UUID,
@@ -509,17 +599,43 @@ def _resolve_or_register_patient(
         return patient
 
     mobile = (payload.mobile or "").strip()
-    existing = (
-        db.query(Patient)
-        .filter(Patient.hospital_id == hospital_id, Patient.mobile == mobile)
-        .first()
-    )
-    if existing:
-        return existing
-
     first = (payload.first_name or "").strip()
     last = (payload.last_name or "").strip()
+    requested_name = _display_name(first, last).strip()
+    existing = _find_patient_by_mobile(db, hospital_id, mobile)
+    if existing:
+        existing_name = (existing.name or "").strip()
+        if (
+            requested_name
+            and existing_name
+            and requested_name.casefold() != existing_name.casefold()
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Mobile {mobile} already belongs to {existing_name}"
+                    f"{f' ({existing.uhid})' if existing.uhid else ''}. "
+                    "Select that patient under Existing patient, or use a different mobile number."
+                ),
+            )
+        return existing
+
     age = payload.age if payload.age is not None else _age_from_dob(payload.date_of_birth)
+    if age is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Age is required for new patients")
+    if not payload.date_of_birth:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Date of birth is required for new patients")
+    emergency = payload.emergency_contact.strip() if payload.emergency_contact else None
+    if not emergency:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Emergency contact number is required for new patients",
+        )
+    if emergency == mobile:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Emergency contact number must be different from patient mobile number",
+        )
     uhid = _next_uhid(db, hospital_id)
     patient = Patient(
         hospital_id=hospital_id,
@@ -533,7 +649,7 @@ def _resolve_or_register_patient(
         date_of_birth=payload.date_of_birth,
         gender=(payload.gender or "").strip(),
         address=payload.address.strip() if payload.address else None,
-        emergency_contact=payload.emergency_contact.strip() if payload.emergency_contact else None,
+        emergency_contact=emergency,
         blood_group=payload.blood_group,
         status=PatientStatus.active,
     )
@@ -635,6 +751,15 @@ def book_appointment(
 
     wing_id = payload.wing_id
     department_id = payload.department_id
+    if not wing_id or not department_id:
+        auto_wing, auto_dept = resolve_wing_department_for_doctor(
+            db,
+            hospital_id,
+            payload.doctor_id,
+            appt_type.id if appt_type else None,
+        )
+        wing_id = wing_id or auto_wing
+        department_id = department_id or auto_dept
     if wing_id:
         wing = db.query(Wing).filter(Wing.id == wing_id, Wing.hospital_id == hospital_id).first()
         if not wing:

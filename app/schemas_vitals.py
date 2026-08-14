@@ -6,8 +6,9 @@ from pydantic import BaseModel, Field
 
 class VitalItemCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    suitable_range: str = Field(min_length=1, max_length=128)
     result: str = Field(min_length=1, max_length=128)
+    # Optional for backward compatibility with older clients; no longer collected in UI
+    suitable_range: str = Field(default="", max_length=128)
 
 
 class VitalBatchCreate(BaseModel):
