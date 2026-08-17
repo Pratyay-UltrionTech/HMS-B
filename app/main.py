@@ -442,6 +442,324 @@ def _migrate_consultation_pricing() -> None:
         logger.warning("consultation pricing migration skipped: %s", exc)
 
 
+def _migrate_nurse_ipd() -> None:
+    """Nurse assignment on appointments and IPD-request status."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        if "appointments" not in insp.get_table_names():
+            return
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS nurse_id UUID"))
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_appointments_nurse_id ON appointments (nurse_id)")
+            )
+            try:
+                conn.execute(
+                    text(
+                        """
+                        DO $$ BEGIN
+                          ALTER TABLE appointments
+                            ADD CONSTRAINT fk_appointments_nurse
+                            FOREIGN KEY (nurse_id) REFERENCES hospital_users(id) ON DELETE SET NULL;
+                        EXCEPTION WHEN duplicate_object THEN NULL;
+                        END $$;
+                        """
+                    )
+                )
+            except Exception:
+                pass
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TYPE appointment_status ADD VALUE IF NOT EXISTS 'ipd_transfer_requested';
+                    EXCEPTION WHEN others THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+    except Exception as exc:
+        logger.warning("nurse IPD migration skipped: %s", exc)
+
+
+def _migrate_encounter_ids() -> None:
+    """OP/IP encounter numbers and appointment→admission link. Cheap no-op after first run."""
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        tables = set(insp.get_table_names())
+        if "appointments" not in tables:
+            return
+        appt_cols = {c["name"] for c in insp.get_columns("appointments")}
+        adm_cols = (
+            {c["name"] for c in insp.get_columns("admissions")} if "admissions" in tables else set()
+        )
+        schema_ready = "op_id" in appt_cols and "admission_id" in appt_cols and "ip_id" in adm_cols
+
+        with engine.begin() as conn:
+            has_status = conn.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                      SELECT 1
+                      FROM pg_enum e
+                      JOIN pg_type t ON t.oid = e.enumtypid
+                      WHERE t.typname = 'appointment_status'
+                        AND e.enumlabel = 'transferred_to_inpatient'
+                    )
+                    """
+                )
+            ).scalar()
+            if not has_status:
+                conn.execute(
+                    text(
+                        """
+                        DO $$ BEGIN
+                          ALTER TYPE appointment_status ADD VALUE IF NOT EXISTS 'transferred_to_inpatient';
+                        EXCEPTION WHEN others THEN NULL;
+                        END $$;
+                        """
+                    )
+                )
+            if schema_ready:
+                missing_op = conn.execute(
+                    text("SELECT EXISTS (SELECT 1 FROM appointments WHERE op_id IS NULL)")
+                ).scalar()
+                missing_ip = conn.execute(
+                    text("SELECT EXISTS (SELECT 1 FROM admissions WHERE ip_id IS NULL)")
+                ).scalar()
+                if not missing_op and not missing_ip:
+                    return
+                if missing_op:
+                    conn.execute(
+                        text(
+                            """
+                            WITH seq AS (
+                              SELECT hospital_id,
+                                     EXTRACT(YEAR FROM COALESCE(created_at, CURRENT_TIMESTAMP))::int AS yr,
+                                     COALESCE(MAX(NULLIF(split_part(op_id, '-', 3), '')::int), 0) AS max_seq
+                              FROM appointments
+                              WHERE op_id LIKE 'OP-%'
+                              GROUP BY 1, 2
+                            ),
+                            numbered AS (
+                              SELECT a.id,
+                                     'OP-' || EXTRACT(YEAR FROM COALESCE(a.created_at, CURRENT_TIMESTAMP))::int
+                                     || '-' || lpad((
+                                       COALESCE(s.max_seq, 0) + ROW_NUMBER() OVER (
+                                         PARTITION BY a.hospital_id,
+                                           EXTRACT(YEAR FROM COALESCE(a.created_at, CURRENT_TIMESTAMP))
+                                         ORDER BY a.created_at, a.id
+                                       )
+                                     )::text, 5, '0') AS new_id
+                              FROM appointments a
+                              LEFT JOIN seq s
+                                ON s.hospital_id = a.hospital_id
+                               AND s.yr = EXTRACT(YEAR FROM COALESCE(a.created_at, CURRENT_TIMESTAMP))::int
+                              WHERE a.op_id IS NULL
+                            )
+                            UPDATE appointments a SET op_id = n.new_id
+                            FROM numbered n WHERE a.id = n.id
+                            """
+                        )
+                    )
+                if missing_ip:
+                    conn.execute(
+                        text(
+                            """
+                            WITH seq AS (
+                              SELECT hospital_id,
+                                     EXTRACT(YEAR FROM COALESCE(admitted_at, CURRENT_TIMESTAMP))::int AS yr,
+                                     COALESCE(MAX(NULLIF(split_part(ip_id, '-', 3), '')::int), 0) AS max_seq
+                              FROM admissions
+                              WHERE ip_id LIKE 'IP-%'
+                              GROUP BY 1, 2
+                            ),
+                            numbered AS (
+                              SELECT a.id,
+                                     'IP-' || EXTRACT(YEAR FROM COALESCE(a.admitted_at, CURRENT_TIMESTAMP))::int
+                                     || '-' || lpad((
+                                       COALESCE(s.max_seq, 0) + ROW_NUMBER() OVER (
+                                         PARTITION BY a.hospital_id,
+                                           EXTRACT(YEAR FROM COALESCE(a.admitted_at, CURRENT_TIMESTAMP))
+                                         ORDER BY a.admitted_at, a.id
+                                       )
+                                     )::text, 5, '0') AS new_id
+                              FROM admissions a
+                              LEFT JOIN seq s
+                                ON s.hospital_id = a.hospital_id
+                               AND s.yr = EXTRACT(YEAR FROM COALESCE(a.admitted_at, CURRENT_TIMESTAMP))::int
+                              WHERE a.ip_id IS NULL
+                            )
+                            UPDATE admissions a SET ip_id = n.new_id
+                            FROM numbered n WHERE a.id = n.id
+                            """
+                        )
+                    )
+                return
+
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TYPE appointment_status ADD VALUE IF NOT EXISTS 'transferred_to_inpatient';
+                    EXCEPTION WHEN others THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+            if "op_id" not in appt_cols:
+                conn.execute(text("ALTER TABLE appointments ADD COLUMN op_id VARCHAR(32)"))
+            if "admission_id" not in appt_cols:
+                conn.execute(text("ALTER TABLE appointments ADD COLUMN admission_id UUID"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_appointments_op_id ON appointments (op_id)"))
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_appointments_admission_id ON appointments (admission_id)")
+            )
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TABLE appointments
+                        ADD CONSTRAINT uq_appointment_hospital_op_id UNIQUE (hospital_id, op_id);
+                    EXCEPTION WHEN duplicate_table OR duplicate_object THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+            if "admissions" in tables:
+                conn.execute(
+                    text(
+                        """
+                        DO $$ BEGIN
+                          ALTER TABLE appointments
+                            ADD CONSTRAINT fk_appointments_admission_id
+                            FOREIGN KEY (admission_id) REFERENCES admissions(id) ON DELETE SET NULL;
+                        EXCEPTION WHEN duplicate_object THEN NULL;
+                        END $$;
+                        """
+                    )
+                )
+                if "ip_id" not in adm_cols:
+                    conn.execute(text("ALTER TABLE admissions ADD COLUMN ip_id VARCHAR(32)"))
+                if "er_id" not in adm_cols:
+                    conn.execute(text("ALTER TABLE admissions ADD COLUMN er_id VARCHAR(32)"))
+                if "source_appointment_id" not in adm_cols:
+                    conn.execute(text("ALTER TABLE admissions ADD COLUMN source_appointment_id UUID"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_admissions_ip_id ON admissions (ip_id)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_admissions_er_id ON admissions (er_id)"))
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_admissions_source_appointment_id "
+                        "ON admissions (source_appointment_id)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        """
+                        DO $$ BEGIN
+                          ALTER TABLE admissions
+                            ADD CONSTRAINT uq_admission_hospital_ip_id UNIQUE (hospital_id, ip_id);
+                        EXCEPTION WHEN duplicate_table OR duplicate_object THEN NULL;
+                        END $$;
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        """
+                        DO $$ BEGIN
+                          ALTER TABLE admissions
+                            ADD CONSTRAINT uq_admission_hospital_er_id UNIQUE (hospital_id, er_id);
+                        EXCEPTION WHEN duplicate_table OR duplicate_object THEN NULL;
+                        END $$;
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        """
+                        DO $$ BEGIN
+                          ALTER TABLE admissions
+                            ADD CONSTRAINT fk_admissions_source_appointment_id
+                            FOREIGN KEY (source_appointment_id) REFERENCES appointments(id) ON DELETE SET NULL;
+                        EXCEPTION WHEN duplicate_object THEN NULL;
+                        END $$;
+                        """
+                    )
+                )
+            conn.execute(
+                text(
+                    """
+                    WITH seq AS (
+                      SELECT hospital_id,
+                             EXTRACT(YEAR FROM COALESCE(created_at, CURRENT_TIMESTAMP))::int AS yr,
+                             COALESCE(MAX(NULLIF(split_part(op_id, '-', 3), '')::int), 0) AS max_seq
+                      FROM appointments
+                      WHERE op_id LIKE 'OP-%'
+                      GROUP BY 1, 2
+                    ),
+                    numbered AS (
+                      SELECT a.id,
+                             'OP-' || EXTRACT(YEAR FROM COALESCE(a.created_at, CURRENT_TIMESTAMP))::int
+                             || '-' || lpad((
+                               COALESCE(s.max_seq, 0) + ROW_NUMBER() OVER (
+                                 PARTITION BY a.hospital_id,
+                                   EXTRACT(YEAR FROM COALESCE(a.created_at, CURRENT_TIMESTAMP))
+                                 ORDER BY a.created_at, a.id
+                               )
+                             )::text, 5, '0') AS new_id
+                      FROM appointments a
+                      LEFT JOIN seq s
+                        ON s.hospital_id = a.hospital_id
+                       AND s.yr = EXTRACT(YEAR FROM COALESCE(a.created_at, CURRENT_TIMESTAMP))::int
+                      WHERE a.op_id IS NULL
+                    )
+                    UPDATE appointments a SET op_id = n.new_id
+                    FROM numbered n WHERE a.id = n.id
+                    """
+                )
+            )
+            if "admissions" in tables:
+                conn.execute(
+                    text(
+                        """
+                        WITH seq AS (
+                          SELECT hospital_id,
+                                 EXTRACT(YEAR FROM COALESCE(admitted_at, CURRENT_TIMESTAMP))::int AS yr,
+                                 COALESCE(MAX(NULLIF(split_part(ip_id, '-', 3), '')::int), 0) AS max_seq
+                          FROM admissions
+                          WHERE ip_id LIKE 'IP-%'
+                          GROUP BY 1, 2
+                        ),
+                        numbered AS (
+                          SELECT a.id,
+                                 'IP-' || EXTRACT(YEAR FROM COALESCE(a.admitted_at, CURRENT_TIMESTAMP))::int
+                                 || '-' || lpad((
+                                   COALESCE(s.max_seq, 0) + ROW_NUMBER() OVER (
+                                     PARTITION BY a.hospital_id,
+                                       EXTRACT(YEAR FROM COALESCE(a.admitted_at, CURRENT_TIMESTAMP))
+                                     ORDER BY a.admitted_at, a.id
+                                   )
+                                 )::text, 5, '0') AS new_id
+                          FROM admissions a
+                          LEFT JOIN seq s
+                            ON s.hospital_id = a.hospital_id
+                           AND s.yr = EXTRACT(YEAR FROM COALESCE(a.admitted_at, CURRENT_TIMESTAMP))::int
+                          WHERE a.ip_id IS NULL
+                        )
+                        UPDATE admissions a SET ip_id = n.new_id
+                        FROM numbered n WHERE a.id = n.id
+                        """
+                    )
+                )
+    except Exception as exc:
+        logger.warning("encounter id migration skipped: %s", exc)
+
+
 def _migrate_admissions_discharge_notes() -> None:
     """Add discharge_notes to admissions if missing."""
     from sqlalchemy import inspect, text
@@ -458,6 +776,26 @@ def _migrate_admissions_discharge_notes() -> None:
             conn.execute(text("ALTER TABLE admissions ADD COLUMN discharge_notes TEXT"))
     except Exception as exc:
         logger.warning("admissions discharge_notes migration skipped: %s", exc)
+
+
+def _migrate_admission_discharge_requested() -> None:
+    """Allow discharge_requested on admission_status enum."""
+    from sqlalchemy import text
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    DO $$ BEGIN
+                      ALTER TYPE admission_status ADD VALUE IF NOT EXISTS 'discharge_requested';
+                    EXCEPTION WHEN others THEN NULL;
+                    END $$;
+                    """
+                )
+            )
+    except Exception as exc:
+        logger.warning("admission discharge_requested migration skipped: %s", exc)
 
 
 def _migrate_hospital_users_shift_id() -> None:
@@ -895,6 +1233,7 @@ async def lifespan(_: FastAPI):
     _migrate_patients_registration_fields()
     _migrate_appointments_extra_fields()
     _migrate_admissions_discharge_notes()
+    _migrate_admission_discharge_requested()
     _migrate_hospital_users_shift_id()
     _migrate_hospital_users_doctor_profile()
     _migrate_departments_optional_wing()
@@ -910,6 +1249,8 @@ async def lifespan(_: FastAPI):
     _migrate_billing_source_type_pharmacy()
     _migrate_org_contact_fields()
     _migrate_prescription_signature()
+    _migrate_encounter_ids()
+    _migrate_nurse_ipd()
     _migrate_performance_indexes()
 
     async def _missed_appointment_loop() -> None:

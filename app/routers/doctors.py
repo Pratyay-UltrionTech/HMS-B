@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from html import escape as html_escape
 from io import BytesIO
 from uuid import UUID
 
@@ -18,6 +19,7 @@ from app.schemas_doctors import (
     DoctorScheduleContext,
     DoctorSummary,
     HospitalClinicProfile,
+    IpdFormHistoryItem,
     LEAVE_TYPES,
     LeaveConflictDay,
     LeaveConflictDetail,
@@ -30,13 +32,17 @@ from app.schemas_doctors import (
     PrescriptionCreate,
     PrescriptionResponse,
     PrescriptionUpdate,
+    TransferToInpatientRequest,
 )
 from app.models import (
+    Admission,
+    AdmissionStatus,
     Appointment,
     AppointmentStatus,
     DoctorLeave,
     Hospital,
     HospitalUser,
+    IpdFormSubmission,
     LabItemStatus,
     LabOrder,
     LabOrderItem,
@@ -56,9 +62,12 @@ from app.models import (
     RadiologyOrder,
     RadiologyOrderStatus,
     RadiologyScanCatalog,
+    ShiftType,
     VitalReading,
 )
+from app.schemas_beds import AdmissionDetail
 from app.utils.audit import write_audit
+from app.utils.encounter_ids import next_encounter_id
 from app.utils.auth import get_hospital_context, require_hospital_user
 from app.utils.lab_panels import resolve_lab_selection
 from app.routers.laboratory import _next_order_no, _order_to_response as _lab_order_to_response
@@ -155,7 +164,27 @@ def _split_name(full: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def _appt_load_options():
+    return (
+        joinedload(Appointment.patient),
+        joinedload(Appointment.doctor),
+        joinedload(Appointment.nurse),
+        joinedload(Appointment.admission).joinedload(Admission.ward),
+        joinedload(Appointment.admission).joinedload(Admission.bed),
+    )
+
+
 def _appointment_response(a: Appointment) -> AppointmentResponse:
+    adm = getattr(a, "admission", None)
+    ward_name = None
+    bed_code = None
+    adm_status = None
+    ip_id = None
+    if adm is not None:
+        ward_name = adm.ward.name if getattr(adm, "ward", None) else None
+        bed_code = adm.bed.bed_code if getattr(adm, "bed", None) else None
+        adm_status = adm.status.value if getattr(adm.status, "value", None) else str(adm.status) if adm.status else None
+        ip_id = getattr(adm, "ip_id", None)
     return AppointmentResponse(
         id=a.id,
         hospital_id=a.hospital_id,
@@ -170,6 +199,15 @@ def _appointment_response(a: Appointment) -> AppointmentResponse:
         patient_name=a.patient.name if a.patient else None,
         patient_mobile=a.patient.mobile if a.patient else None,
         doctor_name=a.doctor.name if a.doctor else None,
+        patient_uhid=getattr(a.patient, "uhid", None) if a.patient else None,
+        op_id=getattr(a, "op_id", None),
+        admission_id=getattr(a, "admission_id", None),
+        ip_id=ip_id,
+        admission_ward=ward_name,
+        admission_bed=bed_code,
+        admission_status=adm_status,
+        nurse_id=getattr(a, "nurse_id", None),
+        nurse_name=a.nurse.name if getattr(a, "nurse", None) else None,
     )
 
 
@@ -212,10 +250,13 @@ def _appointment_status_map(
 
 
 def _assert_prescription_editable(appt: Appointment | None) -> None:
-    if appt is not None and appt.status == AppointmentStatus.completed:
+    if appt is not None and appt.status in {
+        AppointmentStatus.completed,
+        AppointmentStatus.transferred_to_inpatient,
+    }:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot edit a prescription after the visit is marked completed",
+            detail="Cannot edit a prescription after the visit is marked completed or transferred to inpatient",
         )
 
 
@@ -250,7 +291,10 @@ def list_doctors(
     today = date.today()
     q = (
         db.query(HospitalUser)
-        .options(joinedload(HospitalUser.role))
+        .options(
+            joinedload(HospitalUser.role),
+            joinedload(HospitalUser.shift).joinedload(ShiftType.department),
+        )
         .filter(HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
     )
 
@@ -332,6 +376,12 @@ def _doctor_summaries_bulk(
             years_of_experience=doctor.years_of_experience,
             consultation_room=doctor.consultation_room,
             show_financial_details=bool(getattr(doctor, "show_financial_details", True)),
+            department_id=doctor.shift.department_id if doctor.shift else None,
+            department_name=(
+                doctor.shift.department.name
+                if doctor.shift and getattr(doctor.shift, "department", None)
+                else None
+            ),
             custom_values=doctor.custom_values or {},
             is_active=doctor.is_active,
             patient_count=patient_counts.get(doctor.id, 0),
@@ -576,7 +626,7 @@ def get_patient_history(
 
     appointments = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(*_appt_load_options())
         .filter(Appointment.doctor_id == resolved, Appointment.patient_id == patient_id)
         .order_by(Appointment.appointment_date.desc(), Appointment.appointment_time.desc())
         .all()
@@ -636,6 +686,12 @@ def get_patient_history(
         .order_by(VitalReading.recorded_at.desc())
         .all()
     )
+    ipd_forms = (
+        db.query(IpdFormSubmission)
+        .filter(IpdFormSubmission.hospital_id == hospital_id, IpdFormSubmission.patient_id == patient_id)
+        .order_by(IpdFormSubmission.updated_at.desc())
+        .all()
+    )
 
     # Align visit status: no vitals → Scheduled; vitals without Rx stay Checked in
     from app.routers.vitals import _revert_checked_in_without_vitals
@@ -669,6 +725,19 @@ def get_patient_history(
         radiology_orders=[_rad_order_to_response(o) for o in radiology_orders],
         ot_surgeries=[_ot_surgery_to_response(o) for o in ot_surgeries],
         vitals=[_vital_reading_response(v) for v in vitals],
+        ipd_forms=[
+            IpdFormHistoryItem(
+                id=f.id,
+                admission_id=f.admission_id,
+                form_id=f.form_id,
+                form_title=f.form_title,
+                status=f.status,
+                has_html_snapshot=bool(f.html_snapshot),
+                filled_by_name=f.filled_by_name or "",
+                updated_at=f.updated_at,
+            )
+            for f in ipd_forms
+        ],
         financial_summary=financial_summary,
     )
 
@@ -707,6 +776,8 @@ def create_appointment(
         visit_type="OPD",
         status=payload.status,
         notes=payload.notes.strip() if payload.notes else None,
+        op_id=next_encounter_id(db, hospital_id, "OP"),
+        nurse_id=payload.nurse_id,
     )
     db.add(appt)
     db.flush()
@@ -722,7 +793,7 @@ def create_appointment(
     db.commit()
     appt = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(*_appt_load_options())
         .filter(Appointment.id == appt.id)
         .first()
     )
@@ -743,7 +814,7 @@ def list_appointments(
     resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
     q = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(*_appt_load_options())
         .filter(Appointment.doctor_id == resolved, Appointment.hospital_id == hospital_id)
     )
     if on_date:
@@ -771,7 +842,7 @@ def get_calendar(
     end = start + timedelta(days=6)
     rows = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(*_appt_load_options())
         .filter(
             Appointment.doctor_id == resolved,
             Appointment.hospital_id == hospital_id,
@@ -782,6 +853,36 @@ def get_calendar(
         .all()
     )
     return [_appointment_response(a) for a in rows]
+
+
+@router.get("/{doctor_id}/admissions/active", response_model=list[AdmissionDetail])
+def list_active_admissions_for_doctor(
+    doctor_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
+    from app.routers.beds import _admission_detail
+
+    rows = (
+        db.query(Admission)
+        .options(
+            joinedload(Admission.patient),
+            joinedload(Admission.ward),
+            joinedload(Admission.room),
+            joinedload(Admission.bed),
+            joinedload(Admission.doctor),
+        )
+        .filter(
+            Admission.hospital_id == hospital_id,
+            Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+            Admission.doctor_id == resolved,
+        )
+        .order_by(Admission.admitted_at.desc())
+        .all()
+    )
+    return [_admission_detail(a) for a in rows]
 
 
 # ── Schedule / Leave ─────────────────────────────────────────────────────────────
@@ -1096,7 +1197,7 @@ def update_appointment(
     resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
     appt = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(*_appt_load_options())
         .filter(
             Appointment.id == appointment_id,
             Appointment.doctor_id == resolved,
@@ -1107,6 +1208,11 @@ def update_appointment(
     if not appt:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
     data = payload.model_dump(exclude_unset=True)
+    if "status" in data and data["status"] == AppointmentStatus.transferred_to_inpatient:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use Transfer to Inpatient to admit the patient from this visit",
+        )
     if "status" in data and data["status"] == AppointmentStatus.completed:
         from app.utils.appointment_lifecycle import TERMINAL, mark_in_progress
 
@@ -1137,7 +1243,78 @@ def update_appointment(
         summary=f"Updated appointment {appointment_id}",
     )
     db.commit()
-    db.refresh(appt)
+    appt = (
+        db.query(Appointment)
+        .options(*_appt_load_options())
+        .filter(Appointment.id == appt.id)
+        .first()
+    )
+    return _appointment_response(appt)
+
+
+@router.post(
+    "/{doctor_id}/appointments/{appointment_id}/transfer-to-inpatient",
+    response_model=AppointmentResponse,
+)
+def transfer_appointment_to_inpatient(
+    doctor_id: UUID,
+    appointment_id: UUID,
+    payload: TransferToInpatientRequest,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    from app.utils.appointment_lifecycle import TERMINAL
+    from app.utils.audit import write_audit
+
+    resolved = _resolve_doctor_id(user, doctor_id, hospital_id, db)
+    appt = (
+        db.query(Appointment)
+        .options(*_appt_load_options())
+        .filter(
+            Appointment.id == appointment_id,
+            Appointment.doctor_id == resolved,
+            Appointment.hospital_id == hospital_id,
+        )
+        .first()
+    )
+    if not appt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
+    if appt.status == AppointmentStatus.transferred_to_inpatient and appt.admission_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This visit is already transferred to inpatient",
+        )
+    if appt.status == AppointmentStatus.ipd_transfer_requested:
+        return _appointment_response(appt)
+    if appt.status in TERMINAL:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot transfer a {appt.status.value} visit to inpatient",
+        )
+
+    appt.status = AppointmentStatus.ipd_transfer_requested
+    if payload.notes:
+        appt.notes = payload.notes.strip()
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="appointment",
+        entity_id=appt.id,
+        summary=(
+            f"Requested IPD transfer for {appt.patient.name if appt.patient else 'patient'} "
+            f"({appt.op_id or 'OP'}) — waiting for nurse to book a bed"
+        ),
+    )
+    db.commit()
+    appt = (
+        db.query(Appointment)
+        .options(*_appt_load_options())
+        .filter(Appointment.id == appt.id)
+        .first()
+    )
     return _appointment_response(appt)
 
 
@@ -1532,7 +1709,26 @@ def prescription_pdf(
 
     hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
     lab_names, rad_names = _prescription_investigation_names(db, rx)
-    html = _prescription_html(rx, hospital, lab_names=lab_names, rad_names=rad_names)
+    vitals_q = (
+        db.query(VitalReading)
+        .filter(VitalReading.hospital_id == hospital_id, VitalReading.patient_id == rx.patient_id)
+        .order_by(VitalReading.created_at.asc())
+    )
+    if rx.appointment_id:
+        vitals_q = vitals_q.filter(VitalReading.appointment_id == rx.appointment_id)
+    elif rx.created_at:
+        day = rx.created_at.date()
+        vitals_q = vitals_q.filter(func.date(VitalReading.recorded_at) == day)
+    else:
+        vitals_q = vitals_q.filter(False)
+    vital_rows = vitals_q.all()
+    html = _prescription_html(
+        rx,
+        hospital,
+        lab_names=lab_names,
+        rad_names=rad_names,
+        vitals=[(v.name, v.result) for v in vital_rows],
+    )
     # Return printable HTML; browser "Save as PDF" / print works without extra deps
     return StreamingResponse(
         BytesIO(html.encode("utf-8")),
@@ -1635,6 +1831,7 @@ def _prescription_html(
     hospital: Hospital | None = None,
     lab_names: list[str] | None = None,
     rad_names: list[str] | None = None,
+    vitals: list[tuple[str, str]] | None = None,
 ) -> str:
     follow = rx.follow_up_date.strftime("%d %b %Y") if rx.follow_up_date else "—"
     created = rx.created_at.strftime("%d %b %Y") if rx.created_at else ""
@@ -1684,6 +1881,23 @@ def _prescription_html(
         if not body.strip():
             body = "—"
 
+    vitals_block = ""
+    if vitals:
+        rows = "".join(
+            f"<tr><td>{html_escape(name)}</td><td><strong>{html_escape(result)}</strong></td></tr>"
+            for name, result in vitals
+            if name and result
+        )
+        if rows:
+            vitals_block = f"""
+      <div class="vitals">
+        <p class="vitals-title">Vitals</p>
+        <table>
+          <thead><tr><th>Name</th><th>Result</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>"""
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"/><title>Prescription</title>
 <style>
@@ -1701,6 +1915,11 @@ def _prescription_html(
   .line .fill {{ flex: 1; border-bottom: 1px solid #94a3b8; min-height: 22px; padding: 2px 4px; }}
   .row {{ display: flex; gap: 24px; }}
   .row .line {{ flex: 1; }}
+  .vitals {{ margin: 14px 0 8px; padding: 12px 14px; border: 1px solid #fecdd3; border-radius: 12px; background: #fff1f2; }}
+  .vitals-title {{ margin: 0 0 8px; font-size: 12px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: #be123c; }}
+  .vitals table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  .vitals th {{ text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #94a3b8; padding: 0 8px 6px 0; }}
+  .vitals td {{ padding: 6px 8px 6px 0; border-top: 1px solid #fecdd3; color: #0f172a; }}
   .rx {{ margin-top: 18px; position: relative; min-height: 320px; padding: 8px 8px 8px 56px; }}
   .rx-mark {{ position: absolute; left: 0; top: 0; font-size: 42px; font-weight: 800; color: #2563eb; font-family: Georgia, serif; }}
   .rx-content {{ white-space: pre-wrap; font-size: 15px; line-height: 1.7; min-height: 280px; }}
@@ -1719,23 +1938,24 @@ def _prescription_html(
   <div class="pad">
     <div class="header">
       <div>
-        <p class="hosp-name">{hosp_name}</p>
-        <p class="hosp-meta">📍 {hosp_address}<br/>☎ {hosp_phone} &nbsp; ✉ {hosp_email}</p>
+        <p class="hosp-name">{html_escape(hosp_name)}</p>
+        <p class="hosp-meta">📍 {html_escape(hosp_address)}<br/>☎ {html_escape(hosp_phone)} &nbsp; ✉ {html_escape(hosp_email)}</p>
       </div>
       <div class="caduceus">⚕</div>
     </div>
     <div class="body">
-      <div class="line"><label>Patient Name:</label><div class="fill">{patient.name if patient else "—"}</div></div>
+      <div class="line"><label>Patient Name:</label><div class="fill">{html_escape(patient.name if patient else "—")}</div></div>
       <div class="row">
         <div class="line"><label>Age:</label><div class="fill">{patient.age if patient and patient.age is not None else "—"}</div></div>
-        <div class="line"><label>Date:</label><div class="fill">{created}</div></div>
+        <div class="line"><label>Date:</label><div class="fill">{html_escape(created)}</div></div>
       </div>
-      <div class="line"><label>Diagnosis:</label><div class="fill">{rx.diagnosis}</div></div>
+      <div class="line"><label>Diagnosis:</label><div class="fill">{html_escape(rx.diagnosis)}</div></div>
+      {vitals_block}
       <div class="rx">
         <div class="rx-mark">℞</div>
-        <div class="rx-content">{body}</div>
+        <div class="rx-content">{html_escape(body)}</div>
       </div>
-      <div class="line"><label>Follow-up:</label><div class="fill">{follow}</div></div>
+      <div class="line"><label>Follow-up:</label><div class="fill">{html_escape(follow)}</div></div>
       <div class="sign">
         {f'<img src="{rx.signature_data}" alt="Signature" style="max-height:64px;max-width:200px;display:block;margin-left:auto;margin-bottom:4px"/>' if getattr(rx, "signature_data", None) else ""}
         <div class="sign-line">SIGNATURE</div>
@@ -1744,18 +1964,18 @@ def _prescription_html(
     <div class="footer">
       <div>
         <p class="label">Phone</p>
-        <p>☎ {hosp_phone}</p>
+        <p>☎ {html_escape(hosp_phone)}</p>
       </div>
       <div>
         <p class="label">Doctor</p>
-        <p class="strong">{doctor_name}</p>
-        <p>{qualification}</p>
-        {f"<p>Reg. No: {registration_no}</p>" if registration_no else ""}
+        <p class="strong">{html_escape(doctor_name)}</p>
+        <p>{html_escape(qualification)}</p>
+        {f"<p>Reg. No: {html_escape(registration_no)}</p>" if registration_no else ""}
       </div>
       <div>
         <p class="label">Hospital</p>
-        <p class="strong">{hosp_name}</p>
-        <p>{hosp_address}</p>
+        <p class="strong">{html_escape(hosp_name)}</p>
+        <p>{html_escape(hosp_address)}</p>
       </div>
     </div>
   </div>

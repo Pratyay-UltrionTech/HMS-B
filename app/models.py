@@ -432,6 +432,8 @@ class AppointmentStatus(str, enum.Enum):
     scheduled = "scheduled"
     waiting = "waiting"  # checked in / in queue
     completed = "completed"
+    transferred_to_inpatient = "transferred_to_inpatient"
+    ipd_transfer_requested = "ipd_transfer_requested"
     cancelled = "cancelled"
     no_show = "no_show"
 
@@ -444,6 +446,7 @@ class PatientStatus(str, enum.Enum):
 
 class AdmissionStatus(str, enum.Enum):
     admitted = "admitted"
+    discharge_requested = "discharge_requested"
     discharged = "discharged"
 
 
@@ -505,6 +508,7 @@ class Patient(Base):
 
 class Appointment(Base):
     __tablename__ = "appointments"
+    __table_args__ = (UniqueConstraint("hospital_id", "op_id", name="uq_appointment_hospital_op_id"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     hospital_id: Mapped[uuid.UUID] = mapped_column(
@@ -541,11 +545,25 @@ class Appointment(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     queue_token: Mapped[int | None] = mapped_column(Integer, nullable=True)
     checked_in_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    op_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    nurse_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     patient: Mapped["Patient"] = relationship(back_populates="appointments")
-    doctor: Mapped["HospitalUser"] = relationship()
+    doctor: Mapped["HospitalUser"] = relationship(foreign_keys=[doctor_id])
+    nurse: Mapped["HospitalUser | None"] = relationship(foreign_keys=[nurse_id])
     appointment_type: Mapped["AppointmentType | None"] = relationship()
+    admission: Mapped["Admission | None"] = relationship(
+        "Admission",
+        foreign_keys="Appointment.admission_id",
+        primaryjoin="Appointment.admission_id==Admission.id",
+        viewonly=True,
+    )
 
 
 class DoctorLeave(Base):
@@ -593,6 +611,10 @@ class Bed(Base):
 
 class Admission(Base):
     __tablename__ = "admissions"
+    __table_args__ = (
+        UniqueConstraint("hospital_id", "ip_id", name="uq_admission_hospital_ip_id"),
+        UniqueConstraint("hospital_id", "er_id", name="uq_admission_hospital_er_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     hospital_id: Mapped[uuid.UUID] = mapped_column(
@@ -622,6 +644,11 @@ class Admission(Base):
     discharge_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     admitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     discharged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ip_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    er_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    source_appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     patient: Mapped["Patient"] = relationship(back_populates="admissions")
     ward: Mapped["Ward"] = relationship()

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -9,6 +9,7 @@ from app.database import get_db
 from app.models import Appointment, AppointmentStatus, Patient, VitalReading
 from app.schemas_vitals import (
     VitalBatchCreate,
+    VitalItemUpdate,
     VitalReadingResponse,
     VitalsTodayItem,
 )
@@ -182,6 +183,18 @@ def list_vitals(
     return [_reading_response(r) for r in rows]
 
 
+def _assert_can_mutate_vitals(appt: Appointment) -> None:
+    if appt.status in {AppointmentStatus.cancelled, AppointmentStatus.no_show}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot change vitals on this visit")
+    if appt.status == AppointmentStatus.completed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Visit is already completed")
+    if appt.status == AppointmentStatus.transferred_to_inpatient:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Visit was transferred to inpatient",
+        )
+
+
 @router.post("", response_model=list[VitalReadingResponse], status_code=status.HTTP_201_CREATED)
 def create_vitals(
     payload: VitalBatchCreate,
@@ -197,10 +210,7 @@ def create_vitals(
     )
     if not appt:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
-    if appt.status in {AppointmentStatus.cancelled, AppointmentStatus.no_show}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot add vitals to this visit")
-    if appt.status == AppointmentStatus.completed:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Visit is already completed")
+    _assert_can_mutate_vitals(appt)
 
     actor = str(user.get("name") or "Staff")
     created: list[VitalReading] = []
@@ -255,3 +265,84 @@ def create_vitals(
         .all()
     )
     return [_reading_response(r) for r in rows]
+
+
+def _load_vital(db: Session, hospital_id: UUID, vital_id: UUID) -> VitalReading:
+    row = (
+        db.query(VitalReading)
+        .options(
+            joinedload(VitalReading.patient),
+            joinedload(VitalReading.appointment).joinedload(Appointment.doctor),
+        )
+        .filter(VitalReading.id == vital_id, VitalReading.hospital_id == hospital_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vital reading not found")
+    return row
+
+
+@router.put("/{vital_id}", response_model=VitalReadingResponse)
+def update_vital(
+    vital_id: UUID,
+    payload: VitalItemUpdate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    row = _load_vital(db, hospital_id, vital_id)
+    appt = row.appointment
+    if not appt or appt.hospital_id != hospital_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
+    _assert_can_mutate_vitals(appt)
+
+    if payload.name is not None:
+        row.name = payload.name.strip()
+    if payload.result is not None:
+        row.result = payload.result.strip()
+    if payload.suitable_range is not None:
+        row.suitable_range = payload.suitable_range.strip()
+    if not row.name or not row.result:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Each vital needs name and result")
+    row.recorded_by_name = str(user.get("name") or row.recorded_by_name or "Staff")
+    row.recorded_at = datetime.now(timezone.utc)
+
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="vital_reading",
+        entity_id=row.id,
+        summary=f"Updated vital {row.name} for {row.patient.name if row.patient else row.patient_id}",
+    )
+    db.commit()
+    db.refresh(row)
+    return _reading_response(_load_vital(db, hospital_id, row.id))
+
+
+@router.delete("/{vital_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_vital(
+    vital_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    row = _load_vital(db, hospital_id, vital_id)
+    appt = row.appointment
+    if not appt or appt.hospital_id != hospital_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
+    _assert_can_mutate_vitals(appt)
+
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="delete",
+        entity_type="vital_reading",
+        entity_id=row.id,
+        summary=f"Deleted vital {row.name} for {row.patient.name if row.patient else row.patient_id}",
+    )
+    db.delete(row)
+    db.commit()
+    return None

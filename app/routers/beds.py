@@ -22,7 +22,9 @@ from app.schemas_beds import (
     AllocateRequest,
     BedDashboardRow,
     BedOption,
+    DischargeQueueItem,
     DischargeRequest,
+    DischargeRequestCreate,
     OccupancyReport,
     RoomOption,
     TransferRequest,
@@ -30,6 +32,7 @@ from app.schemas_beds import (
 )
 from app.utils.audit import write_audit
 from app.utils.auth import get_hospital_context, require_hospital_user
+from app.utils.billing import ensure_bed_charge_for_admission, patient_ledger_totals
 
 router = APIRouter(prefix="/beds", tags=["beds"])
 
@@ -82,10 +85,19 @@ def _admission_detail(a: Admission) -> AdmissionDetail:
         discharged_at=a.discharged_at,
         admission_fee=float(getattr(ward, "admission_fee", 0) or 0) if ward else 0.0,
         bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
+        ip_id=getattr(a, "ip_id", None),
+        source_appointment_id=getattr(a, "source_appointment_id", None),
     )
 
 
-def _load_admission(db: Session, hospital_id: UUID, admission_id: UUID | None, patient_id: UUID | None) -> Admission:
+def _load_admission(
+    db: Session,
+    hospital_id: UUID,
+    admission_id: UUID | None,
+    patient_id: UUID | None,
+    *,
+    statuses: tuple[AdmissionStatus, ...] = (AdmissionStatus.admitted,),
+) -> Admission:
     q = (
         db.query(Admission)
         .options(
@@ -95,7 +107,7 @@ def _load_admission(db: Session, hospital_id: UUID, admission_id: UUID | None, p
             joinedload(Admission.bed),
             joinedload(Admission.doctor),
         )
-        .filter(Admission.hospital_id == hospital_id, Admission.status == AdmissionStatus.admitted)
+        .filter(Admission.hospital_id == hospital_id, Admission.status.in_(statuses))
     )
     if admission_id:
         a = q.filter(Admission.id == admission_id).first()
@@ -106,6 +118,36 @@ def _load_admission(db: Session, hospital_id: UUID, admission_id: UUID | None, p
     if not a:
         raise HTTPException(status_code=404, detail="Active admission not found")
     return a
+
+
+def _apply_bed_charge(db: Session, admission: Admission, *, until: datetime, actor_name: str) -> None:
+    ward = admission.ward
+    ensure_bed_charge_for_admission(
+        db,
+        hospital_id=admission.hospital_id,
+        patient_id=admission.patient_id,
+        admission_id=admission.id,
+        admitted_at=admission.admitted_at,
+        discharged_at=until,
+        ward_name=ward.name if ward else None,
+        room_code=admission.room.room_code if admission.room else None,
+        bed_code=admission.bed.bed_code if admission.bed else None,
+        bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
+        created_by_name=actor_name,
+    )
+
+
+def _discharge_queue_item(db: Session, hospital_id: UUID, a: Admission) -> DischargeQueueItem:
+    fin = patient_ledger_totals(db, hospital_id, a.patient_id)
+    outstanding = float(fin.get("outstanding") or 0)
+    base = _admission_detail(a)
+    return DischargeQueueItem(
+        **base.model_dump(),
+        total_charges=float(fin.get("total_charges") or 0),
+        total_paid=float(fin.get("total_paid") or 0),
+        outstanding=outstanding,
+        can_discharge=outstanding <= 0.009,
+    )
 
 
 def _get_free_bed(db: Session, hospital_id: UUID, ward_id: UUID, room_id: UUID, bed_id: UUID) -> Bed:
@@ -155,7 +197,10 @@ def bed_dashboard(
     active = (
         db.query(Admission)
         .options(joinedload(Admission.patient), joinedload(Admission.doctor))
-        .filter(Admission.hospital_id == hospital_id, Admission.status == AdmissionStatus.admitted)
+        .filter(
+            Admission.hospital_id == hospital_id,
+            Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+        )
         .all()
     )
     by_bed = {a.bed_id: a for a in active}
@@ -345,7 +390,10 @@ def list_active_admissions(
             joinedload(Admission.bed),
             joinedload(Admission.doctor),
         )
-        .filter(Admission.hospital_id == hospital_id, Admission.status == AdmissionStatus.admitted)
+        .filter(
+            Admission.hospital_id == hospital_id,
+            Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+        )
     )
     if search and search.strip():
         term = f"%{search.strip()}%"
@@ -405,60 +453,23 @@ def admit_patient(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
 
-    active = (
-        db.query(Admission)
-        .filter(
-            Admission.patient_id == payload.patient_id,
-            Admission.hospital_id == hospital_id,
-            Admission.status == AdmissionStatus.admitted,
-        )
-        .first()
-    )
-    if active:
-        raise HTTPException(status_code=409, detail="Patient is already admitted")
-
-    bed = _get_free_bed(db, hospital_id, payload.ward_id, payload.room_id, payload.bed_id)
-
-    if payload.doctor_id:
-        doctor = (
-            db.query(HospitalUser)
-            .filter(HospitalUser.id == payload.doctor_id, HospitalUser.hospital_id == hospital_id)
-            .first()
-        )
-        if not doctor:
-            raise HTTPException(status_code=404, detail="Doctor not found")
+    from app.utils.admissions import create_admission
 
     admitted_at = datetime.now(timezone.utc)
     if payload.admission_date:
         admitted_at = datetime.combine(payload.admission_date, time(9, 0), tzinfo=timezone.utc)
 
-    admission = Admission(
+    admission = create_admission(
+        db,
         hospital_id=hospital_id,
         patient_id=payload.patient_id,
         ward_id=payload.ward_id,
         room_id=payload.room_id,
         bed_id=payload.bed_id,
         doctor_id=payload.doctor_id,
-        status=AdmissionStatus.admitted,
-        notes=payload.notes.strip() if payload.notes else None,
+        notes=payload.notes,
+        created_by_name=str(user.get("name") or "System"),
         admitted_at=admitted_at,
-    )
-    bed.is_occupied = True
-    patient.status = PatientStatus.admitted
-    db.add(admission)
-    db.flush()
-
-    from app.utils.billing import ensure_admission_charge
-
-    ward = bed.ward or db.query(Ward).filter(Ward.id == admission.ward_id).first()
-    ensure_admission_charge(
-        db,
-        hospital_id=hospital_id,
-        patient_id=patient.id,
-        admission_id=admission.id,
-        ward_name=ward.name if ward else None,
-        admission_fee=float(getattr(ward, "admission_fee", 0) or 0) if ward else 0.0,
-        created_by_name=user.get("name") or "System",
     )
 
     write_audit(
@@ -468,7 +479,7 @@ def admit_patient(
         action="create",
         entity_type="admission",
         entity_id=admission.id,
-        summary=f"Admitted {patient.uhid} {patient.name} → {bed.ward.name if bed.ward else ''}/{bed.room.room_code if bed.room else ''}/{bed.bed_code}",
+        summary=f"Admitted {patient.uhid} {patient.name} ({admission.ip_id})",
     )
     db.commit()
     return _admission_detail(_load_admission(db, hospital_id, admission.id, None))
@@ -553,6 +564,73 @@ def transfer_bed(
     return _admission_detail(_load_admission(db, hospital_id, admission.id, None))
 
 
+@router.post("/discharge-request", response_model=AdmissionDetail)
+def request_discharge(
+    payload: DischargeRequestCreate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Doctor requests discharge — nurse completes it after dues are cleared."""
+    admission = _load_admission(db, hospital_id, payload.admission_id, payload.patient_id)
+    now = datetime.now(timezone.utc)
+    admission.status = AdmissionStatus.discharge_requested
+    if payload.discharge_notes and payload.discharge_notes.strip():
+        admission.discharge_notes = payload.discharge_notes.strip()
+    _apply_bed_charge(db, admission, until=now, actor_name=user.get("name") or "System")
+
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="admission",
+        entity_id=admission.id,
+        summary=f"Discharge requested for {admission.patient.name if admission.patient else 'patient'}",
+    )
+    db.commit()
+    return _admission_detail(_load_admission(
+        db,
+        hospital_id,
+        admission.id,
+        None,
+        statuses=(AdmissionStatus.discharge_requested,),
+    ))
+
+
+@router.get("/discharge-requests", response_model=list[DischargeQueueItem])
+def list_discharge_requests(
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Nurse queue: discharge requests with billing totals."""
+    rows = (
+        db.query(Admission)
+        .options(
+            joinedload(Admission.patient),
+            joinedload(Admission.ward),
+            joinedload(Admission.room),
+            joinedload(Admission.bed),
+            joinedload(Admission.doctor),
+        )
+        .filter(
+            Admission.hospital_id == hospital_id,
+            Admission.status == AdmissionStatus.discharge_requested,
+        )
+        .order_by(Admission.admitted_at.asc())
+        .all()
+    )
+    now = datetime.now(timezone.utc)
+    items: list[DischargeQueueItem] = []
+    for a in rows:
+        _apply_bed_charge(db, a, until=now, actor_name="System")
+        items.append(_discharge_queue_item(db, hospital_id, a))
+    if rows:
+        db.commit()
+    return items
+
+
 @router.post("/discharge", response_model=AdmissionDetail)
 def discharge_patient(
     payload: DischargeRequest,
@@ -560,37 +638,45 @@ def discharge_patient(
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
-    admission = _load_admission(db, hospital_id, payload.admission_id, payload.patient_id)
+    """Nurse completes discharge only after doctor requested it and dues are ₹0."""
+    admission = _load_admission(
+        db,
+        hospital_id,
+        payload.admission_id,
+        payload.patient_id,
+        statuses=(AdmissionStatus.discharge_requested,),
+    )
 
     d_date = payload.discharge_date or date.today()
     d_time = payload.discharge_time or datetime.now(timezone.utc).time().replace(microsecond=0)
     discharged_at = datetime.combine(d_date, d_time, tzinfo=timezone.utc)
 
+    _apply_bed_charge(
+        db,
+        admission,
+        until=discharged_at,
+        actor_name=user.get("name") or "System",
+    )
+    fin = patient_ledger_totals(db, hospital_id, admission.patient_id)
+    outstanding = float(fin.get("outstanding") or 0)
+    if outstanding > 0.009:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot discharge — outstanding balance ₹{outstanding:,.2f}. "
+                "Clear all dues before discharging."
+            ),
+        )
+
     admission.status = AdmissionStatus.discharged
     admission.discharged_at = discharged_at
-    admission.discharge_notes = payload.discharge_notes.strip() if payload.discharge_notes else None
+    if payload.discharge_notes and payload.discharge_notes.strip():
+        admission.discharge_notes = payload.discharge_notes.strip()
 
     if admission.bed:
         admission.bed.is_occupied = False
     if admission.patient:
         admission.patient.status = PatientStatus.active
-
-    from app.utils.billing import ensure_bed_charge_for_admission
-
-    ward = admission.ward
-    ensure_bed_charge_for_admission(
-        db,
-        hospital_id=hospital_id,
-        patient_id=admission.patient_id,
-        admission_id=admission.id,
-        admitted_at=admission.admitted_at,
-        discharged_at=discharged_at,
-        ward_name=ward.name if ward else None,
-        room_code=admission.room.room_code if admission.room else None,
-        bed_code=admission.bed.bed_code if admission.bed else None,
-        bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
-        created_by_name=user.get("name") or "System",
-    )
 
     write_audit(
         db,

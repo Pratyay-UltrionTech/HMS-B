@@ -169,6 +169,7 @@ class AdmissionSummary(BaseModel):
     admitted_at: datetime
     discharged_at: datetime | None = None
     notes: str | None = None
+    ip_id: str | None = None
 
 
 class VisitSummary(BaseModel):
@@ -179,6 +180,7 @@ class VisitSummary(BaseModel):
     purpose: str
     visit_type: str
     status: str
+    op_id: str | None = None
 
 
 class PrescriptionSummary(BaseModel):

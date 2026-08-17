@@ -56,6 +56,12 @@ class DischargeRequest(BaseModel):
     discharge_notes: str | None = Field(default=None, max_length=2000)
 
 
+class DischargeRequestCreate(BaseModel):
+    admission_id: UUID | None = None
+    patient_id: UUID | None = None
+    discharge_notes: str | None = Field(default=None, max_length=2000)
+
+
 class AdmissionDetail(BaseModel):
     id: UUID
     patient_id: UUID
@@ -77,6 +83,15 @@ class AdmissionDetail(BaseModel):
     discharged_at: datetime | None = None
     admission_fee: float = 0
     bed_charge_per_day: float = 0
+    ip_id: str | None = None
+    source_appointment_id: UUID | None = None
+
+
+class DischargeQueueItem(AdmissionDetail):
+    total_charges: float = 0
+    total_paid: float = 0
+    outstanding: float = 0
+    can_discharge: bool = False
 
 
 class OccupancyReport(BaseModel):

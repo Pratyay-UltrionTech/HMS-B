@@ -8,7 +8,18 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
-from app.models import Department, Hospital, HospitalUser, OtRoom, OtSurgery, OtSurgeryStatus, Patient
+from app.models import (
+    Admission,
+    AdmissionStatus,
+    Department,
+    Hospital,
+    HospitalUser,
+    OtRoom,
+    OtSurgery,
+    OtSurgeryStatus,
+    Patient,
+    Prescription,
+)
 from app.schemas_ot import (
     OtCalendarEntry,
     OtCompleteRequest,
@@ -341,6 +352,35 @@ def create_surgery(
     )
     if not patient:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+
+    active_admission = (
+        db.query(Admission.id)
+        .filter(
+            Admission.hospital_id == hospital_id,
+            Admission.patient_id == payload.patient_id,
+            Admission.status == AdmissionStatus.admitted,
+        )
+        .first()
+    )
+    if not active_admission:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Transfer the patient to IPD and admit them before booking OT",
+        )
+
+    has_prescription = (
+        db.query(Prescription.id)
+        .filter(
+            Prescription.hospital_id == hospital_id,
+            Prescription.patient_id == payload.patient_id,
+        )
+        .first()
+    )
+    if not has_prescription:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Write a prescription for this patient before booking OT",
+        )
 
     surgeon = None
     if payload.surgeon_id:

@@ -16,6 +16,12 @@ class VitalBatchCreate(BaseModel):
     items: list[VitalItemCreate] = Field(min_length=1)
 
 
+class VitalItemUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    result: str | None = Field(default=None, min_length=1, max_length=128)
+    suitable_range: str | None = Field(default=None, max_length=128)
+
+
 class VitalReadingResponse(BaseModel):
     id: UUID
     hospital_id: UUID

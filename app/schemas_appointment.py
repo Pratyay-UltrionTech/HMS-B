@@ -35,6 +35,7 @@ class BookAppointmentRequest(BaseModel):
     notes: str | None = None
     # walk_in → Checked in (waiting); future → Scheduled
     booking_kind: str = Field(default="future", pattern="^(walk_in|future)$")
+    nurse_id: UUID | None = None
 
     @model_validator(mode="after")
     def require_patient_or_new_details(self):
@@ -101,6 +102,22 @@ class AppointmentListItem(BaseModel):
     patient_uhid: str | None = None
     patient_mobile: str | None = None
     doctor_name: str | None = None
+    op_id: str | None = None
+    admission_id: UUID | None = None
+    ip_id: str | None = None
+    nurse_id: UUID | None = None
+    nurse_name: str | None = None
+
+
+class AssignNurseRequest(BaseModel):
+    nurse_id: UUID | None = None
+
+
+class AdmitIpdRequest(BaseModel):
+    ward_id: UUID
+    room_id: UUID
+    bed_id: UUID
+    notes: str | None = None
 
 
 class FeePreviewResponse(BaseModel):

@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 from app.utils.phone import PhoneNumber
 
-from app.models import AppointmentStatus
+from app.models import AppointmentStatus, IpdFormSubmissionStatus
 from app.schemas_laboratory import LabOrderResponse
 from app.schemas_radiology import RadOrderResponse
 from app.schemas_ot import OtSurgeryResponse
@@ -24,6 +24,8 @@ class DoctorSummary(BaseModel):
     years_of_experience: int | None = None
     consultation_room: str | None = None
     show_financial_details: bool = True
+    department_id: UUID | None = None
+    department_name: str | None = None
     custom_values: dict = {}
     is_active: bool
     patient_count: int = 0
@@ -74,6 +76,7 @@ class AppointmentCreate(BaseModel):
     purpose: str = Field(min_length=1, max_length=255)
     notes: str | None = None
     status: AppointmentStatus = AppointmentStatus.scheduled
+    nurse_id: UUID | None = None
 
 
 class AppointmentUpdate(BaseModel):
@@ -82,6 +85,7 @@ class AppointmentUpdate(BaseModel):
     purpose: str | None = Field(default=None, min_length=1, max_length=255)
     notes: str | None = None
     status: AppointmentStatus | None = None
+    nurse_id: UUID | None = None
 
 
 class AppointmentResponse(BaseModel):
@@ -98,8 +102,21 @@ class AppointmentResponse(BaseModel):
     patient_name: str | None = None
     patient_mobile: str | None = None
     doctor_name: str | None = None
+    patient_uhid: str | None = None
+    op_id: str | None = None
+    admission_id: UUID | None = None
+    ip_id: str | None = None
+    admission_ward: str | None = None
+    admission_bed: str | None = None
+    admission_status: str | None = None
+    nurse_id: UUID | None = None
+    nurse_name: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class TransferToInpatientRequest(BaseModel):
+    notes: str | None = None
 
 
 class PrescriptionCreate(BaseModel):
@@ -181,6 +198,19 @@ class MedicalRecordResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class IpdFormHistoryItem(BaseModel):
+    id: UUID
+    admission_id: UUID | None = None
+    form_id: str
+    form_title: str
+    status: IpdFormSubmissionStatus
+    has_html_snapshot: bool = False
+    filled_by_name: str = ""
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class PatientHistoryResponse(BaseModel):
     patient: PatientResponse
     appointments: list[AppointmentResponse] = []
@@ -190,6 +220,7 @@ class PatientHistoryResponse(BaseModel):
     radiology_orders: list[RadOrderResponse] = []
     ot_surgeries: list[OtSurgeryResponse] = []
     vitals: list[VitalReadingResponse] = []
+    ipd_forms: list[IpdFormHistoryItem] = []
     financial_summary: dict | None = None
 
 

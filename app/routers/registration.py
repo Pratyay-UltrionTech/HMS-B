@@ -298,6 +298,7 @@ def get_patient_profile(
                 purpose=v.purpose,
                 visit_type=getattr(v, "visit_type", None) or "OPD",
                 status=v.status.value if hasattr(v.status, "value") else str(v.status),
+                op_id=getattr(v, "op_id", None),
             )
             for v in visits
         ],
@@ -336,6 +337,7 @@ def get_patient_profile(
                 admitted_at=a.admitted_at,
                 discharged_at=a.discharged_at,
                 notes=a.notes,
+                ip_id=getattr(a, "ip_id", None),
             )
             for a in admissions
         ],
@@ -530,66 +532,18 @@ def admit_patient(
     if not patient:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
 
-    active = (
-        db.query(Admission)
-        .filter(
-            Admission.patient_id == patient_id,
-            Admission.hospital_id == hospital_id,
-            Admission.status == AdmissionStatus.admitted,
-        )
-        .first()
-    )
-    if active:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Patient is already admitted")
+    from app.utils.admissions import create_admission
 
-    bed = (
-        db.query(Bed)
-        .options(joinedload(Bed.ward), joinedload(Bed.room))
-        .filter(Bed.id == payload.bed_id, Bed.hospital_id == hospital_id, Bed.is_active.is_(True))
-        .first()
-    )
-    if not bed:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bed not found")
-    if bed.is_occupied:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bed is already occupied")
-    if bed.ward_id != payload.ward_id or bed.room_id != payload.room_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ward/Room does not match selected bed")
-
-    doctor = None
-    if payload.doctor_id:
-        doctor = (
-            db.query(HospitalUser)
-            .filter(HospitalUser.id == payload.doctor_id, HospitalUser.hospital_id == hospital_id)
-            .first()
-        )
-        if not doctor:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor not found")
-
-    admission = Admission(
+    admission = create_admission(
+        db,
         hospital_id=hospital_id,
         patient_id=patient_id,
         ward_id=payload.ward_id,
         room_id=payload.room_id,
         bed_id=payload.bed_id,
         doctor_id=payload.doctor_id,
-        status=AdmissionStatus.admitted,
-        notes=payload.notes.strip() if payload.notes else None,
-    )
-    bed.is_occupied = True
-    patient.status = PatientStatus.admitted
-    db.add(admission)
-    db.flush()
-
-    from app.utils.billing import ensure_admission_charge
-
-    ensure_admission_charge(
-        db,
-        hospital_id=hospital_id,
-        patient_id=patient_id,
-        admission_id=admission.id,
-        ward_name=bed.ward.name if bed.ward else None,
-        admission_fee=float(getattr(bed.ward, "admission_fee", 0) or 0) if bed.ward else 0.0,
-        created_by_name=user.get("name") or "System",
+        notes=payload.notes,
+        created_by_name=str(user.get("name") or "System"),
     )
 
     write_audit(
@@ -599,7 +553,7 @@ def admit_patient(
         action="create",
         entity_type="admission",
         entity_id=admission.id,
-        summary=f"Admitted {patient.uhid} {patient.name} to {bed.ward.name if bed.ward else ''} / {bed.room.room_code if bed.room else ''} / {bed.bed_code}",
+        summary=f"Admitted {patient.uhid} {patient.name} ({admission.ip_id})",
     )
     db.commit()
     admission = (
@@ -626,6 +580,7 @@ def admit_patient(
         admitted_at=admission.admitted_at,
         discharged_at=admission.discharged_at,
         notes=admission.notes,
+        ip_id=getattr(admission, "ip_id", None),
     )
 
 

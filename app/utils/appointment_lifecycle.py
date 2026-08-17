@@ -31,6 +31,7 @@ NO_SHOW_GRACE_MINUTES = 15
 
 TERMINAL = {
     AppointmentStatus.completed,
+    AppointmentStatus.transferred_to_inpatient,
     AppointmentStatus.cancelled,
     AppointmentStatus.no_show,
 }
@@ -59,6 +60,8 @@ def status_display_label(status: AppointmentStatus | str | None) -> str:
         "scheduled": "Scheduled",
         "waiting": "Checked in",
         "completed": "Completed",
+        "transferred_to_inpatient": "Transferred to Inpatient",
+        "ipd_transfer_requested": "IPD requested",
         "cancelled": "Cancelled",
         "no_show": "No Show",
     }.get(raw, raw.replace("_", " ").title() or "Unknown")

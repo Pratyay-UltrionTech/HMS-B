@@ -20,8 +20,11 @@ from app.models import (
     Wing,
 )
 from app.routers.registration import _age_from_dob, _display_name, _next_uhid
+from app.utils.encounter_ids import next_encounter_id
 from app.schemas_appointment import (
+    AdmitIpdRequest,
     AppointmentListItem,
+    AssignNurseRequest,
     BookAppointmentRequest,
     DoctorAvailability,
     FeePreviewResponse,
@@ -44,6 +47,11 @@ router = APIRouter(prefix="/appointments", tags=["appointments"])
 
 def _is_doctor(user: HospitalUser) -> bool:
     return bool(user.role and "doctor" in (user.role.name or "").lower())
+
+
+def _is_nurse(user: HospitalUser) -> bool:
+    name = (user.role.name or "").lower() if user.role else ""
+    return "nurse" in name or "nursing" in name
 
 
 def _doctor_fallback_fee(doctor: HospitalUser) -> float:
@@ -255,6 +263,11 @@ def _to_item(a: Appointment) -> AppointmentListItem:
         patient_uhid=getattr(a.patient, "uhid", None) if a.patient else None,
         patient_mobile=a.patient.mobile if a.patient else None,
         doctor_name=a.doctor.name if a.doctor else None,
+        op_id=getattr(a, "op_id", None),
+        admission_id=getattr(a, "admission_id", None),
+        ip_id=getattr(getattr(a, "admission", None), "ip_id", None),
+        nurse_id=getattr(a, "nurse_id", None),
+        nurse_name=a.nurse.name if getattr(a, "nurse", None) else None,
     )
 
 
@@ -280,7 +293,12 @@ def _run_missed_auto_cancel(db: Session, hospital_id: UUID) -> None:
 def _load_appt(db: Session, appt_id: UUID, hospital_id: UUID) -> Appointment:
     appt = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(
+            joinedload(Appointment.patient),
+            joinedload(Appointment.doctor),
+            joinedload(Appointment.nurse),
+            joinedload(Appointment.admission),
+        )
         .filter(Appointment.id == appt_id, Appointment.hospital_id == hospital_id)
         .first()
     )
@@ -330,6 +348,18 @@ def _next_queue_token(db: Session, hospital_id: UUID, doctor_id: UUID, on_date: 
     return int(current or 0) + 1
 
 
+def _get_nurse(db: Session, nurse_id: UUID, hospital_id: UUID) -> HospitalUser:
+    nurse = (
+        db.query(HospitalUser)
+        .options(joinedload(HospitalUser.role))
+        .filter(HospitalUser.id == nurse_id, HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
+        .first()
+    )
+    if not nurse or not _is_nurse(nurse):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Nurse not found")
+    return nurse
+
+
 @router.get("/doctors")
 def list_doctors(
     db: Session = Depends(get_db),
@@ -357,6 +387,21 @@ def list_doctors(
         for d in users
         if _is_doctor(d)
     ]
+
+
+@router.get("/nurses")
+def list_nurses(
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    users = (
+        db.query(HospitalUser)
+        .options(joinedload(HospitalUser.role))
+        .filter(HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
+        .all()
+    )
+    return [{"id": str(n.id), "name": n.name, "phone": n.phone, "email": n.email} for n in users if _is_nurse(n)]
 
 
 @router.get("/wings")
@@ -684,6 +729,8 @@ def book_appointment(
     )
     if not doctor or not _is_doctor(doctor):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor not found")
+    if payload.nurse_id:
+        _get_nurse(db, payload.nurse_id, hospital_id)
 
     holiday = _check_holiday(db, hospital_id, payload.appointment_date)
     if holiday:
@@ -802,6 +849,8 @@ def book_appointment(
         status=AppointmentStatus.scheduled,
         booking_kind=booking_kind,
         notes=payload.notes.strip() if payload.notes else None,
+        op_id=next_encounter_id(db, hospital_id, "OP"),
+        nurse_id=payload.nurse_id,
     )
     db.add(appt)
     db.flush()
@@ -839,6 +888,7 @@ def book_appointment(
 @router.get("/today", response_model=list[AppointmentListItem])
 def todays_appointments(
     doctor_id: UUID | None = Query(default=None),
+    nurse_id: UUID | None = Query(default=None),
     db: Session = Depends(get_db),
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -847,11 +897,13 @@ def todays_appointments(
     today = date.today()
     q = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor), joinedload(Appointment.nurse))
         .filter(Appointment.hospital_id == hospital_id, Appointment.appointment_date == today)
     )
     if doctor_id:
         q = q.filter(Appointment.doctor_id == doctor_id)
+    if nurse_id:
+        q = q.filter(Appointment.nurse_id == nurse_id)
     rows = q.order_by(Appointment.appointment_time.asc()).all()
     return [_to_item(a) for a in rows]
 
@@ -874,7 +926,7 @@ def calendar_view(
 
     q = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor), joinedload(Appointment.nurse))
         .filter(
             Appointment.hospital_id == hospital_id,
             Appointment.appointment_date >= date_from,
@@ -899,7 +951,7 @@ def doctor_queue(
     day = on_date or date.today()
     rows = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor), joinedload(Appointment.nurse))
         .filter(
             Appointment.hospital_id == hospital_id,
             Appointment.appointment_date == day,
@@ -934,7 +986,7 @@ def appointment_history(
     _run_missed_auto_cancel(db, hospital_id)
     q = (
         db.query(Appointment)
-        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor))
+        .options(joinedload(Appointment.patient), joinedload(Appointment.doctor), joinedload(Appointment.nurse))
         .filter(Appointment.hospital_id == hospital_id)
     )
     if doctor_id:
@@ -962,7 +1014,12 @@ def check_in(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     appt = _load_appt(db, appointment_id, hospital_id)
-    if appt.status in {AppointmentStatus.cancelled, AppointmentStatus.completed, AppointmentStatus.no_show}:
+    if appt.status in {
+        AppointmentStatus.cancelled,
+        AppointmentStatus.completed,
+        AppointmentStatus.transferred_to_inpatient,
+        AppointmentStatus.no_show,
+    }:
         raise HTTPException(status_code=400, detail=f"Cannot check in appointment with status {appt.status.value}")
     if appt.status == AppointmentStatus.waiting:
         return _to_item(appt)
@@ -1020,7 +1077,7 @@ def cancel_appointment(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     appt = _load_appt(db, appointment_id, hospital_id)
-    if appt.status in {AppointmentStatus.completed, AppointmentStatus.no_show}:
+    if appt.status in {AppointmentStatus.completed, AppointmentStatus.transferred_to_inpatient, AppointmentStatus.no_show}:
         raise HTTPException(
             status_code=400,
             detail=f"Cannot cancel appointment with status {appt.status.value}",
@@ -1080,7 +1137,12 @@ def reschedule_appointment(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     appt = _load_appt(db, appointment_id, hospital_id)
-    if appt.status in {AppointmentStatus.cancelled, AppointmentStatus.completed, AppointmentStatus.no_show}:
+    if appt.status in {
+        AppointmentStatus.cancelled,
+        AppointmentStatus.completed,
+        AppointmentStatus.transferred_to_inpatient,
+        AppointmentStatus.no_show,
+    }:
         raise HTTPException(status_code=400, detail="Cannot reschedule this appointment")
 
     holiday = _check_holiday(db, hospital_id, payload.appointment_date)
@@ -1113,6 +1175,111 @@ def reschedule_appointment(
         entity_type="appointment",
         entity_id=appt.id,
         summary=f"Rescheduled to {payload.appointment_date} {payload.appointment_time}",
+    )
+    db.commit()
+    return _to_item(_load_appt(db, appointment_id, hospital_id))
+
+
+@router.put("/{appointment_id}/nurse", response_model=AppointmentListItem)
+def assign_nurse(
+    appointment_id: UUID,
+    payload: AssignNurseRequest,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    appt = _load_appt(db, appointment_id, hospital_id)
+    if appt.status in {
+        AppointmentStatus.cancelled,
+        AppointmentStatus.completed,
+        AppointmentStatus.transferred_to_inpatient,
+        AppointmentStatus.no_show,
+    }:
+        raise HTTPException(status_code=400, detail="Cannot change nurse on this appointment")
+    if payload.nurse_id:
+        _get_nurse(db, payload.nurse_id, hospital_id)
+        appt.nurse_id = payload.nurse_id
+    else:
+        appt.nurse_id = None
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="appointment",
+        entity_id=appt.id,
+        summary=f"Assigned nurse on appointment {appointment_id}",
+    )
+    db.commit()
+    return _to_item(_load_appt(db, appointment_id, hospital_id))
+
+
+@router.get("/ipd-requests", response_model=list[AppointmentListItem])
+def list_ipd_requests(
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Shared nurse queue: every IPD transfer request is visible to any nurse."""
+    rows = (
+        db.query(Appointment)
+        .options(
+            joinedload(Appointment.patient),
+            joinedload(Appointment.doctor),
+            joinedload(Appointment.nurse),
+            joinedload(Appointment.admission),
+        )
+        .filter(
+            Appointment.hospital_id == hospital_id,
+            Appointment.status == AppointmentStatus.ipd_transfer_requested,
+        )
+        .order_by(Appointment.appointment_date.desc(), Appointment.appointment_time.desc())
+        .all()
+    )
+    return [_to_item(a) for a in rows]
+
+
+@router.post("/{appointment_id}/admit-ipd", response_model=AppointmentListItem)
+def admit_ipd_from_nurse(
+    appointment_id: UUID,
+    payload: AdmitIpdRequest,
+    db: Session = Depends(get_db),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    from app.utils.admissions import create_admission
+
+    appt = _load_appt(db, appointment_id, hospital_id)
+    if appt.status == AppointmentStatus.transferred_to_inpatient and appt.admission_id:
+        raise HTTPException(status_code=400, detail="This visit is already admitted")
+    if appt.status != AppointmentStatus.ipd_transfer_requested:
+        raise HTTPException(status_code=400, detail="Doctor has not requested IPD transfer for this visit")
+
+    admission = create_admission(
+        db,
+        hospital_id=hospital_id,
+        patient_id=appt.patient_id,
+        ward_id=payload.ward_id,
+        room_id=payload.room_id,
+        bed_id=payload.bed_id,
+        doctor_id=appt.doctor_id,
+        notes=payload.notes or appt.notes,
+        created_by_name=str(user.get("name") or "Nurse"),
+        source_appointment_id=appt.id,
+    )
+    appt.status = AppointmentStatus.transferred_to_inpatient
+    appt.admission_id = admission.id
+    write_audit(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="appointment",
+        entity_id=appt.id,
+        summary=(
+            f"Nurse booked bed for {appt.patient.name if appt.patient else 'patient'} "
+            f"({appt.op_id or 'OP'}) → {admission.ip_id}"
+        ),
     )
     db.commit()
     return _to_item(_load_appt(db, appointment_id, hospital_id))
