@@ -1,0 +1,1 @@
+# DMS domain tests package

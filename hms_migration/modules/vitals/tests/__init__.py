@@ -1,0 +1,1 @@
+"""Vitals module tests package."""

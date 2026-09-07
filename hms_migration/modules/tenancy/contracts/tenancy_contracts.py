@@ -1,0 +1,151 @@
+"""
+Tenancy and Hospital domain contracts and schemas.
+
+Conforms to UltrionTech-Backend-Template modules/tenancy/contracts/ specification.
+Provides complete wire compatibility with OG HMS-B /hospitals routes.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel, EmailStr, Field
+
+from hms_migration.modules.tenancy.entities.hospital import PlanType
+from hms_migration.shared.validators.phone import PhoneNumber
+
+
+class HospitalCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    address: str = Field(min_length=1)
+    phone: PhoneNumber
+    email: EmailStr
+    plan: PlanType = PlanType.basic
+    icon_url: str | None = None
+
+
+class HospitalResponse(BaseModel):
+    id: UUID
+    hospital_id: str
+    name: str
+    address: str
+    phone: str
+    email: EmailStr
+    plan: PlanType
+    icon_url: str | None = None
+    is_active: bool
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class HospitalCreateResponse(HospitalResponse):
+    generated_password: str
+
+
+class HospitalDashboardListItem(BaseModel):
+    id: str
+    title: str
+    subtitle: str | None = None
+    meta: str | None = None
+    status: str | None = None
+    time: str | None = None
+
+
+class HospitalDashboardResponse(BaseModel):
+    id: UUID
+    hospital_id: str
+    name: str
+    address: str
+    phone: str
+    email: EmailStr
+    plan: PlanType
+    icon_url: str | None = None
+    is_active: bool
+    created_at: datetime
+    staff_count: int
+    doctor_count: int
+    patient_count: int
+    appointments_today: int
+    active_admissions: int
+    beds_total: int
+    beds_occupied: int
+    modules_available: int
+    # Applied filters (echo)
+    filter_date: date | None = None
+    filter_date_from: date | None = None
+    filter_date_to: date | None = None
+    filter_doctor_id: UUID | None = None
+    filter_wing_id: UUID | None = None
+    # Operations
+    patients_registered_today: int = 0
+    occupied_beds_pct: int = 0
+    appointments_scheduled: int = 0
+    appointments_in_progress: int = 0
+    appointments_completed: int = 0
+    # Clinical
+    lab_orders_today: int = 0
+    radiology_orders_today: int = 0
+    ot_surgeries_today: int = 0
+    # Financial (whole rupees for KPI cards)
+    charges_today: int = 0
+    collections_today: int = 0
+    outstanding_total: int = 0
+    # Lists
+    recent_registrations: list[HospitalDashboardListItem] = []
+    upcoming_appointments: list[HospitalDashboardListItem] = []
+    pending_lab_orders: list[HospitalDashboardListItem] = []
+    pending_radiology_reports: list[HospitalDashboardListItem] = []
+    # Card drill-down details
+    appointments_detail: list[HospitalDashboardListItem] = []
+    admissions_detail: list[HospitalDashboardListItem] = []
+    beds_detail: list[HospitalDashboardListItem] = []
+    lab_orders_detail: list[HospitalDashboardListItem] = []
+    radiology_orders_detail: list[HospitalDashboardListItem] = []
+    ot_surgeries_detail: list[HospitalDashboardListItem] = []
+    charges_detail: list[HospitalDashboardListItem] = []
+    collections_detail: list[HospitalDashboardListItem] = []
+
+
+class RoleDashboardMetric(BaseModel):
+    key: str
+    label: str
+    value: int
+    sub: str | None = None
+
+
+class RoleDashboardListItem(BaseModel):
+    id: str
+    title: str
+    subtitle: str | None = None
+    meta: str | None = None
+    status: str | None = None
+    time: str | None = None
+
+
+class DoctorRecentRevenueItem(BaseModel):
+    patient_name: str
+    appointment_date: str | None = None
+    amount: float
+    status: str
+
+
+class RoleDashboardResponse(BaseModel):
+    persona: str  # doctor | nurse | reception | lab | radiology | ot | billing | admin | staff
+    display_name: str
+    staff_role_name: str | None = None
+    metrics: list[RoleDashboardMetric] = []
+    today_items: list[RoleDashboardListItem] = []
+    upcoming_items: list[RoleDashboardListItem] = []
+    recent_items: list[RoleDashboardListItem] = []
+    activity_items: list[RoleDashboardListItem] = []
+    quick_actions: list[dict[str, Any]] = []
+    # Doctor Practice Performance (doctor persona only; others omit / default)
+    today_revenue: float | None = None
+    month_revenue: float | None = None
+    patients_this_month: int | None = None
+    average_revenue_per_patient: float | None = None
+    recent_revenue: list[DoctorRecentRevenueItem] | None = None
+    show_financial_details: bool | None = None

@@ -1,0 +1,31 @@
+from hms_migration.modules.appointments.contracts.appointments_contracts import (
+    AdmitIpdRequest,
+    AppointmentListItem,
+    AppointmentStatus,
+    AssignNurseRequest,
+    BookAppointmentRequest,
+    DoctorAvailability,
+    FeePreviewRequest,
+    FeePreviewResponse,
+    LeaveBlock,
+    OptionalPhoneNumber,
+    PhoneNumber,
+    QueueGroup,
+    RescheduleRequest,
+)
+
+__all__ = [
+    "AdmitIpdRequest",
+    "AppointmentListItem",
+    "AppointmentStatus",
+    "AssignNurseRequest",
+    "BookAppointmentRequest",
+    "DoctorAvailability",
+    "FeePreviewRequest",
+    "FeePreviewResponse",
+    "LeaveBlock",
+    "OptionalPhoneNumber",
+    "PhoneNumber",
+    "QueueGroup",
+    "RescheduleRequest",
+]
