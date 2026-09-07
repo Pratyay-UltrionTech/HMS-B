@@ -1283,6 +1283,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Register shared domain exception handlers
+from hms_migration.shared.exceptions import register_exception_handlers
+register_exception_handlers(app)
+
 # Trace all routers/endpoints; SQLAlchemy + outbound HTTP under Dependencies
 instrument_fastapi_app(app)
 instrument_sqlalchemy_engine(engine)
@@ -1298,24 +1302,148 @@ app.add_middleware(
 )
 
 app.include_router(auth.router, prefix="/api")
-app.include_router(hospitals.router, prefix="/api")
-app.include_router(masters.router, prefix="/api")
-app.include_router(admin.router, prefix="/api")
-app.include_router(doctors.router, prefix="/api")
-app.include_router(registration.router, prefix="/api")
-app.include_router(appointment.router, prefix="/api")
-app.include_router(beds.router, prefix="/api")
-app.include_router(mis.router, prefix="/api")
-app.include_router(analytics.router, prefix="/api")
-app.include_router(laboratory.router, prefix="/api")
-app.include_router(radiology.router, prefix="/api")
-app.include_router(ot.router, prefix="/api")
-app.include_router(dms.router, prefix="/api")
-app.include_router(equipment.router, prefix="/api")
-app.include_router(billing.router, prefix="/api")
-app.include_router(pharmacy.router, prefix="/api")
-app.include_router(ipd.router, prefix="/api")
-app.include_router(vitals.router, prefix="/api")
+# Controlled Hospitals Router Cutover (Strategy B)
+if settings.use_migrated_hospitals:
+    from hms_migration.modules.tenancy.api.tenancy_api import router as migrated_hospitals_router
+    app.include_router(migrated_hospitals_router, prefix="/api")
+else:
+    app.include_router(hospitals.router, prefix="/api")
+
+# Controlled Masters Router Cutover (Strategy B)
+if settings.use_migrated_masters:
+    from hms_migration.modules.masters.api.masters_api import router as migrated_masters_router
+    app.include_router(migrated_masters_router, prefix="/api")
+else:
+    app.include_router(masters.router, prefix="/api")
+
+# Controlled Admin Router Cutover (Strategy B)
+if settings.use_migrated_admin:
+    from hms_migration.modules.admin.api.admin_api import router as migrated_admin_router
+    app.include_router(migrated_admin_router, prefix="/api")
+else:
+    app.include_router(admin.router, prefix="/api")
+# Controlled Doctors Router Cutover (Strategy B)
+if settings.use_migrated_doctors:
+    from hms_migration.modules.doctors.api.doctors_api import router as migrated_doctors_router
+    app.include_router(migrated_doctors_router, prefix="/api")
+else:
+    app.include_router(doctors.router, prefix="/api")
+
+# Controlled Registration Router Cutover (Strategy B)
+# If both patients and inpatient are migrated, registration.router is fully replaced by:
+# - migrated_patients_router (for /patients, /patients/{id})
+# - registration_inpatient_router (for /beds, /wards-rooms, /patients/{id}/admit, /admissions/{id}/discharge, /doctors)
+if settings.use_migrated_patients and settings.use_migrated_inpatient:
+    from hms_migration.modules.patients.api.patients_api import router as migrated_patients_router
+    from hms_migration.modules.beds.api.beds_api import registration_inpatient_router
+    app.include_router(migrated_patients_router, prefix="/api")
+    app.include_router(registration_inpatient_router, prefix="/api")
+elif settings.use_migrated_patients:
+    from fastapi import APIRouter
+    from hms_migration.modules.patients.api.patients_api import router as migrated_patients_router
+    app.include_router(migrated_patients_router, prefix="/api")
+    legacy_inpatient_router = APIRouter(prefix="/registration", tags=["registration"])
+    for r in registration.router.routes:
+        if r.path not in ("/registration/patients", "/registration/patients/{patient_id}"):
+            legacy_inpatient_router.routes.append(r)
+    app.include_router(legacy_inpatient_router, prefix="/api")
+elif settings.use_migrated_inpatient:
+    from fastapi import APIRouter
+    from hms_migration.modules.beds.api.beds_api import registration_inpatient_router
+    app.include_router(registration_inpatient_router, prefix="/api")
+    legacy_patients_router = APIRouter(prefix="/registration", tags=["registration"])
+    for r in registration.router.routes:
+        if r.path in ("/registration/patients", "/registration/patients/{patient_id}"):
+            legacy_patients_router.routes.append(r)
+    app.include_router(legacy_patients_router, prefix="/api")
+else:
+    app.include_router(registration.router, prefix="/api")
+
+# Controlled Appointments Router Cutover (Strategy B)
+if settings.use_migrated_appointments:
+    from hms_migration.modules.appointments.api.appointments_api import router as migrated_appointments_router
+    app.include_router(migrated_appointments_router, prefix="/api")
+else:
+    app.include_router(appointment.router, prefix="/api")
+
+# Controlled Beds Router Cutover (Strategy B)
+if settings.use_migrated_beds:
+    from hms_migration.modules.beds.api.beds_api import router as migrated_beds_router
+    app.include_router(migrated_beds_router, prefix="/api")
+else:
+    app.include_router(beds.router, prefix="/api")
+
+# Controlled MIS Router Cutover (Strategy B)
+if settings.use_migrated_mis:
+    from hms_migration.modules.mis.api.mis_api import router as migrated_mis_router
+    app.include_router(migrated_mis_router, prefix="/api")
+else:
+    app.include_router(mis.router, prefix="/api")
+
+# Controlled Analytics Router Cutover (Strategy B)
+if settings.use_migrated_analytics:
+    from hms_migration.modules.analytics.api.analytics_api import router as migrated_analytics_router
+    app.include_router(migrated_analytics_router, prefix="/api")
+else:
+    app.include_router(analytics.router, prefix="/api")
+
+# Controlled Laboratory Router Cutover (Strategy B)
+if settings.use_migrated_laboratory:
+    from hms_migration.modules.laboratory.api.laboratory_api import router as migrated_laboratory_router
+    app.include_router(migrated_laboratory_router, prefix="/api")
+else:
+    app.include_router(laboratory.router, prefix="/api")
+
+# Controlled Radiology Router Cutover (Strategy B)
+if settings.use_migrated_radiology:
+    from hms_migration.modules.radiology.api.radiology_api import router as migrated_radiology_router
+    app.include_router(migrated_radiology_router, prefix="/api")
+else:
+    app.include_router(radiology.router, prefix="/api")
+
+# Controlled OT Router Cutover (Strategy B)
+if settings.use_migrated_ot:
+    from hms_migration.modules.ot.api.ot_api import router as migrated_ot_router
+    app.include_router(migrated_ot_router, prefix="/api")
+else:
+    app.include_router(ot.router, prefix="/api")
+# Controlled DMS Router Cutover (Strategy B)
+if settings.use_migrated_dms:
+    from hms_migration.modules.dms.api.dms_api import router as migrated_dms_router
+    app.include_router(migrated_dms_router, prefix="/api")
+else:
+    app.include_router(dms.router, prefix="/api")
+# Controlled Billing Router Cutover (Strategy B)
+if settings.use_migrated_billing:
+    from hms_migration.modules.billing.api.billing_api import router as migrated_billing_router
+    app.include_router(migrated_billing_router, prefix="/api")
+# Controlled Pharmacy Router Cutover (Strategy B)
+if settings.use_migrated_pharmacy:
+    from hms_migration.modules.pharmacy.api.pharmacy_api import router as migrated_pharmacy_router
+    app.include_router(migrated_pharmacy_router, prefix="/api")
+else:
+    app.include_router(pharmacy.router, prefix="/api")
+
+# Controlled Equipment Router Cutover (Strategy B)
+if settings.use_migrated_equipment:
+    from hms_migration.modules.equipment.api.equipment_api import router as migrated_equipment_router
+    app.include_router(migrated_equipment_router, prefix="/api")
+else:
+    app.include_router(equipment.router, prefix="/api")
+
+# Controlled Inpatient / IPD Router Cutover (Strategy B)
+if settings.use_migrated_inpatient:
+    from hms_migration.modules.inpatient.api.ipd_api import router as migrated_ipd_router
+    app.include_router(migrated_ipd_router, prefix="/api")
+else:
+    app.include_router(ipd.router, prefix="/api")
+
+# Controlled Vitals Router Cutover (Strategy B)
+if settings.use_migrated_vitals:
+    from hms_migration.modules.vitals.api.vitals_api import router as migrated_vitals_router
+    app.include_router(migrated_vitals_router, prefix="/api")
+else:
+    app.include_router(vitals.router, prefix="/api")
 
 
 @app.get("/")

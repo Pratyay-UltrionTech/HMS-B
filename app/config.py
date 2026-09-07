@@ -31,6 +31,27 @@ class Settings(BaseSettings):
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
 
+    # Migration / Controlled cutover feature flags (default False = legacy behavior)
+    use_migrated_vitals: bool = False
+    use_migrated_analytics: bool = False
+    use_migrated_patients: bool = False
+    use_migrated_appointments: bool = False
+    use_migrated_doctors: bool = False
+    use_migrated_beds: bool = False
+    use_migrated_inpatient: bool = False
+    use_migrated_billing: bool = False
+    use_migrated_laboratory: bool = False
+    use_migrated_dms: bool = False
+    use_migrated_radiology: bool = False
+    use_migrated_ot: bool = False
+    use_migrated_equipment: bool = False
+    use_migrated_pharmacy: bool = False
+    use_migrated_mis: bool = False
+    use_migrated_masters: bool = False
+    use_migrated_admin: bool = False
+    use_migrated_hospitals: bool = False
+
+
     @property
     def sqlalchemy_database_url(self) -> str:
         password = quote_plus(self.postgres_password)
