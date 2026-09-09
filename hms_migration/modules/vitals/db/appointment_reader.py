@@ -12,7 +12,7 @@ from uuid import UUID
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import Appointment, AppointmentStatus
+from hms_migration.modules.appointments.entities.appointment import Appointment, AppointmentStatus
 
 
 class AppointmentReader:

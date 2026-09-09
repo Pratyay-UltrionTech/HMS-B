@@ -23,9 +23,13 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from typing import TYPE_CHECKING
+
 from hms_migration.infrastructure.postgres.base import Base
-from hms_migration.modules.doctors.entities.doctor import HospitalUser
-from hms_migration.modules.patients.entities.patient import Patient
+
+if TYPE_CHECKING:
+    from hms_migration.modules.doctors.entities.doctor import HospitalUser
+    from hms_migration.modules.patients.entities.patient import Patient
 
 
 class PatientDocumentCategory(str, enum.Enum):

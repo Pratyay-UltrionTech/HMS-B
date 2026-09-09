@@ -31,9 +31,9 @@ from hms_migration.modules.doctors.actions.doctor_appointment_actions import (
     ListDoctorAppointmentsAction,
     TransferAppointmentToInpatientAction,
     UpdateDoctorAppointmentAction,
-    to_doctor_appointment_response,
 )
 from hms_migration.modules.doctors.contracts.doctor_contracts import (
+    DoctorAppointmentResponse,
     DoctorPatientCreate,
     DoctorPatientResponse,
     DoctorPatientUpdate,

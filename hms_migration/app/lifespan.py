@@ -30,9 +30,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Ensure database schema on startup if database is reachable
     try:
         from hms_migration.infrastructure.postgres.base import Base
-        from hms_migration.infrastructure.postgres.engine import get_sync_engine
+        from hms_migration.infrastructure.postgres.engine import get_transitional_sync_engine
 
-        sync_engine = get_sync_engine()
+        sync_engine = get_transitional_sync_engine()
         Base.metadata.create_all(bind=sync_engine)
         logger.info("Target database schema verified/created.")
     except Exception as exc:

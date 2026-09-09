@@ -14,13 +14,15 @@ from uuid import UUID
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import (
-    Admission,
+from hms_migration.modules.appointments.entities.appointment import (
     Appointment,
     AppointmentStatus,
+)
+from hms_migration.modules.clinical_records.entities.clinical_record import (
     MedicalRecord,
     Prescription,
 )
+from hms_migration.modules.inpatient.entities.admission import Admission
 from hms_migration.modules.billing.services.billing_service import (
     build_ledger_entries,
     patient_ledger_totals,

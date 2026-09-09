@@ -242,3 +242,100 @@ def test_doctor_tenant_isolation(
         headers=doctor_auth_headers,
     )
     assert res.status_code == 403
+
+
+def test_get_doctor_patient_history(
+    client: TestClient,
+    doctor_auth_headers: dict[str, str],
+    doctor_user: HospitalUser,
+    db_session: Session,
+    hospital: Hospital,
+):
+    """Verify GET /api/doctors/{doctor_id}/patients/{patient_id} succeeds with 200 OK and eager-loads admission/ward/bed info."""
+    patient = Patient(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        uhid="P9999",
+        name="John Patient",
+        gender="Male",
+        mobile="9998887770",
+    )
+    db_session.add(patient)
+    db_session.commit()
+
+    from hms_migration.modules.beds.entities.bed import Bed, Room, Ward, WardType
+    from hms_migration.modules.inpatient.entities.admission import Admission, AdmissionStatus
+
+    ward = Ward(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        name="General Ward",
+        ward_type=WardType.general,
+    )
+    db_session.add(ward)
+
+    room = Room(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        ward_id=ward.id,
+        room_code="R-101",
+    )
+    db_session.add(room)
+
+    bed = Bed(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        ward_id=ward.id,
+        room_id=room.id,
+        bed_code="B-101",
+    )
+    db_session.add(bed)
+
+    adm = Admission(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        patient_id=patient.id,
+        doctor_id=doctor_user.id,
+        ward_id=ward.id,
+        room_id=room.id,
+        bed_id=bed.id,
+        ip_id="IP0001",
+        status=AdmissionStatus.admitted,
+    )
+    db_session.add(adm)
+    db_session.commit()
+
+    from hms_migration.modules.appointments.entities.appointment import Appointment
+    from hms_migration.modules.appointments.entities.enums import AppointmentStatus
+
+    appt = Appointment(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        doctor_id=doctor_user.id,
+        patient_id=patient.id,
+        admission_id=adm.id,
+        appointment_date=date.today(),
+        appointment_time=time(10, 0),
+        purpose="General Checkup",
+        status=AppointmentStatus.scheduled,
+    )
+    db_session.add(appt)
+    db_session.commit()
+
+    res = client.get(
+        f"/api/doctors/{doctor_user.id}/patients/{patient.id}",
+        headers=doctor_auth_headers,
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["patient"]["id"] == str(patient.id)
+    assert len(data["appointments"]) == 1
+    appt_resp = data["appointments"][0]
+    assert appt_resp["id"] == str(appt.id)
+    assert appt_resp["admission_id"] == str(adm.id)
+    assert appt_resp["ip_id"] == "IP0001"
+    assert appt_resp["admission_ward"] == "General Ward"
+    assert appt_resp["admission_bed"] == "B-101"
+    assert appt_resp["admission_status"] == "admitted"
+
+
