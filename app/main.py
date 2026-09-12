@@ -1182,6 +1182,39 @@ def _migrate_prescription_signature() -> None:
         logger.warning("prescription signature migration skipped: %s", exc)
 
 
+def _migrate_pharmacy_high_alert() -> None:
+    """Add high-alert columns to medicines if missing (model added them after table creation).
+
+    Root cause of 500s on /api/pharmacy/*: Medicine entity selects
+    is_high_alert / high_alert_category / requires_dual_signoff but older
+    databases created medicines without them (create_all never alters).
+    """
+    from sqlalchemy import inspect, text
+
+    try:
+        insp = inspect(engine)
+        if "medicines" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("medicines")}
+        stmts: list[str] = []
+        if "is_high_alert" not in cols:
+            stmts.append("ALTER TABLE medicines ADD COLUMN is_high_alert BOOLEAN NOT NULL DEFAULT FALSE")
+        if "high_alert_category" not in cols:
+            stmts.append("ALTER TABLE medicines ADD COLUMN high_alert_category VARCHAR(64)")
+        if "requires_dual_signoff" not in cols:
+            stmts.append("ALTER TABLE medicines ADD COLUMN requires_dual_signoff BOOLEAN NOT NULL DEFAULT FALSE")
+        if not stmts:
+            return
+        with engine.begin() as conn:
+            for stmt in stmts:
+                logger.info("Applying pharmacy migration: %s", stmt)
+                conn.execute(text(stmt))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_medicines_is_high_alert ON medicines (is_high_alert)"))
+        logger.info("Added missing medicines high-alert columns (%d)", len(stmts))
+    except Exception as exc:
+        logger.warning("pharmacy high-alert migration skipped: %s", exc)
+
+
 def _migrate_performance_indexes() -> None:
     """Composite indexes for bulk list endpoints (DMS, registration, doctors, billing)."""
     from sqlalchemy import text
@@ -1238,6 +1271,15 @@ async def lifespan(_: FastAPI):
     _migrate_hospital_users_doctor_profile()
     _migrate_departments_optional_wing()
     Base.metadata.create_all(bind=engine)
+    # Ensure migrated Clinical Decision tables exist (clinical_rules,
+    # clinical_alerts, clinical_order_sets, medication_reconciliations, ...).
+    # Without this, mounting /api/clinical returns 500 on missing tables.
+    try:
+        from hms_migration.infrastructure.postgres.base import Base as MigratedBase
+        import hms_migration.modules.clinical_decision.entities.clinical_decision_entities  # noqa: F401
+        MigratedBase.metadata.create_all(bind=engine)
+    except Exception as exc:
+        logger.warning("clinical decision tables migration skipped: %s", exc)
     _migrate_appointment_linked_clinical()
     _migrate_doctor_leaves_type_and_reason()
     _migrate_ot_rooms_and_surgery_links()
@@ -1249,6 +1291,7 @@ async def lifespan(_: FastAPI):
     _migrate_billing_source_type_pharmacy()
     _migrate_org_contact_fields()
     _migrate_prescription_signature()
+    _migrate_pharmacy_high_alert()
     _migrate_encounter_ids()
     _migrate_nurse_ipd()
     _migrate_performance_indexes()
@@ -1444,6 +1487,16 @@ if settings.use_migrated_vitals:
     app.include_router(migrated_vitals_router, prefix="/api")
 else:
     app.include_router(vitals.router, prefix="/api")
+
+# Clinical Decision Support (Features 19-21) — no legacy equivalent, always mounted.
+# Previously missing, causing 404s on /api/clinical/alerts and /api/clinical/order-sets.
+try:
+    from hms_migration.modules.clinical_decision.api.clinical_decision_api import (
+        router as clinical_decision_router,
+    )
+    app.include_router(clinical_decision_router, prefix="/api")
+except Exception as exc:
+    logger.warning("clinical decision router not mounted: %s", exc)
 
 
 @app.get("/")
