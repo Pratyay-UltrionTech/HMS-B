@@ -8,11 +8,12 @@ Tables:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import uuid
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     String,
@@ -86,7 +87,18 @@ class Department(Base):
 
 
 class Supplier(Base):
-    """General hospital goods / services supplier."""
+    """General hospital goods / services supplier.
+
+    This is the enterprise-canonical vendor master. Feature 53 (Vendor Master,
+    modules/procurement) does NOT create a separate vendor/supplier table — all
+    procurement entities (PurchaseOrder, GoodsReceivedNote) reference this
+    `Supplier` row via FK. The fields below (payment_terms, tax_id, contract
+    dates, supplied_categories) were added additively as nullable columns to
+    support procurement use cases without altering or breaking any existing
+    row or caller of this entity. `modules/pharmacy`'s `PharmacySupplier` and
+    this `Supplier` remain intentionally separate (pharmacy-scoped vs general
+    hospital procurement) — consolidating them is a larger follow-up not
+    undertaken here."""
 
     __tablename__ = "suppliers"
     __table_args__ = (
@@ -108,3 +120,10 @@ class Supplier(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # ── Additive columns for Feature 53 (Vendor Master / procurement) ───────
+    payment_terms: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tax_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # GSTIN / tax registration no.
+    contract_start: Mapped[date | None] = mapped_column(Date, nullable=True)
+    contract_end: Mapped[date | None] = mapped_column(Date, nullable=True)
+    supplied_categories: Mapped[str | None] = mapped_column(Text, nullable=True)  # comma-separated free text

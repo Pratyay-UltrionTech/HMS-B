@@ -115,7 +115,7 @@ def delete_document(
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> None:
+):
     DeleteDmsDocumentAction(db, hospital_id).execute(document_id, user)
 
 

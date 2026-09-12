@@ -114,7 +114,7 @@ def delete_scan(
     db: Session = Depends(get_transitional_sync_session),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> None:
+):
     DeleteScanAction(db, hospital_id, user).execute(scan_id)
 
 

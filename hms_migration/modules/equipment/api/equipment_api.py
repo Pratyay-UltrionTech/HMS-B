@@ -89,9 +89,8 @@ def delete_category(
     db: Session = Depends(get_transitional_sync_session),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> None:
+):
     EquipmentActions(db, hospital_id, user).delete_category(category_id)
-    return None
 
 
 # ── Inventory ─────────────────────────────────────────────────────────────────
@@ -141,7 +140,7 @@ def delete_item(
     db: Session = Depends(get_transitional_sync_session),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> None:
+):
     EquipmentActions(db, hospital_id, user).delete_item(item_id)
     return None
 

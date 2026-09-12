@@ -1,3 +1,1 @@
-from hms_migration.modules.laboratory.api.laboratory_api import router
-
-__all__ = ["router"]
+"""Laboratory module conforming to UltrionTech-Backend-Template."""

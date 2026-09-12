@@ -11,7 +11,7 @@ from datetime import date
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.orm import Session
 
 from hms_migration.infrastructure.postgres.session import get_transitional_sync_session
@@ -83,14 +83,15 @@ def update_role(
     return AdminActions(db, hospital_id, actor).update_role(role_id, payload)
 
 
-@router.delete("/roles/{role_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/roles/{role_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def delete_role(
     role_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+) -> Response:
     AdminActions(db, hospital_id, actor).delete_role(role_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ── Users ──────────────────────────────────────────────────────────────────────
@@ -124,14 +125,15 @@ def update_user(
     return AdminActions(db, hospital_id, actor).update_user(user_id, payload)
 
 
-@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def delete_user(
     user_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+) -> Response:
     AdminActions(db, hospital_id, actor).delete_user(user_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ── Audit Logs ─────────────────────────────────────────────────────────────────
@@ -184,14 +186,15 @@ def seed_shift_roster(
     return AdminActions(db, hospital_id, actor).seed_shift_roster(payload)
 
 
-@router.delete("/shift-roster", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/shift-roster", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def clear_shift_roster_overrides(
     roster_date: date = Query(...),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+) -> Response:
     AdminActions(db, hospital_id, actor).clear_shift_roster_overrides(roster_date)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/shift-roster/snapshot", response_model=ShiftRosterSnapshot)

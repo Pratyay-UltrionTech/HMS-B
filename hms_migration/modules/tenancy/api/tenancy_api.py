@@ -94,5 +94,5 @@ def delete_hospital(
     hospital_uuid: str,
     db: Session = Depends(get_transitional_sync_session),
     _: dict[str, Any] = Depends(require_super_admin),
-) -> None:
+):
     TenancyActions(db).delete_hospital(hospital_uuid)

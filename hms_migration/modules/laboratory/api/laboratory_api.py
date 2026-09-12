@@ -12,7 +12,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from hms_migration.infrastructure.postgres.session import get_transitional_sync_session
@@ -126,14 +126,15 @@ def update_test(
     return UpdateLabTestAction(db, hospital_id).execute(test_id, payload, user)
 
 
-@router.delete("/tests/{test_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/tests/{test_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def delete_test(
     test_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> None:
+) -> Response:
     DeleteLabTestAction(db, hospital_id).execute(test_id, user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ── 7-12. Panels ───────────────────────────────────────────────────────────────
@@ -194,7 +195,7 @@ def delete_panel(
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> None:
+):
     DeleteLabPanelAction(db, hospital_id).execute(panel_id, user)
 
 

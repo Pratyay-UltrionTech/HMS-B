@@ -98,7 +98,7 @@ def delete_wing(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_wing(wing_id)
 
 
@@ -139,7 +139,7 @@ def delete_department(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_department(department_id)
 
 
@@ -181,7 +181,7 @@ def delete_shift_type(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_shift_type(shift_id)
 
 
@@ -222,7 +222,7 @@ def delete_holiday(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_holiday(holiday_id)
 
 
@@ -263,7 +263,7 @@ def delete_appointment_type(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_appointment_type(item_id)
 
 
@@ -304,7 +304,7 @@ def delete_ward(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_ward(ward_id)
 
 
@@ -345,7 +345,7 @@ def delete_room(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_room(room_id)
 
 
@@ -388,7 +388,7 @@ def delete_ot_room(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_ot_room(room_id)
 
 
@@ -429,7 +429,7 @@ def delete_supplier(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_supplier(supplier_id)
 
 
@@ -481,7 +481,7 @@ def delete_consultation_pricing(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_consultation_pricing(item_id)
 
 
@@ -529,6 +529,6 @@ def delete_insurance_provider(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
     actor: dict[str, Any] = Depends(require_hospital_admin),
-) -> None:
+):
     MastersActions(db, hospital_id, actor).delete_insurance_provider(item_id)
 

@@ -95,7 +95,7 @@ def delete_vital(
     db: Session = Depends(get_db),
     user: dict[str, Any] = Depends(require_vitals_access),
     hospital_id: UUID = Depends(get_vitals_hospital_context),
-) -> None:
+):
     """Delete an existing vital reading record."""
     repo = VitalsRepository(db=db, hospital_id=hospital_id)
     DeleteVitalAction(repo).execute(vital_id=vital_id, user=user)
