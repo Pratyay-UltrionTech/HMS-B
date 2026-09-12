@@ -38,6 +38,8 @@ from hms_migration.modules.admin.contracts.admin_contracts import (
     ShiftRosterResponse,
     ShiftRosterSeed,
     ShiftRosterSnapshot,
+    HospitalFacilitySettings,
+    HospitalFacilitySettingsUpdate,
 )
 from hms_migration.modules.doctors.entities.doctor import (
     Holiday,
@@ -793,3 +795,64 @@ class AdminActions:
             text=text,
             entries_count=len(entries),
         )
+
+    # ── Hospital Facility Settings (SCR-022) ──────────────────────────────────
+    def get_facility_settings(self) -> HospitalFacilitySettings:
+        hospital = self.db.query(Hospital).filter(Hospital.id == self.hospital_id).first()
+        if not hospital:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+
+        stored = _FACILITY_SETTINGS_STORE.get(self.hospital_id, {})
+        return HospitalFacilitySettings(
+            hospital_id=hospital.hospital_id,
+            legal_name=stored.get("legal_name", hospital.name),
+            display_name=stored.get("display_name", hospital.name.split(" & ")[0] if " & " in hospital.name else hospital.name),
+            institutional_code=stored.get("institutional_code", hospital.hospital_id),
+            address=stored.get("address", hospital.address),
+            phone=stored.get("phone", hospital.phone),
+            email=stored.get("email", hospital.email),
+            cea_registration=stored.get("cea_registration", "CEA/DL/2024/0981"),
+            nabh_accreditation_ref=stored.get("nabh_accreditation_ref", "NABH-2024-0418"),
+            nabh_status=stored.get("nabh_status", "Full Accreditation Valid"),
+            tax_gstin=stored.get("tax_gstin", "07AAACH1234F1Z5"),
+            rohini_id=stored.get("rohini_id", "890000124578"),
+            aerb_license_no=stored.get("aerb_license_no", "AERB/MED/DL/0412"),
+            pharmacy_license_no=stored.get("pharmacy_license_no", "DL-20B/21B-45892"),
+            prescription_header_text=stored.get("prescription_header_text", f"{hospital.name.upper()} • CLINICAL SERVICES"),
+            prescription_footer_text=stored.get("prescription_footer_text", f"Emergency Hotline: {hospital.phone} • Contact: {hospital.email}"),
+            abdm_facility_id=stored.get("abdm_facility_id", "IN0710000412"),
+            abdm_m1_active=stored.get("abdm_m1_active", True),
+            abdm_m2_active=stored.get("abdm_m2_active", True),
+            abdm_m3_active=stored.get("abdm_m3_active", True),
+            sms_gateway_active=stored.get("sms_gateway_active", True),
+            whatsapp_gateway_active=stored.get("whatsapp_gateway_active", True),
+            dlt_sender_id=stored.get("dlt_sender_id", "CGHHSP"),
+        )
+
+    def update_facility_settings(self, payload: HospitalFacilitySettingsUpdate) -> HospitalFacilitySettings:
+        hospital = self.db.query(Hospital).filter(Hospital.id == self.hospital_id).first()
+        if not hospital:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+
+        updates = payload.model_dump(exclude_unset=True)
+        if "legal_name" in updates and updates["legal_name"]:
+            hospital.name = updates["legal_name"]
+        if "address" in updates and updates["address"]:
+            hospital.address = updates["address"]
+        if "phone" in updates and updates["phone"]:
+            hospital.phone = updates["phone"]
+        if "email" in updates and updates["email"]:
+            hospital.email = updates["email"]
+
+        self.db.flush()
+
+        stored = _FACILITY_SETTINGS_STORE.setdefault(self.hospital_id, {})
+        stored.update(updates)
+
+        self._audit("update", "facility_settings", self.hospital_id, f"Updated facility settings for {hospital.name}")
+        self.db.commit()
+        return self.get_facility_settings()
+
+
+_FACILITY_SETTINGS_STORE: dict[UUID, dict[str, Any]] = {}
+

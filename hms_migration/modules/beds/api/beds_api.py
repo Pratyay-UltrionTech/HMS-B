@@ -223,6 +223,34 @@ def discharge_patient(
     return DischargePatientAction(db).execute(hospital_id, payload, user)
 
 
+@router.get("/transfer-logs")
+def get_bed_transfer_logs(
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> list[dict[str, Any]]:
+    from hms_migration.shared.audit.entities.audit_log import AuditLog
+
+    logs = (
+        db.query(AuditLog)
+        .filter(AuditLog.hospital_id == hospital_id, AuditLog.entity_type == "admission")
+        .order_by(AuditLog.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": str(log.id),
+            "actor_name": log.actor_name,
+            "action": log.action,
+            "summary": log.summary,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        }
+        for log in logs
+    ]
+
+
 # ── /registration Inpatient Endpoints ───────────────────────────────────────
 
 @registration_inpatient_router.get("/beds", response_model=list[BedOption])

@@ -255,3 +255,56 @@ class AuditLogResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# ── Hospital Facility Settings (SCR-022) ───────────────────────────────────────
+class HospitalFacilitySettings(BaseModel):
+    hospital_id: str
+    legal_name: str
+    display_name: str
+    institutional_code: str
+    address: str
+    phone: str
+    email: str
+    cea_registration: str = "CEA/DL/2024/0981"
+    nabh_accreditation_ref: str = "NABH-2024-0418"
+    nabh_status: str = "Full Accreditation Valid"
+    tax_gstin: str = "07AAACH1234F1Z5"
+    rohini_id: str = "890000124578"
+    aerb_license_no: str = "AERB/MED/DL/0412"
+    pharmacy_license_no: str = "DL-20B/21B-45892"
+    prescription_header_text: str = "CITY GENERAL HOSPITAL & MEDICAL RESEARCH CENTRE"
+    prescription_footer_text: str = "Emergency Hotline: 1066 / 011-26598700 • Email: emergency@hospital.org"
+    abdm_facility_id: str = "IN0710000412"
+    abdm_m1_active: bool = True
+    abdm_m2_active: bool = True
+    abdm_m3_active: bool = True
+    sms_gateway_active: bool = True
+    whatsapp_gateway_active: bool = True
+    dlt_sender_id: str = "CGHHSP"
+
+
+class HospitalFacilitySettingsUpdate(BaseModel):
+    legal_name: str | None = None
+    display_name: str | None = None
+    institutional_code: str | None = None
+    address: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    cea_registration: str | None = None
+    nabh_accreditation_ref: str | None = None
+    nabh_status: str | None = None
+    tax_gstin: str | None = None
+    rohini_id: str | None = None
+    aerb_license_no: str | None = None
+    pharmacy_license_no: str | None = None
+    prescription_header_text: str | None = None
+    prescription_footer_text: str | None = None
+    abdm_facility_id: str | None = None
+    abdm_m1_active: bool | None = None
+    abdm_m2_active: bool | None = None
+    abdm_m3_active: bool | None = None
+    sms_gateway_active: bool | None = None
+    whatsapp_gateway_active: bool | None = None
+    dlt_sender_id: str | None = None
+

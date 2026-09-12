@@ -47,6 +47,11 @@ from hms_migration.modules.masters.contracts.masters_contracts import (
     WingResponse,
     WingUpdate,
 )
+from hms_migration.modules.masters.contracts.insurance_contracts import (
+    InsuranceProviderCreate,
+    InsuranceProviderResponse,
+    InsuranceProviderUpdate,
+)
 from hms_migration.shared.auth import (
     get_hospital_context,
     require_hospital_admin,
@@ -478,3 +483,52 @@ def delete_consultation_pricing(
     actor: dict[str, Any] = Depends(require_hospital_admin),
 ) -> None:
     MastersActions(db, hospital_id, actor).delete_consultation_pricing(item_id)
+
+
+# ── Insurance & TPA Master ───────────────────────────────────────────────────
+@router.get("/insurance", response_model=list[InsuranceProviderResponse])
+def list_insurance_providers(
+    search: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    _: dict[str, Any] = Depends(require_hospital_user),
+) -> list[InsuranceProviderResponse]:
+    return MastersActions(db, hospital_id).list_insurance_providers(
+        search=search,
+        category=category,
+        status_filter=status_filter,
+    )
+
+
+@router.post("/insurance", response_model=InsuranceProviderResponse, status_code=status.HTTP_201_CREATED)
+def create_insurance_provider(
+    payload: InsuranceProviderCreate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> InsuranceProviderResponse:
+    return MastersActions(db, hospital_id, actor).create_insurance_provider(payload)
+
+
+@router.put("/insurance/{item_id}", response_model=InsuranceProviderResponse)
+def update_insurance_provider(
+    item_id: UUID,
+    payload: InsuranceProviderUpdate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> InsuranceProviderResponse:
+    return MastersActions(db, hospital_id, actor).update_insurance_provider(item_id, payload)
+
+
+@router.delete("/insurance/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_insurance_provider(
+    item_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> None:
+    MastersActions(db, hospital_id, actor).delete_insurance_provider(item_id)
+

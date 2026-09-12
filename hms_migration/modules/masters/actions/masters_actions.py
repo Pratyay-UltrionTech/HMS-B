@@ -60,6 +60,12 @@ from hms_migration.modules.masters.contracts.masters_contracts import (
     WingUpdate,
 )
 from hms_migration.modules.masters.entities.organization_entities import Department, Supplier, Wing
+from hms_migration.modules.masters.entities.insurance_entities import InsuranceProvider
+from hms_migration.modules.masters.contracts.insurance_contracts import (
+    InsuranceProviderCreate,
+    InsuranceProviderResponse,
+    InsuranceProviderUpdate,
+)
 from hms_migration.modules.ot.entities.ot_entities import OtRoom
 from hms_migration.shared.audit import write_audit_log
 
@@ -665,3 +671,212 @@ class MastersActions:
         self._audit("delete", "consultation_pricing", item.id, "Deleted consultation pricing")
         self.db.delete(item)
         self.db.commit()
+
+    # ── Insurance & TPA Master ────────────────────────────────────────────────
+    def _seed_insurance_if_empty(self) -> None:
+        count = self.db.query(InsuranceProvider).filter(InsuranceProvider.hospital_id == self.hospital_id).count()
+        if count > 0:
+            return
+        from datetime import date
+        seed_data = [
+            {
+                "code": "TPA-MA-001",
+                "name": "Medi Assist Insurance TPA Pvt. Ltd.",
+                "category": "Private TPA",
+                "irdai_reg_no": "IRDAI: #003",
+                "pre_auth_sla_hours": 2,
+                "tariff_discount_percent": 15.0,
+                "tariff_notes": "15% on IPD • 10% Labs",
+                "contact_person": "Alok Tandon",
+                "phone": "+91 98111 22334",
+                "email": "claims@mediassist.in",
+                "status": "active",
+                "mou_valid_till": date(2027, 11, 30),
+                "active_claims_count": 24,
+                "active_receivables_amount": 3420000.0,
+            },
+            {
+                "code": "INS-SH-002",
+                "name": "Star Health & Allied Insurance Co. Ltd.",
+                "category": "Direct Insurer",
+                "irdai_reg_no": "IRDAI: #129",
+                "pre_auth_sla_hours": 2,
+                "tariff_discount_percent": 12.0,
+                "tariff_notes": "12% on All Packages",
+                "contact_person": "Priya Sharma",
+                "phone": "+91 98222 33445",
+                "email": "hospitaldesk@starhealth.in",
+                "status": "active",
+                "mou_valid_till": date(2027, 6, 30),
+                "active_claims_count": 18,
+                "active_receivables_amount": 2650000.0,
+            },
+            {
+                "code": "INS-IL-003",
+                "name": "ICICI Lombard General Insurance",
+                "category": "Direct Insurer",
+                "irdai_reg_no": "IRDAI: #115",
+                "pre_auth_sla_hours": 2,
+                "tariff_discount_percent": 10.0,
+                "tariff_notes": "10% Standard Rate",
+                "contact_person": "Vikram Seth",
+                "phone": "+91 98333 44556",
+                "email": "cashless@icicilombard.com",
+                "status": "active",
+                "mou_valid_till": date(2028, 3, 31),
+                "active_claims_count": 15,
+                "active_receivables_amount": 2180000.0,
+            },
+            {
+                "code": "INS-HE-004",
+                "name": "HDFC ERGO General Insurance Co.",
+                "category": "Direct Insurer",
+                "irdai_reg_no": "IRDAI: #146",
+                "pre_auth_sla_hours": 2,
+                "tariff_discount_percent": 10.0,
+                "tariff_notes": "10% on IPD Packages",
+                "contact_person": "Rajesh Nair",
+                "phone": "+91 98444 55667",
+                "email": "claims@hdfcergo.com",
+                "status": "active",
+                "mou_valid_till": date(2027, 9, 30),
+                "active_claims_count": 12,
+                "active_receivables_amount": 1740000.0,
+            },
+            {
+                "code": "TPA-VH-005",
+                "name": "Vidal Health Insurance TPA",
+                "category": "Private TPA",
+                "irdai_reg_no": "IRDAI: #016",
+                "pre_auth_sla_hours": 2,
+                "tariff_discount_percent": 15.0,
+                "tariff_notes": "15% on IPD • 5% Pharmacy",
+                "contact_person": "Sunita Patel",
+                "phone": "+91 98555 66778",
+                "email": "preauth@vidalhealthtpa.com",
+                "status": "active",
+                "mou_valid_till": date(2026, 12, 31),
+                "active_claims_count": 9,
+                "active_receivables_amount": 1120000.0,
+            },
+            {
+                "code": "GOV-PM-006",
+                "name": "PM-JAY Ayushman Bharat Scheme",
+                "category": "Government Scheme",
+                "irdai_reg_no": "NHA-PMJAY",
+                "pre_auth_sla_hours": 4,
+                "tariff_discount_percent": 20.0,
+                "tariff_notes": "Pre-fixed Package Rates (TMS 2.0)",
+                "contact_person": "Nodal Officer Health",
+                "phone": "+91 98666 77889",
+                "email": "pmjay@hospital.gov.in",
+                "status": "active",
+                "mou_valid_till": date(2029, 12, 31),
+                "active_claims_count": 32,
+                "active_receivables_amount": 4250000.0,
+            },
+            {
+                "code": "TPA-MD-007",
+                "name": "MDIndia Health Insurance TPA",
+                "category": "Private TPA",
+                "irdai_reg_no": "IRDAI: #005",
+                "pre_auth_sla_hours": 2,
+                "tariff_discount_percent": 14.0,
+                "tariff_notes": "14% on Ward Tariffs",
+                "contact_person": "Amit Joshi",
+                "phone": "+91 98777 88990",
+                "email": "customercare@mdindia.com",
+                "status": "under_renewal",
+                "mou_valid_till": date(2026, 10, 15),
+                "active_claims_count": 5,
+                "active_receivables_amount": 680000.0,
+            },
+        ]
+        for item in seed_data:
+            prov = InsuranceProvider(hospital_id=self.hospital_id, **item)
+            self.db.add(prov)
+        self.db.commit()
+
+    def list_insurance_providers(
+        self,
+        search: str | None = None,
+        category: str | None = None,
+        status_filter: str | None = None,
+    ) -> list[InsuranceProviderResponse]:
+        self._seed_insurance_if_empty()
+        query = self.db.query(InsuranceProvider).filter(
+            InsuranceProvider.hospital_id == self.hospital_id,
+            InsuranceProvider.is_active.is_(True),
+        )
+        if category:
+            query = query.filter(InsuranceProvider.category == category)
+        if status_filter:
+            query = query.filter(InsuranceProvider.status == status_filter)
+        if search:
+            s = f"%{search.strip()}%"
+            query = query.filter(
+                (InsuranceProvider.name.ilike(s))
+                | (InsuranceProvider.code.ilike(s))
+                | (InsuranceProvider.irdai_reg_no.ilike(s))
+                | (InsuranceProvider.contact_person.ilike(s))
+            )
+        rows = query.order_by(InsuranceProvider.name.asc()).all()
+        return [InsuranceProviderResponse.model_validate(r) for r in rows]
+
+    def create_insurance_provider(self, payload: InsuranceProviderCreate) -> InsuranceProviderResponse:
+        existing = (
+            self.db.query(InsuranceProvider)
+            .filter(
+                InsuranceProvider.hospital_id == self.hospital_id,
+                InsuranceProvider.code == payload.code.strip(),
+            )
+            .first()
+        )
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Insurance provider with code '{payload.code}' already exists",
+            )
+        item = InsuranceProvider(
+            hospital_id=self.hospital_id,
+            **payload.model_dump(),
+        )
+        self.db.add(item)
+        self.db.flush()
+        self._audit("create", "insurance_provider", item.id, f"Created insurance provider {item.name} ({item.code})")
+        self.db.commit()
+        self.db.refresh(item)
+        return InsuranceProviderResponse.model_validate(item)
+
+    def update_insurance_provider(self, item_id: UUID, payload: InsuranceProviderUpdate) -> InsuranceProviderResponse:
+        item = self._get_or_404(InsuranceProvider, item_id, "Insurance provider")
+        data = payload.model_dump(exclude_unset=True)
+        if "code" in data and data["code"] != item.code:
+            existing = (
+                self.db.query(InsuranceProvider)
+                .filter(
+                    InsuranceProvider.hospital_id == self.hospital_id,
+                    InsuranceProvider.code == data["code"],
+                    InsuranceProvider.id != item_id,
+                )
+                .first()
+            )
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Insurance provider with code '{data['code']}' already exists",
+                )
+        for k, v in data.items():
+            setattr(item, k, v)
+        self.db.flush()
+        self._audit("update", "insurance_provider", item.id, f"Updated insurance provider {item.name}")
+        self.db.commit()
+        self.db.refresh(item)
+        return InsuranceProviderResponse.model_validate(item)
+
+    def delete_insurance_provider(self, item_id: UUID) -> None:
+        item = self._get_or_404(InsuranceProvider, item_id, "Insurance provider")
+        self._audit("delete", "insurance_provider", item.id, f"Deleted insurance provider {item.name}")
+        self.db.delete(item)
+        self.db.commit()
+

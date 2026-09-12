@@ -5,10 +5,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
+from pydantic import BaseModel
+
 from app.database import get_db
 from app.models import (
     Admission,
     AdmissionStatus,
+    AuditLog,
     Bed,
     HospitalUser,
     Patient,
@@ -701,4 +704,51 @@ def discharge_patient(
         .filter(Admission.id == admission.id)
         .first()
     )
+    if a is None:
+        raise HTTPException(status_code=404, detail="Admission not found after discharge")
     return _admission_detail(a)
+
+
+# ── Admission audit-trail (transfer/discharge history panel) ────────────────────
+class AdmissionHistoryEntry(BaseModel):
+    id: UUID
+    action: str
+    actor_name: str
+    actor_role_label: str | None
+    summary: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/admissions/{admission_id}/history", response_model=list[AdmissionHistoryEntry])
+def get_admission_history(
+    admission_id: UUID,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Real audit-trail feed (allocate/transfer/discharge events) for one admission,
+    for the Bed Transfer/Discharge sidebar. Open to hospital_admin and hospital_staff
+    (reception/nursing use this screen), unlike the admin-only /api/admin/audit-logs
+    endpoint — scoped to the same audit_logs rows written by write_audit() in this file."""
+    admission = (
+        db.query(Admission)
+        .filter(Admission.id == admission_id, Admission.hospital_id == hospital_id)
+        .first()
+    )
+    if not admission:
+        raise HTTPException(status_code=404, detail="Admission not found")
+
+    rows = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.hospital_id == hospital_id,
+            AuditLog.entity_type == "admission",
+            AuditLog.entity_id == str(admission_id),
+        )
+        .order_by(AuditLog.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    return rows

@@ -30,6 +30,8 @@ from hms_migration.modules.admin.contracts.admin_contracts import (
     ShiftRosterResponse,
     ShiftRosterSeed,
     ShiftRosterSnapshot,
+    HospitalFacilitySettings,
+    HospitalFacilitySettingsUpdate,
 )
 from hms_migration.shared.auth import (
     get_hospital_context,
@@ -200,3 +202,24 @@ def get_shift_roster_snapshot(
     _: dict[str, Any] = Depends(require_hospital_user),
 ) -> ShiftRosterSnapshot:
     return AdminActions(db, hospital_id).get_shift_roster_snapshot(roster_date)
+
+
+# ── Hospital Facility Settings (SCR-022) ───────────────────────────────────────
+@router.get("/facility-settings", response_model=HospitalFacilitySettings)
+def get_facility_settings(
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    _: dict[str, Any] = Depends(require_hospital_user),
+) -> HospitalFacilitySettings:
+    return AdminActions(db, hospital_id).get_facility_settings()
+
+
+@router.put("/facility-settings", response_model=HospitalFacilitySettings)
+def update_facility_settings(
+    payload: HospitalFacilitySettingsUpdate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> HospitalFacilitySettings:
+    return AdminActions(db, hospital_id, actor).update_facility_settings(payload)
+
