@@ -124,6 +124,8 @@ class ListChargesAction:
         from_date: date | None = None,
         to_date: date | None = None,
         search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[BillingChargeResponse]:
         charges = self.repo.list_charges(
             patient_id=patient_id,
@@ -132,6 +134,8 @@ class ListChargesAction:
             from_date=from_date,
             to_date=to_date,
             search=search,
+            limit=limit,
+            offset=offset,
         )
         return [BillingChargeResponse.model_validate(charge_to_dict(c)) for c in charges]
 
@@ -261,12 +265,16 @@ class ListPaymentsAction:
         from_date: date | None = None,
         to_date: date | None = None,
         payment_method: BillingPaymentMethod | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[BillingPaymentResponse]:
         payments = self.repo.list_payments(
             patient_id=patient_id,
             from_date=from_date,
             to_date=to_date,
             payment_method=payment_method,
+            limit=limit,
+            offset=offset,
         )
         return [_payment_response_dto(self.db, p) for p in payments]
 
@@ -330,6 +338,8 @@ class ListInvoicesAction:
         from_date: date | None = None,
         to_date: date | None = None,
         search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[BillingInvoiceResponse]:
         invoices = self.repo.list_invoices(
             patient_id=patient_id,
@@ -337,6 +347,8 @@ class ListInvoicesAction:
             from_date=from_date,
             to_date=to_date,
             search=search,
+            limit=limit,
+            offset=offset,
         )
         return [BillingInvoiceResponse.model_validate(invoice_to_dict(inv)) for inv in invoices]
 
@@ -443,8 +455,12 @@ class ListReceiptsAction:
         patient_id: UUID | None = None,
         from_date: date | None = None,
         to_date: date | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[BillingReceiptResponse]:
-        receipts = self.repo.list_receipts(patient_id=patient_id, from_date=from_date, to_date=to_date)
+        receipts = self.repo.list_receipts(
+            patient_id=patient_id, from_date=from_date, to_date=to_date, limit=limit, offset=offset
+        )
         return [BillingReceiptResponse.model_validate(receipt_to_dict(r)) for r in receipts]
 
 

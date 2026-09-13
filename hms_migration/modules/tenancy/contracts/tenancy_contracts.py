@@ -109,6 +109,32 @@ class HospitalDashboardResponse(BaseModel):
     collections_detail: list[HospitalDashboardListItem] = []
 
 
+class HospitalDashboardSummaryResponse(BaseModel):
+    """Lightweight counters-only view of the dashboard.
+
+    For call sites that only need a handful of numbers (e.g. a sidebar badge
+    showing today's appointment/lab-order counts) rather than the full
+    dashboard with its ~10 detail lists and cross-reference lookups.
+    """
+
+    patient_count: int
+    appointments_today: int
+    appointments_scheduled: int
+    appointments_in_progress: int
+    appointments_completed: int
+    active_admissions: int
+    beds_total: int
+    beds_occupied: int
+    occupied_beds_pct: int = 0
+    patients_registered_today: int = 0
+    lab_orders_today: int = 0
+    radiology_orders_today: int = 0
+    ot_surgeries_today: int = 0
+    charges_today: int = 0
+    collections_today: int = 0
+    outstanding_total: int = 0
+
+
 class RoleDashboardMetric(BaseModel):
     key: str
     label: str

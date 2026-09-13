@@ -207,17 +207,24 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
     )
 
     # 2. Appointments
-    for a in (
+    appointments = (
         db.query(Appointment)
         .filter(Appointment.hospital_id == hospital_id, Appointment.patient_id == patient.id)
         .all()
-    ):
+    )
+    appt_doctor_ids = {a.doctor_id for a in appointments if a.doctor_id}
+    appt_doctor_map = (
+        {d.id: d for d in db.query(HospitalUser).filter(HospitalUser.id.in_(appt_doctor_ids)).all()}
+        if appt_doctor_ids
+        else {}
+    )
+    for a in appointments:
         when = (
             datetime.combine(a.appointment_date, a.appointment_time).replace(tzinfo=timezone.utc)
             if a.appointment_date and a.appointment_time
             else a.created_at
         )
-        doctor = db.get(HospitalUser, a.doctor_id) if a.doctor_id else None
+        doctor = appt_doctor_map.get(a.doctor_id) if a.doctor_id else None
         doctor_name = doctor.name if doctor else "Doctor"
         events.append(
             DmsTimelineEvent(
@@ -448,7 +455,7 @@ def build_patient_file(
         doc_map = {d.id: d for d in db.query(HospitalUser).filter(HospitalUser.id.in_(doc_ids)).all()} if doc_ids else {}
 
         for o in rad_orders:
-            doc = doc_map.get(getattr(o, "doctor_id", None))
+            doc = doc_map.get(o.doctor_id) if o.doctor_id else None
             radiology_reports.append(
                 DmsRadiologyItem(
                     id=o.id,
@@ -483,13 +490,13 @@ def build_patient_file(
         surg_map = {d.id: d for d in db.query(HospitalUser).filter(HospitalUser.id.in_(surg_ids)).all()} if surg_ids else {}
 
         for s in surgeries:
-            surg = surg_map.get(getattr(s, "surgeon_id", None))
+            surg = surg_map.get(s.surgeon_id) if s.surgeon_id else None
             ot_records.append(
                 DmsOtItem(
                     id=s.id,
                     surgery_no=s.surgery_no,
                     surgery_type=s.surgery_type,
-                    surgeon_name=s.surgeon.name if s.surgeon else None,
+                    surgeon_name=surg.name if surg else None,
                     scheduled_at=s.scheduled_at,
                     status=s.status.value,
                     has_notes=bool(s.pre_op_diagnosis and s.procedure_performed),

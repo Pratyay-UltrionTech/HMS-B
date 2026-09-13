@@ -9,7 +9,7 @@ from typing import Sequence
 from uuid import UUID
 
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from hms_migration.modules.pharmacy.contracts.pharmacy_contracts import (
     InventoryRow,
@@ -90,6 +90,8 @@ class PharmacyRepository:
         search: str | None = None,
         category_id: UUID | None = None,
         active_only: bool | None = None,
+        limit: int = 300,
+        offset: int = 0,
     ) -> Sequence[Medicine]:
         q = (
             self.db.query(Medicine)
@@ -111,7 +113,7 @@ class PharmacyRepository:
             q = q.filter(Medicine.category_id == category_id)
         if active_only is not None:
             q = q.filter(Medicine.is_active == active_only)
-        return q.order_by(Medicine.medicine_name.asc()).all()
+        return q.order_by(Medicine.medicine_name.asc()).limit(limit).offset(offset).all()
 
     def get_medicine_by_id(self, medicine_id: UUID, hospital_id: UUID) -> Medicine | None:
         return (
@@ -332,7 +334,7 @@ class PharmacyRepository:
             self.db.query(PharmacyPurchase)
             .options(
                 joinedload(PharmacyPurchase.supplier),
-                joinedload(PharmacyPurchase.items).joinedload(PharmacyPurchaseItem.medicine),
+                selectinload(PharmacyPurchase.items).joinedload(PharmacyPurchaseItem.medicine),
             )
             .filter(PharmacyPurchase.hospital_id == hospital_id)
         )
@@ -378,7 +380,7 @@ class PharmacyRepository:
         q = (
             self.db.query(PharmacySale)
             .options(
-                joinedload(PharmacySale.items).joinedload(PharmacySaleItem.medicine),
+                selectinload(PharmacySale.items).joinedload(PharmacySaleItem.medicine),
             )
             .filter(PharmacySale.hospital_id == hospital_id)
         )

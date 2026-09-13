@@ -127,3 +127,12 @@ class InpatientBillingService:
         """Compute patient financial totals: charges, payments, outstanding balance."""
         from hms_migration.modules.billing.services.billing_service import patient_ledger_totals
         return patient_ledger_totals(self.db, hospital_id, patient_id)
+
+    def get_ledger_totals_bulk(
+        self, hospital_id: UUID, patient_ids: list[UUID]
+    ) -> dict[UUID, dict[str, Any]]:
+        """Compute financial totals for many patients in two bulk queries."""
+        from hms_migration.modules.billing.services.billing_service import (
+            patient_ledger_totals_bulk,
+        )
+        return patient_ledger_totals_bulk(self.db, hospital_id, patient_ids)

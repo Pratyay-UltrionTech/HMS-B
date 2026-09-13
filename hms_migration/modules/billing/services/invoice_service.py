@@ -9,7 +9,6 @@ from __future__ import annotations
 from datetime import date
 from uuid import UUID
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from hms_migration.modules.billing.entities.billing_entities import (
@@ -119,22 +118,28 @@ def refresh_invoice_paid_status(
         )
         .all()
     )
-    for inv in invoices:
-        charge_ids = [ln.charge_id for ln in inv.lines if ln.charge_id]
-        if not charge_ids:
-            continue
-        open_count = (
-            db.query(func.count(BillingCharge.id))
+    all_charge_ids = {
+        ln.charge_id for inv in invoices for ln in inv.lines if ln.charge_id
+    }
+    open_charge_ids: set = set()
+    if all_charge_ids:
+        open_charge_ids = {
+            row[0]
+            for row in db.query(BillingCharge.id)
             .filter(
-                BillingCharge.id.in_(charge_ids),
+                BillingCharge.id.in_(all_charge_ids),
                 BillingCharge.status.in_(
                     [BillingChargeStatus.pending, BillingChargeStatus.partially_paid]
                 ),
             )
-            .scalar()
-            or 0
-        )
-        if int(open_count) == 0:
+            .all()
+        }
+    for inv in invoices:
+        charge_ids = [ln.charge_id for ln in inv.lines if ln.charge_id]
+        if not charge_ids:
+            continue
+        open_count = sum(1 for cid in charge_ids if cid in open_charge_ids)
+        if open_count == 0:
             inv.status = BillingInvoiceStatus.paid
 
 

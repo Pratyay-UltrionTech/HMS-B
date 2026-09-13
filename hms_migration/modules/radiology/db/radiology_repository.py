@@ -94,6 +94,17 @@ class RadiologyRepository:
         )
         return f"RAD{int(count) + 1:04d}"
 
+    def next_order_no_batch(self, n: int) -> list[str]:
+        """Reserve n sequential order numbers with a single count query."""
+        count = (
+            self.db.query(func.count(RadiologyOrder.id))
+            .filter(RadiologyOrder.hospital_id == self.hospital_id)
+            .scalar()
+            or 0
+        )
+        start = int(count) + 1
+        return [f"RAD{i:04d}" for i in range(start, start + n)]
+
     def get_order(self, order_id: UUID) -> RadiologyOrder | None:
         return (
             self.db.query(RadiologyOrder)
@@ -186,21 +197,21 @@ class RadiologyRepository:
         day_start = datetime.combine(today, time.min, tzinfo=timezone.utc)
         day_end = datetime.combine(today, time.max, tzinfo=timezone.utc)
 
-        base = self.db.query(RadiologyOrder).filter(
-            RadiologyOrder.hospital_id == self.hospital_id
-        )
-        todays = base.filter(
-            RadiologyOrder.ordered_at >= day_start,
-            RadiologyOrder.ordered_at <= day_end,
-        ).count()
-        pending = base.filter(
-            RadiologyOrder.status.in_(
-                [RadiologyOrderStatus.ordered, RadiologyOrderStatus.scheduled]
+        def _order_count(*conds):
+            q = self.db.query(func.count(RadiologyOrder.id)).filter(
+                RadiologyOrder.hospital_id == self.hospital_id, *conds
             )
-        ).count()
-        completed = base.filter(RadiologyOrder.status == RadiologyOrderStatus.completed).count()
-        cancelled = base.filter(RadiologyOrder.status == RadiologyOrderStatus.cancelled).count()
-        reports_pending = base.filter(
+            return q.scalar_subquery()
+
+        todays_sq = _order_count(
+            RadiologyOrder.ordered_at >= day_start, RadiologyOrder.ordered_at <= day_end
+        )
+        pending_sq = _order_count(
+            RadiologyOrder.status.in_([RadiologyOrderStatus.ordered, RadiologyOrderStatus.scheduled])
+        )
+        completed_sq = _order_count(RadiologyOrder.status == RadiologyOrderStatus.completed)
+        cancelled_sq = _order_count(RadiologyOrder.status == RadiologyOrderStatus.cancelled)
+        reports_pending_sq = _order_count(
             RadiologyOrder.status.in_(
                 [RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed]
             ),
@@ -208,21 +219,30 @@ class RadiologyRepository:
                 RadiologyOrder.findings.is_(None),
                 RadiologyOrder.findings == "",
             ),
-        ).count()
-        scans_count = (
+        )
+        scans_count_sq = (
             self.db.query(func.count(RadiologyScanCatalog.id))
             .filter(
                 RadiologyScanCatalog.hospital_id == self.hospital_id,
                 RadiologyScanCatalog.is_active.is_(True),
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
+
+        row = self.db.query(
+            todays_sq,
+            pending_sq,
+            completed_sq,
+            cancelled_sq,
+            reports_pending_sq,
+            scans_count_sq,
+        ).one()
+        todays, pending, completed, cancelled, reports_pending, scans_count = row
         return {
-            "todays_orders": todays,
-            "pending_scans": pending,
-            "completed_scans": completed,
-            "reports_pending": reports_pending,
-            "cancelled_orders": cancelled,
-            "scans_count": int(scans_count),
+            "todays_orders": int(todays or 0),
+            "pending_scans": int(pending or 0),
+            "completed_scans": int(completed or 0),
+            "reports_pending": int(reports_pending or 0),
+            "cancelled_orders": int(cancelled or 0),
+            "scans_count": int(scans_count or 0),
         }

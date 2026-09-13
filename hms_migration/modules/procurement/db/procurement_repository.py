@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Sequence
 from uuid import UUID
 
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from hms_migration.modules.inventory.entities.inventory_entities import ConsumableItem
 from hms_migration.modules.masters.entities.organization_entities import Supplier
@@ -114,7 +114,10 @@ class ProcurementRepository:
     def list_pos(self, hospital_id: UUID, status_filter: PurchaseOrderStatus | None = None) -> Sequence[PurchaseOrder]:
         q = (
             self.db.query(PurchaseOrder)
-            .options(joinedload(PurchaseOrder.items).joinedload(PurchaseOrderItem.item), joinedload(PurchaseOrder.supplier))
+            .options(
+                selectinload(PurchaseOrder.items).joinedload(PurchaseOrderItem.item),
+                joinedload(PurchaseOrder.supplier),
+            )
             .filter(PurchaseOrder.hospital_id == hospital_id)
         )
         if status_filter:
@@ -156,7 +159,7 @@ class ProcurementRepository:
     def list_pos_for_supplier(self, supplier_id: UUID, hospital_id: UUID) -> Sequence[PurchaseOrder]:
         return (
             self.db.query(PurchaseOrder)
-            .options(joinedload(PurchaseOrder.items))
+            .options(selectinload(PurchaseOrder.items))
             .filter(PurchaseOrder.supplier_id == supplier_id, PurchaseOrder.hospital_id == hospital_id)
             .all()
         )
@@ -165,7 +168,7 @@ class ProcurementRepository:
         return (
             self.db.query(GoodsReceivedNote)
             .join(PurchaseOrder, GoodsReceivedNote.purchase_order_id == PurchaseOrder.id)
-            .options(joinedload(GoodsReceivedNote.items))
+            .options(selectinload(GoodsReceivedNote.items))
             .filter(PurchaseOrder.supplier_id == supplier_id, GoodsReceivedNote.hospital_id == hospital_id)
             .all()
         )
@@ -174,7 +177,7 @@ class ProcurementRepository:
         return (
             self.db.query(PurchaseOrder)
             .options(
-                joinedload(PurchaseOrder.items).joinedload(PurchaseOrderItem.item),
+                selectinload(PurchaseOrder.items).joinedload(PurchaseOrderItem.item),
                 joinedload(PurchaseOrder.supplier),
             )
             .filter(PurchaseOrder.hospital_id == hospital_id)

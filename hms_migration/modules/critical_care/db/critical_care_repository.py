@@ -8,17 +8,16 @@ Kept strictly under 500 lines.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from uuid import UUID
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
-from hms_migration.modules.beds.entities.bed import Bed, Ward, WardType
+from hms_migration.modules.beds.entities.bed import Ward, WardType
 from hms_migration.modules.critical_care.entities.critical_care_entities import (
     AlertStatus,
     ClinicalDeteriorationAlert,
-    CodeBlueEvent,
     CodeBlueIncident,
     IcuFlowsheetEntry,
     IcuPatientProfile,
@@ -72,6 +71,43 @@ class CriticalCareRepository:
             .order_by(Admission.admitted_at.asc())
             .all()
         )
+
+    def get_icu_profiles_for_admissions(
+        self, admission_ids: list[UUID]
+    ) -> dict[UUID, IcuPatientProfile]:
+        """Bulk-fetch ICU profiles keyed by admission_id (avoids N+1 on the board view)."""
+        if not admission_ids:
+            return {}
+        rows = (
+            self.db.query(IcuPatientProfile)
+            .filter(
+                IcuPatientProfile.admission_id.in_(admission_ids),
+                IcuPatientProfile.hospital_id == self.hospital_id,
+            )
+            .all()
+        )
+        return {p.admission_id: p for p in rows}
+
+    def get_latest_flowsheets_for_admissions(
+        self, admission_ids: list[UUID]
+    ) -> dict[UUID, IcuFlowsheetEntry]:
+        """Bulk-fetch the most recent flowsheet entry per admission_id (avoids N+1 on the board view)."""
+        if not admission_ids:
+            return {}
+        rows = (
+            self.db.query(IcuFlowsheetEntry)
+            .filter(
+                IcuFlowsheetEntry.admission_id.in_(admission_ids),
+                IcuFlowsheetEntry.hospital_id == self.hospital_id,
+            )
+            .order_by(IcuFlowsheetEntry.admission_id, IcuFlowsheetEntry.recorded_at.desc())
+            .all()
+        )
+        latest: dict[UUID, IcuFlowsheetEntry] = {}
+        for entry in rows:
+            if entry.admission_id not in latest:
+                latest[entry.admission_id] = entry
+        return latest
 
     def get_icu_profile(self, admission_id: UUID) -> IcuPatientProfile | None:
         return (
@@ -141,15 +177,17 @@ class CriticalCareRepository:
             .first()
         )
 
-    def list_code_blue_incidents(self) -> list[CodeBlueIncident]:
+    def list_code_blue_incidents(self, limit: int = 200, offset: int = 0) -> list[CodeBlueIncident]:
         return (
             self.db.query(CodeBlueIncident)
             .options(
                 joinedload(CodeBlueIncident.patient),
-                joinedload(CodeBlueIncident.events),
+                selectinload(CodeBlueIncident.events),
             )
             .filter(CodeBlueIncident.hospital_id == self.hospital_id)
             .order_by(CodeBlueIncident.activated_at.desc())
+            .limit(limit)
+            .offset(offset)
             .all()
         )
 

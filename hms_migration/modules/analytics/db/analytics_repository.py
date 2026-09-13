@@ -96,10 +96,21 @@ class AnalyticsRepository:
         val = self.db.execute(stmt).scalar()
         return int(val or 0)
 
-    def get_patient_creation_timestamps(self) -> list[tuple[Any, datetime | None]]:
-        """Fetch patient IDs and creation timestamps for historical cohort aggregation."""
-        stmt = select(_patients.c.id, _patients.c.created_at)
-        return list(self.db.execute(stmt).all())
+    def get_patient_counts_by_month(self, since: datetime) -> dict[str, int]:
+        """Return {"YYYY-MM": count} of patients created on/after `since`, grouped in SQL.
+
+        Replaces pulling every patient row platform-wide into Python just to
+        bucket by month — this aggregates in the database instead.
+        """
+        # Truncate in UTC explicitly — date_trunc on a timestamptz otherwise
+        # uses the DB session's timezone, which could shift month boundaries.
+        bucket = func.date_trunc("month", func.timezone("UTC", _patients.c.created_at))
+        stmt = (
+            select(bucket.label("bucket"), func.count(_patients.c.id))
+            .where(_patients.c.created_at >= since)
+            .group_by(bucket)
+        )
+        return {row[0].strftime("%Y-%m"): int(row[1]) for row in self.db.execute(stmt).all() if row[0]}
 
     def get_recent_hospitals(self, limit: int = 8) -> list[dict[str, Any]]:
         """Fetch recently onboarded hospitals ordered by creation timestamp."""

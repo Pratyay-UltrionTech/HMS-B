@@ -209,6 +209,8 @@ def appointment_history(
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     status_filter: AppointmentStatus | None = Query(default=None, alias="status"),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     _: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -221,15 +223,10 @@ def appointment_history(
         from_date=effective_from,
         to_date=effective_to,
         status=status_filter,
+        patient_search=patient,
+        limit=limit,
+        offset=offset,
     )
-    if patient:
-        term = patient.strip().lower()
-        items = [
-            i for i in items
-            if (i.patient_name and term in i.patient_name.lower())
-            or (i.patient_uhid and term in i.patient_uhid.lower())
-            or (i.patient_mobile and term in i.patient_mobile.lower())
-        ]
     return items
 
 

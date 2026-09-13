@@ -18,6 +18,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -88,6 +89,9 @@ class BillingCharge(Base):
     """Unified patient charge / billable transaction (ledger debit)."""
 
     __tablename__ = "billing_charges"
+    __table_args__ = (
+        Index("ix_billing_charges_hospital_created", "hospital_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -119,7 +123,7 @@ class BillingCharge(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -132,6 +136,9 @@ class BillingPayment(Base):
     """Patient payment collection (ledger credit)."""
 
     __tablename__ = "billing_payments"
+    __table_args__ = (
+        Index("ix_billing_payments_hospital_created", "hospital_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -152,7 +159,7 @@ class BillingPayment(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     received_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
@@ -164,6 +171,7 @@ class BillingInvoice(Base):
     __tablename__ = "billing_invoices"
     __table_args__ = (
         UniqueConstraint("hospital_id", "invoice_number", name="uq_billing_invoice_number"),
+        Index("ix_billing_invoices_hospital_created", "hospital_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -190,7 +198,7 @@ class BillingInvoice(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -238,6 +246,7 @@ class BillingReceipt(Base):
     __tablename__ = "billing_receipts"
     __table_args__ = (
         UniqueConstraint("hospital_id", "receipt_number", name="uq_billing_receipt_number"),
+        Index("ix_billing_receipts_hospital_created", "hospital_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -273,7 +282,7 @@ class BillingReceipt(Base):
     )
     collected_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])

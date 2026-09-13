@@ -25,25 +25,45 @@ class BedsRepository:
 
     def ensure_beds_for_room(self, hospital_id: UUID, room: Room) -> None:
         """Create bed rows if fewer than room.bed_count exist."""
-        existing = (
-            self.db.query(func.count(Bed.id))
-            .filter(Bed.room_id == room.id, Bed.hospital_id == hospital_id)
-            .scalar()
-            or 0
-        )
-        if existing >= room.bed_count:
+        self._ensure_beds_bulk(hospital_id, [room])
+
+    def _ensure_beds_bulk(self, hospital_id: UUID, rooms: list[Room]) -> None:
+        """Create missing bed rows for every given room in a single pass.
+
+        Was previously one COUNT query per room (ensure_beds_for_room called
+        in a loop) on every dashboard/report/options load — with N active
+        rooms that's N+1 queries just to verify beds exist, before the actual
+        data query even runs. Now a single grouped COUNT plus one bulk insert
+        regardless of how many rooms there are.
+        """
+        if not rooms:
             return
-        for i in range(existing + 1, room.bed_count + 1):
-            self.db.add(
-                Bed(
-                    hospital_id=hospital_id,
-                    ward_id=room.ward_id,
-                    room_id=room.id,
-                    bed_code=f"Bed-{i}",
-                    is_occupied=False,
-                    is_active=True,
+        room_ids = [room.id for room in rooms]
+        count_rows = (
+            self.db.query(Bed.room_id, func.count(Bed.id))
+            .filter(Bed.hospital_id == hospital_id, Bed.room_id.in_(room_ids))
+            .group_by(Bed.room_id)
+            .all()
+        )
+        existing_counts = {room_id: int(cnt) for room_id, cnt in count_rows}
+        new_beds = []
+        for room in rooms:
+            existing = existing_counts.get(room.id, 0)
+            if existing >= room.bed_count:
+                continue
+            for i in range(existing + 1, room.bed_count + 1):
+                new_beds.append(
+                    Bed(
+                        hospital_id=hospital_id,
+                        ward_id=room.ward_id,
+                        room_id=room.id,
+                        bed_code=f"Bed-{i}",
+                        is_occupied=False,
+                        is_active=True,
+                    )
                 )
-            )
+        if new_beds:
+            self.db.add_all(new_beds)
         self.db.flush()
 
     def sync_all_beds(self, hospital_id: UUID) -> None:
@@ -53,9 +73,7 @@ class BedsRepository:
             .filter(Room.hospital_id == hospital_id, Room.is_active.is_(True))
             .all()
         )
-        for room in rooms:
-            self.ensure_beds_for_room(hospital_id, room)
-        self.db.flush()
+        self._ensure_beds_bulk(hospital_id, rooms)
 
     def get_dashboard_rows(
         self,
@@ -221,8 +239,7 @@ class BedsRepository:
             rooms_q = rooms_q.filter(Room.ward_id == ward_id)
         if room_id:
             rooms_q = rooms_q.filter(Room.id == room_id)
-        for room in rooms_q.all():
-            self.ensure_beds_for_room(hospital_id, room)
+        self._ensure_beds_bulk(hospital_id, rooms_q.all())
         self.db.commit()
 
         q = (

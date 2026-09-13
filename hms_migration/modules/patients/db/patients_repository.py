@@ -86,8 +86,15 @@ class PatientRepository(BaseRepository[Patient]):
         self,
         search: str | None = None,
         status_filter: PatientStatus | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[Patient]:
-        """List patients filtered by tenant, status, and search string ordered by created_at desc."""
+        """List patients filtered by tenant, status, and search string ordered by created_at desc.
+
+        Bounded by limit/offset: an unbounded .all() here previously pulled every
+        patient row on every directory load, which is why the screen got slower
+        as the hospital's patient count grew.
+        """
         q = self.db.query(Patient).filter(Patient.hospital_id == self.hospital_id)
         if status_filter:
             q = q.filter(Patient.status == status_filter)
@@ -102,4 +109,4 @@ class PatientRepository(BaseRepository[Patient]):
                     Patient.last_name.ilike(term),
                 )
             )
-        return q.order_by(Patient.created_at.desc()).all()
+        return q.order_by(Patient.created_at.desc()).limit(limit).offset(offset).all()

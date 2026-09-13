@@ -262,6 +262,17 @@ class ClinicalDecisionActions:
         triggered_alerts: list[ClinicalAlert] = []
         now = datetime.now(timezone.utc)
 
+        # Bulk-fetch already-active alerts for this patient once, instead of
+        # issuing one existence-check query per rule inside the loop below.
+        existing_active_rule_ids = {
+            a.rule_id
+            for a in self.db.query(ClinicalAlert.rule_id).filter(
+                ClinicalAlert.patient_id == patient_id,
+                ClinicalAlert.status == ClinicalAlertStatus.active,
+                ClinicalAlert.hospital_id == self.hospital_id,
+            ).all()
+        }
+
         # Evaluate rules dynamically without hardcoded medical cutoffs (Correction #2)
         for rule in active_rules:
             definition = rule.rule_definition or {}
@@ -287,14 +298,7 @@ class ClinicalDecisionActions:
             rule_triggered = all(matches) if logic == "AND" else any(matches)
             if rule_triggered:
                 # Avoid duplicate active alert if already active
-                existing_active = self.db.query(ClinicalAlert).filter(
-                    ClinicalAlert.patient_id == patient_id,
-                    ClinicalAlert.rule_id == rule.id,
-                    ClinicalAlert.status == ClinicalAlertStatus.active,
-                    ClinicalAlert.hospital_id == self.hospital_id,
-                ).first()
-
-                if not existing_active:
+                if rule.id not in existing_active_rule_ids:
                     alert = ClinicalAlert(
                         hospital_id=self.hospital_id,
                         patient_id=patient_id,
@@ -498,12 +502,21 @@ class ClinicalDecisionActions:
             self.db.flush()
             created_lab_order_id = lab_order.id
 
+            lab_catalog_ids = {li.lab_test_catalog_id for li in lab_items if li.lab_test_catalog_id}
+            lab_catalog_map = (
+                {
+                    c.id: c
+                    for c in self.db.query(LabTestCatalog).filter(
+                        LabTestCatalog.id.in_(lab_catalog_ids),
+                        LabTestCatalog.hospital_id == self.hospital_id,
+                    ).all()
+                }
+                if lab_catalog_ids
+                else {}
+            )
             for li in lab_items:
                 if li.lab_test_catalog_id:
-                    cat_test = self.db.query(LabTestCatalog).filter(
-                        LabTestCatalog.id == li.lab_test_catalog_id,
-                        LabTestCatalog.hospital_id == self.hospital_id,
-                    ).first()
+                    cat_test = lab_catalog_map.get(li.lab_test_catalog_id)
                     lo_item = LabOrderItem(
                         hospital_id=self.hospital_id,
                         order_id=lab_order.id,
@@ -518,12 +531,21 @@ class ClinicalDecisionActions:
                     self.db.add(lo_item)
 
         # Reuses existing RadiologyOrder engine (Correction #3)
+        rad_catalog_ids = {ri.radiology_scan_catalog_id for ri in rad_items if ri.radiology_scan_catalog_id}
+        rad_catalog_map = (
+            {
+                s.id: s
+                for s in self.db.query(RadiologyScanCatalog).filter(
+                    RadiologyScanCatalog.id.in_(rad_catalog_ids),
+                    RadiologyScanCatalog.hospital_id == self.hospital_id,
+                ).all()
+            }
+            if rad_catalog_ids
+            else {}
+        )
         for ri in rad_items:
             if ri.radiology_scan_catalog_id:
-                scan = self.db.query(RadiologyScanCatalog).filter(
-                    RadiologyScanCatalog.id == ri.radiology_scan_catalog_id,
-                    RadiologyScanCatalog.hospital_id == self.hospital_id,
-                ).first()
+                scan = rad_catalog_map.get(ri.radiology_scan_catalog_id)
                 rad_order_no = f"RO-{uuid.uuid4().hex[:8].upper()}"
                 actor_name = str(self.actor.get("email") or self.actor.get("username") or "System")
                 rad_order = RadiologyOrder(

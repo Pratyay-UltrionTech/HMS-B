@@ -37,6 +37,27 @@ class AppointmentReader:
             .first()
         )
 
+    def get_appointments_by_ids(self, appointment_ids: list[UUID]) -> dict[UUID, Appointment]:
+        """Batch-fetch appointments by id, scoped to this hospital, patient/doctor eager-loaded.
+
+        Use this instead of calling get_appointment_by_id in a loop.
+        """
+        if not appointment_ids:
+            return {}
+        rows = (
+            self.db.query(Appointment)
+            .options(
+                joinedload(Appointment.patient),
+                joinedload(Appointment.doctor),
+            )
+            .filter(
+                Appointment.id.in_(appointment_ids),
+                Appointment.hospital_id == self.hospital_id,
+            )
+            .all()
+        )
+        return {a.id: a for a in rows}
+
     def get_today_appointments(self, on_date: date) -> list[Appointment]:
         """Fetch today's non-cancelled appointments for this hospital, ordered chronologically."""
         return (

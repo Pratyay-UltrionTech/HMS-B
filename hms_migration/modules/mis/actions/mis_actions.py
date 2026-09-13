@@ -96,8 +96,7 @@ class MisActions:
                 q = q.filter(Patient.status == PatientStatus(status_filter))
             except ValueError:
                 pass
-
-        total = q.count()
+        total_sq = q.with_entities(func.count(Patient.id)).scalar_subquery()
 
         new_today_q = self.db.query(func.count(Patient.id)).filter(
             Patient.hospital_id == self.hospital_id,
@@ -106,7 +105,7 @@ class MisActions:
         )
         if patient_id:
             new_today_q = new_today_q.filter(Patient.id == patient_id)
-        new_today = new_today_q.scalar() or 0
+        new_today_sq = new_today_q.scalar_subquery()
 
         new_in_range_q = self.db.query(func.count(Patient.id)).filter(
             Patient.hospital_id == self.hospital_id,
@@ -115,13 +114,12 @@ class MisActions:
         )
         if patient_id:
             new_in_range_q = new_in_range_q.filter(Patient.id == patient_id)
-        new_in_range = new_in_range_q.scalar() or 0
+        new_in_range_sq = new_in_range_q.scalar_subquery()
 
-        admitted = (
+        admitted_sq = (
             self.db.query(func.count(Patient.id))
             .filter(Patient.hospital_id == self.hospital_id, Patient.status == PatientStatus.admitted)
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
 
         opd_q = (
@@ -137,7 +135,7 @@ class MisActions:
             opd_q = opd_q.filter(Appointment.doctor_id == doctor_id)
         if patient_id:
             opd_q = opd_q.filter(Appointment.patient_id == patient_id)
-        opd = opd_q.scalar() or 0
+        opd_sq = opd_q.scalar_subquery()
 
         ipd_q = self.db.query(func.count(Admission.id)).filter(
             Admission.hospital_id == self.hospital_id,
@@ -150,9 +148,9 @@ class MisActions:
         ward_ids = ward_ids_for_department(self.db, self.hospital_id, department_id)
         if ward_ids is not None:
             ipd_q = ipd_q.filter(Admission.ward_id.in_(ward_ids) if ward_ids else Admission.ward_id.is_(None))
-        ipd = ipd_q.scalar() or 0
+        ipd_sq = ipd_q.scalar_subquery()
 
-        discharged_today = (
+        discharged_today_sq = (
             self.db.query(func.count(Admission.id))
             .filter(
                 Admission.hospital_id == self.hospital_id,
@@ -160,11 +158,10 @@ class MisActions:
                 Admission.discharged_at >= day_start(today),
                 Admission.discharged_at <= day_end(today),
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
 
-        discharged_range = (
+        discharged_range_sq = (
             self.db.query(func.count(Admission.id))
             .filter(
                 Admission.hospital_id == self.hospital_id,
@@ -172,9 +169,36 @@ class MisActions:
                 Admission.discharged_at >= day_start(df),
                 Admission.discharged_at <= day_end(dt),
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
+
+        (
+            total,
+            new_today,
+            new_in_range,
+            admitted,
+            opd,
+            ipd,
+            discharged_today,
+            discharged_range,
+        ) = self.db.query(
+            total_sq,
+            new_today_sq,
+            new_in_range_sq,
+            admitted_sq,
+            opd_sq,
+            ipd_sq,
+            discharged_today_sq,
+            discharged_range_sq,
+        ).one()
+        total = total or 0
+        new_today = new_today or 0
+        new_in_range = new_in_range or 0
+        admitted = admitted or 0
+        opd = opd or 0
+        ipd = ipd or 0
+        discharged_today = discharged_today or 0
+        discharged_range = discharged_range or 0
 
         metrics = [
             MetricRow(metric="New Patients Today", count=int(new_today)),
@@ -445,15 +469,14 @@ class MisActions:
     ) -> DailySummaryResponse:
         day = on_date or date.today()
 
-        new_patients = (
+        new_patients_sq = (
             self.db.query(func.count(Patient.id))
             .filter(
                 Patient.hospital_id == self.hospital_id,
                 Patient.created_at >= day_start(day),
                 Patient.created_at <= day_end(day),
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
 
         appt_q = self.db.query(func.count(Appointment.id)).filter(
@@ -464,7 +487,7 @@ class MisActions:
             appt_q = appt_q.filter(Appointment.doctor_id == doctor_id)
         if patient_id:
             appt_q = appt_q.filter(Appointment.patient_id == patient_id)
-        appointments = appt_q.scalar() or 0
+        appointments_sq = appt_q.scalar_subquery()
 
         adm_q = self.db.query(func.count(Admission.id)).filter(
             Admission.hospital_id == self.hospital_id,
@@ -473,7 +496,7 @@ class MisActions:
         )
         if doctor_id:
             adm_q = adm_q.filter(Admission.doctor_id == doctor_id)
-        admissions = adm_q.scalar() or 0
+        admissions_sq = adm_q.scalar_subquery()
 
         dis_q = self.db.query(func.count(Admission.id)).filter(
             Admission.hospital_id == self.hospital_id,
@@ -481,14 +504,22 @@ class MisActions:
             Admission.discharged_at >= day_start(day),
             Admission.discharged_at <= day_end(day),
         )
-        discharges = dis_q.scalar() or 0
+        discharges_sq = dis_q.scalar_subquery()
 
-        occupied = (
+        occupied_sq = (
             self.db.query(func.count(Bed.id))
             .filter(Bed.hospital_id == self.hospital_id, Bed.is_active.is_(True), Bed.is_occupied.is_(True))
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
+
+        new_patients, appointments, admissions, discharges, occupied = self.db.query(
+            new_patients_sq, appointments_sq, admissions_sq, discharges_sq, occupied_sq
+        ).one()
+        new_patients = new_patients or 0
+        appointments = appointments or 0
+        admissions = admissions or 0
+        discharges = discharges or 0
+        occupied = occupied or 0
 
         billing_rev = sum_billing_charges(self.db, self.hospital_id, date_from=day, date_to=day, doctor_id=doctor_id)
         if billing_rev > 0:

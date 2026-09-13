@@ -12,7 +12,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from hms_migration.modules.laboratory.entities.lab_entities import (
     LabItemStatus,
@@ -164,14 +164,19 @@ class LaboratoryRepository:
         order_date: date | None = None,
         order_source: LabOrderSource | None = None,
         search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[LabOrder]:
         q = (
             self.db.query(LabOrder)
             .options(
                 joinedload(LabOrder.patient),
                 joinedload(LabOrder.doctor),
-                joinedload(LabOrder.items),
-                joinedload(LabOrder.results),
+                # items/results are one-to-many: joinedload here would multiply
+                # each order row by (item_count * result_count) over the wire.
+                # selectinload fetches them in separate IN(...) queries instead.
+                selectinload(LabOrder.items),
+                selectinload(LabOrder.results),
             )
             .filter(LabOrder.hospital_id == self.hospital_id)
         )
@@ -190,7 +195,7 @@ class LaboratoryRepository:
         if search:
             term = f"%{search}%"
             q = q.filter(LabOrder.order_no.ilike(term))
-        return q.order_by(LabOrder.ordered_at.desc()).all()
+        return q.order_by(LabOrder.ordered_at.desc()).limit(limit).offset(offset).all()
 
     def get_order(self, order_id: UUID) -> LabOrder | None:
         return (
@@ -198,8 +203,11 @@ class LaboratoryRepository:
             .options(
                 joinedload(LabOrder.patient),
                 joinedload(LabOrder.doctor),
-                joinedload(LabOrder.items),
-                joinedload(LabOrder.results),
+                # items/results are one-to-many: joinedload here would multiply
+                # each order row by (item_count * result_count) over the wire.
+                # selectinload fetches them in separate IN(...) queries instead.
+                selectinload(LabOrder.items),
+                selectinload(LabOrder.results),
             )
             .filter(LabOrder.id == order_id, LabOrder.hospital_id == self.hospital_id)
             .first()

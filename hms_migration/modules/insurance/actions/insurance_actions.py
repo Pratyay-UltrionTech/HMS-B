@@ -567,18 +567,33 @@ class InsuranceActions:
         summaries: list[TPAPerformanceSummary] = []
         now = datetime.now(timezone.utc)
 
+        # Bulk-fetch all claims and all settlements for every provider up front
+        # (each tagged with provider_id) instead of two queries per provider.
+        all_claims = (
+            self.db.query(InsuranceClaimDossier, InsurancePatientPolicy.provider_id)
+            .join(InsuranceAdmissionPolicy, InsuranceClaimDossier.admission_policy_id == InsuranceAdmissionPolicy.id)
+            .join(InsurancePatientPolicy, InsuranceAdmissionPolicy.patient_policy_id == InsurancePatientPolicy.id)
+            .filter(InsuranceClaimDossier.hospital_id == self.hospital_id)
+            .all()
+        )
+        claims_by_provider: dict[UUID, list] = {}
+        for claim, provider_id in all_claims:
+            claims_by_provider.setdefault(provider_id, []).append(claim)
+
+        all_settlements = (
+            self.db.query(InsuranceCashlessSettlement, InsurancePatientPolicy.provider_id)
+            .join(InsuranceClaimDossier, InsuranceCashlessSettlement.claim_id == InsuranceClaimDossier.id)
+            .join(InsuranceAdmissionPolicy, InsuranceClaimDossier.admission_policy_id == InsuranceAdmissionPolicy.id)
+            .join(InsurancePatientPolicy, InsuranceAdmissionPolicy.patient_policy_id == InsurancePatientPolicy.id)
+            .filter(InsuranceCashlessSettlement.hospital_id == self.hospital_id)
+            .all()
+        )
+        settlements_by_provider: dict[UUID, list] = {}
+        for settlement, provider_id in all_settlements:
+            settlements_by_provider.setdefault(provider_id, []).append(settlement)
+
         for prov in providers:
-            # Query all claims associated with this provider through admission_policies -> patient_policies
-            claims = (
-                self.db.query(InsuranceClaimDossier)
-                .join(InsuranceAdmissionPolicy, InsuranceClaimDossier.admission_policy_id == InsuranceAdmissionPolicy.id)
-                .join(InsurancePatientPolicy, InsuranceAdmissionPolicy.patient_policy_id == InsurancePatientPolicy.id)
-                .filter(
-                    InsuranceClaimDossier.hospital_id == self.hospital_id,
-                    InsurancePatientPolicy.provider_id == prov.id,
-                )
-                .all()
-            )
+            claims = claims_by_provider.get(prov.id, [])
 
             total_claims = len(claims)
             settled_claims = len([c for c in claims if c.status == ClaimStatus.settled])
@@ -586,18 +601,8 @@ class InsuranceActions:
             pending_claims = total_claims - (settled_claims + rejected_claims)
 
             total_claimed = sum(c.claimed_amount for c in claims)
-            
-            settlements = (
-                self.db.query(InsuranceCashlessSettlement)
-                .join(InsuranceClaimDossier, InsuranceCashlessSettlement.claim_id == InsuranceClaimDossier.id)
-                .join(InsuranceAdmissionPolicy, InsuranceClaimDossier.admission_policy_id == InsuranceAdmissionPolicy.id)
-                .join(InsurancePatientPolicy, InsuranceAdmissionPolicy.patient_policy_id == InsurancePatientPolicy.id)
-                .filter(
-                    InsuranceCashlessSettlement.hospital_id == self.hospital_id,
-                    InsurancePatientPolicy.provider_id == prov.id,
-                )
-                .all()
-            )
+
+            settlements = settlements_by_provider.get(prov.id, [])
 
             total_settled = sum(s.approved_by_insurer_amount for s in settlements)
             total_deductions = sum(s.disallowed_deduction_amount for s in settlements)

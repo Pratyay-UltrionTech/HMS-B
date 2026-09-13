@@ -7,6 +7,7 @@ Wires configuration, lifespan, middleware, exception handlers, and root router.
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from hms_migration.app.lifespan import lifespan
 from hms_migration.app.router import root_router
@@ -36,8 +37,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Instrument FastAPI application for OpenTelemetry / Azure Monitor
     instrument_fastapi_app(app)
 
-    # Register request logging and CORS middleware
+    # Register request logging, compression, and CORS middleware.
+    # GZip cuts transfer time for the larger JSON payloads (dashboard detail
+    # lists, patient/billing lists) — pure win once DB round-trip latency
+    # isn't the dominant cost (same-region deployment).
     app.add_middleware(RequestLogMiddleware)
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cfg.cors_origin_list,

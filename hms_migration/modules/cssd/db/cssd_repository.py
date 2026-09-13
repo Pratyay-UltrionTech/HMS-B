@@ -8,7 +8,7 @@ from typing import Sequence
 from uuid import UUID
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from hms_migration.modules.cssd.entities.cssd_entities import (
     InstrumentDiscrepancyReport,
@@ -42,10 +42,22 @@ class CssdRepository:
             .first()
         )
 
+    def get_sets_by_ids(self, set_ids: list[UUID], hospital_id: UUID) -> dict[UUID, InstrumentSet]:
+        """Fetch many instrument sets in a single query, keyed by id."""
+        if not set_ids:
+            return {}
+        rows = (
+            self.db.query(InstrumentSet)
+            .options(joinedload(InstrumentSet.items))
+            .filter(InstrumentSet.id.in_(set_ids), InstrumentSet.hospital_id == hospital_id)
+            .all()
+        )
+        return {r.id: r for r in rows}
+
     def list_sets(self, hospital_id: UUID, active_only: bool | None = None) -> Sequence[InstrumentSet]:
         q = (
             self.db.query(InstrumentSet)
-            .options(joinedload(InstrumentSet.items))
+            .options(selectinload(InstrumentSet.items))
             .filter(InstrumentSet.hospital_id == hospital_id)
         )
         if active_only:
@@ -72,7 +84,7 @@ class CssdRepository:
     def list_batches(self, hospital_id: UUID, status_filter=None) -> Sequence[SterilizationBatch]:
         q = (
             self.db.query(SterilizationBatch)
-            .options(joinedload(SterilizationBatch.items), joinedload(SterilizationBatch.qc))
+            .options(selectinload(SterilizationBatch.items), joinedload(SterilizationBatch.qc))
             .filter(SterilizationBatch.hospital_id == hospital_id)
         )
         if status_filter:

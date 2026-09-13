@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from hms_migration.modules.billing.entities.billing_entities import (
     BillingCharge,
@@ -52,6 +52,8 @@ class BillingRepository:
         from_date: date | None = None,
         to_date: date | None = None,
         search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[BillingCharge]:
         q = (
             self.db.query(BillingCharge)
@@ -77,7 +79,7 @@ class BillingRepository:
                 | (Patient.name.ilike(term))
                 | (Patient.uhid.ilike(term))
             )
-        return q.order_by(BillingCharge.created_at.desc()).all()
+        return q.order_by(BillingCharge.created_at.desc()).limit(limit).offset(offset).all()
 
     def get_charge_by_id(self, charge_id: UUID) -> BillingCharge | None:
         return (
@@ -96,6 +98,8 @@ class BillingRepository:
         from_date: date | None = None,
         to_date: date | None = None,
         payment_method: BillingPaymentMethod | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[BillingPayment]:
         q = (
             self.db.query(BillingPayment)
@@ -110,7 +114,7 @@ class BillingRepository:
             q = q.filter(BillingPayment.payment_date <= to_date)
         if payment_method:
             q = q.filter(BillingPayment.payment_method == payment_method)
-        return q.order_by(BillingPayment.created_at.desc()).all()
+        return q.order_by(BillingPayment.created_at.desc()).limit(limit).offset(offset).all()
 
     def get_payment_by_id(self, payment_id: UUID) -> BillingPayment | None:
         return (
@@ -130,10 +134,18 @@ class BillingRepository:
         from_date: date | None = None,
         to_date: date | None = None,
         search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[BillingInvoice]:
         q = (
             self.db.query(BillingInvoice)
-            .options(joinedload(BillingInvoice.patient), joinedload(BillingInvoice.lines))
+            .options(
+                joinedload(BillingInvoice.patient),
+                # one-to-many: joinedload here multiplies each invoice row by
+                # its line count across a paginated list; selectinload avoids
+                # that with one extra IN(...) query instead.
+                selectinload(BillingInvoice.lines),
+            )
             .filter(BillingInvoice.hospital_id == self.hospital_id)
         )
         if patient_id:
@@ -151,7 +163,7 @@ class BillingRepository:
                 | (Patient.name.ilike(term))
                 | (Patient.uhid.ilike(term))
             )
-        return q.order_by(BillingInvoice.created_at.desc()).all()
+        return q.order_by(BillingInvoice.created_at.desc()).limit(limit).offset(offset).all()
 
     def get_invoice_by_id(self, invoice_id: UUID) -> BillingInvoice | None:
         return (
@@ -169,6 +181,8 @@ class BillingRepository:
         patient_id: UUID | None = None,
         from_date: date | None = None,
         to_date: date | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[BillingReceipt]:
         q = (
             self.db.query(BillingReceipt)
@@ -181,7 +195,7 @@ class BillingRepository:
             q = q.filter(BillingReceipt.payment_date >= from_date)
         if to_date:
             q = q.filter(BillingReceipt.payment_date <= to_date)
-        return q.order_by(BillingReceipt.created_at.desc()).all()
+        return q.order_by(BillingReceipt.created_at.desc()).limit(limit).offset(offset).all()
 
     def get_receipt_by_id(self, receipt_id: UUID) -> BillingReceipt | None:
         return (

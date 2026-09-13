@@ -91,6 +91,8 @@ def list_charges(
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
     search: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     _: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -102,6 +104,8 @@ def list_charges(
         from_date=from_date,
         to_date=to_date,
         search=search,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -144,6 +148,8 @@ def list_payments(
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
     payment_method: BillingPaymentMethod | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     _: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -153,6 +159,8 @@ def list_payments(
         from_date=from_date,
         to_date=to_date,
         payment_method=payment_method,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -175,6 +183,8 @@ def list_invoices(
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
     search: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     _: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -185,6 +195,8 @@ def list_invoices(
         from_date=from_date,
         to_date=to_date,
         search=search,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -248,12 +260,14 @@ def list_receipts(
     patient_id: UUID | None = Query(default=None),
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     _: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[BillingReceiptResponse]:
     return ListReceiptsAction(db, hospital_id).execute(
-        patient_id=patient_id, from_date=from_date, to_date=to_date
+        patient_id=patient_id, from_date=from_date, to_date=to_date, limit=limit, offset=offset
     )
 
 

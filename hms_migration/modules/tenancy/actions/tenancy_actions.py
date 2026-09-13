@@ -8,6 +8,8 @@ analytics dashboards, and role-scoped home dashboards.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import concurrent.futures
 from datetime import date, datetime, timedelta, timezone
 import secrets
 import string
@@ -15,8 +17,8 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, sessionmaker
 
 from hms_migration.modules.admin.contracts.admin_contracts import BASIC_MODULE_KEYS
 from hms_migration.modules.appointments.entities.appointment import Appointment
@@ -52,6 +54,7 @@ from hms_migration.modules.tenancy.contracts.tenancy_contracts import (
     HospitalCreateResponse,
     HospitalDashboardListItem,
     HospitalDashboardResponse,
+    HospitalDashboardSummaryResponse,
     HospitalResponse,
     RoleDashboardListItem,
     RoleDashboardMetric,
@@ -143,6 +146,61 @@ def _status_display_label(st: Any) -> str | None:
 class TenancyActions:
     def __init__(self, db: Session) -> None:
         self.db = db
+
+    # Caps how many NEW DB connections one _run_parallel batch will open at
+    # once. This dev DB server caps out at 50 total connections *shared
+    # across every user session on the whole app*, not just this request —
+    # a batch of 17 briefly used here during development tripped "remaining
+    # connection slots are reserved for SUPERUSER" under only light
+    # concurrent load. Keep batches well under that so one dashboard load
+    # can't meaningfully dent the server's shared connection budget.
+    _MAX_PARALLEL_CONNECTIONS = 8
+
+    def _run_parallel(self, jobs: list[Callable[[Session], Any]]) -> list[Any]:
+        """Run independent read-only queries concurrently, each on its own Session.
+
+        SQLAlchemy Sessions are not thread-safe, so each job gets a fresh
+        Session from the shared connection pool rather than reusing self.db.
+        This exists because the dashboard-building actions below fire many
+        queries that don't depend on each other's results (e.g. 12 separate
+        "detail list" queries) but were running one after another. On this
+        deployment, each round trip to the DB costs ~800ms of network latency
+        regardless of query complexity (measured directly — a no-DB endpoint
+        responds in ~4ms, a trivial single-row query takes ~800ms), so the
+        real lever is collapsing N sequential round trips into one overlapped
+        batch, not further query tuning.
+
+        Concurrency is capped at _MAX_PARALLEL_CONNECTIONS: the session for
+        each job is opened lazily inside the worker thread (not eagerly
+        before submission), so limiting max_workers actually limits how many
+        new connections can be in flight at once, rather than just how many
+        threads process already-open ones.
+
+        New sessions are bound to self.db's own engine (via sessionmaker,
+        not the global get_transitional_sync_session_factory()) so this
+        works correctly under test fixtures that override self.db onto a
+        different engine (e.g. SQLite), not just against the real DB.
+        """
+        if not jobs:
+            return []
+        factory = sessionmaker(bind=self.db.get_bind())
+        results: list[Any] = [None] * len(jobs)
+        max_workers = min(len(jobs), self._MAX_PARALLEL_CONNECTIONS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(TenancyActions._run_one, job, factory): idx for idx, job in enumerate(jobs)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                results[futures[future]] = future.result()
+        return results
+
+    @staticmethod
+    def _run_one(job: Callable[[Session], Any], factory: sessionmaker[Session]) -> Any:
+        session = factory()
+        try:
+            return job(session)
+        finally:
+            session.close()
 
     # ── CRUD Operations ───────────────────────────────────────────────────────
     def create_hospital(self, payload: HospitalCreate) -> HospitalCreateResponse:
@@ -489,15 +547,19 @@ class TenancyActions:
             .limit(20)
             .all()
         )
-        beds_total = int(
-            self.db.query(func.count(Bed.id)).filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True)).scalar() or 0
+        beds_total_sq = (
+            self.db.query(func.count(Bed.id))
+            .filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True))
+            .scalar_subquery()
         )
-        beds_occupied = int(
+        beds_occupied_sq = (
             self.db.query(func.count(Bed.id))
             .filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True), Bed.is_occupied.is_(True))
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
+        beds_total, beds_occupied = self.db.query(beds_total_sq, beds_occupied_sq).one()
+        beds_total = int(beds_total or 0)
+        beds_occupied = int(beds_occupied or 0)
         occupancy = int(round((beds_occupied / beds_total) * 100)) if beds_total else 0
 
         discharge_candidates = [
@@ -616,29 +678,31 @@ class TenancyActions:
         waiting = [a for a in today_rows if a.status == AppointmentStatus.waiting]
         completed = [a for a in today_rows if a.status == AppointmentStatus.completed]
         scheduled = [a for a in today_rows if a.status == AppointmentStatus.scheduled]
-        no_shows = int(
+        no_shows_sq = (
             self.db.query(func.count(Appointment.id))
             .filter(
                 Appointment.hospital_id == hospital_id,
                 Appointment.appointment_date == today,
                 Appointment.status == AppointmentStatus.no_show,
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
-
-        registrations_today = int(
+        registrations_today_sq = (
             self.db.query(func.count(Patient.id))
             .filter(Patient.hospital_id == hospital_id, Patient.created_at >= start, Patient.created_at <= end)
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
-        admissions_today = int(
+        admissions_today_sq = (
             self.db.query(func.count(Admission.id))
             .filter(Admission.hospital_id == hospital_id, Admission.admitted_at >= start, Admission.admitted_at <= end)
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
+        no_shows, registrations_today, admissions_today = self.db.query(
+            no_shows_sq, registrations_today_sq, admissions_today_sq
+        ).one()
+        no_shows = int(no_shows or 0)
+        registrations_today = int(registrations_today or 0)
+        admissions_today = int(admissions_today or 0)
 
         recent_patients = (
             self.db.query(Patient)
@@ -718,45 +782,32 @@ class TenancyActions:
         start = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
         end = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
 
-        todays_orders = int(
-            self.db.query(func.count(LabOrder.id)).filter(
-                LabOrder.hospital_id == hospital_id,
-                LabOrder.ordered_at >= start,
-                LabOrder.ordered_at <= end,
-            ).scalar() or 0
-        )
-        pending = int(
-            self.db.query(func.count(LabOrder.id))
-            .filter(
-                LabOrder.hospital_id == hospital_id,
-                LabOrder.status.in_([LabOrderStatus.ordered, LabOrderStatus.sample_collected, LabOrderStatus.in_progress]),
+        def _lab_count(*conds):
+            return (
+                self.db.query(func.count(LabOrder.id))
+                .filter(LabOrder.hospital_id == hospital_id, *conds)
+                .scalar_subquery()
             )
-            .scalar()
-            or 0
+
+        todays_orders_sq = _lab_count(LabOrder.ordered_at >= start, LabOrder.ordered_at <= end)
+        pending_sq = _lab_count(
+            LabOrder.status.in_([LabOrderStatus.ordered, LabOrderStatus.sample_collected, LabOrderStatus.in_progress])
         )
-        sample_collected = int(
-            self.db.query(func.count(LabOrder.id))
-            .filter(LabOrder.hospital_id == hospital_id, LabOrder.status == LabOrderStatus.sample_collected)
-            .scalar()
-            or 0
+        sample_collected_sq = _lab_count(LabOrder.status == LabOrderStatus.sample_collected)
+        in_progress_sq = _lab_count(LabOrder.status == LabOrderStatus.in_progress)
+        completed_today_sq = _lab_count(
+            LabOrder.status == LabOrderStatus.completed,
+            LabOrder.ordered_at >= start,
+            LabOrder.ordered_at <= end,
         )
-        in_progress = int(
-            self.db.query(func.count(LabOrder.id))
-            .filter(LabOrder.hospital_id == hospital_id, LabOrder.status == LabOrderStatus.in_progress)
-            .scalar()
-            or 0
-        )
-        completed_today = int(
-            self.db.query(func.count(LabOrder.id))
-            .filter(
-                LabOrder.hospital_id == hospital_id,
-                LabOrder.status == LabOrderStatus.completed,
-                LabOrder.ordered_at >= start,
-                LabOrder.ordered_at <= end,
-            )
-            .scalar()
-            or 0
-        )
+        (todays_orders, pending, sample_collected, in_progress, completed_today) = self.db.query(
+            todays_orders_sq, pending_sq, sample_collected_sq, in_progress_sq, completed_today_sq
+        ).one()
+        todays_orders = int(todays_orders or 0)
+        pending = int(pending or 0)
+        sample_collected = int(sample_collected or 0)
+        in_progress = int(in_progress or 0)
+        completed_today = int(completed_today or 0)
 
         doctor_requests = (
             self.db.query(LabPrescriptionRequest)
@@ -870,55 +921,41 @@ class TenancyActions:
         start = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
         end = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
 
-        todays_scans = int(
-            self.db.query(func.count(RadiologyOrder.id))
-            .filter(
-                RadiologyOrder.hospital_id == hospital_id,
-                RadiologyOrder.ordered_at >= start,
-                RadiologyOrder.ordered_at <= end,
-                RadiologyOrder.status != RadiologyOrderStatus.cancelled,
+        def _rad_count(*conds):
+            return (
+                self.db.query(func.count(RadiologyOrder.id))
+                .filter(RadiologyOrder.hospital_id == hospital_id, *conds)
+                .scalar_subquery()
             )
-            .scalar()
-            or 0
+
+        todays_scans_sq = _rad_count(
+            RadiologyOrder.ordered_at >= start,
+            RadiologyOrder.ordered_at <= end,
+            RadiologyOrder.status != RadiologyOrderStatus.cancelled,
         )
-        pending_scans = int(
-            self.db.query(func.count(RadiologyOrder.id))
-            .filter(
-                RadiologyOrder.hospital_id == hospital_id,
-                RadiologyOrder.status.in_(
-                    [RadiologyOrderStatus.ordered, RadiologyOrderStatus.scheduled, RadiologyOrderStatus.in_progress]
-                ),
+        pending_scans_sq = _rad_count(
+            RadiologyOrder.status.in_(
+                [RadiologyOrderStatus.ordered, RadiologyOrderStatus.scheduled, RadiologyOrderStatus.in_progress]
             )
-            .scalar()
-            or 0
         )
-        scheduled = int(
-            self.db.query(func.count(RadiologyOrder.id))
-            .filter(RadiologyOrder.hospital_id == hospital_id, RadiologyOrder.status == RadiologyOrderStatus.scheduled)
-            .scalar()
-            or 0
+        scheduled_sq = _rad_count(RadiologyOrder.status == RadiologyOrderStatus.scheduled)
+        reports_pending_sq = _rad_count(
+            RadiologyOrder.status.in_([RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed]),
+            RadiologyOrder.report_file_data.is_(None),
         )
-        reports_pending = int(
-            self.db.query(func.count(RadiologyOrder.id))
-            .filter(
-                RadiologyOrder.hospital_id == hospital_id,
-                RadiologyOrder.status.in_([RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed]),
-                RadiologyOrder.report_file_data.is_(None),
-            )
-            .scalar()
-            or 0
+        completed_today_sq = _rad_count(
+            RadiologyOrder.status == RadiologyOrderStatus.completed,
+            RadiologyOrder.ordered_at >= start,
+            RadiologyOrder.ordered_at <= end,
         )
-        completed_today = int(
-            self.db.query(func.count(RadiologyOrder.id))
-            .filter(
-                RadiologyOrder.hospital_id == hospital_id,
-                RadiologyOrder.status == RadiologyOrderStatus.completed,
-                RadiologyOrder.ordered_at >= start,
-                RadiologyOrder.ordered_at <= end,
-            )
-            .scalar()
-            or 0
-        )
+        (todays_scans, pending_scans, scheduled, reports_pending, completed_today) = self.db.query(
+            todays_scans_sq, pending_scans_sq, scheduled_sq, reports_pending_sq, completed_today_sq
+        ).one()
+        todays_scans = int(todays_scans or 0)
+        pending_scans = int(pending_scans or 0)
+        scheduled = int(scheduled or 0)
+        reports_pending = int(reports_pending or 0)
+        completed_today = int(completed_today or 0)
 
         scheduled_today = (
             self.db.query(RadiologyOrder)
@@ -1083,7 +1120,7 @@ class TenancyActions:
         start = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
         end = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
 
-        todays_charges = float(
+        todays_charges_sq = (
             self.db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
             .filter(
                 BillingCharge.hospital_id == hospital_id,
@@ -1091,60 +1128,78 @@ class TenancyActions:
                 BillingCharge.created_at >= start,
                 BillingCharge.created_at <= end,
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
-        todays_collections = float(
+        todays_collections_sq = (
             self.db.query(func.coalesce(func.sum(BillingPayment.amount), 0.0))
             .filter(BillingPayment.hospital_id == hospital_id, BillingPayment.payment_date == today)
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
-        total_net = float(
+        total_net_sq = (
             self.db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
             .filter(
                 BillingCharge.hospital_id == hospital_id,
                 BillingCharge.status != BillingChargeStatus.cancelled,
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
-        total_paid = float(
+        total_paid_sq = (
             self.db.query(func.coalesce(func.sum(BillingPayment.amount), 0.0))
             .filter(BillingPayment.hospital_id == hospital_id)
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
-        outstanding = max(0.0, total_net - total_paid)
-        pending_charges = int(
+        pending_charges_sq = (
             self.db.query(func.count(BillingCharge.id))
             .filter(
                 BillingCharge.hospital_id == hospital_id,
                 BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
-        today_invoices = int(
+        today_invoices_sq = (
             self.db.query(func.count(BillingInvoice.id))
             .filter(
                 BillingInvoice.hospital_id == hospital_id,
                 BillingInvoice.invoice_date == today,
                 BillingInvoice.status != BillingInvoiceStatus.cancelled,
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
-        today_receipts = int(
+        today_receipts_sq = (
             self.db.query(func.count(BillingReceipt.id))
             .filter(
                 BillingReceipt.hospital_id == hospital_id,
                 BillingReceipt.payment_date == today,
                 BillingReceipt.status != BillingReceiptStatus.cancelled,
             )
-            .scalar()
-            or 0
+            .scalar_subquery()
         )
+
+        (
+            todays_charges,
+            todays_collections,
+            total_net,
+            total_paid,
+            pending_charges,
+            today_invoices,
+            today_receipts,
+        ) = self.db.query(
+            todays_charges_sq,
+            todays_collections_sq,
+            total_net_sq,
+            total_paid_sq,
+            pending_charges_sq,
+            today_invoices_sq,
+            today_receipts_sq,
+        ).one()
+        todays_charges = float(todays_charges or 0)
+        todays_collections = float(todays_collections or 0)
+        total_net = float(total_net or 0)
+        total_paid = float(total_paid or 0)
+        outstanding = max(0.0, total_net - total_paid)
+        pending_charges = int(pending_charges or 0)
+        today_invoices = int(today_invoices or 0)
+        today_receipts = int(today_receipts or 0)
 
         recent_charges = (
             self.db.query(BillingCharge)
@@ -1267,10 +1322,6 @@ class TenancyActions:
         roles = {r.id: r for r in self.db.query(StaffRole).filter(StaffRole.id.in_(role_ids)).all()} if role_ids else {}
         doctor_count = sum(1 for u in staff_users if _is_doctor_role(roles.get(u.role_id).name if u.role_id in roles else None))
 
-        patient_count = int(
-            self.db.query(func.count(Patient.id)).filter(Patient.hospital_id == hospital_id).scalar() or 0
-        )
-
         today = date.today()
         if on_date and not date_from and not date_to:
             range_from = on_date
@@ -1284,243 +1335,362 @@ class TenancyActions:
         start = _day_start(range_from)
         end = _day_end(range_to)
 
-        # Appointments
-        appt_base = self.db.query(Appointment).filter(
-            Appointment.hospital_id == hospital_id,
-            Appointment.appointment_date >= range_from,
-            Appointment.appointment_date <= range_to,
-            Appointment.status != AppointmentStatus.cancelled,
-        )
-        if doctor_id:
-            appt_base = appt_base.filter(Appointment.doctor_id == doctor_id)
-        if wing_id:
-            appt_base = appt_base.filter(Appointment.wing_id == wing_id)
+        # Independent scalar counts merged into a single round trip. Each of
+        # these used to be its own query; on tiny tables (tens-to-hundreds of
+        # rows) network round-trip latency to the DB dominates over actual
+        # query execution time, so collapsing 6 sequential round trips into 1
+        # matters far more here than any index would.
+        patient_count_stmt = select(func.count(Patient.id)).where(Patient.hospital_id == hospital_id)
 
-        appointments_today = int(appt_base.with_entities(func.count(Appointment.id)).scalar() or 0)
-        appointments_scheduled = int(
-            appt_base.filter(Appointment.status == AppointmentStatus.scheduled)
-            .with_entities(func.count(Appointment.id))
-            .scalar()
-            or 0
-        )
-        appointments_in_progress = int(
-            appt_base.filter(Appointment.status == AppointmentStatus.waiting)
-            .with_entities(func.count(Appointment.id))
-            .scalar()
-            or 0
-        )
-        appointments_completed = int(
-            appt_base.filter(Appointment.status == AppointmentStatus.completed)
-            .with_entities(func.count(Appointment.id))
-            .scalar()
-            or 0
+        patients_today_stmt = select(func.count(Patient.id)).where(
+            Patient.hospital_id == hospital_id,
+            Patient.created_at >= start,
+            Patient.created_at <= end,
         )
 
-        # Admissions
-        adm_q = self.db.query(Admission).filter(
+        admissions_stmt = select(func.count(Admission.id)).where(
             Admission.hospital_id == hospital_id,
             Admission.status == AdmissionStatus.admitted,
         )
         if doctor_id:
-            adm_q = adm_q.filter(Admission.doctor_id == doctor_id)
+            admissions_stmt = admissions_stmt.where(Admission.doctor_id == doctor_id)
         if wing_id:
-            adm_q = adm_q.join(Ward, Ward.id == Admission.ward_id).filter(Ward.wing_id == wing_id)
-        active_admissions = int(adm_q.with_entities(func.count(Admission.id)).scalar() or 0)
+            admissions_stmt = admissions_stmt.join(Ward, Ward.id == Admission.ward_id).where(
+                Ward.wing_id == wing_id
+            )
 
-        # Beds
-        beds_q = self.db.query(Bed).filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True))
-        if wing_id:
-            beds_q = beds_q.join(Ward, Ward.id == Bed.ward_id).filter(Ward.wing_id == wing_id)
-        beds_total = int(beds_q.with_entities(func.count(Bed.id)).scalar() or 0)
-        beds_occupied = int(
-            beds_q.filter(Bed.is_occupied.is_(True)).with_entities(func.count(Bed.id)).scalar() or 0
-        )
-        occupied_pct = int(round((beds_occupied / beds_total) * 100)) if beds_total else 0
-
-        patients_registered_today = int(
-            self.db.query(func.count(Patient.id))
-            .filter(Patient.hospital_id == hospital_id, Patient.created_at >= start, Patient.created_at <= end)
-            .scalar()
-            or 0
-        )
-
-        # Lab / Radiology / OT
-        lab_q = self.db.query(LabOrder).filter(
+        lab_today_stmt = select(func.count(LabOrder.id)).where(
             LabOrder.hospital_id == hospital_id,
             LabOrder.ordered_at >= start,
             LabOrder.ordered_at <= end,
             LabOrder.status != LabOrderStatus.cancelled,
         )
         if doctor_id:
-            lab_q = lab_q.filter(LabOrder.doctor_id == doctor_id)
-        lab_orders_today = int(lab_q.with_entities(func.count(LabOrder.id)).scalar() or 0)
+            lab_today_stmt = lab_today_stmt.where(LabOrder.doctor_id == doctor_id)
 
-        rad_q = self.db.query(RadiologyOrder).filter(
+        rad_today_stmt = select(func.count(RadiologyOrder.id)).where(
             RadiologyOrder.hospital_id == hospital_id,
             RadiologyOrder.ordered_at >= start,
             RadiologyOrder.ordered_at <= end,
             RadiologyOrder.status != RadiologyOrderStatus.cancelled,
         )
         if doctor_id:
-            rad_q = rad_q.filter(RadiologyOrder.doctor_id == doctor_id)
-        radiology_orders_today = int(rad_q.with_entities(func.count(RadiologyOrder.id)).scalar() or 0)
+            rad_today_stmt = rad_today_stmt.where(RadiologyOrder.doctor_id == doctor_id)
 
-        ot_q = self.db.query(OtSurgery).filter(
+        ot_today_stmt = select(func.count(OtSurgery.id)).where(
             OtSurgery.hospital_id == hospital_id,
             OtSurgery.scheduled_at >= start,
             OtSurgery.scheduled_at <= end,
             OtSurgery.status != OtSurgeryStatus.cancelled,
         )
         if doctor_id:
-            ot_q = ot_q.filter(OtSurgery.surgeon_id == doctor_id)
+            ot_today_stmt = ot_today_stmt.where(OtSurgery.surgeon_id == doctor_id)
         if wing_id:
-            ot_q = ot_q.outerjoin(OtRoom, OtRoom.id == OtSurgery.ot_room_id).filter(
-                OtRoom.wing_id == wing_id
-            )
-        ot_surgeries_today = int(ot_q.with_entities(func.count(OtSurgery.id)).scalar() or 0)
+            ot_today_stmt = ot_today_stmt.join(
+                OtRoom, OtRoom.id == OtSurgery.ot_room_id, isouter=True
+            ).where(OtRoom.wing_id == wing_id)
 
-        # Financials
-        charges_today = float(
-            self.db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
-            .filter(
-                BillingCharge.hospital_id == hospital_id,
-                BillingCharge.status != BillingChargeStatus.cancelled,
-                BillingCharge.created_at >= start,
-                BillingCharge.created_at <= end,
-            )
-            .scalar()
-            or 0
-        )
-        collections_today = float(
-            self.db.query(func.coalesce(func.sum(BillingPayment.amount), 0.0))
-            .filter(
-                BillingPayment.hospital_id == hospital_id,
-                BillingPayment.payment_date >= range_from,
-                BillingPayment.payment_date <= range_to,
-            )
-            .scalar()
-            or 0
-        )
-        total_net = float(
-            self.db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
-            .filter(
-                BillingCharge.hospital_id == hospital_id,
-                BillingCharge.status != BillingChargeStatus.cancelled,
-            )
-            .scalar()
-            or 0
-        )
-        total_paid = float(
-            self.db.query(func.coalesce(func.sum(BillingPayment.amount), 0.0))
-            .filter(BillingPayment.hospital_id == hospital_id)
-            .scalar()
-            or 0
-        )
+        # These 5 aggregate queries (merged-6-count, appointment counts, bed
+        # counts, charges, payments) are independent of each other, so they
+        # run as one parallel batch instead of 5 sequential round trips.
+        def _job_merged_counts(db: Session) -> tuple[int, ...]:
+            row = db.execute(
+                select(
+                    patient_count_stmt.scalar_subquery(),
+                    patients_today_stmt.scalar_subquery(),
+                    admissions_stmt.scalar_subquery(),
+                    lab_today_stmt.scalar_subquery(),
+                    rad_today_stmt.scalar_subquery(),
+                    ot_today_stmt.scalar_subquery(),
+                )
+            ).one()
+            return tuple(int(v or 0) for v in row)
 
-        # Lists
-        recent_registrations_rows = (
-            self.db.query(Patient)
-            .filter(Patient.hospital_id == hospital_id, Patient.created_at >= start, Patient.created_at <= end)
-            .order_by(Patient.created_at.desc())
-            .limit(50)
-            .all()
-        )
-        if not recent_registrations_rows:
-            recent_registrations_rows = (
-                self.db.query(Patient)
-                .filter(Patient.hospital_id == hospital_id)
+        def _job_appt_counts(db: Session) -> tuple[int, int, int, int]:
+            appt_base = db.query(Appointment).filter(
+                Appointment.hospital_id == hospital_id,
+                Appointment.appointment_date >= range_from,
+                Appointment.appointment_date <= range_to,
+                Appointment.status != AppointmentStatus.cancelled,
+            )
+            if doctor_id:
+                appt_base = appt_base.filter(Appointment.doctor_id == doctor_id)
+            if wing_id:
+                appt_base = appt_base.filter(Appointment.wing_id == wing_id)
+            row = appt_base.with_entities(
+                func.count(Appointment.id),
+                func.count(Appointment.id).filter(Appointment.status == AppointmentStatus.scheduled),
+                func.count(Appointment.id).filter(Appointment.status == AppointmentStatus.waiting),
+                func.count(Appointment.id).filter(Appointment.status == AppointmentStatus.completed),
+            ).first() or (0, 0, 0, 0)
+            return (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0), int(row[3] or 0))
+
+        def _job_bed_counts(db: Session) -> tuple[int, int]:
+            beds_q = db.query(Bed).filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True))
+            if wing_id:
+                beds_q = beds_q.join(Ward, Ward.id == Bed.ward_id).filter(Ward.wing_id == wing_id)
+            row = beds_q.with_entities(
+                func.count(Bed.id),
+                func.count(Bed.id).filter(Bed.is_occupied.is_(True)),
+            ).first() or (0, 0)
+            return (int(row[0] or 0), int(row[1] or 0))
+
+        def _job_charges(db: Session) -> tuple[float, float]:
+            row = (
+                db.query(
+                    func.coalesce(func.sum(BillingCharge.net_amount), 0.0),
+                    func.coalesce(
+                        func.sum(BillingCharge.net_amount).filter(
+                            BillingCharge.created_at >= start, BillingCharge.created_at <= end
+                        ),
+                        0.0,
+                    ),
+                )
+                .filter(
+                    BillingCharge.hospital_id == hospital_id,
+                    BillingCharge.status != BillingChargeStatus.cancelled,
+                )
+                .first()
+                or (0.0, 0.0)
+            )
+            return (float(row[0] or 0), float(row[1] or 0))
+
+        def _job_payments(db: Session) -> tuple[float, float]:
+            row = (
+                db.query(
+                    func.coalesce(func.sum(BillingPayment.amount), 0.0),
+                    func.coalesce(
+                        func.sum(BillingPayment.amount).filter(
+                            BillingPayment.payment_date >= range_from,
+                            BillingPayment.payment_date <= range_to,
+                        ),
+                        0.0,
+                    ),
+                )
+                .filter(BillingPayment.hospital_id == hospital_id)
+                .first()
+                or (0.0, 0.0)
+            )
+            return (float(row[0] or 0), float(row[1] or 0))
+
+        # Lists — these 12 queries don't depend on each other, only on the
+        # filter values above, so they run as one parallel batch (each on its
+        # own Session) instead of 12 sequential round trips. See
+        # _run_parallel's docstring for why this matters more than query
+        # tuning at this point.
+        def _job_recent_registrations(db: Session) -> list[Patient]:
+            rows = (
+                db.query(Patient)
+                .filter(Patient.hospital_id == hospital_id, Patient.created_at >= start, Patient.created_at <= end)
                 .order_by(Patient.created_at.desc())
-                .limit(8)
+                .limit(50)
+                .all()
+            )
+            if not rows:
+                rows = (
+                    db.query(Patient)
+                    .filter(Patient.hospital_id == hospital_id)
+                    .order_by(Patient.created_at.desc())
+                    .limit(8)
+                    .all()
+                )
+            return rows
+
+        def _job_upcoming_appts(db: Session) -> list[Appointment]:
+            q = db.query(Appointment).filter(
+                Appointment.hospital_id == hospital_id,
+                Appointment.appointment_date >= range_from,
+                Appointment.appointment_date <= range_to,
+                Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.no_show, AppointmentStatus.completed]),
+            )
+            if doctor_id:
+                q = q.filter(Appointment.doctor_id == doctor_id)
+            if wing_id:
+                q = q.filter(Appointment.wing_id == wing_id)
+            return q.order_by(Appointment.appointment_date.asc(), Appointment.appointment_time.asc()).limit(8).all()
+
+        def _job_pending_lab(db: Session) -> list[LabOrder]:
+            q = db.query(LabOrder).filter(
+                LabOrder.hospital_id == hospital_id,
+                LabOrder.status.in_([LabOrderStatus.ordered, LabOrderStatus.sample_collected, LabOrderStatus.in_progress]),
+            )
+            if doctor_id:
+                q = q.filter(LabOrder.doctor_id == doctor_id)
+            return q.order_by(LabOrder.ordered_at.asc()).limit(8).all()
+
+        def _job_pending_rad(db: Session) -> list[RadiologyOrder]:
+            q = db.query(RadiologyOrder).filter(
+                RadiologyOrder.hospital_id == hospital_id,
+                RadiologyOrder.status.in_([RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed]),
+                RadiologyOrder.report_file_data.is_(None),
+            )
+            if doctor_id:
+                q = q.filter(RadiologyOrder.doctor_id == doctor_id)
+            return q.order_by(RadiologyOrder.ordered_at.desc()).limit(8).all()
+
+        def _job_appointments_detail(db: Session) -> list[Appointment]:
+            q = db.query(Appointment).filter(
+                Appointment.hospital_id == hospital_id,
+                Appointment.appointment_date >= range_from,
+                Appointment.appointment_date <= range_to,
+                Appointment.status != AppointmentStatus.cancelled,
+            )
+            if doctor_id:
+                q = q.filter(Appointment.doctor_id == doctor_id)
+            if wing_id:
+                q = q.filter(Appointment.wing_id == wing_id)
+            return q.order_by(Appointment.appointment_date.asc(), Appointment.appointment_time.asc()).limit(100).all()
+
+        def _job_admissions_detail(db: Session) -> list[Admission]:
+            q = db.query(Admission).filter(
+                Admission.hospital_id == hospital_id,
+                Admission.status == AdmissionStatus.admitted,
+            )
+            if doctor_id:
+                q = q.filter(Admission.doctor_id == doctor_id)
+            if wing_id:
+                q = q.join(Ward, Ward.id == Admission.ward_id).filter(Ward.wing_id == wing_id)
+            return q.order_by(Admission.admitted_at.desc()).limit(100).all()
+
+        def _job_beds_detail(db: Session) -> list[Bed]:
+            q = db.query(Bed).filter(
+                Bed.hospital_id == hospital_id,
+                Bed.is_active.is_(True),
+                Bed.is_occupied.is_(True),
+            )
+            if wing_id:
+                q = q.join(Ward, Ward.id == Bed.ward_id).filter(Ward.wing_id == wing_id)
+            return q.limit(100).all()
+
+        def _job_lab_detail(db: Session) -> list[LabOrder]:
+            q = db.query(LabOrder).filter(
+                LabOrder.hospital_id == hospital_id,
+                LabOrder.ordered_at >= start,
+                LabOrder.ordered_at <= end,
+                LabOrder.status != LabOrderStatus.cancelled,
+            )
+            if doctor_id:
+                q = q.filter(LabOrder.doctor_id == doctor_id)
+            return q.order_by(LabOrder.ordered_at.desc()).limit(100).all()
+
+        def _job_rad_detail(db: Session) -> list[RadiologyOrder]:
+            q = db.query(RadiologyOrder).filter(
+                RadiologyOrder.hospital_id == hospital_id,
+                RadiologyOrder.ordered_at >= start,
+                RadiologyOrder.ordered_at <= end,
+                RadiologyOrder.status != RadiologyOrderStatus.cancelled,
+            )
+            if doctor_id:
+                q = q.filter(RadiologyOrder.doctor_id == doctor_id)
+            return q.order_by(RadiologyOrder.ordered_at.desc()).limit(100).all()
+
+        def _job_ot_detail(db: Session) -> list[OtSurgery]:
+            q = db.query(OtSurgery).filter(
+                OtSurgery.hospital_id == hospital_id,
+                OtSurgery.scheduled_at >= start,
+                OtSurgery.scheduled_at <= end,
+                OtSurgery.status != OtSurgeryStatus.cancelled,
+            )
+            if doctor_id:
+                q = q.filter(OtSurgery.surgeon_id == doctor_id)
+            if wing_id:
+                q = q.outerjoin(OtRoom, OtRoom.id == OtSurgery.ot_room_id).filter(OtRoom.wing_id == wing_id)
+            return q.order_by(OtSurgery.scheduled_at.desc()).limit(100).all()
+
+        def _job_charges_detail(db: Session) -> list[BillingCharge]:
+            return (
+                db.query(BillingCharge)
+                .filter(
+                    BillingCharge.hospital_id == hospital_id,
+                    BillingCharge.status != BillingChargeStatus.cancelled,
+                    BillingCharge.created_at >= start,
+                    BillingCharge.created_at <= end,
+                )
+                .order_by(BillingCharge.created_at.desc())
+                .limit(100)
                 .all()
             )
 
-        upcoming_q = self.db.query(Appointment).filter(
-            Appointment.hospital_id == hospital_id,
-            Appointment.appointment_date >= range_from,
-            Appointment.appointment_date <= range_to,
-            Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.no_show, AppointmentStatus.completed]),
-        )
-        if doctor_id:
-            upcoming_q = upcoming_q.filter(Appointment.doctor_id == doctor_id)
-        if wing_id:
-            upcoming_q = upcoming_q.filter(Appointment.wing_id == wing_id)
-        upcoming_appts = upcoming_q.order_by(Appointment.appointment_date.asc(), Appointment.appointment_time.asc()).limit(8).all()
-
-        pending_lab_q = self.db.query(LabOrder).filter(
-            LabOrder.hospital_id == hospital_id,
-            LabOrder.status.in_([LabOrderStatus.ordered, LabOrderStatus.sample_collected, LabOrderStatus.in_progress]),
-        )
-        if doctor_id:
-            pending_lab_q = pending_lab_q.filter(LabOrder.doctor_id == doctor_id)
-        pending_lab = pending_lab_q.order_by(LabOrder.ordered_at.asc()).limit(8).all()
-
-        pending_rad_q = self.db.query(RadiologyOrder).filter(
-            RadiologyOrder.hospital_id == hospital_id,
-            RadiologyOrder.status.in_([RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed]),
-            RadiologyOrder.report_file_data.is_(None),
-        )
-        if doctor_id:
-            pending_rad_q = pending_rad_q.filter(RadiologyOrder.doctor_id == doctor_id)
-        pending_rad = pending_rad_q.order_by(RadiologyOrder.ordered_at.desc()).limit(8).all()
-
-        appt_detail_q = self.db.query(Appointment).filter(
-            Appointment.hospital_id == hospital_id,
-            Appointment.appointment_date >= range_from,
-            Appointment.appointment_date <= range_to,
-            Appointment.status != AppointmentStatus.cancelled,
-        )
-        if doctor_id:
-            appt_detail_q = appt_detail_q.filter(Appointment.doctor_id == doctor_id)
-        if wing_id:
-            appt_detail_q = appt_detail_q.filter(Appointment.wing_id == wing_id)
-        appointments_detail_rows = appt_detail_q.order_by(Appointment.appointment_date.asc(), Appointment.appointment_time.asc()).limit(100).all()
-
-        adm_detail_q = self.db.query(Admission).filter(
-            Admission.hospital_id == hospital_id,
-            Admission.status == AdmissionStatus.admitted,
-        )
-        if doctor_id:
-            adm_detail_q = adm_detail_q.filter(Admission.doctor_id == doctor_id)
-        if wing_id:
-            adm_detail_q = adm_detail_q.join(Ward, Ward.id == Admission.ward_id).filter(Ward.wing_id == wing_id)
-        admissions_detail_rows = adm_detail_q.order_by(Admission.admitted_at.desc()).limit(100).all()
-
-        beds_detail_q = self.db.query(Bed).filter(
-            Bed.hospital_id == hospital_id,
-            Bed.is_active.is_(True),
-            Bed.is_occupied.is_(True),
-        )
-        if wing_id:
-            beds_detail_q = beds_detail_q.join(Ward, Ward.id == Bed.ward_id).filter(Ward.wing_id == wing_id)
-        beds_detail_rows = beds_detail_q.limit(100).all()
-
-        lab_detail_rows = lab_q.order_by(LabOrder.ordered_at.desc()).limit(100).all()
-        rad_detail_rows = rad_q.order_by(RadiologyOrder.ordered_at.desc()).limit(100).all()
-        ot_detail_rows = ot_q.order_by(OtSurgery.scheduled_at.desc()).limit(100).all()
-
-        charges_detail_rows = (
-            self.db.query(BillingCharge)
-            .filter(
-                BillingCharge.hospital_id == hospital_id,
-                BillingCharge.status != BillingChargeStatus.cancelled,
-                BillingCharge.created_at >= start,
-                BillingCharge.created_at <= end,
+        def _job_collections_detail(db: Session) -> list[BillingPayment]:
+            return (
+                db.query(BillingPayment)
+                .filter(
+                    BillingPayment.hospital_id == hospital_id,
+                    BillingPayment.payment_date >= range_from,
+                    BillingPayment.payment_date <= range_to,
+                )
+                .order_by(BillingPayment.created_at.desc())
+                .limit(100)
+                .all()
             )
-            .order_by(BillingCharge.created_at.desc())
-            .limit(100)
-            .all()
+
+        # Wave A (5 aggregate jobs, defined above) and Wave B (these 12 list
+        # jobs) don't depend on each other's results, only on the filter
+        # values computed earlier. They were briefly merged into one 17-job
+        # batch, but this Azure server caps out at 50 total connections
+        # server-wide (shared across every user session, not just this
+        # request) and a single dashboard load spiking to 17 simultaneous new
+        # connections risks exhausting that under real concurrent traffic —
+        # confirmed by hitting "remaining connection slots are reserved for
+        # SUPERUSER" during testing. Kept as two separate batches (5 then 12)
+        # to cap the peak simultaneous connections this endpoint opens.
+        (
+            (
+                patient_count,
+                patients_registered_today,
+                active_admissions,
+                lab_orders_today,
+                radiology_orders_today,
+                ot_surgeries_today,
+            ),
+            (appointments_today, appointments_scheduled, appointments_in_progress, appointments_completed),
+            (beds_total, beds_occupied),
+            (total_net, charges_today),
+            (total_paid, collections_today),
+        ) = self._run_parallel(
+            [_job_merged_counts, _job_appt_counts, _job_bed_counts, _job_charges, _job_payments]
         )
-        collections_detail_rows = (
-            self.db.query(BillingPayment)
-            .filter(
-                BillingPayment.hospital_id == hospital_id,
-                BillingPayment.payment_date >= range_from,
-                BillingPayment.payment_date <= range_to,
-            )
-            .order_by(BillingPayment.created_at.desc())
-            .limit(100)
-            .all()
+        occupied_pct = int(round((beds_occupied / beds_total) * 100)) if beds_total else 0
+
+        (
+            recent_registrations_rows,
+            pending_lab,
+            pending_rad,
+            appointments_detail_rows,
+            admissions_detail_rows,
+            beds_detail_rows,
+            lab_detail_rows,
+            rad_detail_rows,
+            ot_detail_rows,
+            charges_detail_rows,
+            collections_detail_rows,
+        ) = self._run_parallel(
+            [
+                _job_recent_registrations,
+                _job_pending_lab,
+                _job_pending_rad,
+                _job_appointments_detail,
+                _job_admissions_detail,
+                _job_beds_detail,
+                _job_lab_detail,
+                _job_rad_detail,
+                _job_ot_detail,
+                _job_charges_detail,
+                _job_collections_detail,
+            ]
         )
+
+        # upcoming_appts is a strict subset of appointments_detail_rows (same
+        # hospital/date-range/doctor/wing filters, just narrower status
+        # exclusion and a smaller limit) — derive it in Python instead of a
+        # separate round trip. Falls back to a real query only if the detail
+        # rows were truncated at their 100-row limit AND that wasn't enough
+        # to find 8 upcoming ones, so behavior can't silently diverge for
+        # unusually large multi-day ranges.
+        _excluded_upcoming_statuses = {AppointmentStatus.cancelled, AppointmentStatus.no_show, AppointmentStatus.completed}
+        upcoming_appts = [a for a in appointments_detail_rows if a.status not in _excluded_upcoming_statuses][:8]
+        if len(upcoming_appts) < 8 and len(appointments_detail_rows) >= 100:
+            upcoming_appts = _job_upcoming_appts(self.db)
 
         # Batch lookup patients, doctors, wards
         all_patient_ids = {
@@ -1539,10 +1709,31 @@ class TenancyActions:
         ward_ids.update({b.ward_id for b in beds_detail_rows if getattr(b, "ward_id", None)})
         bed_ids = {a.bed_id for a in admissions_detail_rows if getattr(a, "bed_id", None)}
 
-        patient_map = {p.id: p for p in self.db.query(Patient).filter(Patient.id.in_(all_patient_ids)).all()} if all_patient_ids else {}
-        doctor_map = {d.id: d for d in self.db.query(HospitalUser).filter(HospitalUser.id.in_(doctor_ids)).all()} if doctor_ids else {}
-        ward_map = {w.id: w for w in self.db.query(Ward).filter(Ward.id.in_(ward_ids)).all()} if ward_ids else {}
-        bed_map = {b.id: b for b in self.db.query(Bed).filter(Bed.id.in_(bed_ids)).all()} if bed_ids else {}
+        # Only `.name` (and `.bed_code` for beds) is read from these maps below —
+        # select just those columns instead of full ORM rows to cut both DB and
+        # serialization work for a query already fetching several id sets. The
+        # four lookups are independent of each other, so run them as one
+        # parallel batch instead of 4 sequential round trips.
+        lookup_jobs: list[Callable[[Session], Any]] = []
+        lookup_names: list[str] = []
+        if all_patient_ids:
+            lookup_jobs.append(lambda db: db.query(Patient.id, Patient.name).filter(Patient.id.in_(all_patient_ids)).all())
+            lookup_names.append("patient")
+        if doctor_ids:
+            lookup_jobs.append(lambda db: db.query(HospitalUser.id, HospitalUser.name).filter(HospitalUser.id.in_(doctor_ids)).all())
+            lookup_names.append("doctor")
+        if ward_ids:
+            lookup_jobs.append(lambda db: db.query(Ward.id, Ward.name).filter(Ward.id.in_(ward_ids)).all())
+            lookup_names.append("ward")
+        if bed_ids:
+            lookup_jobs.append(lambda db: db.query(Bed.id, Bed.bed_code).filter(Bed.id.in_(bed_ids)).all())
+            lookup_names.append("bed")
+
+        lookup_results = dict(zip(lookup_names, self._run_parallel(lookup_jobs)))
+        patient_map = {row.id: row for row in lookup_results.get("patient", [])}
+        doctor_map = {row.id: row for row in lookup_results.get("doctor", [])}
+        ward_map = {row.id: row for row in lookup_results.get("ward", [])}
+        bed_map = {row.id: row for row in lookup_results.get("bed", [])}
 
         return HospitalDashboardResponse(
             id=hospital.id,
@@ -1711,4 +1902,144 @@ class TenancyActions:
                 )
                 for p in collections_detail_rows
             ],
+        )
+
+    def get_hospital_dashboard_summary(self, hospital_id: UUID) -> HospitalDashboardSummaryResponse:
+        """Counters-only dashboard view: ~8 queries instead of the ~19 the full
+        dashboard runs, none of which build detail lists or cross-reference
+        patients/doctors/wards/beds. Meant for call sites (e.g. a sidebar
+        badge) that only display a couple of numbers, not the full screen.
+        """
+        today = date.today()
+        start = _day_start(today)
+        end = _day_end(today)
+
+        patient_count = int(
+            self.db.query(func.count(Patient.id)).filter(Patient.hospital_id == hospital_id).scalar() or 0
+        )
+
+        appt_counts = (
+            self.db.query(
+                func.count(Appointment.id),
+                func.count(Appointment.id).filter(Appointment.status == AppointmentStatus.scheduled),
+                func.count(Appointment.id).filter(Appointment.status == AppointmentStatus.waiting),
+                func.count(Appointment.id).filter(Appointment.status == AppointmentStatus.completed),
+            )
+            .filter(
+                Appointment.hospital_id == hospital_id,
+                Appointment.appointment_date == today,
+                Appointment.status != AppointmentStatus.cancelled,
+            )
+            .first()
+            or (0, 0, 0, 0)
+        )
+
+        active_admissions = int(
+            self.db.query(func.count(Admission.id))
+            .filter(Admission.hospital_id == hospital_id, Admission.status == AdmissionStatus.admitted)
+            .scalar()
+            or 0
+        )
+
+        bed_counts = (
+            self.db.query(
+                func.count(Bed.id),
+                func.count(Bed.id).filter(Bed.is_occupied.is_(True)),
+            )
+            .filter(Bed.hospital_id == hospital_id, Bed.is_active.is_(True))
+            .first()
+            or (0, 0)
+        )
+        beds_total, beds_occupied = int(bed_counts[0] or 0), int(bed_counts[1] or 0)
+
+        patients_registered_today = int(
+            self.db.query(func.count(Patient.id))
+            .filter(Patient.hospital_id == hospital_id, Patient.created_at >= start, Patient.created_at <= end)
+            .scalar()
+            or 0
+        )
+        lab_orders_today = int(
+            self.db.query(func.count(LabOrder.id))
+            .filter(
+                LabOrder.hospital_id == hospital_id,
+                LabOrder.ordered_at >= start,
+                LabOrder.ordered_at <= end,
+                LabOrder.status != LabOrderStatus.cancelled,
+            )
+            .scalar()
+            or 0
+        )
+        radiology_orders_today = int(
+            self.db.query(func.count(RadiologyOrder.id))
+            .filter(
+                RadiologyOrder.hospital_id == hospital_id,
+                RadiologyOrder.ordered_at >= start,
+                RadiologyOrder.ordered_at <= end,
+                RadiologyOrder.status != RadiologyOrderStatus.cancelled,
+            )
+            .scalar()
+            or 0
+        )
+        ot_surgeries_today = int(
+            self.db.query(func.count(OtSurgery.id))
+            .filter(
+                OtSurgery.hospital_id == hospital_id,
+                OtSurgery.scheduled_at >= start,
+                OtSurgery.scheduled_at <= end,
+                OtSurgery.status != OtSurgeryStatus.cancelled,
+            )
+            .scalar()
+            or 0
+        )
+
+        charges_row = (
+            self.db.query(
+                func.coalesce(func.sum(BillingCharge.net_amount), 0.0),
+                func.coalesce(
+                    func.sum(BillingCharge.net_amount).filter(
+                        BillingCharge.created_at >= start, BillingCharge.created_at <= end
+                    ),
+                    0.0,
+                ),
+            )
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.status != BillingChargeStatus.cancelled,
+            )
+            .first()
+            or (0.0, 0.0)
+        )
+        total_net, charges_today = float(charges_row[0] or 0), float(charges_row[1] or 0)
+
+        payments_row = (
+            self.db.query(
+                func.coalesce(func.sum(BillingPayment.amount), 0.0),
+                func.coalesce(
+                    func.sum(BillingPayment.amount).filter(BillingPayment.payment_date == today),
+                    0.0,
+                ),
+            )
+            .filter(BillingPayment.hospital_id == hospital_id)
+            .first()
+            or (0.0, 0.0)
+        )
+        total_paid, collections_today = float(payments_row[0] or 0), float(payments_row[1] or 0)
+
+        return HospitalDashboardSummaryResponse(
+            patient_count=patient_count,
+            appointments_today=int(appt_counts[0] or 0),
+            appointments_scheduled=int(appt_counts[1] or 0),
+            appointments_in_progress=int(appt_counts[2] or 0),
+            appointments_completed=int(appt_counts[3] or 0),
+            active_admissions=active_admissions,
+            beds_total=beds_total,
+            beds_occupied=beds_occupied,
+            occupied_beds_pct=int(round((beds_occupied / beds_total) * 100)) if beds_total else 0,
+            patients_registered_today=patients_registered_today,
+            lab_orders_today=lab_orders_today,
+            radiology_orders_today=radiology_orders_today,
+            ot_surgeries_today=ot_surgeries_today,
+            charges_today=int(round(charges_today)),
+            collections_today=int(round(collections_today)),
+            outstanding_total=int(round(max(0.0, total_net - total_paid))),
         )

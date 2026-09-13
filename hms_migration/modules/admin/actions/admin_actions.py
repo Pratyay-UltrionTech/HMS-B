@@ -322,9 +322,16 @@ class AdminActions:
             )
         return shift
 
-    def _user_to_response(self, user: HospitalUser) -> HospitalUserResponse:
+    def _user_to_response(
+        self, user: HospitalUser, dept_by_id: dict[UUID, Department] | None = None
+    ) -> HospitalUserResponse:
         shift = user.shift
-        dept = self.db.query(Department).filter(Department.id == shift.department_id).first() if shift and shift.department_id else None
+        dept = None
+        if shift and shift.department_id:
+            if dept_by_id is not None:
+                dept = dept_by_id.get(shift.department_id)
+            else:
+                dept = self.db.query(Department).filter(Department.id == shift.department_id).first()
         return HospitalUserResponse(
             id=user.id,
             hospital_id=user.hospital_id,
@@ -358,7 +365,12 @@ class AdminActions:
             .order_by(HospitalUser.name)
             .all()
         )
-        return [self._user_to_response(u) for u in users]
+        dept_ids = {u.shift.department_id for u in users if u.shift and u.shift.department_id}
+        dept_by_id: dict[UUID, Department] = {}
+        if dept_ids:
+            for d in self.db.query(Department).filter(Department.id.in_(dept_ids)).all():
+                dept_by_id[d.id] = d
+        return [self._user_to_response(u, dept_by_id) for u in users]
 
     def create_user(self, payload: HospitalUserCreate) -> HospitalUserResponse:
         role = self._get_role(payload.role_id)

@@ -135,12 +135,14 @@ def create_patient(
 def list_doctor_patients(
     doctor_id: UUID,
     search: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
-    return ListDoctorPatientsAction(db).execute(hospital_id, resolved, search)
+    return ListDoctorPatientsAction(db).execute(hospital_id, resolved, search, limit=limit, offset=offset)
 
 
 @router.get("/{doctor_id}/patients/{patient_id}", response_model=PatientHistoryResponse)

@@ -77,13 +77,15 @@ def register_emergency_encounter(
 )
 def list_emergency_encounters(
     search: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     _: dict[str, Any] = Depends(require_emergency_access),
     hospital_id: UUID = Depends(get_emergency_hospital_context),
 ):
     """List emergency encounters for the hospital."""
     repo = EmergencyRepository(db, hospital_id)
-    encounters = repo.list_encounters(search=search)
+    encounters = repo.list_encounters(search=search, limit=limit, offset=offset)
     return [EmergencyEncounterResponse.model_validate(e) for e in encounters]
 
 

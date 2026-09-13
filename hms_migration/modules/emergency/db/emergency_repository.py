@@ -92,6 +92,8 @@ class EmergencyRepository:
         self,
         statuses: Sequence[EmergencyStatus] | None = None,
         search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[EmergencyEncounter]:
         """List encounters matching filters."""
         q = (
@@ -114,7 +116,7 @@ class EmergencyRepository:
                     Patient.mobile.ilike(term),
                 )
             )
-        return q.order_by(EmergencyEncounter.arrival_time.desc()).all()
+        return q.order_by(EmergencyEncounter.arrival_time.desc()).limit(limit).offset(offset).all()
 
     def get_triage_queue(self) -> list[EmergencyEncounter]:
         """

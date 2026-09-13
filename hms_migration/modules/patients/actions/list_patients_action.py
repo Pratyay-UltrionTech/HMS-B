@@ -25,9 +25,13 @@ class ListPatientsAction:
         self,
         search: str | None = None,
         status_filter: PatientStatus | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[PatientDirectoryItem]:
         """Execute patient search with bulk last visit resolution."""
-        rows = self.repo.list_patients(search=search, status_filter=status_filter)
+        rows = self.repo.list_patients(
+            search=search, status_filter=status_filter, limit=limit, offset=offset
+        )
         visits = self.repo.profile_reader.get_bulk_last_visits([p.id for p in rows])
 
         return [

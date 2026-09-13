@@ -265,6 +265,66 @@ def patient_ledger_totals(
     }
 
 
+def patient_ledger_totals_bulk(
+    db: Session, hospital_id: UUID, patient_ids: list[UUID]
+) -> dict[UUID, dict[str, Any]]:
+    """Compute aggregate charges, payments, and outstanding balance for many patients
+    in two bulk queries instead of one pair of queries per patient."""
+    unique_ids = list({pid for pid in patient_ids if pid is not None})
+    result: dict[UUID, dict[str, Any]] = {
+        pid: {
+            "total_charges": 0.0,
+            "total_paid": 0.0,
+            "outstanding": 0.0,
+            "charge_count": 0,
+            "payment_count": 0,
+        }
+        for pid in unique_ids
+    }
+    if not unique_ids:
+        return result
+
+    charges = (
+        db.query(BillingCharge)
+        .filter(
+            BillingCharge.hospital_id == hospital_id,
+            BillingCharge.patient_id.in_(unique_ids),
+            BillingCharge.status != BillingChargeStatus.cancelled,
+        )
+        .all()
+    )
+    payments = (
+        db.query(BillingPayment)
+        .filter(
+            BillingPayment.hospital_id == hospital_id,
+            BillingPayment.patient_id.in_(unique_ids),
+        )
+        .all()
+    )
+
+    charges_by_patient: dict[UUID, list[BillingCharge]] = {}
+    for c in charges:
+        charges_by_patient.setdefault(c.patient_id, []).append(c)
+    payments_by_patient: dict[UUID, list[BillingPayment]] = {}
+    for p in payments:
+        payments_by_patient.setdefault(p.patient_id, []).append(p)
+
+    for pid in unique_ids:
+        p_charges = charges_by_patient.get(pid, [])
+        p_payments = payments_by_patient.get(pid, [])
+        total_charges = round(sum(float(c.net_amount) for c in p_charges), 2)
+        total_paid = round(sum(float(p.amount) for p in p_payments), 2)
+        outstanding = round(max(0.0, total_charges - total_paid), 2)
+        result[pid] = {
+            "total_charges": total_charges,
+            "total_paid": total_paid,
+            "outstanding": outstanding,
+            "charge_count": len(p_charges),
+            "payment_count": len(p_payments),
+        }
+    return result
+
+
 def charge_to_dict(c: BillingCharge, patient: Patient | None = None) -> dict[str, Any]:
     """Serialize BillingCharge ORM model to dictionary with patient context."""
     p = patient or c.patient

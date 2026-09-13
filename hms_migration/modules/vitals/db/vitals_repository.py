@@ -32,11 +32,7 @@ class VitalsRepository(BaseRepository[VitalReading]):
         appt_ids = {r.appointment_id for r in rows if r.appointment_id}
         patient_ids = {r.patient_id for r in rows if r.patient_id}
 
-        appts = {}
-        for appt_id in appt_ids:
-            appt = self.appointment_reader.get_appointment_by_id(appt_id)
-            if appt:
-                appts[appt_id] = appt
+        appts = self.appointment_reader.get_appointments_by_ids(list(appt_ids))
 
         # Resolve patients for any rows whose appointment did not load patient
         patient_map = {}

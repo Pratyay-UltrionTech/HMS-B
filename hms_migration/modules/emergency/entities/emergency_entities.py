@@ -94,7 +94,7 @@ class EmergencyEncounter(Base):
     )
     er_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     arrival_time: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     arrival_source: Mapped[EmergencyArrivalSource] = mapped_column(
         Enum(EmergencyArrivalSource, name="emergency_arrival_source"),

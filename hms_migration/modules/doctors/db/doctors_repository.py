@@ -153,7 +153,12 @@ class DoctorsRepository:
         return q.order_by(Patient.name.asc()).limit(50).all()
 
     def list_doctor_patients(
-        self, hospital_id: UUID, doctor_id: UUID, search: str | None = None
+        self,
+        hospital_id: UUID,
+        doctor_id: UUID,
+        search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[Patient]:
         """List patients associated with a specific doctor."""
         appt_patient_ids = (
@@ -179,4 +184,4 @@ class DoctorsRepository:
                     Patient.mobile.ilike(term),
                 )
             )
-        return q.order_by(Patient.name.asc()).all()
+        return q.order_by(Patient.name.asc()).limit(limit).offset(offset).all()

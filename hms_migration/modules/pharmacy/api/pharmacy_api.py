@@ -133,6 +133,8 @@ def list_medicines(
     search: str | None = Query(None),
     category_id: UUID | None = Query(None),
     active_only: bool | None = Query(None),
+    limit: int = Query(default=300, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -141,6 +143,8 @@ def list_medicines(
         search=search,
         category_id=category_id,
         active_only=active_only,
+        limit=limit,
+        offset=offset,
     )
 
 

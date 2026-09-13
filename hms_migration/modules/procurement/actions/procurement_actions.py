@@ -565,14 +565,21 @@ class ProcurementActions:
         # ALL its GRN lines reach quantity_ordered — a rejected item can never
         # be re-shipped against this PO in this simplified model, so rejected
         # quantity also counts toward closing the line (not just accepted).
+        po_item_ids = [po_item.id for po_item in po.items]
+        accounted_by_item: dict[UUID, float] = {}
+        if po_item_ids:
+            for gi in (
+                self.db.query(GoodsReceivedNoteItem)
+                .filter(GoodsReceivedNoteItem.purchase_order_item_id.in_(po_item_ids))
+                .all()
+            ):
+                accounted_by_item[gi.purchase_order_item_id] = accounted_by_item.get(
+                    gi.purchase_order_item_id, 0.0
+                ) + float(gi.accepted_quantity or 0) + float(gi.rejected_quantity or 0)
+
         all_lines_closed = True
         for po_item in po.items:
-            accounted = (
-                self.db.query(GoodsReceivedNoteItem)
-                .filter(GoodsReceivedNoteItem.purchase_order_item_id == po_item.id)
-                .all()
-            )
-            total_accounted = sum(float(gi.accepted_quantity or 0) + float(gi.rejected_quantity or 0) for gi in accounted)
+            total_accounted = accounted_by_item.get(po_item.id, 0.0)
             if total_accounted < po_item.quantity_ordered - 1e-9:
                 all_lines_closed = False
                 break
@@ -738,9 +745,12 @@ class ProcurementActions:
         # Reorder alerts: real comparison of reorder_level vs CentralInventoryStock.
         from hms_migration.modules.inventory.entities.inventory_entities import CentralInventoryStock
 
+        from sqlalchemy.orm import joinedload as _joinedload
+
         alerts: list[ReorderAlert] = []
         central_rows = (
             self.db.query(CentralInventoryStock)
+            .options(_joinedload(CentralInventoryStock.item))
             .filter(CentralInventoryStock.hospital_id == self.hospital_id)
             .all()
         )

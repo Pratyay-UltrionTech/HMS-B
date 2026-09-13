@@ -195,12 +195,67 @@ class BloodBankRepository:
         )
         return list(self.db.scalars(stmt).all())
 
+    def get_child_units_bulk(self, parent_unit_ids: list[UUID]) -> dict[UUID, list[BloodUnit]]:
+        """Fetch children for many parent units in a single query."""
+        if not parent_unit_ids:
+            return {}
+        stmt = select(BloodUnit).where(
+            BloodUnit.hospital_id == self.hospital_id,
+            BloodUnit.parent_unit_id.in_(parent_unit_ids),
+        )
+        result: dict[UUID, list[BloodUnit]] = {}
+        for u in self.db.scalars(stmt).all():
+            result.setdefault(u.parent_unit_id, []).append(u)
+        return result
+
     def get_units_for_donation(self, donation_id: UUID) -> list[BloodUnit]:
         stmt = select(BloodUnit).where(
             BloodUnit.hospital_id == self.hospital_id,
             BloodUnit.donation_id == donation_id,
         )
         return list(self.db.scalars(stmt).all())
+
+    def get_issues_for_units_bulk(self, unit_ids: list[UUID]) -> dict[UUID, BloodIssue]:
+        """Latest BloodIssue per unit, fetched in a single query."""
+        if not unit_ids:
+            return {}
+        stmt = (
+            select(BloodIssue)
+            .where(BloodIssue.hospital_id == self.hospital_id, BloodIssue.blood_unit_id.in_(unit_ids))
+            .order_by(desc(BloodIssue.issued_at))
+        )
+        result: dict[UUID, BloodIssue] = {}
+        for i in self.db.scalars(stmt).all():
+            if i.blood_unit_id not in result:
+                result[i.blood_unit_id] = i
+        return result
+
+    def get_transfusions_for_units_bulk(self, unit_ids: list[UUID]) -> dict[UUID, BloodTransfusion]:
+        """Latest BloodTransfusion per unit, fetched in a single query."""
+        if not unit_ids:
+            return {}
+        stmt = (
+            select(BloodTransfusion)
+            .where(
+                BloodTransfusion.hospital_id == self.hospital_id,
+                BloodTransfusion.blood_unit_id.in_(unit_ids),
+            )
+            .order_by(desc(BloodTransfusion.start_time))
+        )
+        result: dict[UUID, BloodTransfusion] = {}
+        for t in self.db.scalars(stmt).all():
+            if t.blood_unit_id not in result:
+                result[t.blood_unit_id] = t
+        return result
+
+    def get_returns_for_issues_bulk(self, issue_ids: list[UUID]) -> dict[UUID, BloodReturn]:
+        """BloodReturn per issue, fetched in a single query."""
+        if not issue_ids:
+            return {}
+        stmt = select(BloodReturn).where(
+            BloodReturn.hospital_id == self.hospital_id, BloodReturn.issue_id.in_(issue_ids)
+        )
+        return {r.issue_id: r for r in self.db.scalars(stmt).all()}
 
     # -----------------------------------------------------------------------
     # Feature 37: Transfusions

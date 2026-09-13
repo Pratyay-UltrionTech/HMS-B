@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from datetime import datetime
 import enum
-from typing import TYPE_CHECKING
 import uuid
 
 from sqlalchemy import (
@@ -30,10 +29,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from hms_migration.infrastructure.postgres.base import Base
 
-if TYPE_CHECKING:
-    from hms_migration.modules.doctors.entities.doctor import HospitalUser
-    from hms_migration.modules.masters.entities.organization_entities import Department, Wing
-    from hms_migration.modules.patients.entities.patient import Patient
+# Imported unconditionally (not just under TYPE_CHECKING): the string-based
+# relationship() targets below ("Wing", "Department", "HospitalUser",
+# "Patient") are resolved from SQLAlchemy's mapper registry at first mapper
+# configuration, which requires these classes to have actually been imported
+# by then. Depending on module import order elsewhere in the app, that was
+# not always guaranteed, causing
+# `InvalidRequestError: ... expression 'Wing' failed to locate a name`.
+from hms_migration.modules.doctors.entities.doctor import HospitalUser
+from hms_migration.modules.masters.entities.organization_entities import Department, Wing
+from hms_migration.modules.patients.entities.patient import Patient
 
 
 class OtPriority(str, enum.Enum):

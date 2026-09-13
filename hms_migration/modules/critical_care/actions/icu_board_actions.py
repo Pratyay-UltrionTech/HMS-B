@@ -36,9 +36,13 @@ class GetIcuBoardAction:
         now = datetime.now(timezone.utc)
         results: list[IcuBoardPatientResponse] = []
 
+        admission_ids = [adm.id for adm in admissions]
+        profile_map = self.repo.get_icu_profiles_for_admissions(admission_ids)
+        flowsheet_map = self.repo.get_latest_flowsheets_for_admissions(admission_ids)
+
         for adm in admissions:
-            profile = self.repo.get_icu_profile(adm.id)
-            latest_flowsheet = self.repo.get_latest_flowsheet(adm.id)
+            profile = profile_map.get(adm.id)
+            latest_flowsheet = flowsheet_map.get(adm.id)
 
             # Calculate Length of Stay (LOS) in days
             los_days = 0

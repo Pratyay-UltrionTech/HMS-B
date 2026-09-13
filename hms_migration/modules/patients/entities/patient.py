@@ -10,7 +10,7 @@ from datetime import date, datetime
 import enum
 import uuid
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Enum, Index, Integer, JSON, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -32,6 +32,7 @@ class Patient(Base):
     __table_args__ = (
         UniqueConstraint("hospital_id", "mobile", name="uq_patient_hospital_mobile"),
         UniqueConstraint("hospital_id", "uhid", name="uq_patient_hospital_uhid"),
+        Index("ix_patients_hospital_created", "hospital_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -65,5 +66,5 @@ class Patient(Base):
         default=PatientStatus.active,
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )

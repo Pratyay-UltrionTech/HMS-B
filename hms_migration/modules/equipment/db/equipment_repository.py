@@ -8,7 +8,7 @@ from typing import Sequence
 from uuid import UUID
 
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from hms_migration.modules.equipment.entities.equipment_entities import (
     EquipmentAssignment,
@@ -128,7 +128,7 @@ class EquipmentRepository:
     ) -> Sequence[EquipmentItem]:
         q = (
             self.db.query(EquipmentItem)
-            .options(joinedload(EquipmentItem.category), joinedload(EquipmentItem.assignments))
+            .options(joinedload(EquipmentItem.category), selectinload(EquipmentItem.assignments))
             .filter(EquipmentItem.hospital_id == hospital_id)
         )
         if search:
@@ -157,18 +157,28 @@ class EquipmentRepository:
         return q.order_by(EquipmentItem.asset_id.asc()).limit(500).all()
 
     def get_dashboard_counts(self, hospital_id: UUID) -> dict[str, int]:
-        q = self.db.query(EquipmentItem).filter(EquipmentItem.hospital_id == hospital_id)
-        total = q.count()
-        available = q.filter(EquipmentItem.status == EquipmentStatus.available).count()
-        in_use = q.filter(EquipmentItem.status == EquipmentStatus.in_use).count()
-        under_maintenance = q.filter(EquipmentItem.status == EquipmentStatus.under_maintenance).count()
-        out_of_service = q.filter(EquipmentItem.status == EquipmentStatus.out_of_service).count()
+        def _count(*conds):
+            return (
+                self.db.query(func.count(EquipmentItem.id))
+                .filter(EquipmentItem.hospital_id == hospital_id, *conds)
+                .scalar_subquery()
+            )
+
+        total_sq = _count()
+        available_sq = _count(EquipmentItem.status == EquipmentStatus.available)
+        in_use_sq = _count(EquipmentItem.status == EquipmentStatus.in_use)
+        under_maintenance_sq = _count(EquipmentItem.status == EquipmentStatus.under_maintenance)
+        out_of_service_sq = _count(EquipmentItem.status == EquipmentStatus.out_of_service)
+
+        total, available, in_use, under_maintenance, out_of_service = self.db.query(
+            total_sq, available_sq, in_use_sq, under_maintenance_sq, out_of_service_sq
+        ).one()
         return {
-            "total": total,
-            "available": available,
-            "in_use": in_use,
-            "under_maintenance": under_maintenance,
-            "out_of_service": out_of_service,
+            "total": int(total or 0),
+            "available": int(available or 0),
+            "in_use": int(in_use or 0),
+            "under_maintenance": int(under_maintenance or 0),
+            "out_of_service": int(out_of_service or 0),
         }
 
     # ── Assignments ───────────────────────────────────────────────────────────

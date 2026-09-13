@@ -66,13 +66,17 @@ def register_patient(
 def list_patients(
     search: str | None = Query(default=None),
     status_filter: PatientStatus | None = Query(default=None, alias="status"),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     _: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[PatientDirectoryItem]:
     """Search and list patients within the current hospital tenant."""
     repo = PatientRepository(db=db, hospital_id=hospital_id)
-    return ListPatientsAction(repo).execute(search=search, status_filter=status_filter)
+    return ListPatientsAction(repo).execute(
+        search=search, status_filter=status_filter, limit=limit, offset=offset
+    )
 
 
 @router.get(

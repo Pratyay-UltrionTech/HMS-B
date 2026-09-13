@@ -12,7 +12,7 @@ from datetime import date, datetime, time
 from typing import TYPE_CHECKING
 import uuid
 
-from sqlalchemy import Date, DateTime, Enum, Float, ForeignKey, Integer, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import Date, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text, Time, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -32,6 +32,7 @@ class Appointment(Base):
     __tablename__ = "appointments"
     __table_args__ = (
         UniqueConstraint("hospital_id", "op_id", name="uq_appointment_hospital_op_id"),
+        Index("ix_appointments_hospital_date", "hospital_id", "appointment_date"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

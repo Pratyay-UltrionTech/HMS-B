@@ -252,9 +252,14 @@ class ListDoctorPatientsAction:
         self.repo = DoctorsRepository(db)
 
     def execute(
-        self, hospital_id: UUID, doctor_id: UUID, search: str | None = None
+        self,
+        hospital_id: UUID,
+        doctor_id: UUID,
+        search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[DoctorPatientResponse]:
-        patients = self.repo.list_doctor_patients(hospital_id, doctor_id, search)
+        patients = self.repo.list_doctor_patients(hospital_id, doctor_id, search, limit=limit, offset=offset)
         return [to_doctor_patient_response(p) for p in patients]
 
 

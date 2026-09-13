@@ -428,8 +428,12 @@ class PharmacyActions:
         search: str | None = None,
         category_id: UUID | None = None,
         active_only: bool | None = None,
+        limit: int = 300,
+        offset: int = 0,
     ) -> list[MedicineResponse]:
-        rows = self.repo.list_medicines(self.hospital_id, search, category_id, active_only)
+        rows = self.repo.list_medicines(
+            self.hospital_id, search, category_id, active_only, limit=limit, offset=offset
+        )
         return [self._medicine_to_response(r) for r in rows]
 
     def create_medicine(self, payload: MedicineCreate) -> MedicineResponse:

@@ -96,30 +96,48 @@ class BloodTraceabilityActions:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood donor not found")
 
         donations = self.repo.get_donations_for_donor(donor.id)
-        donation_traces: list[DonationTrace] = []
 
+        # First pass: gather each donation's direct units, then expand the full
+        # parent/child lineage frontier using bulk (one-query-per-level) lookups
+        # instead of one child-unit query per unit.
+        units_by_donation: dict[UUID, list] = {}
+        all_units_by_id: dict[UUID, object] = {}
+        frontier_ids: list[UUID] = []
         for donation in donations:
             units = self.repo.get_units_for_donation(donation.id)
-            # Include separated child components derived from any whole-blood unit of this donation
-            all_units = list(units)
-            seen_ids = {u.id for u in all_units}
-            frontier = list(units)
-            while frontier:
-                next_frontier = []
-                for u in frontier:
-                    children = self.repo.get_child_units(u.id)
-                    for c in children:
-                        if c.id not in seen_ids:
-                            all_units.append(c)
-                            seen_ids.add(c.id)
-                            next_frontier.append(c)
-                frontier = next_frontier
+            units_by_donation[donation.id] = list(units)
+            for u in units:
+                all_units_by_id[u.id] = u
+                frontier_ids.append(u.id)
 
+        frontier = list(frontier_ids)
+        while frontier:
+            children_by_parent = self.repo.get_child_units_bulk(frontier)
+            next_frontier: list[UUID] = []
+            for parent_id, children in children_by_parent.items():
+                donation_id_for_parent = all_units_by_id[parent_id].donation_id
+                for c in children:
+                    if c.id not in all_units_by_id:
+                        all_units_by_id[c.id] = c
+                        units_by_donation.setdefault(donation_id_for_parent, []).append(c)
+                        next_frontier.append(c.id)
+            frontier = next_frontier
+
+        # Second pass: bulk-fetch issue/transfusion/return context for every unit at once.
+        all_unit_ids = list(all_units_by_id.keys())
+        issues_by_unit = self.repo.get_issues_for_units_bulk(all_unit_ids)
+        transfusions_by_unit = self.repo.get_transfusions_for_units_bulk(all_unit_ids)
+        issue_ids = [i.id for i in issues_by_unit.values()]
+        returns_by_issue = self.repo.get_returns_for_issues_bulk(issue_ids)
+
+        donation_traces: list[DonationTrace] = []
+        for donation in donations:
+            all_units = units_by_donation.get(donation.id, [])
             derived_traces: list[DerivedUnitTrace] = []
             for u in all_units:
-                issue = self.repo.get_issue_for_unit(u.id)
-                transfusion = self.repo.get_transfusion_for_unit(u.id)
-                return_record = self.repo.get_return_by_issue_id(issue.id) if issue else None
+                issue = issues_by_unit.get(u.id)
+                transfusion = transfusions_by_unit.get(u.id)
+                return_record = returns_by_issue.get(issue.id) if issue else None
                 derived_traces.append(
                     DerivedUnitTrace(
                         unit=BloodUnitResponse.model_validate(u),

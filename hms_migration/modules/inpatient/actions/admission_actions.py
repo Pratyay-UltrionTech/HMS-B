@@ -346,7 +346,11 @@ class ListDischargeRequestsAction:
                 bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
                 created_by_name="System",
             )
-            fin = self.billing_svc.get_ledger_totals(hospital_id, a.patient_id)
+        ledgers = self.billing_svc.get_ledger_totals_bulk(
+            hospital_id, [a.patient_id for a in rows]
+        )
+        for a in rows:
+            fin = ledgers.get(a.patient_id, {})
             outstanding = float(fin.get("outstanding") or 0)
             base = to_admission_detail(a)
             items.append(

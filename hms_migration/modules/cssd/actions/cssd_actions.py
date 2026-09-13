@@ -234,9 +234,10 @@ class CssdActions:
         if self.repo.get_batch_by_number(self.hospital_id, batch_number):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Batch number already exists")
 
+        sets_by_id = self.repo.get_sets_by_ids(payload.instrument_set_ids, self.hospital_id)
         items: list[SterilizationBatchItem] = []
         for set_id in payload.instrument_set_ids:
-            iset = self.repo.get_set_by_id(set_id, self.hospital_id)
+            iset = sets_by_id.get(set_id)
             if not iset:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Instrument set {set_id} not found")
             items.append(SterilizationBatchItem(hospital_id=self.hospital_id, instrument_set_id=iset.id))

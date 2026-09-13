@@ -82,20 +82,23 @@ class GetPlatformAnalyticsAction:
 
         # 4. Total Patients
         total_patients = self.repo.get_total_patients_count()
-        patient_records = self.repo.get_patient_creation_timestamps()
 
         # 5. Six-Month Rolling Growth
+        six_months_ago = _month_start(*_add_months(now.year, now.month, -5))
+        patient_counts_by_month = self.repo.get_patient_counts_by_month(since=six_months_ago)
+
         growth: list[MonthCount] = []
         patient_growth: list[MonthCount] = []
         for i in range(5, -1, -1):
             year, month = _add_months(now.year, now.month, -i)
             cursor = _month_start(year, month)
-            ny, nm = _add_months(year, month, 1)
-            next_month = _month_start(ny, nm)
+            next_month = _month_start(*_add_months(year, month, 1))
             label = _month_label(year, month)
             key = f"{year:04d}-{month:02d}"
 
-            # Filter hospitals created in this calendar month window
+            # Filter hospitals created in this calendar month window (hospital
+            # count is small platform-wide, so an in-memory scan here is fine —
+            # unlike patients, which is aggregated in SQL below).
             created = 0
             for h in hospitals:
                 created_at = h.get("created_at")
@@ -105,13 +108,7 @@ class GetPlatformAnalyticsAction:
                         created += 1
             growth.append(MonthCount(month=key, label=label, count=created))
 
-            # Filter patients created in this calendar month window
-            registered = 0
-            for _pid, created_at in patient_records:
-                if created_at:
-                    dt = created_at.astimezone(timezone.utc) if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
-                    if cursor <= dt < next_month:
-                        registered += 1
+            registered = patient_counts_by_month.get(key, 0)
             patient_growth.append(MonthCount(month=key, label=label, count=registered))
 
         # 6. Format Plan Distribution List

@@ -187,6 +187,9 @@ class AppointmentsRepository(BaseRepository[Appointment]):
         from_date: date | None = None,
         to_date: date | None = None,
         status: AppointmentStatus | None = None,
+        patient_search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[Appointment]:
         """List historical appointments matching filters."""
         q = self.db.query(Appointment).filter(Appointment.hospital_id == self.hospital_id)
@@ -200,7 +203,21 @@ class AppointmentsRepository(BaseRepository[Appointment]):
             q = q.filter(Appointment.appointment_date <= to_date)
         if status:
             q = q.filter(Appointment.status == status)
-        return q.order_by(Appointment.appointment_date.desc(), Appointment.appointment_time.desc()).all()
+        if patient_search:
+            term = f"%{patient_search.strip()}%"
+            q = q.join(Patient, Patient.id == Appointment.patient_id).filter(
+                or_(
+                    Patient.name.ilike(term),
+                    Patient.uhid.ilike(term),
+                    Patient.mobile.ilike(term),
+                )
+            )
+        return (
+            q.order_by(Appointment.appointment_date.desc(), Appointment.appointment_time.desc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
 
     def list_ipd_requests(self) -> list[Appointment]:
         """List appointments requesting IPD bed transfer."""

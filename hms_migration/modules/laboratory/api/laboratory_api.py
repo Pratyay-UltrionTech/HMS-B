@@ -259,6 +259,8 @@ def list_orders(
     order_date: date | None = Query(default=None),
     order_source: LabOrderSource | None = Query(default=None),
     search: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -270,6 +272,8 @@ def list_orders(
         order_date=order_date,
         order_source=order_source,
         search=search,
+        limit=limit,
+        offset=offset,
     )
 
 

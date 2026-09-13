@@ -71,6 +71,9 @@ class ListAppointmentsActions:
         from_date: date | None = None,
         to_date: date | None = None,
         status: AppointmentStatus | None = None,
+        patient_search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[AppointmentListItem]:
         """Fetch historical appointment records."""
         appts = self.repo.list_history(
@@ -79,6 +82,9 @@ class ListAppointmentsActions:
             from_date=from_date,
             to_date=to_date,
             status=status,
+            patient_search=patient_search,
+            limit=limit,
+            offset=offset,
         )
         return self.repo.hydrate_appointment_items(appts)
 

@@ -20,6 +20,7 @@ from hms_migration.modules.tenancy.contracts.tenancy_contracts import (
     HospitalCreate,
     HospitalCreateResponse,
     HospitalDashboardResponse,
+    HospitalDashboardSummaryResponse,
     HospitalResponse,
     RoleDashboardResponse,
 )
@@ -69,6 +70,17 @@ def hospital_dashboard(
         doctor_id=doctor_id,
         wing_id=wing_id,
     )
+
+
+@router.get("/me/dashboard/summary", response_model=HospitalDashboardSummaryResponse)
+def hospital_dashboard_summary(
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    _: dict[str, Any] = Depends(require_hospital_user),
+) -> HospitalDashboardSummaryResponse:
+    """Counters-only dashboard view for badges/widgets that don't need the
+    full detail lists (~8 queries vs ~19 for the full dashboard)."""
+    return TenancyActions(db).get_hospital_dashboard_summary(hospital_id=hospital_id)
 
 
 @router.get("/me/role-dashboard", response_model=RoleDashboardResponse)

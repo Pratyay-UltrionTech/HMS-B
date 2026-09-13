@@ -617,6 +617,8 @@ class ListLabOrdersAction:
         order_date: Any | None = None,
         order_source: LabOrderSource | None = None,
         search: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[LabOrderResponse]:
         orders = self.repo.list_orders(
             status=status,
@@ -625,6 +627,8 @@ class ListLabOrdersAction:
             order_date=order_date,
             order_source=order_source,
             search=search,
+            limit=limit,
+            offset=offset,
         )
         return [_order_to_response(o) for o in orders]
 

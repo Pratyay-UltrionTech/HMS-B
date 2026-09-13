@@ -274,8 +274,9 @@ class CreateOrdersAction:
         actor_role = _actor_role(self.user)
         created_ids: list[UUID] = []
 
+        order_nos = iter(self.repo.next_order_no_batch(len(scans)))
         for scan in scans:
-            order_no = self.repo.next_order_no()
+            order_no = next(order_nos)
             order = RadiologyOrder(
                 hospital_id=self.hospital_id,
                 order_no=order_no,

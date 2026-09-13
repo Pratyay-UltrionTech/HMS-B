@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from datetime import datetime
 import enum
-from typing import TYPE_CHECKING
 import uuid
 
 from sqlalchemy import (
@@ -20,6 +19,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -32,10 +32,15 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from hms_migration.infrastructure.postgres.base import Base
 
-if TYPE_CHECKING:
-    from hms_migration.modules.patients.entities.patient import Patient
-    from hms_migration.modules.doctors.entities.doctor import HospitalUser
-    from hms_migration.modules.clinical_records.entities.clinical_record import Prescription
+# Imported unconditionally (not just under TYPE_CHECKING): the string-based
+# relationship() targets below are resolved from SQLAlchemy's mapper registry
+# at first mapper configuration, which requires these classes to have
+# actually been imported by then — not guaranteed under TYPE_CHECKING-only
+# imports depending on module import order elsewhere in the app. Same bug
+# class as the earlier `OtRoom` -> `Wing` fix in modules/ot/entities.
+from hms_migration.modules.clinical_records.entities.clinical_record import Prescription
+from hms_migration.modules.doctors.entities.doctor import HospitalUser
+from hms_migration.modules.patients.entities.patient import Patient
 
 
 class LabSampleType(str, enum.Enum):
@@ -177,6 +182,7 @@ class LabOrder(Base):
     __tablename__ = "lab_orders"
     __table_args__ = (
         UniqueConstraint("hospital_id", "order_no", name="uq_lab_order_no"),
+        Index("ix_lab_orders_hospital_ordered", "hospital_id", "ordered_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -215,6 +221,7 @@ class LabOrder(Base):
         Enum(LabOrderStatus, name="lab_order_status"),
         nullable=False,
         default=LabOrderStatus.ordered,
+        index=True,
     )
     clinical_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     sample_type: Mapped[LabSampleType | None] = mapped_column(
@@ -224,7 +231,7 @@ class LabOrder(Base):
     collected_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     collection_remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
     ordered_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
