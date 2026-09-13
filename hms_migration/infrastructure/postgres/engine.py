@@ -25,6 +25,10 @@ def get_async_engine(settings: Settings | None = None) -> AsyncEngine:
     return create_async_engine(
         cfg.asyncpg_database_url,
         pool_pre_ping=True,
+        pool_size=cfg.db_pool_size,
+        max_overflow=cfg.db_max_overflow,
+        pool_timeout=cfg.db_pool_timeout,
+        pool_recycle=cfg.db_pool_recycle,
         echo=False,
     )
 
@@ -46,5 +50,9 @@ def get_transitional_sync_engine(settings: Settings | None = None) -> Engine:
     return create_engine(
         cfg.sqlalchemy_database_url,
         pool_pre_ping=True,
+        pool_size=cfg.db_pool_size,
+        max_overflow=cfg.db_max_overflow,
+        pool_timeout=cfg.db_pool_timeout,
+        pool_recycle=cfg.db_pool_recycle,
         echo=False,
     )

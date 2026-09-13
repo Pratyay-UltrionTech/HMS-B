@@ -50,6 +50,23 @@ class Settings(BaseSettings):
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
 
+    # Schema management: create_all is expensive (walks every table on every
+    # boot, including every --reload restart) and duplicates what a real
+    # migration tool should do. Off by default; run scripts/create_schema.py
+    # once instead, or flip this on for a throwaway local DB.
+    auto_create_schema: bool = False
+
+    # SQLAlchemy connection pool sizing. The Azure Postgres server backing
+    # this app caps out at max_connections=50 total, shared with the legacy
+    # app/database.py engine's own pool (pool_size=5 + max_overflow=5 there),
+    # so this pool must leave headroom rather than being sized in isolation.
+    db_pool_size: int = 10
+    db_max_overflow: int = 5
+    db_pool_timeout: int = 30
+    # Recycle connections that have sat open too long so leaked/forgotten
+    # sessions don't hold a slot indefinitely (one was observed idle 13h).
+    db_pool_recycle: int = 1800
+
     # Migration / Controlled cutover feature flags (default False = legacy behavior)
     use_migrated_vitals: bool = False
     use_migrated_analytics: bool = False

@@ -13,6 +13,7 @@ import logging
 
 from fastapi import FastAPI
 
+from hms_migration.config.settings import get_settings
 from hms_migration.infrastructure.postgres.engine import get_async_engine
 from hms_migration.infrastructure.postgres.session import get_transitional_sync_session_factory
 from hms_migration.modules.appointments.services.appointment_lifecycle import (
@@ -27,16 +28,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup and graceful teardown hooks for the application."""
     logger.info("Initializing HMS target application lifecycle...")
 
-    # Ensure database schema on startup if database is reachable
-    try:
-        from hms_migration.infrastructure.postgres.base import Base
-        from hms_migration.infrastructure.postgres.engine import get_transitional_sync_engine
+    # create_all walks every table across every mounted module on every boot
+    # (including every --reload restart), which is a major source of slow
+    # startup. It is opt-in now; run scripts/create_schema.py once per schema
+    # change instead, or set AUTO_CREATE_SCHEMA=true for a throwaway local DB.
+    if get_settings().auto_create_schema:
+        try:
+            from hms_migration.infrastructure.postgres.base import Base
+            from hms_migration.infrastructure.postgres.engine import get_transitional_sync_engine
 
-        sync_engine = get_transitional_sync_engine()
-        Base.metadata.create_all(bind=sync_engine)
-        logger.info("Target database schema verified/created.")
-    except Exception as exc:
-        logger.warning("Target database schema initialization skipped: %s", exc)
+            sync_engine = get_transitional_sync_engine()
+            Base.metadata.create_all(bind=sync_engine)
+            logger.info("Target database schema verified/created.")
+        except Exception as exc:
+            logger.warning("Target database schema initialization skipped: %s", exc)
 
     async def _missed_appointment_loop() -> None:
         factory = get_transitional_sync_session_factory()
