@@ -8,7 +8,7 @@ Verifies:
 1. When flags are false:
    - Handlers belong to legacy app.routers.
 2. When flags are true:
-   - Handlers belong to migrated hms_migration.modules.*.api.
+   - Handlers belong to migrated modules.*.api.
 3. No duplicate routes or OpenAPI collision.
 """
 
@@ -19,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.models import Hospital
-from hms_migration.shared.auth.jwt import create_access_token
+from shared.auth.jwt import create_access_token
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +66,7 @@ def test_migrated_mode_doctors_router_registration(monkeypatch):
         for route in app.main.app.routes
     }
     assert "/api/doctors" in route_modules
-    assert "hms_migration.modules.doctors.api.doctors_api" in route_modules["/api/doctors"]
+    assert "modules.doctors.api.doctors_api" in route_modules["/api/doctors"]
 
 
 def test_legacy_mode_beds_router_registration(monkeypatch):
@@ -100,7 +100,7 @@ def test_migrated_mode_beds_router_registration(monkeypatch):
         for route in app.main.app.routes
     }
     assert "/api/beds/dashboard" in route_modules
-    assert "hms_migration.modules.beds.api.beds_api" in route_modules["/api/beds/dashboard"]
+    assert "modules.beds.api.beds_api" in route_modules["/api/beds/dashboard"]
 
 
 def test_migrated_mode_inpatient_router_registration(monkeypatch):
@@ -117,4 +117,4 @@ def test_migrated_mode_inpatient_router_registration(monkeypatch):
         for route in app.main.app.routes
     }
     assert "/api/ipd/form-submissions" in route_modules
-    assert "hms_migration.modules.inpatient.api.ipd_api" in route_modules["/api/ipd/form-submissions"]
+    assert "modules.inpatient.api.ipd_api" in route_modules["/api/ipd/form-submissions"]

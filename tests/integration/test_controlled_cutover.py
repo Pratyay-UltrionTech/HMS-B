@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Appointment, AppointmentStatus, Hospital, HospitalUser, Patient, VitalReading
-from hms_migration.infrastructure.postgres import get_transitional_sync_session
+from infrastructure.postgres import get_transitional_sync_session
 
 
 # Uses hospital and auth_headers fixtures from tests/conftest.py
@@ -208,12 +208,12 @@ def test_cutover_toggle_both_states(db_session: Session):
     """
     Verify that toggling USE_MIGRATED_VITALS exclusively routes traffic:
     - False -> app.routers.vitals.list_today_bookings
-    - True  -> hms_migration.modules.vitals.api.vitals_api.list_today_bookings
+    - True  -> modules.vitals.api.vitals_api.list_today_bookings
     With zero duplicate routes or route shadowing.
     """
     from fastapi import FastAPI
     from app.routers import vitals as legacy_vitals
-    from hms_migration.modules.vitals.api import vitals_api as migrated_vitals
+    from modules.vitals.api import vitals_api as migrated_vitals
 
     # 1. Simulate legacy router mount (USE_MIGRATED_VITALS=false)
     legacy_app = FastAPI()

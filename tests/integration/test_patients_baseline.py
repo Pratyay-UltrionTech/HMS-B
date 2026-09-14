@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Appointment, AppointmentStatus, AuditLog, Hospital, HospitalUser, Patient, PatientStatus
 from app.routers import registration as legacy_registration
-from hms_migration.shared.auth.jwt import create_access_token
+from shared.auth.jwt import create_access_token
 
 
 @pytest.fixture(scope="function")

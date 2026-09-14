@@ -7,7 +7,7 @@ Verifies:
    - Route handler belongs to legacy app.routers.analytics.
 2. When USE_MIGRATED_ANALYTICS=true:
    - Exactly one /api/analytics/platform route exists.
-   - Route handler belongs to migrated hms_migration.modules.analytics.api.analytics_api.
+   - Route handler belongs to migrated modules.analytics.api.analytics_api.
    - Full HTTP request lifecycle completes successfully with identical response shape.
 3. Zero duplicate route registrations or conflicting OpenAPI operation IDs.
 """
@@ -21,10 +21,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Hospital
-from hms_migration.infrastructure.postgres.session import (
+from infrastructure.postgres.session import (
     get_transitional_sync_session as migrated_get_db,
 )
-from hms_migration.shared.auth.jwt import create_access_token
+from shared.auth.jwt import create_access_token
 
 
 @pytest.fixture(scope="function")
@@ -77,7 +77,7 @@ def test_migrated_mode_router_registration_and_execution(
         if getattr(r, "path", None) == "/api/analytics/platform"
     ]
     assert len(routes) == 1
-    assert "hms_migration.modules.analytics.api.analytics_api" in routes[0].endpoint.__module__
+    assert "modules.analytics.api.analytics_api" in routes[0].endpoint.__module__
 
     # Execute against running app
     app.main.app.dependency_overrides[get_db] = lambda: db_session

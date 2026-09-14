@@ -5,7 +5,7 @@ Verifies:
 1. When USE_MIGRATED_APPOINTMENTS=false:
    - Route handlers belong to legacy app.routers.appointment.
 2. When USE_MIGRATED_APPOINTMENTS=true:
-   - Route handlers belong to migrated hms_migration.modules.appointments.api.appointments_api.
+   - Route handlers belong to migrated modules.appointments.api.appointments_api.
    - Zero duplicate route registrations or conflicting OpenAPI paths.
    - Real HTTP request lifecycle completes successfully via FastAPI application runtime.
 """
@@ -22,10 +22,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Hospital, HospitalUser
-from hms_migration.infrastructure.postgres.session import (
+from infrastructure.postgres.session import (
     get_transitional_sync_session as migrated_get_db,
 )
-from hms_migration.shared.auth.jwt import create_access_token
+from shared.auth.jwt import create_access_token
 
 
 @pytest.fixture(scope="function")

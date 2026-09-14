@@ -25,7 +25,7 @@ from app.database import get_db
 from app.models import Hospital, HospitalUser, Patient, PlanType, RolePermission
 from app.routers import analytics as legacy_analytics
 from fastapi import FastAPI
-from hms_migration.shared.auth.jwt import create_access_token
+from shared.auth.jwt import create_access_token
 
 
 @pytest.fixture(scope="function")

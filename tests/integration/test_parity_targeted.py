@@ -16,34 +16,34 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 from fastapi import HTTPException
 
-from hms_migration.infrastructure.postgres.base import Base
-from hms_migration.modules.appointments.entities.appointment_type import AppointmentType
-from hms_migration.modules.clinical_records.entities.clinical_record import Prescription
-from hms_migration.modules.doctors.entities.doctor import HospitalUser, StaffRole
-from hms_migration.modules.tenancy.entities.hospital import Hospital, PlanType
-from hms_migration.modules.masters.entities.organization_entities import Wing, Department
-from hms_migration.modules.beds.entities.bed import Ward, Room, Bed, WardType
-from hms_migration.modules.pharmacy.entities.pharmacy_entities import (
+from infrastructure.postgres.base import Base
+from modules.appointments.entities.appointment_type import AppointmentType
+from modules.clinical_records.entities.clinical_record import Prescription
+from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.tenancy.entities.hospital import Hospital, PlanType
+from modules.masters.entities.organization_entities import Wing, Department
+from modules.beds.entities.bed import Ward, Room, Bed, WardType
+from modules.pharmacy.entities.pharmacy_entities import (
     Medicine,
     MedicineBatch,
     MedicineCategory,
     StockTransaction,
 )
-from hms_migration.modules.pharmacy.services.pharmacy_stock_service import allocate_fifo
-from hms_migration.modules.equipment.entities.equipment_entities import (
+from modules.pharmacy.services.pharmacy_stock_service import allocate_fifo
+from modules.equipment.entities.equipment_entities import (
     EquipmentCategory,
     EquipmentItem,
     EquipmentMaintenance,
     EquipmentStatus,
     MaintenanceStatus,
 )
-from hms_migration.modules.equipment.services.equipment_service import refresh_maintenance_status
-from hms_migration.modules.ot.entities.ot_entities import OtRoom, OtSurgery, OtSurgeryStatus
-from hms_migration.modules.inpatient.entities.admission import Admission, AdmissionStatus
-from hms_migration.modules.patients.entities.patient import Patient, PatientStatus
-from hms_migration.modules.inpatient.actions.admission_actions import DischargePatientAction
-from hms_migration.modules.inpatient.contracts.inpatient_contracts import DischargeRequest
-from hms_migration.modules.billing.entities.billing_entities import (
+from modules.equipment.services.equipment_service import refresh_maintenance_status
+from modules.ot.entities.ot_entities import OtRoom, OtSurgery, OtSurgeryStatus
+from modules.inpatient.entities.admission import Admission, AdmissionStatus
+from modules.patients.entities.patient import Patient, PatientStatus
+from modules.inpatient.actions.admission_actions import DischargePatientAction
+from modules.inpatient.contracts.inpatient_contracts import DischargeRequest
+from modules.billing.entities.billing_entities import (
     BillingCharge,
     BillingChargeStatus,
     BillingSourceType,
@@ -341,7 +341,7 @@ def test_ot_room_collision_window(parity_db: Session, sample_hospital: Hospital)
     parity_db.add(existing_surg)
     parity_db.commit()
 
-    from hms_migration.modules.ot.db.ot_repository import OtRepository
+    from modules.ot.db.ot_repository import OtRepository
     repo = OtRepository(parity_db, sample_hospital.id)
 
     # Overlapping 11:00 to 13:00 -> Collision (True)

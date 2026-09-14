@@ -3,7 +3,7 @@ import os
 
 import uvicorn
 
-from app.config import get_settings
+from config import get_settings
 
 logger = logging.getLogger("hms.api")
 

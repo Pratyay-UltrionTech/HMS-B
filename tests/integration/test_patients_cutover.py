@@ -7,7 +7,7 @@ Verifies:
    - Handlers belong to legacy app.routers.registration.
 2. When USE_MIGRATED_PATIENTS=true:
    - Exactly one set of /api/registration/patients routes exists.
-   - Handlers belong to migrated hms_migration.modules.patients.api.patients_api.
+   - Handlers belong to migrated modules.patients.api.patients_api.
    - Legacy inpatient routes (/beds, /wards-rooms, /admit, /discharge, /doctors) remain mounted.
    - Zero duplicate route registrations or conflicting OpenAPI operation IDs.
    - Full HTTP request lifecycle completes successfully via real application runtime.
@@ -23,10 +23,10 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Hospital
-from hms_migration.infrastructure.postgres.session import (
+from infrastructure.postgres.session import (
     get_transitional_sync_session as migrated_get_db,
 )
-from hms_migration.shared.auth.jwt import create_access_token
+from shared.auth.jwt import create_access_token
 
 
 @pytest.fixture(scope="function")
@@ -100,7 +100,7 @@ def test_migrated_mode_patient_router_registration(monkeypatch):
     ]
     assert len(patient_routes) == 4
     for r in patient_routes:
-        assert "hms_migration.modules.patients.api.patients_api" in r.endpoint.__module__
+        assert "modules.patients.api.patients_api" in r.endpoint.__module__
 
     # Verify legacy inpatient routes remain intact
     inpatient_paths = [
