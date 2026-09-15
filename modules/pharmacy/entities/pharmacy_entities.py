@@ -439,7 +439,9 @@ class PharmacySale(Base):
     )
     payment_method: Mapped[str] = mapped_column(String(32), nullable=False, default="cash")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    billing_charge_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    billing_charge_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_charges.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

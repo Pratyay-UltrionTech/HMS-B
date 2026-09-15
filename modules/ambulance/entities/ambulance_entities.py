@@ -70,7 +70,9 @@ class AmbulanceVehicle(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    hospital_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     registration_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     vehicle_type: Mapped[AmbulanceType] = mapped_column(
         Enum(AmbulanceType, name="ambulance_type"), nullable=False, default=AmbulanceType.bls
@@ -111,7 +113,9 @@ class AmbulanceDispatch(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    hospital_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     dispatch_code: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     ambulance_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("ambulance_vehicles.id", ondelete="RESTRICT"), nullable=False, index=True

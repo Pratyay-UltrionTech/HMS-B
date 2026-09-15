@@ -51,7 +51,7 @@ class Admission(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
@@ -110,7 +110,7 @@ class IpdFormSubmission(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True

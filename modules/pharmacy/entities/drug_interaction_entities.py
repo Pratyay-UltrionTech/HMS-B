@@ -47,7 +47,9 @@ class DrugInteractionRule(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    hospital_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     drug_a: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     drug_b: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     severity: Mapped[InteractionSeverity] = mapped_column(

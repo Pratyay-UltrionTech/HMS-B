@@ -88,7 +88,9 @@ class EmergencyEncounter(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    hospital_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -143,7 +145,9 @@ class EmergencyTriageAssessment(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    hospital_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     encounter_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("emergency_encounters.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -174,7 +178,9 @@ class EmergencyTreatmentOrder(Base):
     __tablename__ = "emergency_treatment_orders"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    hospital_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     encounter_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("emergency_encounters.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -188,9 +194,13 @@ class EmergencyTreatmentOrder(Base):
     route: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_stat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_verbal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    ordered_by_doctor_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    ordered_by_doctor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     ordered_by_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    executed_by_nurse_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    executed_by_nurse_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     executed_by_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     execution_status: Mapped[EmergencyOrderStatus] = mapped_column(
         Enum(EmergencyOrderStatus, name="emergency_order_status"),
@@ -215,7 +225,9 @@ class EmergencyDisposition(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    hospital_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     encounter_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("emergency_encounters.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -223,12 +235,20 @@ class EmergencyDisposition(Base):
         Enum(EmergencyDispositionType, name="emergency_disposition_type"),
         nullable=False,
     )
-    destination_ward_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-    destination_bed_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-    admission_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    destination_ward_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wards.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    destination_bed_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("beds.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     transfer_facility: Mapped[str | None] = mapped_column(String(255), nullable=True)
     disposition_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    decided_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    decided_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     decided_by_name: Mapped[str] = mapped_column(String(255), nullable=False)
     decided_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

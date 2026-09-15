@@ -9,7 +9,7 @@ completely eliminating runtime imports of app.models.VitalReading.
 from datetime import datetime
 import uuid
 
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -26,16 +26,19 @@ class VitalReading(Base):
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
+        ForeignKey("hospitals.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
     appointment_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
+        ForeignKey("appointments.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
+        ForeignKey("patients.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )

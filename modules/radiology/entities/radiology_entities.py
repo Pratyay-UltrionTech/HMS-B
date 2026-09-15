@@ -20,14 +20,16 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    case,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 
 from infrastructure.postgres.base import Base
 
@@ -77,6 +79,8 @@ class RadiologyOrder(Base):
     __tablename__ = "radiology_orders"
     __table_args__ = (
         UniqueConstraint("hospital_id", "order_no", name="uq_rad_order_no"),
+        Index("ix_rad_orders_hospital_ordered", "hospital_id", "ordered_at"),
+        Index("ix_rad_orders_hospital_status", "hospital_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -119,9 +123,21 @@ class RadiologyOrder(Base):
     impression: Mapped[str | None] = mapped_column(Text, nullable=True)
     remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    report_file_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_file_data: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
     image_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    image_file_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    image_file_data: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
+    has_report_file: Mapped[bool] = column_property(
+        case(
+            (report_file_data.isnot(None) & (report_file_data != ""), True),
+            else_=False,
+        )
+    )
+    has_image_file: Mapped[bool] = column_property(
+        case(
+            (image_file_data.isnot(None) & (image_file_data != ""), True),
+            else_=False,
+        )
+    )
     report_uploaded_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     report_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     ordered_at: Mapped[datetime] = mapped_column(

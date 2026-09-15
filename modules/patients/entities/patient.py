@@ -10,7 +10,7 @@ from datetime import date, datetime
 import enum
 import uuid
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, Index, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,7 +39,7 @@ class Patient(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     uhid: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     first_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")

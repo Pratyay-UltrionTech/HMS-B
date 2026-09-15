@@ -21,12 +21,14 @@ Deviation note: Instrument sets and sterilization batches are deliberately kept 
 from `modules/equipment` (EquipmentCategory/EquipmentItem) — sterile instrument sets are
 tracked as reusable kits with a composition (InstrumentSetItem), a sterilization/QC
 lifecycle, and a issue/return workflow that does not map onto generic equipment
-assignment. No Department entity is FK-able in `modules/masters` in a way that is reused
-elsewhere as a hard FK (equipment/OT modules also store department as a plain string), so
-`owning_department` / `issued_to_department` here are plain strings for consistency with
-the rest of the codebase. `machine_id` on SterilizationBatch is a plain string rather than
-an EquipmentItem FK because there is no dedicated "Sterilizer/Autoclave" equipment category
-in `modules/equipment` today.
+assignment. `owning_department` / `issued_to_department` remain free-text labels (kept for
+backward compatibility with existing records and callers that pass an arbitrary label), but
+`InstrumentSetIssue` additionally carries `issued_to_department_id -> departments.id`,
+`issued_to_user_id -> hospital_users.id`, and `returned_by_user_id -> hospital_users.id` as
+real, optional foreign keys so issue/return events can be traced back to `modules.masters`
+and `modules.doctors` the same way `modules/ot` FKs its OT rooms/surgeries to `departments.id`.
+`machine_id` on SterilizationBatch is a plain string rather than an EquipmentItem FK because
+there is no dedicated "Sterilizer/Autoclave" equipment category in `modules/equipment` today.
 """
 
 from __future__ import annotations
@@ -255,7 +257,13 @@ class InstrumentSetIssue(Base):
         UUID(as_uuid=True), ForeignKey("cssd_sterilization_batches.id", ondelete="CASCADE"), nullable=False, index=True
     )
     issued_to_department: Mapped[str] = mapped_column(String(128), nullable=False)
+    issued_to_department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     issued_to_staff_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    issued_to_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     issue_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     expected_return_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[InstrumentSetIssueStatus] = mapped_column(
@@ -265,6 +273,9 @@ class InstrumentSetIssue(Base):
     )
     return_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     returned_by_staff_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    returned_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     return_condition: Mapped[ReturnCondition | None] = mapped_column(
         Enum(ReturnCondition, name="cssd_return_condition"), nullable=True
     )

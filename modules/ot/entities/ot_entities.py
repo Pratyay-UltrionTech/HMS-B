@@ -18,14 +18,16 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    case,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 
 from infrastructure.postgres.base import Base
 
@@ -97,6 +99,14 @@ class OtSurgery(Base):
     __tablename__ = "ot_surgeries"
     __table_args__ = (
         UniqueConstraint("hospital_id", "surgery_no", name="uq_ot_surgery_no"),
+        # Every list/calendar/dashboard query filters hospital_id and sorts
+        # or range-filters scheduled_at (list_surgeries, list_calendar_surgeries,
+        # get_dashboard_metrics) — this composite lets those run as a single
+        # ordered index scan instead of a bitmap-AND + sort. Retrofitted onto
+        # the live DB via scripts/add_ot_schedule_index.py (CONCURRENTLY); the
+        # declaration here keeps the ORM model in sync for anything created
+        # fresh from this metadata (see create_schema.py).
+        Index("ix_ot_surgeries_hospital_scheduled", "hospital_id", "scheduled_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -157,11 +167,20 @@ class OtSurgery(Base):
 
     # Attachments
     ot_report_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    ot_report_file_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ot_report_file_data: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
     consent_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    consent_file_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consent_file_data: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
     image_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    image_file_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    image_file_data: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
+    has_ot_report: Mapped[bool] = column_property(
+        case((ot_report_file_data.isnot(None) & (ot_report_file_data != ""), True), else_=False)
+    )
+    has_consent: Mapped[bool] = column_property(
+        case((consent_file_data.isnot(None) & (consent_file_data != ""), True), else_=False)
+    )
+    has_image: Mapped[bool] = column_property(
+        case((image_file_data.isnot(None) & (image_file_data != ""), True), else_=False)
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

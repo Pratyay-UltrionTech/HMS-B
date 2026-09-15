@@ -50,13 +50,13 @@ class Ward(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     wing_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True, index=True
+        UUID(as_uuid=True), ForeignKey("wings.id", ondelete="SET NULL"), nullable=True, index=True
     )
     department_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True, index=True
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     ward_type: Mapped[WardType] = mapped_column(
@@ -90,7 +90,7 @@ class Room(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     ward_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("wards.id", ondelete="CASCADE"), nullable=False, index=True
@@ -119,7 +119,7 @@ class Bed(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     ward_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("wards.id", ondelete="CASCADE"), nullable=False, index=True

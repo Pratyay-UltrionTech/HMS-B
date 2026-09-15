@@ -52,7 +52,7 @@ class StaffRole(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -78,7 +78,7 @@ class RoleCustomField(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     role_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("staff_roles.id", ondelete="CASCADE"), nullable=False, index=True
@@ -107,7 +107,7 @@ class RolePermission(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     role_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("staff_roles.id", ondelete="CASCADE"), nullable=False, index=True
@@ -131,7 +131,7 @@ class ShiftType(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     department_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False, index=True
@@ -158,7 +158,7 @@ class HospitalUser(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     role_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("staff_roles.id", ondelete="RESTRICT"), nullable=False, index=True
@@ -199,7 +199,7 @@ class DoctorLeave(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     doctor_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
@@ -228,7 +228,7 @@ class Holiday(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     holiday_date: Mapped[date] = mapped_column(Date, nullable=False)
@@ -249,7 +249,7 @@ class StaffDailyShift(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     hospital_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
