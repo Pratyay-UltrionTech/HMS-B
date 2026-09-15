@@ -123,8 +123,26 @@ class InsuranceActions:
             status=PolicyStatus.active,
         )
         self.db.add(policy)
+
+        # `insurance` is the source of truth for policy data; keep the
+        # Patient.has_insurance/insurance_provider quick-reference fields
+        # (used by registration/profile screens) in sync so the two never
+        # disagree about whether a patient has active coverage.
+        patient.has_insurance = True
+        patient.insurance_provider = provider.name
+
         self.db.commit()
         self.db.refresh(policy)
+
+        patient.insurance_details = {
+            "policy_id": str(policy.id),
+            "provider_id": str(provider.id),
+            "policy_number": payload.policy_number,
+            "member_id": payload.member_id,
+            "valid_to": payload.valid_to.isoformat() if payload.valid_to else None,
+        }
+        self.db.add(patient)
+        self.db.commit()
         return PatientPolicyResponse.model_validate(policy)
 
     def link_admission_policy(self, payload: AdmissionPolicyLinkCreate) -> AdmissionPolicyResponse:

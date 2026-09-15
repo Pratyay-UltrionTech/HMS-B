@@ -63,7 +63,7 @@ class ListCalendarAction:
         start = datetime.combine(date_from, time.min).replace(tzinfo=timezone.utc)
         end = datetime.combine(date_to, time.max).replace(tzinfo=timezone.utc)
 
-        rows = self.repo.list_calendar_surgeries(end=end, ot_room_id=ot_room_id)
+        rows = self.repo.list_calendar_surgeries(end=end, start=start, ot_room_id=ot_room_id)
         out: list[OtCalendarEntry] = []
         for item in rows:
             ends = surgery_end(item)
@@ -136,10 +136,21 @@ class ListSurgeriesAction:
             notes_pending=notes_pending,
         )
 
+        # sync_time_based_status only returns True when it actually moved a
+        # row from scheduled/confirmed into in_progress. Committing here is a
+        # write side-effect on what is otherwise a read endpoint — skip it
+        # entirely when nothing changed, which is the common case. This also
+        # avoids expiring the eager-loaded patient/surgeon/department/room
+        # relations on every row (expire_on_commit=True on this sync session),
+        # which previously forced a fresh SELECT per relation per row in
+        # surgery_to_response() below even when no status transition occurred.
         now = datetime.now(timezone.utc)
+        changed = False
         for r in rows:
-            sync_time_based_status(r, now)
-        self.db.commit()
+            if sync_time_based_status(r, now):
+                changed = True
+        if changed:
+            self.db.commit()
 
         return [surgery_to_response(r) for r in rows]
 

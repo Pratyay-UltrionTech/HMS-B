@@ -148,12 +148,15 @@ class InstrumentSetIssueCreate(BaseModel):
     instrument_set_id: UUID
     batch_id: UUID
     issued_to_department: str = Field(min_length=1, max_length=128)
+    issued_to_department_id: UUID | None = None
     issued_to_staff_id: str | None = None
+    issued_to_user_id: UUID | None = None
     expected_return_time: datetime | None = None
 
 
 class InstrumentSetReturn(BaseModel):
     returned_by_staff_id: str | None = None
+    returned_by_user_id: UUID | None = None
     return_condition: ReturnCondition = ReturnCondition.intact
     discrepancy_instrument_name: str | None = None
     discrepancy_quantity_affected: int = Field(ge=1, default=1)
@@ -167,12 +170,15 @@ class InstrumentSetIssueResponse(BaseModel):
     batch_id: UUID
     batch_number: str | None = None
     issued_to_department: str
+    issued_to_department_id: UUID | None = None
     issued_to_staff_id: str | None
+    issued_to_user_id: UUID | None = None
     issue_time: datetime
     expected_return_time: datetime | None
     status: InstrumentSetIssueStatus
     return_time: datetime | None
     returned_by_staff_id: str | None
+    returned_by_user_id: UUID | None = None
     return_condition: ReturnCondition | None
 
     model_config = {"from_attributes": True}

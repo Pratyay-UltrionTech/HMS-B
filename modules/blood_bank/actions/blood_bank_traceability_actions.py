@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from shared.exceptions.base import NotFoundError
 from sqlalchemy.orm import Session
 
 from modules.blood_bank.contracts.blood_bank_contracts import (
@@ -39,7 +39,7 @@ class BloodTraceabilityActions:
     def get_unit_traceability(self, unit_id: UUID) -> UnitTraceabilityResponse:
         unit = self.repo.get_unit_by_id(unit_id)
         if not unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood unit not found")
+            raise NotFoundError("Blood unit not found")
 
         donation = None
         donor = None
@@ -93,7 +93,7 @@ class BloodTraceabilityActions:
     def get_donor_traceability(self, donor_id: UUID) -> DonorTraceabilityResponse:
         donor = self.repo.get_donor_by_id(donor_id)
         if not donor:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood donor not found")
+            raise NotFoundError("Blood donor not found")
 
         donations = self.repo.get_donations_for_donor(donor.id)
 

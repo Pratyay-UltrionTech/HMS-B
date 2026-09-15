@@ -8,8 +8,8 @@ from datetime import datetime, time, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import case, func, or_
+from sqlalchemy.orm import Session, defer, joinedload
 
 from modules.doctors.entities.doctor import HospitalUser
 from modules.patients.entities.patient import Patient
@@ -112,6 +112,8 @@ class RadiologyRepository:
                 joinedload(RadiologyOrder.patient),
                 joinedload(RadiologyOrder.doctor),
                 joinedload(RadiologyOrder.scan),
+                defer(RadiologyOrder.report_file_data),
+                defer(RadiologyOrder.image_file_data),
             )
             .filter(
                 RadiologyOrder.id == order_id,
@@ -133,6 +135,8 @@ class RadiologyRepository:
             .options(
                 joinedload(RadiologyOrder.patient),
                 joinedload(RadiologyOrder.doctor),
+                defer(RadiologyOrder.report_file_data),
+                defer(RadiologyOrder.image_file_data),
             )
             .filter(RadiologyOrder.hospital_id == self.hospital_id)
         )
@@ -197,47 +201,33 @@ class RadiologyRepository:
         day_start = datetime.combine(today, time.min, tzinfo=timezone.utc)
         day_end = datetime.combine(today, time.max, tzinfo=timezone.utc)
 
-        def _order_count(*conds):
-            q = self.db.query(func.count(RadiologyOrder.id)).filter(
-                RadiologyOrder.hospital_id == self.hospital_id, *conds
-            )
-            return q.scalar_subquery()
+        row = self.db.query(
+            func.count(case((RadiologyOrder.ordered_at >= day_start, 1))),
+            func.count(case((RadiologyOrder.status.in_([RadiologyOrderStatus.ordered, RadiologyOrderStatus.scheduled]), 1))),
+            func.count(case((RadiologyOrder.status == RadiologyOrderStatus.completed, 1))),
+            func.count(case((RadiologyOrder.status == RadiologyOrderStatus.cancelled, 1))),
+            func.count(
+                case(
+                    (
+                        RadiologyOrder.status.in_([RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed])
+                        & or_(RadiologyOrder.findings.is_(None), RadiologyOrder.findings == ""),
+                        1,
+                    )
+                )
+            ),
+        ).filter(RadiologyOrder.hospital_id == self.hospital_id).one()
+        todays, pending, completed, cancelled, reports_pending = row
 
-        todays_sq = _order_count(
-            RadiologyOrder.ordered_at >= day_start, RadiologyOrder.ordered_at <= day_end
-        )
-        pending_sq = _order_count(
-            RadiologyOrder.status.in_([RadiologyOrderStatus.ordered, RadiologyOrderStatus.scheduled])
-        )
-        completed_sq = _order_count(RadiologyOrder.status == RadiologyOrderStatus.completed)
-        cancelled_sq = _order_count(RadiologyOrder.status == RadiologyOrderStatus.cancelled)
-        reports_pending_sq = _order_count(
-            RadiologyOrder.status.in_(
-                [RadiologyOrderStatus.in_progress, RadiologyOrderStatus.completed]
-            ),
-            or_(
-                RadiologyOrder.findings.is_(None),
-                RadiologyOrder.findings == "",
-            ),
-        )
-        scans_count_sq = (
+        scans_count = (
             self.db.query(func.count(RadiologyScanCatalog.id))
             .filter(
                 RadiologyScanCatalog.hospital_id == self.hospital_id,
                 RadiologyScanCatalog.is_active.is_(True),
             )
-            .scalar_subquery()
+            .scalar()
+            or 0
         )
 
-        row = self.db.query(
-            todays_sq,
-            pending_sq,
-            completed_sq,
-            cancelled_sq,
-            reports_pending_sq,
-            scans_count_sq,
-        ).one()
-        todays, pending, completed, cancelled, reports_pending, scans_count = row
         return {
             "todays_orders": int(todays or 0),
             "pending_scans": int(pending or 0),

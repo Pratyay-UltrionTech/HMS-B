@@ -44,6 +44,7 @@ from modules.cssd.contracts.cssd_contracts import (
     SterilizationQCResponse,
 )
 from modules.cssd.db.cssd_repository import CssdRepository
+from modules.masters.entities.organization_entities import Department
 from modules.cssd.entities.cssd_entities import (
     DiscrepancyInvestigationStatus,
     InstrumentDiscrepancyReport,
@@ -122,12 +123,15 @@ def _issue_to_response(row: InstrumentSetIssue) -> InstrumentSetIssueResponse:
         batch_id=row.batch_id,
         batch_number=row.batch.batch_number if row.batch else None,
         issued_to_department=row.issued_to_department,
+        issued_to_department_id=row.issued_to_department_id,
         issued_to_staff_id=row.issued_to_staff_id,
+        issued_to_user_id=row.issued_to_user_id,
         issue_time=row.issue_time,
         expected_return_time=row.expected_return_time,
         status=row.status,
         return_time=row.return_time,
         returned_by_staff_id=row.returned_by_staff_id,
+        returned_by_user_id=row.returned_by_user_id,
         return_condition=row.return_condition,
     )
 
@@ -412,12 +416,22 @@ class CssdActions:
                 detail="Instrument set was not part of this sterilization batch",
             )
 
+        if payload.issued_to_department_id is not None:
+            department = self.db.query(Department).filter(
+                Department.id == payload.issued_to_department_id,
+                Department.hospital_id == self.hospital_id,
+            ).first()
+            if not department:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+
         row = InstrumentSetIssue(
             hospital_id=self.hospital_id,
             instrument_set_id=iset.id,
             batch_id=batch.id,
             issued_to_department=payload.issued_to_department.strip(),
+            issued_to_department_id=payload.issued_to_department_id,
             issued_to_staff_id=payload.issued_to_staff_id,
+            issued_to_user_id=payload.issued_to_user_id,
             expected_return_time=payload.expected_return_time,
             status=InstrumentSetIssueStatus.issued,
         )
@@ -447,6 +461,7 @@ class CssdActions:
         row.status = InstrumentSetIssueStatus.returned
         row.return_time = datetime.now(timezone.utc)
         row.returned_by_staff_id = payload.returned_by_staff_id
+        row.returned_by_user_id = payload.returned_by_user_id
         row.return_condition = payload.return_condition
 
         summary = f"Returned set for issue {row.id} — condition: {payload.return_condition.value}"

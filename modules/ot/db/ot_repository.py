@@ -8,7 +8,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from modules.clinical_records.entities.clinical_record import Prescription
@@ -144,7 +144,20 @@ class OtRepository:
                 return True
         return False
 
-    def list_calendar_surgeries(self, end: datetime, ot_room_id: UUID | None = None) -> list[OtSurgery]:
+    def list_calendar_surgeries(
+        self, end: datetime, start: datetime | None = None, ot_room_id: UUID | None = None
+    ) -> list[OtSurgery]:
+        """
+        `start` bounds how far back the query looks. The caller (ExecuteCalendar
+        in ot_actions.py) additionally keeps a surgery that started just before
+        `start` but ends inside the visible window — that's a Python-side
+        post-filter on `surgery_end(item) >= start`, unchanged by this method.
+        To keep that post-filter correct, `start` here is widened by a fixed
+        buffer (24h, comfortably larger than any real OT booking duration) so
+        the SQL query can never exclude a row the post-filter would have kept.
+        Previously this had no lower bound at all, scanning every surgery ever
+        booked on every calendar render.
+        """
         q = (
             self.db.query(OtSurgery)
             .options(
@@ -158,28 +171,73 @@ class OtRepository:
                 OtSurgery.status != OtSurgeryStatus.cancelled,
             )
         )
+        if start is not None:
+            q = q.filter(OtSurgery.scheduled_at >= start - timedelta(hours=24))
         if ot_room_id:
             q = q.filter(OtSurgery.ot_room_id == ot_room_id)
         return q.order_by(OtSurgery.scheduled_at.asc()).all()
 
     def get_dashboard_metrics(self) -> dict[str, int]:
+        """
+        Single grouped query instead of 5 separate COUNT(*) queries.
+
+        All 5 original counts scanned the same ot_surgeries rows for this
+        hospital_id, just with different filters — conditional aggregation
+        (SUM of a per-bucket CASE) computes all 5 in one pass over the table
+        instead of 5 round trips, using the same (hospital_id, scheduled_at)
+        index for the "todays" bucket. Bucket definitions are unchanged from
+        the original per-count filters (see git history for the prior form).
+        """
         today = date.today()
         start = datetime.combine(today, time.min).replace(tzinfo=timezone.utc)
         end = datetime.combine(today, time.max).replace(tzinfo=timezone.utc)
-        q = self.db.query(OtSurgery).filter(OtSurgery.hospital_id == self.hospital_id)
-        todays = q.filter(OtSurgery.scheduled_at >= start, OtSurgery.scheduled_at <= end).count()
-        completed = q.filter(OtSurgery.status == OtSurgeryStatus.completed).count()
-        ongoing = q.filter(OtSurgery.status == OtSurgeryStatus.in_progress).count()
-        scheduled = q.filter(
-            OtSurgery.status.in_([OtSurgeryStatus.scheduled, OtSurgeryStatus.confirmed])
-        ).count()
-        cancelled = q.filter(OtSurgery.status == OtSurgeryStatus.cancelled).count()
+
+        row = (
+            self.db.query(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                (OtSurgery.scheduled_at >= start) & (OtSurgery.scheduled_at <= end),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(case((OtSurgery.status == OtSurgeryStatus.completed, 1), else_=0)), 0
+                ),
+                func.coalesce(
+                    func.sum(case((OtSurgery.status == OtSurgeryStatus.in_progress, 1), else_=0)), 0
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                OtSurgery.status.in_([OtSurgeryStatus.scheduled, OtSurgeryStatus.confirmed]),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(case((OtSurgery.status == OtSurgeryStatus.cancelled, 1), else_=0)), 0
+                ),
+            )
+            .filter(OtSurgery.hospital_id == self.hospital_id)
+            .one()
+        )
+        todays, completed, ongoing, scheduled, cancelled = row
         return {
-            "todays_surgeries": todays,
-            "completed": completed,
-            "ongoing": ongoing,
-            "scheduled": scheduled,
-            "cancelled": cancelled,
+            "todays_surgeries": int(todays),
+            "completed": int(completed),
+            "ongoing": int(ongoing),
+            "scheduled": int(scheduled),
+            "cancelled": int(cancelled),
         }
 
     def get_patient(self, patient_id: UUID) -> Patient | None:

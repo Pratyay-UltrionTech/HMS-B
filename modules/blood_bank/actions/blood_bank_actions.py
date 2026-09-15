@@ -16,7 +16,7 @@ from typing import Any
 import uuid
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from shared.exceptions.base import NotFoundError, ValidationError
 from sqlalchemy.orm import Session
 
 from modules.blood_bank.contracts.blood_bank_contracts import (
@@ -97,13 +97,10 @@ class BloodBankActions:
     def record_donation(self, payload: BloodDonationCreate) -> BloodDonationResponse:
         donor = self.repo.get_donor_by_id(payload.donor_id)
         if not donor:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood donor not found")
+            raise NotFoundError("Blood donor not found")
 
         if not donor.is_eligible:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Donor {donor.donor_number} is currently deferred: {donor.deferral_reason or 'Not eligible'}",
-            )
+            raise ValidationError(f"Donor {donor.donor_number} is currently deferred: {donor.deferral_reason or 'Not eligible'}")
 
         now = datetime.now(timezone.utc)
         actor_name = str(self.actor.get("email") or self.actor.get("username") or "Phlebotomist")
@@ -183,7 +180,7 @@ class BloodBankActions:
     def clear_serology(self, unit_id: UUID, payload: BloodUnitSerologyClear) -> BloodUnitResponse:
         unit = self.repo.get_unit_by_id(unit_id)
         if not unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood unit not found")
+            raise NotFoundError("Blood unit not found")
 
         unit.serology_tested = True
         unit.serology_cleared = payload.serology_cleared
@@ -209,19 +206,13 @@ class BloodBankActions:
     def separate_components(self, parent_unit_id: UUID, payload: ComponentSeparationRequest) -> ComponentSeparationResponse:
         parent_unit = self.repo.get_unit_by_id(parent_unit_id)
         if not parent_unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent blood unit not found")
+            raise NotFoundError("Parent blood unit not found")
 
         if parent_unit.component_type != BloodComponentType.whole_blood:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot separate unit of type '{parent_unit.component_type}'. Only whole_blood can be separated.",
-            )
+            raise ValidationError(f"Cannot separate unit of type '{parent_unit.component_type}'. Only whole_blood can be separated.")
 
         if parent_unit.status not in (BloodUnitStatus.available, BloodUnitStatus.quarantine):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot separate unit in status '{parent_unit.status}'. Must be available or quarantine.",
-            )
+            raise ValidationError(f"Cannot separate unit in status '{parent_unit.status}'. Must be available or quarantine.")
 
         now = datetime.now(timezone.utc)
         actor_name = str(self.actor.get("email") or self.actor.get("username") or "Lab Specialist")
@@ -288,32 +279,26 @@ class BloodBankActions:
     def record_cross_match(self, payload: CrossMatchCreate) -> CrossMatchResponse:
         unit = self.repo.get_unit_by_id(payload.blood_unit_id)
         if not unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood unit not found")
+            raise NotFoundError("Blood unit not found")
 
         # Must be available or reserved for this exact patient
         if unit.status == BloodUnitStatus.reserved and unit.reserved_for_patient_id != payload.patient_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Blood unit {unit.unit_number} is already reserved for another patient.",
-            )
+            raise ValidationError(f"Blood unit {unit.unit_number} is already reserved for another patient.")
         elif unit.status not in (BloodUnitStatus.available, BloodUnitStatus.reserved):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Blood unit {unit.unit_number} cannot be cross-matched in status '{unit.status}'. Must be available.",
-            )
+            raise ValidationError(f"Blood unit {unit.unit_number} cannot be cross-matched in status '{unit.status}'. Must be available.")
 
         patient = self.db.query(Patient).filter(
             Patient.id == payload.patient_id, Patient.hospital_id == self.hospital_id
         ).first()
         if not patient:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
+            raise NotFoundError("Patient not found")
 
         if payload.admission_id:
             adm = self.db.query(Admission).filter(
                 Admission.id == payload.admission_id, Admission.hospital_id == self.hospital_id
             ).first()
             if not adm:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found")
+                raise NotFoundError("Admission not found")
 
         now = datetime.now(timezone.utc)
         actor_name = str(self.actor.get("email") or self.actor.get("username") or "Lab Technician")
@@ -357,20 +342,14 @@ class BloodBankActions:
     def issue_blood_unit(self, payload: BloodIssueCreate) -> BloodIssueResponse:
         unit = self.repo.get_unit_by_id(payload.blood_unit_id)
         if not unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood unit not found")
+            raise NotFoundError("Blood unit not found")
 
         # Validate eligible status
         if unit.status not in (BloodUnitStatus.reserved, BloodUnitStatus.available):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Blood unit {unit.unit_number} cannot be issued from status '{unit.status}'. Must be reserved or available.",
-            )
+            raise ValidationError(f"Blood unit {unit.unit_number} cannot be issued from status '{unit.status}'. Must be reserved or available.")
 
         if unit.status == BloodUnitStatus.reserved and unit.reserved_for_patient_id != payload.patient_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Blood unit {unit.unit_number} is reserved for a different patient.",
-            )
+            raise ValidationError(f"Blood unit {unit.unit_number} is reserved for a different patient.")
 
         now = datetime.now(timezone.utc)
         actor_name = str(self.actor.get("email") or self.actor.get("username") or "Blood Bank Officer")
@@ -401,17 +380,14 @@ class BloodBankActions:
     def return_blood_unit(self, issue_id: UUID, payload: BloodReturnCreate) -> BloodReturnResponse:
         issue = self.repo.get_issue_by_id(issue_id)
         if not issue:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood issue record not found")
+            raise NotFoundError("Blood issue record not found")
 
         if issue.status != BloodIssueStatus.issued:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot return blood issue in status '{issue.status}'.",
-            )
+            raise ValidationError(f"Cannot return blood issue in status '{issue.status}'.")
 
         unit = self.repo.get_unit_by_id(issue.blood_unit_id)
         if not unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked blood unit not found")
+            raise NotFoundError("Linked blood unit not found")
 
         now = datetime.now(timezone.utc)
         actor_name = str(self.actor.get("email") or self.actor.get("username") or "Blood Bank Officer")
@@ -455,31 +431,22 @@ class BloodBankActions:
     def start_transfusion(self, payload: TransfusionStart) -> BloodTransfusionResponse:
         issue = self.repo.get_issue_by_id(payload.issue_id)
         if not issue:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood issue record not found")
+            raise NotFoundError("Blood issue record not found")
 
         # Cannot create a transfusion for an issue/unit not in "issued" status
         if issue.status != BloodIssueStatus.issued:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot start transfusion for issue in status '{issue.status}'. Must be issued.",
-            )
+            raise ValidationError(f"Cannot start transfusion for issue in status '{issue.status}'. Must be issued.")
 
         unit = self.repo.get_unit_by_id(issue.blood_unit_id)
         if not unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked blood unit not found")
+            raise NotFoundError("Linked blood unit not found")
 
         if unit.status != BloodUnitStatus.issued:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot start transfusion; blood unit {unit.unit_number} is not in 'issued' status.",
-            )
+            raise ValidationError(f"Cannot start transfusion; blood unit {unit.unit_number} is not in 'issued' status.")
 
         existing = self.repo.get_transfusion_by_issue_id(issue.id)
         if existing:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="A transfusion record already exists for this issue.",
-            )
+            raise ValidationError("A transfusion record already exists for this issue.")
 
         now = datetime.now(timezone.utc)
         tx_num = f"TRX-{uuid.uuid4().hex[:8].upper()}"
@@ -505,19 +472,16 @@ class BloodBankActions:
     def _get_in_progress_transfusion(self, transfusion_id: UUID) -> BloodTransfusion:
         transfusion = self.repo.get_transfusion_by_id(transfusion_id)
         if not transfusion:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transfusion record not found")
+            raise NotFoundError("Transfusion record not found")
         if transfusion.status != BloodTransfusionStatus.in_progress:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot transition transfusion in status '{transfusion.status}'. Must be in_progress.",
-            )
+            raise ValidationError(f"Cannot transition transfusion in status '{transfusion.status}'. Must be in_progress.")
         return transfusion
 
     def complete_transfusion(self, transfusion_id: UUID, payload: TransfusionComplete) -> BloodTransfusionResponse:
         transfusion = self._get_in_progress_transfusion(transfusion_id)
         unit = self.repo.get_unit_by_id(transfusion.blood_unit_id)
         if not unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked blood unit not found")
+            raise NotFoundError("Linked blood unit not found")
 
         now = datetime.now(timezone.utc)
         transfusion.status = BloodTransfusionStatus.completed
@@ -582,7 +546,7 @@ class BloodBankActions:
     def get_donor(self, donor_id: UUID) -> BloodDonorResponse:
         donor = self.repo.get_donor_by_id(donor_id)
         if not donor:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood donor not found")
+            raise NotFoundError("Blood donor not found")
         return BloodDonorResponse.model_validate(donor)
 
     def get_units(
@@ -594,7 +558,7 @@ class BloodBankActions:
     def get_unit(self, unit_id: UUID) -> BloodUnitResponse:
         unit = self.repo.get_unit_by_id(unit_id)
         if not unit:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Blood unit not found")
+            raise NotFoundError("Blood unit not found")
         return BloodUnitResponse.model_validate(unit)
 
     def get_issues(self, limit: int = 100) -> list[BloodIssueResponse]:

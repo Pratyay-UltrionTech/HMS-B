@@ -36,10 +36,16 @@ def surgery_end(item: OtSurgery) -> datetime:
     return start + timedelta(minutes=int(item.duration_minutes or 60))
 
 
-def sync_time_based_status(item: OtSurgery, now: datetime | None = None) -> None:
-    """Move scheduled surgeries into in_progress while inside the booked window."""
+def sync_time_based_status(item: OtSurgery, now: datetime | None = None) -> bool:
+    """
+    Move scheduled surgeries into in_progress while inside the booked window.
+
+    Returns True when it actually mutated the row (so callers can commit only
+    when there is something to persist, instead of unconditionally committing
+    on every read — see ListSurgeriesAction, which reads this return value).
+    """
     if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled):
-        return
+        return False
     now = now or datetime.now(timezone.utc)
     start = item.scheduled_at
     if start.tzinfo is None:
@@ -49,6 +55,8 @@ def sync_time_based_status(item: OtSurgery, now: datetime | None = None) -> None
         item.status = OtSurgeryStatus.in_progress
         if not item.started_at:
             item.started_at = start
+        return True
+    return False
 
 
 def surgery_to_response(item: OtSurgery) -> OtSurgeryResponse:
@@ -91,11 +99,11 @@ def surgery_to_response(item: OtSurgery) -> OtSurgeryResponse:
         notes_recorded_by=item.notes_recorded_by,
         notes_recorded_at=item.notes_recorded_at,
         ot_report_file_name=item.ot_report_file_name,
-        has_ot_report=bool(item.ot_report_file_data),
+        has_ot_report=bool(getattr(item, "has_ot_report", None) if getattr(item, "has_ot_report", None) is not None else item.ot_report_file_name),
         consent_file_name=item.consent_file_name,
-        has_consent=bool(item.consent_file_data),
+        has_consent=bool(getattr(item, "has_consent", None) if getattr(item, "has_consent", None) is not None else item.consent_file_name),
         image_file_name=item.image_file_name,
-        has_image=bool(item.image_file_data),
+        has_image=bool(getattr(item, "has_image", None) if getattr(item, "has_image", None) is not None else item.image_file_name),
         has_notes=bool(item.pre_op_diagnosis and item.procedure_performed),
         created_at=item.created_at,
         patient_name=item.patient.name if item.patient else None,

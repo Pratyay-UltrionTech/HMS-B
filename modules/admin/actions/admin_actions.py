@@ -814,7 +814,7 @@ class AdminActions:
         if not hospital:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
 
-        stored = _FACILITY_SETTINGS_STORE.get(self.hospital_id, {})
+        stored = hospital.facility_settings or {}
         return HospitalFacilitySettings(
             hospital_id=hospital.hospital_id,
             legal_name=stored.get("legal_name", hospital.name),
@@ -856,15 +856,12 @@ class AdminActions:
         if "email" in updates and updates["email"]:
             hospital.email = updates["email"]
 
-        self.db.flush()
-
-        stored = _FACILITY_SETTINGS_STORE.setdefault(self.hospital_id, {})
+        stored = dict(hospital.facility_settings or {})
         stored.update(updates)
+        hospital.facility_settings = stored
+        self.db.flush()
 
         self._audit("update", "facility_settings", self.hospital_id, f"Updated facility settings for {hospital.name}")
         self.db.commit()
         return self.get_facility_settings()
-
-
-_FACILITY_SETTINGS_STORE: dict[UUID, dict[str, Any]] = {}
 
