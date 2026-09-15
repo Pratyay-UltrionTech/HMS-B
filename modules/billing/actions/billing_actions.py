@@ -13,7 +13,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session, joinedload
 
 from modules.billing.contracts.billing_contracts import (
@@ -106,6 +106,50 @@ def _payment_response_dto(
             d["receipt_id"] = rcpt.id
             d["receipt_number"] = rcpt.receipt_number
     return BillingPaymentResponse.model_validate(d)
+
+
+def _payment_response_dtos(
+    db: Session,
+    payments: list[BillingPayment],
+    patient: Patient | None = None,
+) -> list[BillingPaymentResponse]:
+    """
+    Batch version of _payment_response_dto for list/dashboard responses.
+
+    The per-payment version queries BillingReceipt once per payment (N+1 —
+    up to 200 extra round trips on the payments list, 5 more on the
+    dashboard). This fetches all matching receipts in one query and maps
+    them back, producing identical output to calling _payment_response_dto
+    in a loop.
+    """
+    if not payments:
+        return []
+    payment_ids = [p.id for p in payments]
+    receipts = (
+        db.query(BillingReceipt)
+        .filter(
+            BillingReceipt.hospital_id == payments[0].hospital_id,
+            BillingReceipt.payment_id.in_(payment_ids),
+            BillingReceipt.status != BillingReceiptStatus.cancelled,
+        )
+        .all()
+    )
+    # Same tie-break as the per-payment query's .first(): first match wins if
+    # more than one non-cancelled receipt somehow exists for a payment.
+    receipt_by_payment_id: dict[UUID, BillingReceipt] = {}
+    for r in receipts:
+        if r.payment_id is not None:
+            receipt_by_payment_id.setdefault(r.payment_id, r)
+
+    out: list[BillingPaymentResponse] = []
+    for p in payments:
+        rcpt = receipt_by_payment_id.get(p.id)
+        d = payment_to_dict(p, patient)
+        if rcpt:
+            d["receipt_id"] = rcpt.id
+            d["receipt_number"] = rcpt.receipt_number
+        out.append(BillingPaymentResponse.model_validate(d))
+    return out
 
 
 # ── Charge Actions ──────────────────────────────────────────────────────────
@@ -276,7 +320,7 @@ class ListPaymentsAction:
             limit=limit,
             offset=offset,
         )
-        return [_payment_response_dto(self.db, p) for p in payments]
+        return _payment_response_dtos(self.db, payments)
 
 
 class CreatePaymentAction:
@@ -350,7 +394,16 @@ class ListInvoicesAction:
             limit=limit,
             offset=offset,
         )
-        return [BillingInvoiceResponse.model_validate(invoice_to_dict(inv)) for inv in invoices]
+        # include_lines=False: the Invoices tab table never reads line items
+        # (only the "view invoice" detail modal does, which fetches its own
+        # full detail via GET /invoices/{id} — see BillingPage.tsx's
+        # setViewInvoice). Dropping lines here trims this list response and
+        # lets the repository skip eager-loading them (see list_invoices()
+        # in billing_repository.py).
+        return [
+            BillingInvoiceResponse.model_validate(invoice_to_dict(inv, include_lines=False))
+            for inv in invoices
+        ]
 
 
 class GetInvoiceAction:
@@ -579,17 +632,26 @@ class GetPatientLedgerAction:
 
     def execute(self, patient_id: UUID) -> PatientLedgerResponse:
         patient = _get_patient_or_404(self.repo, patient_id)
-        totals = patient_ledger_totals(self.db, self.repo.hospital_id, patient_id)
-        charges = (
+        # Fetch charges/payments once and share them across totals, the
+        # response's own charges/payments fields, and build_ledger_entries —
+        # this endpoint previously fetched each of those independently
+        # (1 query here in the caller + 2 inside patient_ledger_totals + 2
+        # inside build_ledger_entries = 5 queries over the same two tables).
+        # all_charges intentionally has NO status filter (unlike the old
+        # standalone query below) because build_ledger_entries needs
+        # cancelled charges too, to render them in the timeline; it filters
+        # them out itself. non_cancelled_charges recreates the old filtered
+        # set for totals and the response's `charges` field.
+        all_charges = (
             self.db.query(BillingCharge)
             .filter(
                 BillingCharge.hospital_id == self.repo.hospital_id,
                 BillingCharge.patient_id == patient_id,
-                BillingCharge.status != BillingChargeStatus.cancelled,
             )
             .order_by(BillingCharge.created_at.desc())
             .all()
         )
+        non_cancelled_charges = [c for c in all_charges if c.status != BillingChargeStatus.cancelled]
         payments = (
             self.db.query(BillingPayment)
             .filter(
@@ -599,6 +661,10 @@ class GetPatientLedgerAction:
             .order_by(BillingPayment.created_at.desc())
             .all()
         )
+        totals = patient_ledger_totals(
+            self.db, self.repo.hospital_id, patient_id, charges=non_cancelled_charges, payments=payments
+        )
+        charges = non_cancelled_charges
         invoices = (
             self.db.query(BillingInvoice)
             .options(joinedload(BillingInvoice.lines))
@@ -620,7 +686,9 @@ class GetPatientLedgerAction:
             .order_by(BillingReceipt.created_at.desc())
             .all()
         )
-        entries = build_ledger_entries(self.db, self.repo.hospital_id, patient_id)
+        entries = build_ledger_entries(
+            self.db, self.repo.hospital_id, patient_id, charges=all_charges, payments=payments
+        )
         return PatientLedgerResponse(
             patient_id=patient_id,
             patient_name=patient.name,
@@ -631,7 +699,7 @@ class GetPatientLedgerAction:
             charge_count=totals["charge_count"],
             payment_count=totals["payment_count"],
             charges=[BillingChargeResponse.model_validate(charge_to_dict(c, patient)) for c in charges],
-            payments=[_payment_response_dto(self.db, p, patient) for p in payments],
+            payments=_payment_response_dtos(self.db, payments, patient),
             invoices=[BillingInvoiceResponse.model_validate(invoice_to_dict(inv, patient)) for inv in invoices],
             receipts=[BillingReceiptResponse.model_validate(receipt_to_dict(r, patient)) for r in receipts],
             entries=[LedgerEntry.model_validate(e) for e in entries],
@@ -645,8 +713,32 @@ class GetPatientSummaryAction:
 
     def execute(self, patient_id: UUID) -> PatientFinancialSummary:
         _get_patient_or_404(self.repo, patient_id)
-        totals = patient_ledger_totals(self.db, self.repo.hospital_id, patient_id)
-        entries = build_ledger_entries(self.db, self.repo.hospital_id, patient_id)[:10]
+        # Same sharing as GetPatientLedgerAction above: one charges fetch and
+        # one payments fetch instead of 2 queries inside patient_ledger_totals
+        # plus 2 more inside build_ledger_entries.
+        all_charges = (
+            self.db.query(BillingCharge)
+            .filter(
+                BillingCharge.hospital_id == self.repo.hospital_id,
+                BillingCharge.patient_id == patient_id,
+            )
+            .all()
+        )
+        non_cancelled_charges = [c for c in all_charges if c.status != BillingChargeStatus.cancelled]
+        payments = (
+            self.db.query(BillingPayment)
+            .filter(
+                BillingPayment.hospital_id == self.repo.hospital_id,
+                BillingPayment.patient_id == patient_id,
+            )
+            .all()
+        )
+        totals = patient_ledger_totals(
+            self.db, self.repo.hospital_id, patient_id, charges=non_cancelled_charges, payments=payments
+        )
+        entries = build_ledger_entries(
+            self.db, self.repo.hospital_id, patient_id, charges=all_charges, payments=payments
+        )[:10]
         return PatientFinancialSummary(
             patient_id=patient_id,
             total_charges=totals["total_charges"],
@@ -665,77 +757,83 @@ class GetBillingDashboardAction:
         hid = self.repo.hospital_id
         today_start = datetime.combine(date.today(), time.min).replace(tzinfo=timezone.utc)
         today_end = datetime.combine(date.today(), time.max).replace(tzinfo=timezone.utc)
+        today = date.today()
 
-        todays_charges = (
-            self.db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
-            .filter(
-                BillingCharge.hospital_id == hid,
-                BillingCharge.created_at >= today_start,
-                BillingCharge.created_at <= today_end,
-                BillingCharge.status != BillingChargeStatus.cancelled,
+        # All 5 of these scan billing_charges for this hospital_id — collapsed
+        # into one conditional-aggregation query (was 5 separate round trips).
+        # outstanding_by_cat below stays a separate GROUP BY query: combining a
+        # scalar-aggregate query with a grouped one needs a window function or
+        # UNION, which isn't worth the added complexity for one extra round
+        # trip that's already a single efficient query on its own (see the
+        # revised optimization plan, "be careful with query consolidation").
+        is_today = (BillingCharge.created_at >= today_start) & (BillingCharge.created_at <= today_end)
+        not_cancelled = BillingCharge.status != BillingChargeStatus.cancelled
+        charge_row = (
+            self.db.query(
+                func.coalesce(func.sum(case((is_today & not_cancelled, BillingCharge.net_amount), else_=0.0)), 0.0),
+                func.coalesce(func.sum(case((not_cancelled, BillingCharge.net_amount), else_=0.0)), 0.0),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                BillingCharge.status.in_(
+                                    [BillingChargeStatus.pending, BillingChargeStatus.partially_paid]
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case((is_today & not_cancelled & (BillingCharge.source_type == BillingSourceType.ot), BillingCharge.net_amount), else_=0.0)
+                    ),
+                    0.0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                is_today
+                                & not_cancelled
+                                & BillingCharge.source_type.in_([BillingSourceType.bed, BillingSourceType.admission]),
+                                BillingCharge.net_amount,
+                            ),
+                            else_=0.0,
+                        )
+                    ),
+                    0.0,
+                ),
             )
-            .scalar()
-            or 0.0
+            .filter(BillingCharge.hospital_id == hid)
+            .one()
         )
-        todays_collections = (
-            self.db.query(func.coalesce(func.sum(BillingPayment.amount), 0.0))
-            .filter(
-                BillingPayment.hospital_id == hid,
-                BillingPayment.created_at >= today_start,
-                BillingPayment.created_at <= today_end,
+        todays_charges, total_charges, pending_count, todays_ot, todays_ipd = charge_row
+
+        # todays_collections + total_paid both scan billing_payments — 1 query.
+        payment_row = (
+            self.db.query(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                (BillingPayment.created_at >= today_start) & (BillingPayment.created_at <= today_end),
+                                BillingPayment.amount,
+                            ),
+                            else_=0.0,
+                        )
+                    ),
+                    0.0,
+                ),
+                func.coalesce(func.sum(BillingPayment.amount), 0.0),
             )
-            .scalar()
-            or 0.0
-        )
-        total_charges = (
-            self.db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
-            .filter(BillingCharge.hospital_id == hid, BillingCharge.status != BillingChargeStatus.cancelled)
-            .scalar()
-            or 0.0
-        )
-        total_paid = (
-            self.db.query(func.coalesce(func.sum(BillingPayment.amount), 0.0))
             .filter(BillingPayment.hospital_id == hid)
-            .scalar()
-            or 0.0
+            .one()
         )
+        todays_collections, total_paid = payment_row
         outstanding_total = round(max(0.0, float(total_charges) - float(total_paid)), 2)
-
-        pending_count = (
-            self.db.query(func.count(BillingCharge.id))
-            .filter(
-                BillingCharge.hospital_id == hid,
-                BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
-            )
-            .scalar()
-            or 0
-        )
-
-        # Revenue by source
-        todays_ot = (
-            self.db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
-            .filter(
-                BillingCharge.hospital_id == hid,
-                BillingCharge.source_type == BillingSourceType.ot,
-                BillingCharge.created_at >= today_start,
-                BillingCharge.created_at <= today_end,
-                BillingCharge.status != BillingChargeStatus.cancelled,
-            )
-            .scalar()
-            or 0.0
-        )
-        todays_ipd = (
-            self.db.query(func.coalesce(func.sum(BillingCharge.net_amount), 0.0))
-            .filter(
-                BillingCharge.hospital_id == hid,
-                BillingCharge.source_type.in_([BillingSourceType.bed, BillingSourceType.admission]),
-                BillingCharge.created_at >= today_start,
-                BillingCharge.created_at <= today_end,
-                BillingCharge.status != BillingChargeStatus.cancelled,
-            )
-            .scalar()
-            or 0.0
-        )
 
         # Outstanding by category
         cat_rows = (
@@ -752,24 +850,32 @@ class GetBillingDashboardAction:
             for r in cat_rows
         }
 
-        # Daily counts
-        today_inv_count = (
-            self.db.query(func.count(BillingInvoice.id))
-            .filter(BillingInvoice.hospital_id == hid, BillingInvoice.invoice_date == date.today())
-            .scalar()
-            or 0
+        # today_inv_count + total_inv both scan billing_invoices — 1 query.
+        invoice_row = (
+            self.db.query(
+                func.coalesce(
+                    func.sum(case((BillingInvoice.invoice_date == today, 1), else_=0)), 0
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (BillingInvoice.status != BillingInvoiceStatus.cancelled, BillingInvoice.grand_total),
+                            else_=0.0,
+                        )
+                    ),
+                    0.0,
+                ),
+            )
+            .filter(BillingInvoice.hospital_id == hid)
+            .one()
         )
+        today_inv_count, total_inv = invoice_row
+
         today_rcpt_count = (
             self.db.query(func.count(BillingReceipt.id))
-            .filter(BillingReceipt.hospital_id == hid, BillingReceipt.payment_date == date.today())
+            .filter(BillingReceipt.hospital_id == hid, BillingReceipt.payment_date == today)
             .scalar()
             or 0
-        )
-        total_inv = (
-            self.db.query(func.coalesce(func.sum(BillingInvoice.grand_total), 0.0))
-            .filter(BillingInvoice.hospital_id == hid, BillingInvoice.status != BillingInvoiceStatus.cancelled)
-            .scalar()
-            or 0.0
         )
 
         recent_charges = (
@@ -802,5 +908,5 @@ class GetBillingDashboardAction:
             total_invoiced=round(float(total_inv), 2),
             total_collected=round(float(total_paid), 2),
             recent_charges=[BillingChargeResponse.model_validate(charge_to_dict(c)) for c in recent_charges],
-            recent_payments=[_payment_response_dto(self.db, p) for p in recent_payments],
+            recent_payments=_payment_response_dtos(self.db, recent_payments),
         )

@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, joinedload
 
 from modules.billing.entities.billing_entities import (
     BillingCharge,
@@ -141,10 +141,11 @@ class BillingRepository:
             self.db.query(BillingInvoice)
             .options(
                 joinedload(BillingInvoice.patient),
-                # one-to-many: joinedload here multiplies each invoice row by
-                # its line count across a paginated list; selectinload avoids
-                # that with one extra IN(...) query instead.
-                selectinload(BillingInvoice.lines),
+                # Lines are no longer serialized into the list response (the
+                # Invoices tab table doesn't read them — see invoice_to_dict's
+                # include_lines and ListInvoicesAction), so there's no reason
+                # to eager-load them here either: this drops one query on top
+                # of the smaller payload.
             )
             .filter(BillingInvoice.hospital_id == self.hospital_id)
         )

@@ -306,10 +306,19 @@ def issue_receipt_for_payment(
     )
 
 
-def invoice_to_dict(inv: BillingInvoice, patient: Patient | None = None) -> dict:
-    """Serialize BillingInvoice ORM model to dictionary with patient context."""
+def invoice_to_dict(inv: BillingInvoice, patient: Patient | None = None, *, include_lines: bool = True) -> dict:
+    """
+    Serialize BillingInvoice ORM model to dictionary with patient context.
+
+    `include_lines=False` (used by ListInvoicesAction — the Invoices tab
+    table, which never reads line items) skips serializing them, trimming
+    payload size for a list that can run to 200 invoices. Every other caller
+    (single-invoice fetch, the patient ledger's invoice list — whose
+    `invoicedChargeIds` computation on the frontend does read `.lines`, see
+    BillingPage.tsx) keeps the default `True` so its response is unchanged.
+    """
     p = patient or inv.patient
-    lines = sorted(inv.lines or [], key=lambda ln: ln.sort_order)
+    lines = sorted(inv.lines or [], key=lambda ln: ln.sort_order) if include_lines else []
     return {
         "id": inv.id,
         "hospital_id": inv.hospital_id,

@@ -233,26 +233,43 @@ def allocate_payment_to_charges(
 
 
 def patient_ledger_totals(
-    db: Session, hospital_id: UUID, patient_id: UUID
+    db: Session,
+    hospital_id: UUID,
+    patient_id: UUID,
+    *,
+    charges: list[BillingCharge] | None = None,
+    payments: list[BillingPayment] | None = None,
 ) -> dict[str, Any]:
-    """Compute aggregate charges, payments, and outstanding balance for a patient."""
-    charges = (
-        db.query(BillingCharge)
-        .filter(
-            BillingCharge.hospital_id == hospital_id,
-            BillingCharge.patient_id == patient_id,
-            BillingCharge.status != BillingChargeStatus.cancelled,
+    """
+    Compute aggregate charges, payments, and outstanding balance for a patient.
+
+    `charges`/`payments` are optional pre-fetched rows for callers that
+    already loaded the same (hospital_id, patient_id, non-cancelled-charges)
+    rows for another purpose in the same request — e.g. GetPatientLedgerAction
+    and GetPatientSummaryAction in billing_actions.py, which previously
+    triggered 2 extra queries here on top of their own, plus 2 more in
+    build_ledger_entries, to fetch what is functionally the same row set
+    three times over. When omitted, behavior is unchanged from before.
+    """
+    if charges is None:
+        charges = (
+            db.query(BillingCharge)
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.patient_id == patient_id,
+                BillingCharge.status != BillingChargeStatus.cancelled,
+            )
+            .all()
         )
-        .all()
-    )
-    payments = (
-        db.query(BillingPayment)
-        .filter(
-            BillingPayment.hospital_id == hospital_id,
-            BillingPayment.patient_id == patient_id,
+    if payments is None:
+        payments = (
+            db.query(BillingPayment)
+            .filter(
+                BillingPayment.hospital_id == hospital_id,
+                BillingPayment.patient_id == patient_id,
+            )
+            .all()
         )
-        .all()
-    )
     total_charges = round(sum(float(c.net_amount) for c in charges), 2)
     total_paid = round(sum(float(p.amount) for p in payments), 2)
     outstanding = round(max(0.0, total_charges - total_paid), 2)
@@ -371,27 +388,44 @@ def payment_to_dict(
 
 
 def build_ledger_entries(
-    db: Session, hospital_id: UUID, patient_id: UUID
+    db: Session,
+    hospital_id: UUID,
+    patient_id: UUID,
+    *,
+    charges: list[BillingCharge] | None = None,
+    payments: list[BillingPayment] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build chronological unified ledger timeline with charge debits and payment credits."""
-    charges = (
-        db.query(BillingCharge)
-        .options(joinedload(BillingCharge.patient))
-        .filter(
-            BillingCharge.hospital_id == hospital_id,
-            BillingCharge.patient_id == patient_id,
+    """
+    Build chronological unified ledger timeline with charge debits and payment credits.
+
+    `charges`/`payments` are optional pre-fetched rows — see
+    patient_ledger_totals() above for why. This function includes cancelled
+    charges in its own filter (unlike patient_ledger_totals) so it can still
+    render them in the timeline; it filters them out in the entries loop
+    below. Passing in patient_ledger_totals' non-cancelled-only charges list
+    would therefore be wrong here — callers combining both must pass this
+    function its own charges list (or none, to keep the original query).
+    """
+    if charges is None:
+        charges = (
+            db.query(BillingCharge)
+            .options(joinedload(BillingCharge.patient))
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.patient_id == patient_id,
+            )
+            .all()
         )
-        .all()
-    )
-    payments = (
-        db.query(BillingPayment)
-        .options(joinedload(BillingPayment.patient))
-        .filter(
-            BillingPayment.hospital_id == hospital_id,
-            BillingPayment.patient_id == patient_id,
+    if payments is None:
+        payments = (
+            db.query(BillingPayment)
+            .options(joinedload(BillingPayment.patient))
+            .filter(
+                BillingPayment.hospital_id == hospital_id,
+                BillingPayment.patient_id == patient_id,
+            )
+            .all()
         )
-        .all()
-    )
     entries: list[dict[str, Any]] = []
     for c in charges:
         if c.status == BillingChargeStatus.cancelled:
