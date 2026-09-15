@@ -11,8 +11,9 @@ from datetime import date, datetime, time, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
+
+from shared.exceptions.base import ConflictError, NotFoundError, ValidationError
 
 from modules.beds.db.beds_repository import BedsRepository
 from modules.beds.entities.bed import Bed
@@ -87,7 +88,7 @@ class AdmitPatientAction:
             .first()
         )
         if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
+            raise NotFoundError("Patient not found")
 
         active = (
             self.db.query(Admission)
@@ -99,15 +100,15 @@ class AdmitPatientAction:
             .first()
         )
         if active:
-            raise HTTPException(status_code=409, detail="Patient is already admitted")
+            raise ConflictError("Patient is already admitted")
 
         bed = self.beds_repo.get_bed_by_id(hospital_id, payload.bed_id)
         if not bed:
-            raise HTTPException(status_code=404, detail="Bed not found")
+            raise NotFoundError("Bed not found")
         if bed.is_occupied:
-            raise HTTPException(status_code=409, detail="Bed is already occupied")
+            raise ConflictError("Bed is already occupied")
         if bed.ward_id != payload.ward_id or bed.room_id != payload.room_id:
-            raise HTTPException(status_code=400, detail="Ward/Room does not match selected bed")
+            raise ValidationError("Ward/Room does not match selected bed")
 
         if payload.doctor_id:
             doc = (
@@ -116,7 +117,7 @@ class AdmitPatientAction:
                 .first()
             )
             if not doc:
-                raise HTTPException(status_code=404, detail="Doctor not found")
+                raise NotFoundError("Doctor not found")
 
         admitted_at = datetime.now(timezone.utc)
         if payload.admission_date:
@@ -175,18 +176,18 @@ class AllocateBedAction:
             hospital_id, payload.admission_id, payload.patient_id
         )
         if not admission:
-            raise HTTPException(status_code=404, detail="Active admission not found")
+            raise NotFoundError("Active admission not found")
 
         if admission.bed_id == payload.bed_id:
             return to_admission_detail(admission)
 
         new_bed = self.beds_repo.get_bed_by_id(hospital_id, payload.bed_id)
         if not new_bed:
-            raise HTTPException(status_code=404, detail="Bed not found")
+            raise NotFoundError("Bed not found")
         if new_bed.ward_id != payload.ward_id or new_bed.room_id != payload.room_id:
-            raise HTTPException(status_code=400, detail="Ward/Room does not match selected bed")
+            raise ValidationError("Ward/Room does not match selected bed")
         if new_bed.is_occupied:
-            raise HTTPException(status_code=409, detail="Bed is already occupied")
+            raise ConflictError("Bed is already occupied")
 
         old_bed = self.db.query(Bed).filter(Bed.id == admission.bed_id).first()
         if old_bed:
@@ -227,18 +228,18 @@ class TransferBedAction:
             hospital_id, payload.admission_id, payload.patient_id
         )
         if not admission:
-            raise HTTPException(status_code=404, detail="Active admission not found")
+            raise NotFoundError("Active admission not found")
 
         if admission.bed_id == payload.to_bed_id:
-            raise HTTPException(status_code=400, detail="Patient is already on this bed")
+            raise ValidationError("Patient is already on this bed")
 
         new_bed = self.beds_repo.get_bed_by_id(hospital_id, payload.to_bed_id)
         if not new_bed:
-            raise HTTPException(status_code=404, detail="Bed not found")
+            raise NotFoundError("Bed not found")
         if new_bed.ward_id != payload.to_ward_id or new_bed.room_id != payload.to_room_id:
-            raise HTTPException(status_code=400, detail="Ward/Room does not match selected bed")
+            raise ValidationError("Ward/Room does not match selected bed")
         if new_bed.is_occupied:
-            raise HTTPException(status_code=409, detail="Bed is already occupied")
+            raise ConflictError("Bed is already occupied")
 
         old_bed = self.db.query(Bed).filter(Bed.id == admission.bed_id).first()
         from_label = (
@@ -285,7 +286,7 @@ class RequestDischargeAction:
             hospital_id, payload.admission_id, payload.patient_id
         )
         if not admission:
-            raise HTTPException(status_code=404, detail="Active admission not found")
+            raise NotFoundError("Active admission not found")
 
         now = datetime.now(timezone.utc)
         admission.status = AdmissionStatus.discharge_requested
@@ -386,7 +387,7 @@ class DischargePatientAction:
             statuses=(AdmissionStatus.discharge_requested,),
         )
         if not admission:
-            raise HTTPException(status_code=404, detail="Active admission not found")
+            raise NotFoundError("Active admission not found")
 
         d_date = payload.discharge_date or date.today()
         d_time = payload.discharge_time or datetime.now(timezone.utc).time().replace(microsecond=0)
@@ -408,10 +409,7 @@ class DischargePatientAction:
         fin = self.billing_svc.get_ledger_totals(hospital_id, admission.patient_id)
         outstanding = float(fin.get("outstanding") or 0)
         if outstanding > 0.009:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot discharge — outstanding balance ₹{outstanding:,.2f}. Clear all dues before discharging.",
-            )
+            raise ValidationError(f"Cannot discharge — outstanding balance ₹{outstanding:,.2f}. Clear all dues before discharging.")
 
         admission.status = AdmissionStatus.discharged
         admission.discharged_at = discharged_at

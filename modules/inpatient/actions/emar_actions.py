@@ -12,6 +12,8 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
+
+from shared.exceptions.base import NotFoundError
 from sqlalchemy.orm import Session
 
 from modules.inpatient.contracts.nursing_contracts import (
@@ -43,7 +45,7 @@ class ScheduleMedicationAction:
     ) -> MedicationAdminResponse:
         admission = self.admission_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not admission:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found")
+            raise NotFoundError("Admission not found")
 
         record = MedicationAdministrationRecord(
             hospital_id=self.hospital_id,
@@ -87,10 +89,7 @@ class RecordMedicationExecutionAction:
     ) -> MedicationAdminResponse:
         record = self.repo.get_emar_record_by_id(record_id)
         if not record:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Medication administration record not found",
-            )
+            raise NotFoundError("Medication administration record not found")
 
         # Feature 18: High-alert dual sign-off validation
         if record.is_high_alert and payload.status == MedicationAdminStatus.administered:

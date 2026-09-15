@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from shared.exceptions.base import NotFoundError
 from sqlalchemy.orm import Session
 
 from modules.inpatient.contracts.nursing_contracts import (
@@ -42,7 +42,7 @@ class CreateNursingCarePlanAction:
     ) -> NursingCarePlanResponse:
         adm = self.adm_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not adm:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found")
+            raise NotFoundError("Admission not found")
 
         nurse_name = str(actor.get("name") or "Primary Nurse")
 
@@ -89,7 +89,7 @@ class ReassessNursingCarePlanAction:
     ) -> NursingCarePlanResponse:
         plan = self.nursing_repo.get_care_plan_by_id(plan_id)
         if not plan:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Nursing care plan not found")
+            raise NotFoundError("Nursing care plan not found")
 
         plan.status = payload.status
         plan.reassessment_notes = payload.reassessment_notes.strip()
@@ -116,7 +116,7 @@ class GetNursingCarePlanAction:
     def execute(self, plan_id: UUID) -> NursingCarePlanResponse:
         plan = self.nursing_repo.get_care_plan_by_id(plan_id)
         if not plan:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Nursing care plan not found")
+            raise NotFoundError("Nursing care plan not found")
         return NursingCarePlanResponse.model_validate(plan)
 
 

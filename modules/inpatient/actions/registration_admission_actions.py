@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from shared.exceptions.base import ConflictError, NotFoundError, ValidationError
 from sqlalchemy.orm import Session
 
 from modules.beds.db.beds_repository import BedsRepository
@@ -53,7 +53,7 @@ class RegistrationAdmitAction:
             .first()
         )
         if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
+            raise NotFoundError("Patient not found")
 
         active = (
             self.db.query(Admission)
@@ -65,15 +65,15 @@ class RegistrationAdmitAction:
             .first()
         )
         if active:
-            raise HTTPException(status_code=409, detail="Patient is already admitted")
+            raise ConflictError("Patient is already admitted")
 
         bed = self.beds_repo.get_bed_by_id(hospital_id, payload.bed_id)
         if not bed:
-            raise HTTPException(status_code=404, detail="Bed not found")
+            raise NotFoundError("Bed not found")
         if bed.is_occupied:
-            raise HTTPException(status_code=409, detail="Bed is already occupied")
+            raise ConflictError("Bed is already occupied")
         if bed.ward_id != payload.ward_id or bed.room_id != payload.room_id:
-            raise HTTPException(status_code=400, detail="Ward/Room does not match selected bed")
+            raise ValidationError("Ward/Room does not match selected bed")
 
         if payload.doctor_id:
             doc = (
@@ -82,7 +82,7 @@ class RegistrationAdmitAction:
                 .first()
             )
             if not doc:
-                raise HTTPException(status_code=404, detail="Doctor not found")
+                raise NotFoundError("Doctor not found")
 
         ip_id = next_ip_encounter_id(self.db, hospital_id)
         admission = self.admissions_repo.create_admission(
@@ -151,9 +151,9 @@ class RegistrationDischargeAction:
     ) -> DischargeResponse:
         admission = self.admissions_repo.get_admission_by_id(hospital_id, admission_id)
         if not admission:
-            raise HTTPException(status_code=404, detail="Admission not found")
+            raise NotFoundError("Admission not found")
         if admission.status != AdmissionStatus.admitted:
-            raise HTTPException(status_code=400, detail="Admission already discharged")
+            raise ValidationError("Admission already discharged")
 
         now = datetime.now(timezone.utc)
         admission.status = AdmissionStatus.discharged

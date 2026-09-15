@@ -12,7 +12,7 @@ from io import BytesIO
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from shared.exceptions.base import NotFoundError, ValidationError
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -81,7 +81,7 @@ class CreateFormSubmissionAction:
             .first()
         )
         if not patient:
-            raise HTTPException(status_code=404, detail="Patient not found")
+            raise NotFoundError("Patient not found")
 
         if payload.admission_id:
             adm = (
@@ -94,7 +94,7 @@ class CreateFormSubmissionAction:
                 .first()
             )
             if not adm:
-                raise HTTPException(status_code=400, detail="Invalid admission for patient")
+                raise ValidationError("Invalid admission for patient")
 
         actor_id = resolve_actor_id(actor)
         actor_name = str(actor.get("name") or actor.get("sub") or "Staff")
@@ -148,7 +148,7 @@ class UpdateFormSubmissionAction:
     ) -> IpdFormSubmissionResponse:
         sub = self.repo.get_by_id(hospital_id, submission_id)
         if not sub:
-            raise HTTPException(status_code=404, detail="Submission not found")
+            raise NotFoundError("Submission not found")
 
         if payload.admission_id is not None:
             adm = (
@@ -161,7 +161,7 @@ class UpdateFormSubmissionAction:
                 .first()
             )
             if not adm:
-                raise HTTPException(status_code=400, detail="Invalid admission for patient")
+                raise ValidationError("Invalid admission for patient")
             sub.admission_id = payload.admission_id
 
         if payload.form_data is not None:
@@ -222,7 +222,7 @@ class GetFormSubmissionAction:
     def execute(self, hospital_id: UUID, submission_id: UUID) -> IpdFormSubmissionResponse:
         sub = self.repo.get_by_id(hospital_id, submission_id)
         if not sub:
-            raise HTTPException(status_code=404, detail="Submission not found")
+            raise NotFoundError("Submission not found")
         return to_form_response(sub)
 
 
@@ -233,9 +233,9 @@ class ViewFormSubmissionHtmlAction:
     def execute(self, hospital_id: UUID, submission_id: UUID) -> StreamingResponse:
         sub = self.repo.get_by_id(hospital_id, submission_id)
         if not sub:
-            raise HTTPException(status_code=404, detail="Submission not found")
+            raise NotFoundError("Submission not found")
         if not sub.html_snapshot:
-            raise HTTPException(status_code=404, detail="No HTML snapshot for this form")
+            raise NotFoundError("No HTML snapshot for this form")
         patient_label = sub.patient.uhid if sub.patient else "patient"
         return StreamingResponse(
             BytesIO(sub.html_snapshot.encode("utf-8")),

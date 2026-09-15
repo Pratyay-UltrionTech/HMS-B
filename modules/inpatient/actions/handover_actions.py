@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from shared.exceptions.base import NotFoundError
 from sqlalchemy.orm import Session
 
 from modules.inpatient.contracts.nursing_contracts import (
@@ -42,7 +42,7 @@ class CreateNursingShiftHandoverAction:
     ) -> NursingShiftHandoverResponse:
         adm = self.adm_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not adm:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found")
+            raise NotFoundError("Admission not found")
 
         nurse_name = str(actor.get("name") or "Outgoing Nurse")
         nurse_id_raw = actor.get("user_id")
@@ -97,7 +97,7 @@ class AcknowledgeNursingShiftHandoverAction:
     ) -> NursingShiftHandoverResponse:
         handover = self.nursing_repo.get_handover_by_id(handover_id)
         if not handover:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Handover record not found")
+            raise NotFoundError("Handover record not found")
 
         nurse_name = str(actor.get("name") or "Incoming Nurse")
         nurse_id_raw = actor.get("user_id")
@@ -129,7 +129,7 @@ class GetNursingShiftHandoverAction:
     def execute(self, handover_id: UUID) -> NursingShiftHandoverResponse:
         handover = self.nursing_repo.get_handover_by_id(handover_id)
         if not handover:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Handover record not found")
+            raise NotFoundError("Handover record not found")
         return NursingShiftHandoverResponse.model_validate(handover)
 
 

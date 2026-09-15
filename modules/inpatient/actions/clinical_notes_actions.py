@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from shared.exceptions.base import NotFoundError
 from sqlalchemy.orm import Session
 
 from modules.inpatient.contracts.nursing_contracts import (
@@ -44,7 +44,7 @@ class CreateIpdClinicalNoteAction:
     ) -> IpdClinicalNoteResponse:
         adm = self.adm_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not adm:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found")
+            raise NotFoundError("Admission not found")
 
         author_name = str(actor.get("name") or "Clinical Staff")
         author_role = str(actor.get("staff_role_name") or actor.get("role") or "nurse")
@@ -114,7 +114,7 @@ class GetIpdClinicalNoteAction:
     def execute(self, note_id: UUID) -> IpdClinicalNoteResponse:
         note = self.nursing_repo.get_clinical_note_by_id(note_id)
         if not note:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Clinical note not found")
+            raise NotFoundError("Clinical note not found")
         return IpdClinicalNoteResponse.model_validate(note)
 
 
