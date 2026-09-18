@@ -4,6 +4,8 @@ Target-native SQLAlchemy entities for Radiology domain.
 Tables:
 - radiology_scan_catalog
 - radiology_orders
+- rad_prescription_requests
+- rad_prescription_request_items
 """
 
 from __future__ import annotations
@@ -22,16 +24,22 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
     case,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 
 from infrastructure.postgres.base import Base
+
+# Imported unconditionally (not just under TYPE_CHECKING): string-based
+# relationship() targets are resolved from SQLAlchemy's mapper registry at
+# first mapper configuration (same pattern as laboratory entities).
+from modules.clinical_records.entities.clinical_record import Prescription
 
 if TYPE_CHECKING:
     from modules.doctors.entities.doctor import HospitalUser
@@ -43,6 +51,24 @@ class RadiologyOrderStatus(str, enum.Enum):
     scheduled = "scheduled"
     in_progress = "in_progress"
     completed = "completed"
+    cancelled = "cancelled"
+
+
+class RadPrescriptionRequestStatus(str, enum.Enum):
+    """Lifecycle of a doctor-prescribed radiology investigation request."""
+
+    pending = "pending"
+    partially_processed = "partially_processed"
+    completed = "completed"
+    cancelled = "cancelled"
+
+
+class RadRequestItemStatus(str, enum.Enum):
+    """Per-scan fulfillment state within a radiology prescription request."""
+
+    pending = "pending"
+    ordered = "ordered"
+    unavailable = "unavailable"
     cancelled = "cancelled"
 
 
@@ -102,6 +128,12 @@ class RadiologyOrder(Base):
     scan_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("radiology_scan_catalog.id", ondelete="SET NULL"), nullable=True
     )
+    prescription_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("prescriptions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    prescription_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rad_prescription_requests.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     scan_code: Mapped[str] = mapped_column(String(32), nullable=False)
     scan_name: Mapped[str] = mapped_column(String(255), nullable=False)
     category: Mapped[str] = mapped_column(String(128), nullable=False, default="")
@@ -147,3 +179,91 @@ class RadiologyOrder(Base):
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
     doctor: Mapped["HospitalUser | None"] = relationship("HospitalUser", foreign_keys=[doctor_id])
     scan: Mapped["RadiologyScanCatalog | None"] = relationship("RadiologyScanCatalog", foreign_keys=[scan_id])
+
+
+class RadPrescriptionRequest(Base):
+    """Doctor-prescribed radiology investigation awaiting fulfillment."""
+
+    __tablename__ = "rad_prescription_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    prescription_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("prescriptions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    doctor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    status: Mapped[RadPrescriptionRequestStatus] = mapped_column(
+        Enum(RadPrescriptionRequestStatus, name="rad_prescription_request_status"),
+        nullable=False,
+        default=RadPrescriptionRequestStatus.pending,
+    )
+    prescribed_scan_ids: Mapped[list] = mapped_column(
+        JSONB().with_variant(JSON, "sqlite"), nullable=False, default=list
+    )
+    clinical_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    doctor: Mapped["HospitalUser"] = relationship("HospitalUser", foreign_keys=[doctor_id])
+    prescription: Mapped["Prescription"] = relationship("Prescription", foreign_keys=[prescription_id])
+    items: Mapped[list[RadPrescriptionRequestItem]] = relationship(
+        "RadPrescriptionRequestItem",
+        back_populates="request",
+        cascade="all, delete-orphan",
+        order_by="RadPrescriptionRequestItem.sort_order",
+        foreign_keys="RadPrescriptionRequestItem.request_id",
+    )
+
+
+class RadPrescriptionRequestItem(Base):
+    """Line item in a doctor-prescribed radiology investigation request."""
+
+    __tablename__ = "rad_prescription_request_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rad_prescription_requests.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("radiology_scan_catalog.id", ondelete="SET NULL"), nullable=True
+    )
+    scan_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    scan_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    category: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[RadRequestItemStatus] = mapped_column(
+        Enum(RadRequestItemStatus, name="rad_request_item_status"),
+        nullable=False,
+        default=RadRequestItemStatus.pending,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    request: Mapped[RadPrescriptionRequest] = relationship(
+        "RadPrescriptionRequest", back_populates="items", foreign_keys=[request_id]
+    )

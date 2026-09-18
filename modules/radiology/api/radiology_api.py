@@ -15,14 +15,18 @@ from sqlalchemy.orm import Session
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.radiology.actions.radiology_actions import (
     CancelOrderAction,
+    CancelRadPrescriptionRequestAction,
     CompleteScanAction,
     CreateOrdersAction,
     CreateScanAction,
     DeleteScanAction,
     GetDashboardAction,
     GetOrderAction,
+    GetRadPrescriptionRequestAction,
     ListOrdersAction,
+    ListRadPrescriptionRequestsAction,
     ListScansAction,
+    MarkRadRequestItemUnavailableAction,
     ScheduleOrderAction,
     SeedStandardCatalogueAction,
     StartScanAction,
@@ -34,14 +38,19 @@ from modules.radiology.contracts.radiology_contracts import (
     RadDashboardResponse,
     RadOrderCreate,
     RadOrderResponse,
+    RadPrescriptionRequestResponse,
     RadReportRequest,
+    RadRequestCancelBody,
     RadScanCreate,
     RadScanResponse,
     RadScanUpdate,
     RadScheduleRequest,
 )
 from modules.radiology.db.radiology_repository import RadiologyRepository
-from modules.radiology.entities.radiology_entities import RadiologyOrderStatus
+from modules.radiology.entities.radiology_entities import (
+    RadiologyOrderStatus,
+    RadPrescriptionRequestStatus,
+)
 from modules.radiology.services.radiology_service import (
     generate_radiology_report_html,
     stream_radiology_file,
@@ -116,6 +125,58 @@ def delete_scan(
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     DeleteScanAction(db, hospital_id, user).execute(scan_id)
+
+
+# ── Prescription requests ──────────────────────────────────────────────────────
+
+
+@router.get("/prescription-requests", response_model=list[RadPrescriptionRequestResponse])
+def list_prescription_requests(
+    status: RadPrescriptionRequestStatus | None = Query(default=None),
+    patient_id: UUID | None = Query(default=None),
+    doctor_id: UUID | None = Query(default=None),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> list[RadPrescriptionRequestResponse]:
+    return ListRadPrescriptionRequestsAction(db, hospital_id).execute(
+        status=status, patient_id=patient_id, doctor_id=doctor_id
+    )
+
+
+@router.get("/prescription-requests/{request_id}", response_model=RadPrescriptionRequestResponse)
+def get_prescription_request(
+    request_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> RadPrescriptionRequestResponse:
+    return GetRadPrescriptionRequestAction(db, hospital_id).execute(request_id)
+
+
+@router.post("/prescription-requests/{request_id}/cancel", response_model=RadPrescriptionRequestResponse)
+def cancel_prescription_request(
+    request_id: UUID,
+    payload: RadRequestCancelBody,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> RadPrescriptionRequestResponse:
+    return CancelRadPrescriptionRequestAction(db, hospital_id).execute(request_id, payload.reason, user)
+
+
+@router.post(
+    "/prescription-requests/{request_id}/items/{item_id}/unavailable",
+    response_model=RadPrescriptionRequestResponse,
+)
+def mark_request_item_unavailable(
+    request_id: UUID,
+    item_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> RadPrescriptionRequestResponse:
+    return MarkRadRequestItemUnavailableAction(db, hospital_id).execute(request_id, item_id, user)
 
 
 # ── Orders ─────────────────────────────────────────────────────────────────────

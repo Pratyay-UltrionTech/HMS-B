@@ -24,7 +24,9 @@ from modules.radiology.contracts.radiology_contracts import (
     RadDashboardResponse,
     RadOrderCreate,
     RadOrderResponse,
+    RadPrescriptionRequestResponse,
     RadReportRequest,
+    RadRequestCancelBody,
     RadScanCreate,
     RadScanResponse,
     RadScanUpdate,
@@ -35,11 +37,19 @@ from modules.radiology.entities.radiology_entities import (
     RadiologyOrder,
     RadiologyOrderStatus,
     RadiologyScanCatalog,
+    RadPrescriptionRequestStatus,
+    RadRequestItemStatus,
 )
 from modules.radiology.services.radiology_service import (
     STANDARD_RADIOLOGY_SCANS,
     order_to_response,
     sync_radiology_order_medical_record,
+)
+from modules.radiology.services.rad_prescription_service import (
+    assert_request_fulfillable,
+    get_prescription_request,
+    request_to_response_dict,
+    sync_request_after_order_change,
 )
 from shared.audit import write_audit_log
 
@@ -263,35 +273,65 @@ class CreateOrdersAction:
             if not doctor:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Doctor not found")
 
-        scans = self.repo.get_active_scans_by_ids(payload.scan_ids)
-        if len(scans) != len(set(payload.scan_ids)):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="One or more scans are invalid or inactive",
-            )
+        appointment_id = payload.appointment_id
+        clinical_notes = payload.clinical_notes.strip() if payload.clinical_notes else None
+        rad_request = None
+        # (scan_id, scan_code, scan_name, category, price) lines to accession.
+        lines: list[tuple] = []
+
+        if payload.prescription_request_id:
+            rad_request = get_prescription_request(self.db, payload.prescription_request_id, self.hospital_id)
+            if rad_request.patient_id != patient.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Prescription request does not belong to the selected patient",
+                )
+            if payload.scan_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Doctor-prescribed orders cannot add or change scans; fulfill the prescription as written",
+                )
+            fulfill_items = assert_request_fulfillable(self.db, rad_request)
+            appointment_id = rad_request.appointment_id or appointment_id
+            doctor = rad_request.doctor or doctor
+            if not clinical_notes:
+                clinical_notes = rad_request.clinical_notes
+            for it in fulfill_items:
+                lines.append((it.scan_id, it.scan_code, it.scan_name, it.category, it.price))
+        else:
+            scans = self.repo.get_active_scans_by_ids(payload.scan_ids)
+            if len(scans) != len(set(payload.scan_ids)):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="One or more scans are invalid or inactive",
+                )
+            for scan in scans:
+                lines.append((scan.id, scan.scan_code, scan.scan_name, scan.category, scan.price))
 
         actor_name = _actor_name(self.user)
         actor_role = _actor_role(self.user)
         created_ids: list[UUID] = []
 
-        order_nos = iter(self.repo.next_order_no_batch(len(scans)))
-        for scan in scans:
+        order_nos = iter(self.repo.next_order_no_batch(len(lines)))
+        for scan_id, scan_code, scan_name, category, price in lines:
             order_no = next(order_nos)
             order = RadiologyOrder(
                 hospital_id=self.hospital_id,
                 order_no=order_no,
                 patient_id=patient.id,
                 doctor_id=doctor.id if doctor else None,
-                appointment_id=payload.appointment_id,
-                scan_id=scan.id,
-                scan_code=scan.scan_code,
-                scan_name=scan.scan_name,
-                category=scan.category,
-                price=scan.price,
+                appointment_id=appointment_id,
+                prescription_id=rad_request.prescription_id if rad_request else None,
+                prescription_request_id=rad_request.id if rad_request else None,
+                scan_id=scan_id,
+                scan_code=scan_code,
+                scan_name=scan_name,
+                category=category,
+                price=price,
                 ordered_by_name=actor_name,
                 ordered_by_role=actor_role,
                 status=RadiologyOrderStatus.ordered,
-                clinical_notes=payload.clinical_notes.strip() if payload.clinical_notes else None,
+                clinical_notes=clinical_notes,
             )
             self.db.add(order)
             self.db.flush()
@@ -304,8 +344,8 @@ class CreateOrdersAction:
                 patient_id=patient.id,
                 source_type=BillingSourceType.radiology,
                 source_id=order.id,
-                description=f"Radiology {order.order_no} — {scan.scan_name}",
-                charge_amount=float(scan.price or 0),
+                description=f"Radiology {order.order_no} — {scan_name}",
+                charge_amount=float(price or 0),
                 created_by_name=actor_name,
             )
 
@@ -316,16 +356,102 @@ class CreateOrdersAction:
                 action="create",
                 entity_type="radiology_order",
                 entity_id=order.id,
-                summary=f"Radiology order {order.order_no} for {patient.name}: {scan.scan_name}",
+                summary=f"Radiology order {order.order_no} for {patient.name}: {scan_name}",
             )
+
+        if rad_request:
+            for it in fulfill_items:
+                it.status = RadRequestItemStatus.ordered
+            rad_request.status = RadPrescriptionRequestStatus.partially_processed
 
         self.db.commit()
 
-        if payload.appointment_id:
-            sync_appointment_after_clinical_change(self.db, self.hospital_id, payload.appointment_id)
+        if appointment_id:
+            sync_appointment_after_clinical_change(self.db, self.hospital_id, appointment_id)
             self.db.commit()
 
         return [order_to_response(self.repo.get_order(oid)) for oid in created_ids]
+
+
+class ListRadPrescriptionRequestsAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.repo = RadiologyRepository(db, hospital_id)
+
+    def execute(
+        self,
+        status: RadPrescriptionRequestStatus | None = None,
+        patient_id: UUID | None = None,
+        doctor_id: UUID | None = None,
+    ) -> list[RadPrescriptionRequestResponse]:
+        reqs = self.repo.list_prescription_requests(
+            status=status, patient_id=patient_id, doctor_id=doctor_id
+        )
+        return [RadPrescriptionRequestResponse(**request_to_response_dict(r)) for r in reqs]
+
+
+class GetRadPrescriptionRequestAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.repo = RadiologyRepository(db, hospital_id)
+
+    def execute(self, request_id: UUID) -> RadPrescriptionRequestResponse:
+        req = self.repo.get_prescription_request(request_id)
+        if not req:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Prescription radiology request not found",
+            )
+        return RadPrescriptionRequestResponse(**request_to_response_dict(req))
+
+
+class CancelRadPrescriptionRequestAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.hospital_id = hospital_id
+        self.repo = RadiologyRepository(db, hospital_id)
+
+    def execute(self, request_id: UUID, reason: str | None, user: dict) -> RadPrescriptionRequestResponse:
+        req = get_prescription_request(self.db, request_id, self.hospital_id)
+        if req.status == RadPrescriptionRequestStatus.completed:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Completed prescription requests cannot be cancelled",
+            )
+        req.status = RadPrescriptionRequestStatus.cancelled
+        req.cancel_reason = reason.strip() if reason else "Cancelled by staff"
+        for item in req.items or []:
+            if item.status == RadRequestItemStatus.pending:
+                item.status = RadRequestItemStatus.cancelled
+        self.db.commit()
+        if req.appointment_id:
+            sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
+            self.db.commit()
+        return RadPrescriptionRequestResponse(**request_to_response_dict(req))
+
+
+class MarkRadRequestItemUnavailableAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.hospital_id = hospital_id
+
+    def execute(self, request_id: UUID, item_id: UUID, user: dict) -> RadPrescriptionRequestResponse:
+        req = get_prescription_request(self.db, request_id, self.hospital_id)
+        if req.status in {RadPrescriptionRequestStatus.completed, RadPrescriptionRequestStatus.cancelled}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Request cannot be modified")
+        item = next((i for i in (req.items or []) if i.id == item_id), None)
+        if not item:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+        item.status = RadRequestItemStatus.unavailable
+
+        pending = [i for i in req.items if i.status == RadRequestItemStatus.pending]
+        if not pending:
+            req.status = RadPrescriptionRequestStatus.cancelled
+            req.cancel_reason = "All requested scans marked unavailable"
+
+        self.db.commit()
+        if req.appointment_id:
+            sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
+            self.db.commit()
+        return RadPrescriptionRequestResponse(**request_to_response_dict(req))
 
 
 class CancelOrderAction:
@@ -357,6 +483,7 @@ class CancelOrderAction:
             entity_id=order.id,
             summary=f"Cancelled radiology order {order.order_no}",
         )
+        sync_request_after_order_change(self.db, order)
         self.db.commit()
 
         if order.appointment_id:
@@ -460,6 +587,7 @@ class CompleteScanAction:
             entity_id=order.id,
             summary=f"Completed scan for {order.order_no} (report may still be pending)",
         )
+        sync_request_after_order_change(self.db, order)
         self.db.commit()
 
         if order.appointment_id:

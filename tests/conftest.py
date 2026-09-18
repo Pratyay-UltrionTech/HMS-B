@@ -40,22 +40,49 @@ os.environ["POSTGRES_HOST"] = "127.0.0.1"
 os.environ["POSTGRES_PORT"] = "9999"  # Closed port to fail-fast if attempted
 os.environ["POSTGRES_DB"] = "HMS_ISOLATED_TEST"
 
-import app.database
-from app.database import Base, get_db
-import app.models  # Register all 63 ORM models in Base.metadata
-from app.models import Appointment, AppointmentStatus, Hospital, HospitalUser, Patient, VitalReading
-from app.routers import vitals
-from app.utils.auth import create_access_token
+from infrastructure.postgres.base import Base
+from infrastructure.postgres.session import get_transitional_sync_session as get_db
+from infrastructure.postgres.engine import get_transitional_sync_engine
+
+# Import module entities to register all ORM models in Base.metadata
+import modules.tenancy.entities.hospital
+import modules.doctors.entities.doctor
+import modules.patients.entities.patient
+import modules.appointments.entities.appointment
+import modules.appointments.entities.enums
+import modules.clinical_records.entities.clinical_record
+import modules.vitals.entities.vital_reading
+import modules.laboratory.entities.lab_entities
+import modules.radiology.entities.radiology_entities
+import modules.billing.entities.billing_entities
+import modules.pharmacy.entities.pharmacy_entities
+import modules.inpatient.entities.admission
+import modules.beds.entities.bed
+import modules.ot.entities.ot_entities
+import shared.audit.entities.audit_log
+
+from modules.appointments.entities.appointment import Appointment
+from modules.appointments.entities.enums import AppointmentStatus
+from modules.doctors.entities.doctor import HospitalUser
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
+from modules.vitals.entities.vital_reading import VitalReading
+from modules.vitals.api.vitals_api import router as vitals
+from shared.auth.jwt import create_access_token
 
 # Defensively monkeypatch production engine.connect so that ANY code path
-# accidentally referencing app.database.engine fails immediately.
+# accidentally referencing the sync engine fails immediately.
 def _blocked_azure_connect(*args, **kwargs):
     raise RuntimeError(
         "CRITICAL TEST ISOLATION FAILURE: Attempted connection to production/staging "
         "Azure PostgreSQL database engine during test run!"
     )
 
-app.database.engine.connect = _blocked_azure_connect
+try:
+    _prod_engine = get_transitional_sync_engine()
+    _prod_engine.connect = _blocked_azure_connect
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------------------

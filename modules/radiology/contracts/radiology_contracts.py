@@ -7,9 +7,13 @@ from __future__ import annotations
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from modules.radiology.entities.radiology_entities import RadiologyOrderStatus
+from modules.radiology.entities.radiology_entities import (
+    RadiologyOrderStatus,
+    RadPrescriptionRequestStatus,
+    RadRequestItemStatus,
+)
 
 
 class RadScanCreate(BaseModel):
@@ -54,8 +58,60 @@ class RadOrderCreate(BaseModel):
     patient_id: UUID
     doctor_id: UUID | None = None
     appointment_id: UUID | None = None
-    scan_ids: list[UUID] = Field(min_length=1)
+    prescription_request_id: UUID | None = None
+    scan_ids: list[UUID] = Field(default_factory=list)
     clinical_notes: str | None = None
+
+    @model_validator(mode="after")
+    def require_scans_or_request(self):
+        if self.prescription_request_id:
+            return self
+        if not self.scan_ids:
+            raise ValueError("Provide at least one scan, or a prescription request")
+        return self
+
+
+# ── Prescription requests ────────────────────────────────────────────────────
+class RadPrescriptionRequestItemResponse(BaseModel):
+    id: UUID
+    scan_id: UUID | None
+    scan_code: str
+    scan_name: str
+    category: str
+    price: float
+    sort_order: int = 0
+    status: RadRequestItemStatus
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RadPrescriptionRequestResponse(BaseModel):
+    id: UUID
+    hospital_id: UUID
+    prescription_id: UUID
+    patient_id: UUID
+    doctor_id: UUID
+    appointment_id: UUID | None = None
+    status: RadPrescriptionRequestStatus
+    prescribed_scan_ids: list[UUID] = []
+    clinical_notes: str | None = None
+    cancel_reason: str | None = None
+    created_at: datetime
+    updated_at: datetime | None = None
+    patient_name: str | None = None
+    patient_uhid: str | None = None
+    doctor_name: str | None = None
+    scan_names: str | None = None
+    scan_count: int = 0
+    pending_scan_count: int = 0
+    appointment_label: str | None = None
+    items: list[RadPrescriptionRequestItemResponse] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RadRequestCancelBody(BaseModel):
+    reason: str | None = None
 
 
 class RadScheduleRequest(BaseModel):
@@ -82,6 +138,8 @@ class RadOrderResponse(BaseModel):
     patient_id: UUID
     doctor_id: UUID | None
     appointment_id: UUID | None = None
+    prescription_id: UUID | None = None
+    prescription_request_id: UUID | None = None
     scan_id: UUID | None
     scan_code: str
     scan_name: str

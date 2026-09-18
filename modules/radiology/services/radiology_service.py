@@ -53,6 +53,8 @@ def order_to_response(order: RadiologyOrder) -> RadOrderResponse:
         patient_id=order.patient_id,
         doctor_id=order.doctor_id,
         appointment_id=order.appointment_id,
+        prescription_id=order.prescription_id,
+        prescription_request_id=order.prescription_request_id,
         scan_id=order.scan_id,
         scan_code=order.scan_code,
         scan_name=order.scan_name,

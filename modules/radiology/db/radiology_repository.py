@@ -17,6 +17,8 @@ from modules.radiology.entities.radiology_entities import (
     RadiologyOrder,
     RadiologyOrderStatus,
     RadiologyScanCatalog,
+    RadPrescriptionRequest,
+    RadPrescriptionRequestStatus,
 )
 
 
@@ -194,6 +196,48 @@ class RadiologyRepository:
                 RadiologyScanCatalog.is_active.is_(True),
             )
             .all()
+        )
+
+    # ── Prescription requests ─────────────────────────────────────────────
+
+    def list_prescription_requests(
+        self,
+        status: RadPrescriptionRequestStatus | None = None,
+        patient_id: UUID | None = None,
+        doctor_id: UUID | None = None,
+    ) -> list[RadPrescriptionRequest]:
+        q = (
+            self.db.query(RadPrescriptionRequest)
+            .options(
+                joinedload(RadPrescriptionRequest.patient),
+                joinedload(RadPrescriptionRequest.doctor),
+                joinedload(RadPrescriptionRequest.items),
+                joinedload(RadPrescriptionRequest.prescription),
+            )
+            .filter(RadPrescriptionRequest.hospital_id == self.hospital_id)
+        )
+        if status:
+            q = q.filter(RadPrescriptionRequest.status == status)
+        if patient_id:
+            q = q.filter(RadPrescriptionRequest.patient_id == patient_id)
+        if doctor_id:
+            q = q.filter(RadPrescriptionRequest.doctor_id == doctor_id)
+        return q.order_by(RadPrescriptionRequest.created_at.desc()).all()
+
+    def get_prescription_request(self, request_id: UUID) -> RadPrescriptionRequest | None:
+        return (
+            self.db.query(RadPrescriptionRequest)
+            .options(
+                joinedload(RadPrescriptionRequest.patient),
+                joinedload(RadPrescriptionRequest.doctor),
+                joinedload(RadPrescriptionRequest.items),
+                joinedload(RadPrescriptionRequest.prescription),
+            )
+            .filter(
+                RadPrescriptionRequest.id == request_id,
+                RadPrescriptionRequest.hospital_id == self.hospital_id,
+            )
+            .first()
         )
 
     def get_dashboard_metrics(self) -> dict[str, int]:
