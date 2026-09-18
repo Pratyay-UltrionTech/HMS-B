@@ -91,9 +91,3 @@ def validate_update_emergency_contact(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
-
-    if patient_mobile and phone and patient_mobile == phone:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Emergency contact number must be different from patient mobile number",
-        )

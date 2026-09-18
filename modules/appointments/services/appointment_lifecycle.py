@@ -140,15 +140,18 @@ def can_complete_appointment(
     db: Session,
     hospital_id: UUID,
     appt: Appointment,
+    *,
+    force: bool = False,
 ) -> tuple[bool, list[str]]:
     """Determine whether visit can transition to completed."""
     if appt.status in TERMINAL:
         return False, [f"Appointment is already {status_display_label(appt.status)}"]
     if appt.status not in {AppointmentStatus.scheduled, IN_PROGRESS}:
         return False, [f"Cannot complete from status {status_display_label(appt.status)}"]
-    blockers = get_open_clinical_blockers(db, hospital_id, appt.id)
-    if blockers:
-        return False, blockers
+    if not force:
+        blockers = get_open_clinical_blockers(db, hospital_id, appt.id)
+        if blockers:
+            return False, blockers
     return True, []
 
 
@@ -156,9 +159,11 @@ def complete_appointment_record(
     db: Session,
     hospital_id: UUID,
     appt: Appointment,
+    *,
+    force: bool = False,
 ) -> tuple[bool, list[str]]:
-    """Mark appointment Completed if clinical dependencies are clear."""
-    ok, blockers = can_complete_appointment(db, hospital_id, appt)
+    """Mark appointment Completed if clinical dependencies are clear (or forced)."""
+    ok, blockers = can_complete_appointment(db, hospital_id, appt, force=force)
     if not ok:
         return False, blockers
     if appt.status == AppointmentStatus.scheduled:

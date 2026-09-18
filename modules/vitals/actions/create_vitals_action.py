@@ -10,6 +10,7 @@ Handles:
 - Audit trail logging via shared audit foundation
 """
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from modules.appointments.entities.enums import AppointmentStatus
@@ -49,9 +50,30 @@ class CreateVitalsAction:
         assert_can_mutate_vitals(appt)
 
         actor = str(user.get("name") or "Staff")
+
+        # Accidental repeated submission prevention:
+        # Check if the exact same vital reading was already submitted in the last 60 seconds
+        recent_threshold = datetime.now(timezone.utc) - timedelta(seconds=60)
+        recent_readings = (
+            self.repo.db.query(VitalReading)
+            .filter(
+                VitalReading.appointment_id == appt.id,
+                VitalReading.created_at >= recent_threshold,
+            )
+            .all()
+        )
+        recent_set = {(r.name.strip().lower(), r.result.strip()) for r in recent_readings}
+
         created: list[VitalReading] = []
         for item in payload.items:
             name, result = validate_vital_item_strings(item.name, item.result)
+            # If an identical reading was just created within the last 60s, reuse it rather than duplicate-inserting
+            if (name.lower(), result) in recent_set:
+                matched = next((r for r in recent_readings if r.name.strip().lower() == name.lower() and r.result.strip() == result), None)
+                if matched and matched not in created:
+                    created.append(matched)
+                continue
+
             suitable = (item.suitable_range or "").strip()
             row = VitalReading(
                 hospital_id=self.repo.hospital_id,

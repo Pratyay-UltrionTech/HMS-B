@@ -214,7 +214,16 @@ class UpdateDoctorAppointmentAction:
         if payload.notes is not None:
             appt.notes = payload.notes.strip() if payload.notes else None
         if payload.status is not None:
-            appt.status = payload.status
+            if payload.status == AppointmentStatus.completed:
+                from modules.appointments.services.appointment_lifecycle import complete_appointment_record
+                ok, blockers = complete_appointment_record(self.db, hospital_id, appt)
+                if not ok:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cannot complete appointment: {'; '.join(blockers)}",
+                    )
+            else:
+                appt.status = payload.status
         if payload.nurse_id is not None:
             appt.nurse_id = payload.nurse_id
 

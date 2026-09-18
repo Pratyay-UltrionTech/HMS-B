@@ -177,6 +177,7 @@ class HospitalUser(Base):
     qualification: Mapped[str | None] = mapped_column(String(255), nullable=True)
     years_of_experience: Mapped[int | None] = mapped_column(Integer, nullable=True)
     consultation_room: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    digital_signature: Mapped[str | None] = mapped_column(Text, nullable=True)
     show_financial_details: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     custom_values: Mapped[dict] = mapped_column(
         JSONB().with_variant(JSON, "sqlite"), nullable=False, default=dict

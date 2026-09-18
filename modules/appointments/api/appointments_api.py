@@ -43,6 +43,7 @@ from modules.appointments.contracts.appointments_contracts import (
     FeePreviewResponse,
     QueueGroup,
     RescheduleRequest,
+    UpdateInitialFindingsRequest,
 )
 from modules.appointments.db.appointments_repository import AppointmentsRepository
 from modules.appointments.db.availability_reader import AvailabilityReader
@@ -115,6 +116,7 @@ def fee_preview(
     department_id: UUID | None = Query(default=None),
     patient_id: UUID | None = Query(default=None),
     appointment_date: date | None = Query(default=None, alias="date"),
+    appointment_date_compat: date | None = Query(default=None, alias="appointment_date"),
     db: Session = Depends(get_db),
     _: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -129,7 +131,7 @@ def fee_preview(
         wing_id=wing_id,
         department_id=department_id,
         patient_id=patient_id,
-        appointment_date=appointment_date,
+        appointment_date=appointment_date if appointment_date is not None else appointment_date_compat,
     )
 
 
@@ -244,12 +246,13 @@ def check_in(
 @router.post("/{appointment_id}/complete", response_model=AppointmentListItem)
 def complete_appointment(
     appointment_id: UUID,
+    force: bool = False,
     db: Session = Depends(get_db),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> AppointmentListItem:
     repo = AppointmentsRepository(db, hospital_id)
-    return CompleteAppointmentAction(db, hospital_id, repo).execute(appointment_id, user)
+    return CompleteAppointmentAction(db, hospital_id, repo).execute(appointment_id, user, force=force)
 
 
 @router.post("/{appointment_id}/cancel", response_model=AppointmentListItem)
@@ -329,3 +332,33 @@ def admit_ipd_from_nurse(
     return AdmitIpdAction(db, hospital_id, repo).execute(
         appointment_id, payload, user
     )
+
+
+@router.put("/{appointment_id}/initial-findings", response_model=AppointmentListItem)
+def update_initial_findings(
+    appointment_id: UUID,
+    payload: UpdateInitialFindingsRequest,
+    db: Session = Depends(get_db),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> AppointmentListItem:
+    repo = AppointmentsRepository(db, hospital_id)
+    appt = repo.get_by_id(appointment_id)
+    if not appt:
+        from modules.appointments.exceptions.appointments_exceptions import AppointmentNotFoundError
+        raise AppointmentNotFoundError()
+    appt.initial_findings = payload.initial_findings.strip() or None
+    from shared.audit import write_audit_log
+    write_audit_log(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="appointment",
+        entity_id=appt.id,
+        summary=f"Updated initial findings for appointment {appt.id}",
+    )
+    db.commit()
+    db.refresh(appt)
+    items = repo.hydrate_appointment_items([appt])
+    return items[0]

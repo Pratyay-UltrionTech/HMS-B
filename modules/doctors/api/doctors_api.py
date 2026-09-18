@@ -10,11 +10,12 @@ from __future__ import annotations
 from datetime import date
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.appointments.entities.enums import AppointmentStatus
+from modules.doctors.entities.doctor import HospitalUser
 from modules.clinical_records.actions.clinical_actions import (
     CreateMedicalRecordAction,
     CreatePrescriptionAction,
@@ -63,6 +64,7 @@ from modules.doctors.contracts.doctor_contracts import (
     DoctorPatientResponse,
     DoctorPatientUpdate,
     DoctorScheduleContext,
+    DoctorSignatureUpdate,
     DoctorSummary,
     HospitalClinicProfile,
     PatientHistoryResponse,
@@ -417,3 +419,31 @@ def get_record_file(
 ):
     resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
     return GetRecordFileAction(db).execute(hospital_id, resolved, record_id)
+
+
+@router.put("/{doctor_id}/signature")
+def update_doctor_signature(
+    doctor_id: UUID,
+    payload: DoctorSignatureUpdate,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
+    doc = db.query(HospitalUser).filter(HospitalUser.id == resolved, HospitalUser.hospital_id == hospital_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    sig = payload.signature_data
+    doc.digital_signature = str(sig).strip() if sig else None
+    from shared.audit.service import write_audit_log
+    write_audit_log(
+        db,
+        hospital_id=hospital_id,
+        actor=user,
+        action="update",
+        entity_type="hospital_user",
+        entity_id=str(doc.id),
+        summary=f"Updated digital signature for doctor {doc.name}",
+    )
+    db.commit()
+    return {"message": "Signature updated successfully", "digital_signature": doc.digital_signature}

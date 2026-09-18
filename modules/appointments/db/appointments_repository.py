@@ -409,6 +409,7 @@ class AppointmentsRepository(BaseRepository[Appointment]):
                     status=a.status,
                     booking_kind=a.booking_kind or "future",
                     notes=a.notes,
+                    initial_findings=a.initial_findings,
                     queue_token=a.queue_token,
                     checked_in_at=a.checked_in_at,
                     created_at=a.created_at,

@@ -84,6 +84,7 @@ class DoctorsRepository:
                     "qualification": d.qualification,
                     "years_of_experience": d.years_of_experience,
                     "consultation_room": d.consultation_room,
+                    "digital_signature": getattr(d, "digital_signature", None),
                     "show_financial_details": getattr(d, "show_financial_details", True),
                     "department_id": d.shift.department_id if d.shift else None,
                     "department_name": None,

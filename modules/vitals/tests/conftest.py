@@ -14,8 +14,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.database import get_db as legacy_get_db
 from infrastructure.postgres import get_transitional_sync_session
+from infrastructure.postgres.session import get_transitional_sync_session as legacy_get_db
 from modules.vitals.api.vitals_api import router as migrated_vitals_router
 from shared.exceptions import register_exception_handlers
 

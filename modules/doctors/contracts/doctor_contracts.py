@@ -28,6 +28,7 @@ class DoctorSummary(BaseModel):
     qualification: str | None = None
     years_of_experience: int | None = None
     consultation_room: str | None = None
+    digital_signature: str | None = None
     show_financial_details: bool = True
     department_id: UUID | None = None
     department_name: str | None = None
@@ -49,6 +50,11 @@ class StaffDoctorOption(BaseModel):
     medical_registration_number: str | None = None
     years_of_experience: int | None = None
     consultation_room: str | None = None
+    digital_signature: str | None = None
+
+
+class DoctorSignatureUpdate(BaseModel):
+    signature_data: str | None = None
 
 
 class DoctorPatientCreate(BaseModel):

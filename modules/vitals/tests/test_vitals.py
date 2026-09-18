@@ -9,22 +9,20 @@ Verifies:
 """
 
 import uuid
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import (
-    Appointment,
-    AppointmentStatus,
-    AuditLog,
-    Hospital,
-    HospitalUser,
-    Patient,
-    VitalReading,
-)
+from modules.appointments.entities.appointment import Appointment
+from modules.appointments.entities.enums import AppointmentStatus
+from modules.doctors.entities.doctor import HospitalUser
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
+from modules.vitals.entities.vital_reading import VitalReading
+from shared.audit.entities.audit_log import AuditLog
 from modules.vitals.actions.create_vitals_action import CreateVitalsAction
 from modules.vitals.actions.get_today_vitals_action import GetTodayVitalsAction
 from modules.vitals.contracts.vitals_contracts import (
@@ -188,7 +186,7 @@ def test_api_super_admin_forbidden(client: TestClient, super_admin_headers: dict
 
 def test_api_missing_hospital_uuid_returns_401(client: TestClient):
     """Token without hospital_uuid returns 401."""
-    from app.utils.auth import create_access_token
+    from shared.auth.jwt import create_access_token
     token = create_access_token({"sub": "staff@test.com", "role": "hospital_staff"})
     resp = client.get("/api/vitals/today", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 401
@@ -516,6 +514,69 @@ def test_api_create_vitals_on_already_waiting_appointment_preserves_token(
     db_session.refresh(appt)
     assert appt.status == AppointmentStatus.waiting
     assert appt.queue_token == 42
+
+
+def test_legitimate_repeated_vitals_recording(
+    client: TestClient,
+    db_session: Session,
+    appointment_factory: Callable,
+    auth_headers: dict[str, str],
+):
+    """Verify that multiple successive legitimate vital checks (e.g. morning check followed by review check 90m later)
+    are both preserved chronologically in the database without overwriting or constraint collision."""
+    appt = appointment_factory(status=AppointmentStatus.scheduled)
+
+    # 1. Morning observation vitals at 10:00
+    t1_payload = {
+        "appointment_id": str(appt.id),
+        "items": [
+            {"name": "Blood Pressure", "result": "140/90", "suitable_range": "90-120"},
+            {"name": "Pulse", "result": "88 bpm"},
+        ],
+    }
+    r1 = client.post("/api/vitals", json=t1_payload, headers=auth_headers)
+    assert r1.status_code == 201, r1.text
+    t1_data = r1.json()
+    assert len(t1_data) == 2
+
+    # Backdate the first set of readings by 90 minutes to simulate real clinical workflow time gap
+    t1_time = datetime.now(timezone.utc) - timedelta(minutes=90)
+    for vital_id in [t1_data[0]["id"], t1_data[1]["id"]]:
+        row = db_session.query(VitalReading).filter_by(id=uuid.UUID(vital_id)).first()
+        if row:
+            row.created_at = t1_time
+            row.recorded_at = t1_time
+    db_session.commit()
+
+    # 2. Later clinical review vitals at 11:30 for the same appointment
+    t2_payload = {
+        "appointment_id": str(appt.id),
+        "items": [
+            {"name": "Blood Pressure", "result": "125/82", "suitable_range": "90-120"},
+            {"name": "Pulse", "result": "74 bpm"},
+        ],
+    }
+    r2 = client.post("/api/vitals", json=t2_payload, headers=auth_headers)
+    assert r2.status_code == 201, r2.text
+    t2_data = r2.json()
+    assert len(t2_data) == 2
+
+    # 3. Retrieve all vitals for this appointment
+    list_resp = client.get(f"/api/vitals?appointment_id={appt.id}", headers=auth_headers)
+    assert list_resp.status_code == 200, list_resp.text
+    all_vitals = list_resp.json()
+
+    # Must contain 4 separate readings: 2 from T1 and 2 from T2
+    assert len(all_vitals) == 4
+    bp_readings = [v for v in all_vitals if v["name"] == "Blood Pressure"]
+    pulse_readings = [v for v in all_vitals if v["name"] == "Pulse"]
+    assert len(bp_readings) == 2
+    assert len(pulse_readings) == 2
+
+    bp_results = {v["result"] for v in bp_readings}
+    assert bp_results == {"140/90", "125/82"}
+    pulse_results = {v["result"] for v in pulse_readings}
+    assert pulse_results == {"88 bpm", "74 bpm"}
 
 
 def test_api_update_vital_success_and_audit(

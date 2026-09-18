@@ -45,6 +45,7 @@ from modules.doctors.contracts.doctor_contracts import (
 from modules.doctors.db.doctors_repository import DoctorsRepository
 from modules.doctors.entities.doctor import HospitalUser
 from modules.inpatient.entities.admission import Admission, IpdFormSubmission
+from modules.patients.db.profile_reader import PatientProfileReader
 from modules.patients.entities.patient import Patient
 from modules.vitals.contracts.vitals_contracts import VitalReadingResponse
 from modules.vitals.entities.vital_reading import VitalReading
@@ -249,6 +250,7 @@ class UpdateDoctorPatientAction:
 
 class ListDoctorPatientsAction:
     def __init__(self, db: Session) -> None:
+        self.db = db
         self.repo = DoctorsRepository(db)
 
     def execute(
@@ -260,7 +262,14 @@ class ListDoctorPatientsAction:
         offset: int = 0,
     ) -> list[DoctorPatientResponse]:
         patients = self.repo.list_doctor_patients(hospital_id, doctor_id, search, limit=limit, offset=offset)
-        return [to_doctor_patient_response(p) for p in patients]
+        if not patients:
+            return []
+        patient_ids = [p.id for p in patients]
+        last_visits = PatientProfileReader(self.db, hospital_id).get_bulk_last_visits(patient_ids)
+        return [
+            to_doctor_patient_response(p, last_visit=last_visits.get(p.id))
+            for p in patients
+        ]
 
 
 class GetDoctorPatientHistoryAction:
@@ -307,14 +316,14 @@ class GetDoctorPatientHistoryAction:
         prescriptions = (
             self.db.query(Prescription)
             .options(joinedload(Prescription.patient), joinedload(Prescription.doctor))
-            .filter(Prescription.doctor_id == doctor_id, Prescription.patient_id == patient_id)
+            .filter(Prescription.hospital_id == hospital_id, Prescription.patient_id == patient_id)
             .order_by(Prescription.created_at.desc())
             .all()
         )
         records = (
             self.db.query(MedicalRecord)
             .options(joinedload(MedicalRecord.patient), joinedload(MedicalRecord.doctor))
-            .filter(MedicalRecord.doctor_id == doctor_id, MedicalRecord.patient_id == patient_id)
+            .filter(MedicalRecord.hospital_id == hospital_id, MedicalRecord.patient_id == patient_id)
             .order_by(MedicalRecord.created_at.desc())
             .all()
         )
@@ -333,6 +342,109 @@ class GetDoctorPatientHistoryAction:
 
         last_appt = appointments[0] if appointments else None
         last_rx = prescriptions[0] if prescriptions else None
+
+        # Complete diagnostics for the prescription workspace: the Details modal
+        # links MedicalRecords via lab_order_id / radiology_order_id, so the
+        # history must actually carry the full orders (results, findings,
+        # file flags). Previously these lists were always empty.
+        lab_orders_payload: list[Any] = []
+        radiology_orders_payload: list[Any] = []
+        try:
+            from modules.laboratory.entities.lab_entities import LabOrder
+
+            lab_orders = (
+                self.db.query(LabOrder)
+                .options(joinedload(LabOrder.patient), joinedload(LabOrder.doctor))
+                .filter(
+                    LabOrder.hospital_id == hospital_id,
+                    LabOrder.patient_id == patient_id,
+                )
+                .order_by(LabOrder.ordered_at.desc())
+                .all()
+            )
+            for o in lab_orders:
+                items = list(o.items or [])
+                panel_names = sorted({i.panel_name for i in items if i.panel_name})
+                lab_orders_payload.append(
+                    {
+                        "id": str(o.id),
+                        "order_no": o.order_no,
+                        "status": o.status.value if hasattr(o.status, "value") else str(o.status),
+                        "ordered_at": o.ordered_at.isoformat() if o.ordered_at else None,
+                        "appointment_id": str(o.appointment_id) if o.appointment_id else None,
+                        "doctor_name": o.doctor.name if o.doctor else None,
+                        "ordered_by_name": o.ordered_by_name,
+                        "test_names": ", ".join(i.test_name for i in items) if items else None,
+                        "patient_name": o.patient.name if o.patient else None,
+                        "items": [
+                            {
+                                "id": str(i.id),
+                                "test_id": str(i.test_id) if i.test_id else None,
+                                "panel_id": str(i.panel_id) if getattr(i, "panel_id", None) else None,
+                                "panel_name": i.panel_name,
+                                "test_code": i.test_code,
+                                "test_name": i.test_name,
+                                "department": i.department,
+                                "price": float(i.price or 0),
+                                "status": i.status.value if hasattr(i.status, "value") else str(i.status),
+                            }
+                            for i in items
+                        ],
+                        "results": [
+                            {
+                                "id": str(r.id),
+                                "order_item_id": str(r.order_item_id) if r.order_item_id else None,
+                                "parameter_name": r.parameter_name,
+                                "result_value": r.result_value,
+                                "unit": r.unit,
+                                "reference_range": r.reference_range,
+                                "remarks": r.remarks,
+                            }
+                            for r in (o.results or [])
+                        ],
+                    }
+                )
+        except Exception:
+            lab_orders_payload = []
+        try:
+            from modules.radiology.entities.radiology_entities import RadiologyOrder
+            from modules.radiology.services.radiology_service import order_to_response
+
+            rad_orders = (
+                self.db.query(RadiologyOrder)
+                .options(joinedload(RadiologyOrder.patient), joinedload(RadiologyOrder.doctor))
+                .filter(
+                    RadiologyOrder.hospital_id == hospital_id,
+                    RadiologyOrder.patient_id == patient_id,
+                )
+                .order_by(RadiologyOrder.ordered_at.desc())
+                .all()
+            )
+            for o in rad_orders:
+                try:
+                    radiology_orders_payload.append(order_to_response(o).model_dump(mode="json"))
+                except Exception:
+                    radiology_orders_payload.append(
+                        {
+                            "id": str(o.id),
+                            "order_no": o.order_no,
+                            "status": o.status.value if hasattr(o.status, "value") else str(o.status),
+                            "ordered_at": o.ordered_at.isoformat() if o.ordered_at else None,
+                            "appointment_id": str(o.appointment_id) if o.appointment_id else None,
+                            "scan_name": o.scan_name,
+                            "scan_code": o.scan_code,
+                            "doctor_name": o.doctor.name if o.doctor else None,
+                            "ordered_by_name": o.ordered_by_name,
+                            "has_report_file": bool(o.report_file_name),
+                            "has_image_file": bool(o.image_file_name),
+                            "findings": o.findings,
+                            "impression": o.impression,
+                            "remarks": o.remarks,
+                            "report_date": o.report_date.isoformat() if o.report_date else None,
+                        }
+                    )
+        except Exception:
+            radiology_orders_payload = []
 
         doctor = self.repo.get_doctor(hospital_id, doctor_id)
         financial_summary = None
@@ -362,6 +474,8 @@ class GetDoctorPatientHistoryAction:
                 for p in prescriptions
             ],
             medical_records=[to_record_response(r) for r in records],
+            lab_orders=lab_orders_payload,
+            radiology_orders=radiology_orders_payload,
             vitals=[VitalReadingResponse.model_validate(v) for v in vitals],
             ipd_forms=[
                 IpdFormHistoryItem(

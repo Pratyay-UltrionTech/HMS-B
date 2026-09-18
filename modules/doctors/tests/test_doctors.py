@@ -23,7 +23,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Hospital, HospitalUser, Patient, StaffRole
+from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.doctors.api.doctors_api import router as doctors_router
 from modules.doctors.entities.doctor import DoctorLeave, ShiftType
@@ -337,5 +339,114 @@ def test_get_doctor_patient_history(
     assert appt_resp["admission_ward"] == "General Ward"
     assert appt_resp["admission_bed"] == "B-101"
     assert appt_resp["admission_status"] == "admitted"
+
+
+def test_direct_backend_completion_diagnostic_blockers_enforced(
+    client: TestClient,
+    doctor_auth_headers: dict[str, str],
+    doctor_user: HospitalUser,
+    db_session: Session,
+    hospital: Hospital,
+):
+    """Verify that direct PUT /api/doctors/{id}/appointments/{id} enforcing status=completed
+    reaches canonical blocker validation and rejects completion when open lab orders exist.
+    """
+    from modules.appointments.entities.appointment import Appointment
+    from modules.appointments.entities.enums import AppointmentStatus
+    from modules.laboratory.entities.lab_entities import LabOrder, LabOrderStatus
+
+    patient = Patient(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        uhid="P-BLK-01",
+        name="Blocker Test Patient",
+        gender="Male",
+        mobile="9876543210",
+    )
+    db_session.add(patient)
+    db_session.commit()
+
+    appt = Appointment(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        doctor_id=doctor_user.id,
+        patient_id=patient.id,
+        appointment_date=date.today(),
+        appointment_time=time(11, 0),
+        purpose="Investigation Consultation",
+        status=AppointmentStatus.scheduled,
+    )
+    db_session.add(appt)
+    db_session.commit()
+
+    # Create an open diagnostic blocker (lab order)
+    lab_order = LabOrder(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        order_no="LAB-TEST-001",
+        patient_id=patient.id,
+        appointment_id=appt.id,
+        doctor_id=doctor_user.id,
+        status=LabOrderStatus.ordered,
+        ordered_by_name="Dr. Test",
+    )
+    db_session.add(lab_order)
+    db_session.commit()
+
+    # 1. Attempt to bypass completion via direct doctor appointment update
+    res = client.put(
+        f"/api/doctors/{doctor_user.id}/appointments/{appt.id}",
+        json={"status": "completed"},
+        headers=doctor_auth_headers,
+    )
+    assert res.status_code == 400, res.text
+    assert "Cannot complete appointment" in res.json()["detail"]
+    assert "Lab order LAB-TEST-001 is ordered" in res.json()["detail"]
+
+    # 2. Complete the lab order
+    lab_order.status = LabOrderStatus.completed
+    db_session.commit()
+
+    # 3. Re-attempt completion - now should succeed cleanly
+    res_ok = client.put(
+        f"/api/doctors/{doctor_user.id}/appointments/{appt.id}",
+        json={"status": "completed"},
+        headers=doctor_auth_headers,
+    )
+    assert res_ok.status_code == 200, res_ok.text
+    assert res_ok.json()["status"] == "completed"
+
+
+def test_doctor_signature_update_and_persistence(
+    client: TestClient,
+    doctor_auth_headers: dict[str, str],
+    doctor_user: HospitalUser,
+    db_session: Session,
+):
+    """Verify PUT /api/doctors/{id}/signature updates digital_signature and persists."""
+    sig_payload = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+    res = client.put(
+        f"/api/doctors/{doctor_user.id}/signature",
+        json={"signature_data": sig_payload},
+        headers=doctor_auth_headers,
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["message"] == "Signature updated successfully"
+    assert body["digital_signature"] == sig_payload
+
+    # Verify directly in DB
+    db_session.refresh(doctor_user)
+    assert doctor_user.digital_signature == sig_payload
+
+    # Clear signature
+    res_clear = client.put(
+        f"/api/doctors/{doctor_user.id}/signature",
+        json={"signature_data": None},
+        headers=doctor_auth_headers,
+    )
+    assert res_clear.status_code == 200
+    assert res_clear.json()["digital_signature"] is None
 
 

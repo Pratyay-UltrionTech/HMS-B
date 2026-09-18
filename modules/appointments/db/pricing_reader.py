@@ -105,6 +105,19 @@ class PricingReader:
         if not rows:
             return None
 
+        # When a specific appointment type is requested, only consider rows
+        # for that exact type or generic rows (NULL type). Otherwise an
+        # unrelated type's tariff could win with score 0 and show wrong price.
+        if appt_type_id:
+            filtered = [
+                r
+                for r in rows
+                if r["appointment_type_id"] == appt_type_id or r["appointment_type_id"] is None
+            ]
+            if not filtered:
+                return None
+            rows = filtered
+
         def _score(r):
             score = 0
             if appt_type_id and r["appointment_type_id"] == appt_type_id:

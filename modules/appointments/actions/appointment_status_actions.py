@@ -87,12 +87,18 @@ class CompleteAppointmentAction:
         self.hospital_id = hospital_id
         self.repo = repo
 
-    def execute(self, appointment_id: UUID, user: dict[str, Any]) -> AppointmentListItem:
+    def execute(
+        self,
+        appointment_id: UUID,
+        user: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> AppointmentListItem:
         appt = self.repo.get_by_id(appointment_id)
         if not appt:
             raise AppointmentNotFoundError()
 
-        ok, blockers = complete_appointment_record(self.db, self.hospital_id, appt)
+        ok, blockers = complete_appointment_record(self.db, self.hospital_id, appt, force=force)
         if not ok:
             raise AppointmentValidationError(f"Cannot complete appointment: {'; '.join(blockers)}")
 

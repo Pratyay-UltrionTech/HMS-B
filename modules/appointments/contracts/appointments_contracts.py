@@ -94,8 +94,6 @@ class BookAppointmentRequest(BaseModel):
                 "Provide patient_id for an existing patient, or first_name, last_name, mobile, "
                 "gender, date_of_birth, age, and emergency_contact to auto-register"
             )
-        if self.mobile and self.emergency_contact and self.mobile == self.emergency_contact:
-            raise ValueError("Emergency contact number must be different from patient mobile number")
         return self
 
 
@@ -132,6 +130,7 @@ class AppointmentListItem(BaseModel):
     status: AppointmentStatus
     booking_kind: str = "future"
     notes: str | None = None
+    initial_findings: str | None = None
     queue_token: int | None = None
     checked_in_at: datetime | None = None
     created_at: datetime
@@ -144,6 +143,10 @@ class AppointmentListItem(BaseModel):
     ip_id: str | None = None
     nurse_id: uuid.UUID | None = None
     nurse_name: str | None = None
+
+
+class UpdateInitialFindingsRequest(BaseModel):
+    initial_findings: str = Field(default="", max_length=5000)
 
 
 class AssignNurseRequest(BaseModel):
