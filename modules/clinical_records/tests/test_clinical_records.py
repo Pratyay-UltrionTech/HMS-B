@@ -12,7 +12,7 @@ Verifies:
 8. Multi-tenant isolation for clinical records and prescriptions.
 """
 
-from datetime import date
+from datetime import date, time
 from uuid import uuid4
 
 import pytest
@@ -20,7 +20,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Hospital, HospitalUser, Patient, StaffRole
+from modules.appointments.entities.appointment import Appointment
+from modules.appointments.entities.enums import AppointmentStatus
+from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.doctors.api.doctors_api import router as doctors_router
 from shared.auth.jwt import create_access_token
@@ -211,4 +215,324 @@ def test_medical_record_crud_and_file_download(
     assert file_res.status_code == 200
     file_info = file_res.json()
     assert file_info["file_name"] == "cbc_report.pdf"
+    assert "base64" in file_info["file_data"]
+
+
+def test_historical_prescription_integrity_cannot_edit_completed_visit(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    doctor_with_role: HospitalUser,
+    test_patient: Patient,
+    db_session: Session,
+    hospital: Hospital,
+):
+    """Historical integrity: prescriptions belonging to completed or inpatient-transferred visits are strictly read-only."""
+    doc_id = str(doctor_with_role.id)
+
+    # 1. Create appointment
+    appt = Appointment(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        patient_id=test_patient.id,
+        doctor_id=doctor_with_role.id,
+        appointment_date=date.today(),
+        appointment_time=time(10, 0),
+        status=AppointmentStatus.scheduled,
+        purpose="Cardiology Review",
+    )
+    db_session.add(appt)
+    db_session.commit()
+
+    # 2. Issue prescription linked to this appointment
+    create_payload = {
+        "patient_id": str(test_patient.id),
+        "appointment_id": str(appt.id),
+        "symptoms": "Chest pain",
+        "diagnosis": "Angina",
+        "medicines": "Nitroglycerin",
+        "dosage": "Sublingual as needed",
+        "status": "issued",
+    }
+    create_res = client.post(
+        f"/api/doctors/{doc_id}/prescriptions",
+        json=create_payload,
+        headers=auth_headers,
+    )
+    assert create_res.status_code == 201, create_res.text
+    rx_id = create_res.json()["id"]
+
+    # 3. Mark appointment as completed
+    appt.status = AppointmentStatus.completed
+    db_session.commit()
+
+    # 4. Attempt to edit the prescription for the completed visit
+    put_res = client.put(
+        f"/api/doctors/{doc_id}/prescriptions/{rx_id}",
+        json={"diagnosis": "Unstable Angina", "medicines": "Aspirin, Nitroglycerin"},
+        headers=auth_headers,
+    )
+    assert put_res.status_code == 400, put_res.text
+    assert "Cannot edit a prescription after the visit is marked completed or transferred to inpatient" in put_res.json()["detail"]
+
+    # 5. Switch visit to transferred_to_inpatient and verify guard also prevents edits
+    appt.status = AppointmentStatus.transferred_to_inpatient
+    db_session.commit()
+
+    put_res2 = client.put(
+        f"/api/doctors/{doc_id}/prescriptions/{rx_id}",
+        json={"dosage": "Daily"},
+        headers=auth_headers,
+    )
+    assert put_res2.status_code == 400, put_res2.text
+    assert "Cannot edit a prescription after the visit is marked completed or transferred to inpatient" in put_res2.json()["detail"]
+
+
+def test_draft_prescription_lifecycle_and_validation(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    doctor_with_role: HospitalUser,
+    test_patient: Patient,
+):
+    """Verify drafts allow relaxed content, reject incomplete issue attempts, and issue cleanly when complete."""
+    doc_id = str(doctor_with_role.id)
+
+    # 1. Save partial draft with empty symptoms, diagnosis, and medicines
+    draft_payload = {
+        "patient_id": str(test_patient.id),
+        "symptoms": "",
+        "diagnosis": "",
+        "medicines": "",
+        "dosage": "",
+        "advice": "Preliminary draft notes",
+        "status": "draft",
+    }
+    create_res = client.post(
+        f"/api/doctors/{doc_id}/prescriptions",
+        json=draft_payload,
+        headers=auth_headers,
+    )
+    assert create_res.status_code == 201, create_res.text
+    draft_data = create_res.json()
+    assert draft_data["status"] == "draft"
+    rx_id = draft_data["id"]
+
+    # 2. Attempt to transition draft to 'issued' while missing required clinical content (e.g. diagnosis)
+    invalid_issue_payload = {
+        "status": "issued",
+        "symptoms": "Persistent headache",
+        "diagnosis": "",
+        "medicines": "Paracetamol 500mg",
+        "dosage": "1 SOS",
+    }
+    bad_put_res = client.put(
+        f"/api/doctors/{doc_id}/prescriptions/{rx_id}",
+        json=invalid_issue_payload,
+        headers=auth_headers,
+    )
+    assert bad_put_res.status_code == 400, bad_put_res.text
+    assert "Diagnosis is required to issue prescription" in bad_put_res.json()["detail"]
+
+    # 3. Transition draft to 'issued' with full clinical data
+    valid_issue_payload = {
+        "status": "issued",
+        "symptoms": "Persistent headache and photophobia",
+        "diagnosis": "Migraine without aura",
+        "medicines": "Sumatriptan 50mg, Paracetamol 650mg",
+        "dosage": "1 tablet at onset, 1 tablet TID PRN",
+        "advice": "Rest in a quiet, dark room. Hydrate adequately.",
+    }
+    ok_put_res = client.put(
+        f"/api/doctors/{doc_id}/prescriptions/{rx_id}",
+        json=valid_issue_payload,
+        headers=auth_headers,
+    )
+    assert ok_put_res.status_code == 200, ok_put_res.text
+    issued_data = ok_put_res.json()
+    assert issued_data["status"] == "issued"
+    assert issued_data["diagnosis"] == "Migraine without aura"
+    assert issued_data["medicines"] == "Sumatriptan 50mg, Paracetamol 650mg"
+
+
+def test_draft_linked_to_specific_appointment_not_cross_contaminated(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    doctor_with_role: HospitalUser,
+    test_patient: Patient,
+    db_session: Session,
+    hospital: Hospital,
+):
+    """Verify that drafts are strictly linked to specific encounters and multiple encounters retain distinct drafts."""
+    doc_id = str(doctor_with_role.id)
+
+    # Encounter 1
+    appt1 = Appointment(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        patient_id=test_patient.id,
+        doctor_id=doctor_with_role.id,
+        appointment_date=date.today(),
+        appointment_time=time(9, 0),
+        status=AppointmentStatus.scheduled,
+        purpose="Cardiology Visit",
+    )
+    # Encounter 2
+    appt2 = Appointment(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        patient_id=test_patient.id,
+        doctor_id=doctor_with_role.id,
+        appointment_date=date.today(),
+        appointment_time=time(14, 0),
+        status=AppointmentStatus.scheduled,
+        purpose="Follow-up Review",
+    )
+    db_session.add_all([appt1, appt2])
+    db_session.commit()
+
+    # Draft for Encounter 1
+    r1 = client.post(
+        f"/api/doctors/{doc_id}/prescriptions",
+        json={
+            "patient_id": str(test_patient.id),
+            "appointment_id": str(appt1.id),
+            "status": "draft",
+            "symptoms": "Palpitations",
+            "diagnosis": "Sinus Tachycardia",
+            "medicines": "Metoprolol 25mg",
+            "dosage": "1 OD",
+        },
+        headers=auth_headers,
+    )
+    assert r1.status_code == 201
+    draft1_id = r1.json()["id"]
+
+    # Draft for Encounter 2
+    r2 = client.post(
+        f"/api/doctors/{doc_id}/prescriptions",
+        json={
+            "patient_id": str(test_patient.id),
+            "appointment_id": str(appt2.id),
+            "status": "draft",
+            "symptoms": "Mild Fatigue",
+            "diagnosis": "Observation",
+            "medicines": "Multivitamin",
+            "dosage": "1 OD",
+        },
+        headers=auth_headers,
+    )
+    assert r2.status_code == 201
+    draft2_id = r2.json()["id"]
+
+    # List all prescriptions for patient
+    list_res = client.get(
+        f"/api/doctors/{doc_id}/prescriptions?patient_id={test_patient.id}",
+        headers=auth_headers,
+    )
+    assert list_res.status_code == 200
+    all_rx = list_res.json()
+
+    # Verify each draft is linked specifically to its respective appointment
+    rx1 = next((p for p in all_rx if p["id"] == draft1_id), None)
+    rx2 = next((p for p in all_rx if p["id"] == draft2_id), None)
+    assert rx1 is not None and rx1["appointment_id"] == str(appt1.id)
+    assert rx2 is not None and rx2["appointment_id"] == str(appt2.id)
+    assert rx1["diagnosis"] == "Sinus Tachycardia"
+    assert rx2["diagnosis"] == "Observation"
+
+
+def test_cross_doctor_patient_diagnostic_records_and_history(
+    client: TestClient,
+    doctor_with_role: HospitalUser,
+    test_patient: Patient,
+    db_session: Session,
+    hospital: Hospital,
+):
+    """Verifies that when a patient visits Doctor A and then Doctor B, Doctor B can see all diagnostic records & reports."""
+    # Create Doctor B in same hospital
+    doc_b = HospitalUser(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        role_id=doctor_with_role.role_id,
+        name="Dr. Second Consultant",
+        email="doctor_b@hospital.com",
+        phone="9876500002",
+        password_hash="pwd",
+        specialization="Cardiology",
+        is_active=True,
+    )
+    db_session.add(doc_b)
+    db_session.commit()
+
+    token_a = create_access_token({
+        "sub": doctor_with_role.email,
+        "name": doctor_with_role.name,
+        "role": "hospital_staff",
+        "hospital_uuid": str(hospital.id),
+        "user_id": str(doctor_with_role.id),
+        "doctor_id": str(doctor_with_role.id),
+    })
+    headers_a = {"Authorization": f"Bearer {token_a}"}
+
+    token_b = create_access_token({
+        "sub": doc_b.email,
+        "name": doc_b.name,
+        "role": "hospital_staff",
+        "hospital_uuid": str(hospital.id),
+        "user_id": str(doc_b.id),
+        "doctor_id": str(doc_b.id),
+    })
+    headers_b = {"Authorization": f"Bearer {token_b}"}
+
+    # 1. Doctor A creates a medical/diagnostic record with an attached file
+    rec_res = client.post(
+        f"/api/doctors/{doctor_with_role.id}/records",
+        json={
+            "patient_id": str(test_patient.id),
+            "report_type": "Lab Report",
+            "title": "Lipid Profile",
+            "notes": "Cholesterol: 210 mg/dL",
+            "file_name": "lipid_profile.pdf",
+            "file_data": "data:application/pdf;base64,JVBERi0xLjQKJ...",
+        },
+        headers=headers_a,
+    )
+    assert rec_res.status_code == 201
+    rec_id = rec_res.json()["id"]
+
+    # 2. Patient now has appointment with Doctor B
+    appt_b = Appointment(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        patient_id=test_patient.id,
+        doctor_id=doc_b.id,
+        appointment_date=date.today(),
+        appointment_time=time(11, 0),
+        status=AppointmentStatus.scheduled,
+        purpose="Second Opinion",
+    )
+    db_session.add(appt_b)
+    db_session.commit()
+
+    # 3. Doctor B opens patient history
+    hist_res = client.get(
+        f"/api/doctors/{doc_b.id}/patients/{test_patient.id}",
+        headers=headers_b,
+    )
+    assert hist_res.status_code == 200, hist_res.text
+    history = hist_res.json()
+
+    # Doctor B must see Doctor A's diagnostic record in patient history
+    med_records = history.get("medical_records", [])
+    found_rec = next((r for r in med_records if r["id"] == rec_id), None)
+    assert found_rec is not None
+    assert found_rec["title"] == "Lipid Profile"
+
+    # 4. Doctor B can open and view/download the report file
+    file_res = client.get(
+        f"/api/doctors/{doc_b.id}/records/{rec_id}/file",
+        headers=headers_b,
+    )
+    assert file_res.status_code == 200
+    file_info = file_res.json()
+    assert file_info["file_name"] == "lipid_profile.pdf"
     assert "base64" in file_info["file_data"]

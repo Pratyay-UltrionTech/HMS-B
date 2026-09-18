@@ -274,7 +274,49 @@ def create_investigation_requests_for_prescription(
                 db.add(item)
             db.flush()
 
-    return lab_req, None
+    rad_req = None
+    if scan_ids:
+        from modules.radiology.entities.radiology_entities import (
+            RadPrescriptionRequest,
+            RadPrescriptionRequestItem,
+            RadPrescriptionRequestStatus,
+            RadRequestItemStatus,
+        )
+        from modules.radiology.services.rad_prescription_service import (
+            resolve_rad_selection,
+        )
+
+        scans_resolved = resolve_rad_selection(db, hospital_id, scan_ids)
+        if scans_resolved:
+            rad_req = RadPrescriptionRequest(
+                hospital_id=hospital_id,
+                prescription_id=prescription_id,
+                patient_id=patient_id,
+                doctor_id=doctor_id,
+                appointment_id=appointment_id,
+                status=RadPrescriptionRequestStatus.pending,
+                prescribed_scan_ids=[str(sid) for sid in (scan_ids or [])],
+                clinical_notes=clinical_notes,
+            )
+            db.add(rad_req)
+            db.flush()
+
+            for idx, s in enumerate(scans_resolved):
+                item = RadPrescriptionRequestItem(
+                    hospital_id=hospital_id,
+                    request_id=rad_req.id,
+                    scan_id=s.id,
+                    scan_code=s.scan_code,
+                    scan_name=s.scan_name,
+                    category=s.category,
+                    price=s.price,
+                    sort_order=idx,
+                    status=RadRequestItemStatus.pending,
+                )
+                db.add(item)
+            db.flush()
+
+    return lab_req, rad_req
 
 
 def prescription_investigation_names(

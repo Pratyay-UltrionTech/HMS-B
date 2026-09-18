@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from modules.appointments.entities.appointment import Appointment
 from modules.appointments.entities.enums import AppointmentStatus
+from modules.appointments.services.appointment_lifecycle import mark_in_progress
 from modules.clinical_records.contracts.clinical_contracts import (
     MedicalRecordCreate,
     MedicalRecordResponse,
@@ -54,6 +55,7 @@ def to_prescription_response(
         follow_up_date=p.follow_up_date,
         signature_data=p.signature_data,
         has_signature=bool(p.signature_data),
+        status=getattr(p, "status", "issued") or "issued",
         created_at=p.created_at,
         patient_name=p.patient.name if p.patient else None,
         patient_mobile=p.patient.mobile if p.patient else None,
@@ -114,8 +116,18 @@ class CreatePrescriptionAction:
             )
             if appt:
                 appt_status = appt.status
-                if appt.status in (AppointmentStatus.scheduled, AppointmentStatus.waiting):
-                    appt.status = AppointmentStatus.in_progress
+                mark_in_progress(appt)
+
+        status = payload.status or "issued"
+        if status != "draft":
+            if not payload.symptoms.strip():
+                raise HTTPException(status_code=400, detail="Symptoms are required to issue prescription")
+            if not payload.diagnosis.strip():
+                raise HTTPException(status_code=400, detail="Diagnosis is required to issue prescription")
+            if not payload.medicines.strip():
+                raise HTTPException(status_code=400, detail="Medicines are required to issue prescription")
+            if not payload.dosage.strip():
+                raise HTTPException(status_code=400, detail="Dosage is required to issue prescription")
 
         rx = Prescription(
             hospital_id=hospital_id,
@@ -129,6 +141,7 @@ class CreatePrescriptionAction:
             advice=payload.advice.strip() if payload.advice else None,
             follow_up_date=payload.follow_up_date,
             signature_data=payload.signature_data,
+            status=status,
         )
         self.db.add(rx)
         self.db.flush()
@@ -185,6 +198,9 @@ class UpdatePrescriptionAction:
         if not rx:
             raise HTTPException(status_code=404, detail="Prescription not found")
 
+        if rx.doctor_id != doctor_id and actor.get("role") != "hospital_admin":
+            raise HTTPException(status_code=403, detail="Cannot edit a prescription written by another doctor")
+
         appt_status: AppointmentStatus | None = None
         target_appt_id = payload.appointment_id or rx.appointment_id
         if target_appt_id:
@@ -204,20 +220,38 @@ class UpdatePrescriptionAction:
                         detail="Cannot edit a prescription after the visit is marked completed or transferred to inpatient",
                     )
 
+        target_status = payload.status if payload.status is not None else getattr(rx, "status", "issued")
+        new_symptoms = payload.symptoms.strip() if payload.symptoms is not None else (rx.symptoms or "")
+        new_diagnosis = payload.diagnosis.strip() if payload.diagnosis is not None else (rx.diagnosis or "")
+        new_medicines = payload.medicines.strip() if payload.medicines is not None else (rx.medicines or "")
+        new_dosage = payload.dosage.strip() if payload.dosage is not None else (rx.dosage or "")
+
+        if target_status != "draft":
+            if not new_symptoms:
+                raise HTTPException(status_code=400, detail="Symptoms are required to issue prescription")
+            if not new_diagnosis:
+                raise HTTPException(status_code=400, detail="Diagnosis is required to issue prescription")
+            if not new_medicines:
+                raise HTTPException(status_code=400, detail="Medicines are required to issue prescription")
+            if not new_dosage:
+                raise HTTPException(status_code=400, detail="Dosage is required to issue prescription")
+
         if payload.symptoms is not None:
-            rx.symptoms = payload.symptoms.strip()
+            rx.symptoms = new_symptoms
         if payload.diagnosis is not None:
-            rx.diagnosis = payload.diagnosis.strip()
+            rx.diagnosis = new_diagnosis
         if payload.medicines is not None:
-            rx.medicines = payload.medicines.strip()
+            rx.medicines = new_medicines
         if payload.dosage is not None:
-            rx.dosage = payload.dosage.strip()
+            rx.dosage = new_dosage
         if payload.advice is not None:
             rx.advice = payload.advice.strip() if payload.advice else None
         if payload.follow_up_date is not None:
             rx.follow_up_date = payload.follow_up_date
         if payload.signature_data is not None:
             rx.signature_data = payload.signature_data
+        if payload.status is not None:
+            rx.status = payload.status
 
         write_audit_log(
             self.db,

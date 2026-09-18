@@ -754,6 +754,20 @@ class PharmacyActions:
     def create_sale(self, payload: SaleCreate) -> SaleResponse:
         actor = actor_name(self.user)
         today = payload.sale_date or date.today()
+
+        if payload.prescription_id:
+            from modules.clinical_records.entities.clinical_record import Prescription
+            rx = (
+                self.db.query(Prescription)
+                .filter(Prescription.id == payload.prescription_id, Prescription.hospital_id == self.hospital_id)
+                .first()
+            )
+            if rx and getattr(rx, "status", None) == "draft":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot dispense medication for a draft prescription. Prescription must be issued.",
+                )
+
         invoice_number = next_doc_number(self.db, self.hospital_id, PharmacySale, "invoice_number", "SAL")
 
         sale = PharmacySale(

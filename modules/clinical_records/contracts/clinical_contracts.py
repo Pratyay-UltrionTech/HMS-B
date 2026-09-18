@@ -17,13 +17,14 @@ from modules.appointments.entities.enums import AppointmentStatus
 class PrescriptionCreate(BaseModel):
     patient_id: UUID
     appointment_id: UUID | None = None
-    symptoms: str = Field(min_length=1)
-    diagnosis: str = Field(min_length=1)
-    medicines: str = Field(min_length=1)
-    dosage: str = Field(min_length=1)
+    symptoms: str = Field(default="")
+    diagnosis: str = Field(default="")
+    medicines: str = Field(default="")
+    dosage: str = Field(default="")
     advice: str | None = None
     follow_up_date: date | None = None
     signature_data: str | None = None
+    status: str = "issued"
     test_ids: list[UUID] = Field(default_factory=list)
     panel_ids: list[UUID] = Field(default_factory=list)
     scan_ids: list[UUID] = Field(default_factory=list)
@@ -31,13 +32,14 @@ class PrescriptionCreate(BaseModel):
 
 class PrescriptionUpdate(BaseModel):
     appointment_id: UUID | None = None
-    symptoms: str | None = Field(default=None, min_length=1)
-    diagnosis: str | None = Field(default=None, min_length=1)
-    medicines: str | None = Field(default=None, min_length=1)
-    dosage: str | None = Field(default=None, min_length=1)
+    symptoms: str | None = None
+    diagnosis: str | None = None
+    medicines: str | None = None
+    dosage: str | None = None
     advice: str | None = None
     follow_up_date: date | None = None
     signature_data: str | None = None
+    status: str | None = None
 
 
 class PrescriptionResponse(BaseModel):
@@ -54,6 +56,7 @@ class PrescriptionResponse(BaseModel):
     follow_up_date: date | None = None
     signature_data: str | None = None
     has_signature: bool = False
+    status: str = "issued"
     created_at: datetime
     patient_name: str | None = None
     patient_mobile: str | None = None

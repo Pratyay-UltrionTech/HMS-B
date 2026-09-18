@@ -74,6 +74,10 @@ class PrescriptionHtmlService:
             if not body.strip():
                 body = "—"
 
+        def _has_content(value: object) -> bool:
+            text = str(value or "").strip()
+            return bool(text) and text != "—"
+
         vitals_block = ""
         if vitals:
             rows = "".join(
@@ -89,6 +93,22 @@ class PrescriptionHtmlService:
           <thead><tr><th>Name</th><th>Result</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
+      </div>"""
+
+        symptoms_block = ""
+        if _has_content(rx.symptoms):
+            symptoms_block = f"""
+      <div class="section">
+        <p class="section-title">Clinical Notes / Chief Complaints</p>
+        <p class="section-body">{html_escape(str(rx.symptoms).strip())}</p>
+      </div>"""
+
+        advice_block = ""
+        if _has_content(rx.advice):
+            advice_block = f"""
+      <div class="section">
+        <p class="section-title">General Medical Advice &amp; Lifestyle Instructions</p>
+        <p class="section-body">{html_escape(str(rx.advice).strip())}</p>
       </div>"""
 
         return f"""<!DOCTYPE html>
@@ -115,16 +135,19 @@ class PrescriptionHtmlService:
   .vitals td {{ padding: 6px 8px 6px 0; border-top: 1px solid #fecdd3; color: #0f172a; }}
   .rx {{ margin-top: 18px; position: relative; min-height: 320px; padding: 8px 8px 8px 56px; }}
   .rx-mark {{ position: absolute; left: 0; top: 0; font-size: 42px; font-weight: 800; color: #2563eb; font-family: Georgia, serif; }}
-  .rx-content {{ white-space: pre-wrap; font-size: 15px; line-height: 1.7; min-height: 280px; }}
-  .sign {{ margin-top: 40px; text-align: right; padding-right: 12px; }}
+  .rx-content {{ white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; font-size: 15px; line-height: 1.7; min-height: 280px; }}
+  .section {{ margin: 14px 0 4px; padding: 12px 14px; border: 1px solid #bfdbfe; border-radius: 12px; background: #eff6ff; break-inside: avoid-page; page-break-inside: avoid; }}
+  .section-title {{ margin: 0 0 8px; font-size: 12px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: #1d4ed8; }}
+  .section-body {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; font-size: 13.5px; line-height: 1.65; color: #0f172a; }}
+  .sign {{ margin-top: 40px; text-align: right; padding-right: 12px; break-inside: avoid-page; page-break-inside: avoid; }}
   .sign-line {{ display: inline-block; width: 180px; border-top: 1px solid #64748b; padding-top: 6px; font-size: 11px; letter-spacing: 0.12em; color: #64748b; text-align: center; }}
-  .footer {{ margin-top: auto; background: linear-gradient(90deg, #dbeafe, #eff6ff); padding: 16px 36px; border-top: 2px solid #93c5fd; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }}
+  .footer {{ margin-top: auto; background: linear-gradient(90deg, #dbeafe, #eff6ff); padding: 16px 36px; border-top: 2px solid #93c5fd; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; break-inside: avoid-page; page-break-inside: avoid; }}
   .footer .label {{ font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #94a3b8; margin: 0 0 4px; }}
   .footer p {{ margin: 0; font-size: 12px; color: #334155; }}
   .footer .strong {{ font-weight: 700; color: #1d4ed8; }}
   @media print {{
     body {{ background: #fff; }}
-    .pad {{ margin: 0; max-width: none; min-height: 100vh; page-break-inside: avoid; }}
+    .pad {{ margin: 0; max-width: none; min-height: 100vh; page-break-inside: auto; }}
     .header, .footer {{ position: running(none); }}
   }}
 </style></head><body>
@@ -143,11 +166,13 @@ class PrescriptionHtmlService:
         <div class="line"><label>Date:</label><div class="fill">{html_escape(created)}</div></div>
       </div>
       <div class="line"><label>Diagnosis:</label><div class="fill">{html_escape(rx.diagnosis)}</div></div>
+      {symptoms_block}
       {vitals_block}
       <div class="rx">
         <div class="rx-mark">℞</div>
         <div class="rx-content">{html_escape(body)}</div>
       </div>
+      {advice_block}
       <div class="line"><label>Follow-up:</label><div class="fill">{html_escape(follow)}</div></div>
       <div class="sign">
         {f'<img src="{rx.signature_data}" alt="Signature" style="max-height:64px;max-width:200px;display:block;margin-left:auto;margin-bottom:4px"/>' if getattr(rx, "signature_data", None) else ""}

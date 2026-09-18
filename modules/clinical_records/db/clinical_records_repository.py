@@ -27,13 +27,12 @@ class ClinicalRecordsRepository:
     def get_prescription(
         self, hospital_id: UUID, doctor_id: UUID, prescription_id: UUID
     ) -> Prescription | None:
-        """Fetch prescription by id for a doctor."""
+        """Fetch prescription by id within hospital tenant."""
         return (
             self.db.query(Prescription)
             .options(joinedload(Prescription.patient), joinedload(Prescription.doctor))
             .filter(
                 Prescription.id == prescription_id,
-                Prescription.doctor_id == doctor_id,
                 Prescription.hospital_id == hospital_id,
             )
             .first()
@@ -61,13 +60,12 @@ class ClinicalRecordsRepository:
     def get_medical_record(
         self, hospital_id: UUID, doctor_id: UUID, record_id: UUID
     ) -> MedicalRecord | None:
-        """Fetch medical record by id for a doctor."""
+        """Fetch medical record by id within hospital tenant."""
         return (
             self.db.query(MedicalRecord)
             .options(joinedload(MedicalRecord.patient), joinedload(MedicalRecord.doctor))
             .filter(
                 MedicalRecord.id == record_id,
-                MedicalRecord.doctor_id == doctor_id,
                 MedicalRecord.hospital_id == hospital_id,
             )
             .first()
