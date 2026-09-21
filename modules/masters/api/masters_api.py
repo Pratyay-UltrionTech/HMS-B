@@ -56,6 +56,7 @@ from shared.auth import (
     get_hospital_context,
     require_hospital_admin,
     require_hospital_user,
+    require_permission,
 )
 
 router = APIRouter(prefix="/masters", tags=["masters"])
@@ -71,7 +72,8 @@ def list_wings(
     return MastersActions(db, hospital_id).list_wings()
 
 
-@router.post("/wings", response_model=WingResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/wings", response_model=WingResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_wing(
     payload: WingCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -81,7 +83,7 @@ def create_wing(
     return MastersActions(db, hospital_id, actor).create_wing(payload)
 
 
-@router.put("/wings/{wing_id}", response_model=WingResponse)
+@router.put("/wings/{wing_id}", response_model=WingResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_wing(
     wing_id: UUID,
     payload: WingUpdate,
@@ -92,7 +94,7 @@ def update_wing(
     return MastersActions(db, hospital_id, actor).update_wing(wing_id, payload)
 
 
-@router.delete("/wings/{wing_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/wings/{wing_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_wing(
     wing_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -112,7 +114,8 @@ def list_departments(
     return MastersActions(db, hospital_id).list_departments()
 
 
-@router.post("/departments", response_model=DepartmentResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/departments", response_model=DepartmentResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_department(
     payload: DepartmentCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -122,7 +125,7 @@ def create_department(
     return MastersActions(db, hospital_id, actor).create_department(payload)
 
 
-@router.put("/departments/{department_id}", response_model=DepartmentResponse)
+@router.put("/departments/{department_id}", response_model=DepartmentResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_department(
     department_id: UUID,
     payload: DepartmentUpdate,
@@ -133,7 +136,8 @@ def update_department(
     return MastersActions(db, hospital_id, actor).update_department(department_id, payload)
 
 
-@router.delete("/departments/{department_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/departments/{department_id}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_department(
     department_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -154,7 +158,8 @@ def list_shift_types(
     return MastersActions(db, hospital_id).list_shift_types(department_id)
 
 
-@router.post("/shift-types", response_model=ShiftTypeResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/shift-types", response_model=ShiftTypeResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_shift_type(
     payload: ShiftTypeCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -164,7 +169,7 @@ def create_shift_type(
     return MastersActions(db, hospital_id, actor).create_shift_type(payload)
 
 
-@router.put("/shift-types/{shift_id}", response_model=ShiftTypeResponse)
+@router.put("/shift-types/{shift_id}", response_model=ShiftTypeResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_shift_type(
     shift_id: UUID,
     payload: ShiftTypeUpdate,
@@ -175,7 +180,8 @@ def update_shift_type(
     return MastersActions(db, hospital_id, actor).update_shift_type(shift_id, payload)
 
 
-@router.delete("/shift-types/{shift_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/shift-types/{shift_id}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_shift_type(
     shift_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -195,7 +201,8 @@ def list_holidays(
     return MastersActions(db, hospital_id).list_holidays()
 
 
-@router.post("/holidays", response_model=HolidayResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/holidays", response_model=HolidayResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_holiday(
     payload: HolidayCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -205,7 +212,7 @@ def create_holiday(
     return MastersActions(db, hospital_id, actor).create_holiday(payload)
 
 
-@router.put("/holidays/{holiday_id}", response_model=HolidayResponse)
+@router.put("/holidays/{holiday_id}", response_model=HolidayResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_holiday(
     holiday_id: UUID,
     payload: HolidayUpdate,
@@ -216,7 +223,7 @@ def update_holiday(
     return MastersActions(db, hospital_id, actor).update_holiday(holiday_id, payload)
 
 
-@router.delete("/holidays/{holiday_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/holidays/{holiday_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_holiday(
     holiday_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -236,7 +243,8 @@ def list_appointment_types(
     return MastersActions(db, hospital_id).list_appointment_types()
 
 
-@router.post("/appointment-types", response_model=AppointmentTypeResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/appointment-types", response_model=AppointmentTypeResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_appointment_type(
     payload: AppointmentTypeCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -246,7 +254,8 @@ def create_appointment_type(
     return MastersActions(db, hospital_id, actor).create_appointment_type(payload)
 
 
-@router.put("/appointment-types/{item_id}", response_model=AppointmentTypeResponse)
+@router.put("/appointment-types/{item_id}", response_model=AppointmentTypeResponse,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def update_appointment_type(
     item_id: UUID,
     payload: AppointmentTypeUpdate,
@@ -257,7 +266,8 @@ def update_appointment_type(
     return MastersActions(db, hospital_id, actor).update_appointment_type(item_id, payload)
 
 
-@router.delete("/appointment-types/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/appointment-types/{item_id}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_appointment_type(
     item_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -277,7 +287,8 @@ def list_wards(
     return MastersActions(db, hospital_id).list_wards()
 
 
-@router.post("/wards", response_model=WardResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/wards", response_model=WardResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_ward(
     payload: WardCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -287,7 +298,7 @@ def create_ward(
     return MastersActions(db, hospital_id, actor).create_ward(payload)
 
 
-@router.put("/wards/{ward_id}", response_model=WardResponse)
+@router.put("/wards/{ward_id}", response_model=WardResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_ward(
     ward_id: UUID,
     payload: WardUpdate,
@@ -298,7 +309,7 @@ def update_ward(
     return MastersActions(db, hospital_id, actor).update_ward(ward_id, payload)
 
 
-@router.delete("/wards/{ward_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/wards/{ward_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_ward(
     ward_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -318,7 +329,8 @@ def list_rooms(
     return MastersActions(db, hospital_id).list_rooms()
 
 
-@router.post("/rooms", response_model=RoomResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/rooms", response_model=RoomResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_room(
     payload: RoomCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -328,7 +340,7 @@ def create_room(
     return MastersActions(db, hospital_id, actor).create_room(payload)
 
 
-@router.put("/rooms/{room_id}", response_model=RoomResponse)
+@router.put("/rooms/{room_id}", response_model=RoomResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_room(
     room_id: UUID,
     payload: RoomUpdate,
@@ -339,7 +351,7 @@ def update_room(
     return MastersActions(db, hospital_id, actor).update_room(room_id, payload)
 
 
-@router.delete("/rooms/{room_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/rooms/{room_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_room(
     room_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -361,7 +373,8 @@ def list_ot_rooms(
     return MastersActions(db, hospital_id).list_ot_rooms(department_id, active_only)
 
 
-@router.post("/ot-rooms", response_model=OtRoomResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/ot-rooms", response_model=OtRoomResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_ot_room(
     payload: OtRoomCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -371,7 +384,7 @@ def create_ot_room(
     return MastersActions(db, hospital_id, actor).create_ot_room(payload)
 
 
-@router.put("/ot-rooms/{room_id}", response_model=OtRoomResponse)
+@router.put("/ot-rooms/{room_id}", response_model=OtRoomResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_ot_room(
     room_id: UUID,
     payload: OtRoomUpdate,
@@ -382,7 +395,7 @@ def update_ot_room(
     return MastersActions(db, hospital_id, actor).update_ot_room(room_id, payload)
 
 
-@router.delete("/ot-rooms/{room_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/ot-rooms/{room_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_ot_room(
     room_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -402,7 +415,8 @@ def list_suppliers(
     return MastersActions(db, hospital_id).list_suppliers()
 
 
-@router.post("/suppliers", response_model=SupplierResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/suppliers", response_model=SupplierResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_supplier(
     payload: SupplierCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -412,7 +426,7 @@ def create_supplier(
     return MastersActions(db, hospital_id, actor).create_supplier(payload)
 
 
-@router.put("/suppliers/{supplier_id}", response_model=SupplierResponse)
+@router.put("/suppliers/{supplier_id}", response_model=SupplierResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_supplier(
     supplier_id: UUID,
     payload: SupplierUpdate,
@@ -423,7 +437,8 @@ def update_supplier(
     return MastersActions(db, hospital_id, actor).update_supplier(supplier_id, payload)
 
 
-@router.delete("/suppliers/{supplier_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/suppliers/{supplier_id}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_supplier(
     supplier_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -454,7 +469,8 @@ def list_consultation_pricing(
     )
 
 
-@router.post("/consultation-pricing", response_model=ConsultationPricingResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/consultation-pricing", response_model=ConsultationPricingResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_consultation_pricing(
     payload: ConsultationPricingCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -464,7 +480,8 @@ def create_consultation_pricing(
     return MastersActions(db, hospital_id, actor).create_consultation_pricing(payload)
 
 
-@router.put("/consultation-pricing/{item_id}", response_model=ConsultationPricingResponse)
+@router.put("/consultation-pricing/{item_id}", response_model=ConsultationPricingResponse,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def update_consultation_pricing(
     item_id: UUID,
     payload: ConsultationPricingUpdate,
@@ -475,7 +492,8 @@ def update_consultation_pricing(
     return MastersActions(db, hospital_id, actor).update_consultation_pricing(item_id, payload)
 
 
-@router.delete("/consultation-pricing/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/consultation-pricing/{item_id}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_consultation_pricing(
     item_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -502,7 +520,8 @@ def list_insurance_providers(
     )
 
 
-@router.post("/insurance", response_model=InsuranceProviderResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/insurance", response_model=InsuranceProviderResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("masters", "edit"))])
 def create_insurance_provider(
     payload: InsuranceProviderCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -512,7 +531,7 @@ def create_insurance_provider(
     return MastersActions(db, hospital_id, actor).create_insurance_provider(payload)
 
 
-@router.put("/insurance/{item_id}", response_model=InsuranceProviderResponse)
+@router.put("/insurance/{item_id}", response_model=InsuranceProviderResponse, dependencies=[Depends(require_permission("masters", "edit"))])
 def update_insurance_provider(
     item_id: UUID,
     payload: InsuranceProviderUpdate,
@@ -523,7 +542,7 @@ def update_insurance_provider(
     return MastersActions(db, hospital_id, actor).update_insurance_provider(item_id, payload)
 
 
-@router.delete("/insurance/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/insurance/{item_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("masters", "edit"))])
 def delete_insurance_provider(
     item_id: UUID,
     db: Session = Depends(get_transitional_sync_session),

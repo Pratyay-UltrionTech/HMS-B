@@ -24,7 +24,7 @@ from modules.mis.contracts.mis_contracts import (
     FilterItem,
     PatientReportResponse,
 )
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/mis", tags=["mis"])
 

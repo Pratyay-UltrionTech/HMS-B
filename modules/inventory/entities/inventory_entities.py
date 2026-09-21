@@ -163,6 +163,11 @@ class CentralInventoryStock(Base):
         UUID(as_uuid=True), ForeignKey("inventory_consumable_items.id", ondelete="CASCADE"), nullable=False, index=True
     )
     total_quantity: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # Quantity dispatched but not yet received by the destination (FLAW-019).
+    # Decremented from available on dispatch; restored on reject; converted to
+    # destination stock on completion. Prevents the same stock being double-
+    # consumed while a transfer is in transit.
+    in_transit_quantity: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     location: Mapped[str] = mapped_column(String(128), nullable=False, default="Main Store")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -219,6 +224,8 @@ class DepartmentalStock(Base):
     )
     department: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     quantity: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # Quantity dispatched out of this department but not yet received (FLAW-019).
+    in_transit_quantity: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

@@ -195,10 +195,37 @@ class DeleteDmsDocumentAction:
         self.repo = DmsRepository(db, hospital_id)
 
     def execute(self, document_id: UUID, user: dict) -> None:
-        doc = self.repo.get_document(document_id)
+        # FLAW-018: refuse to hard-delete. Look up the document (including already
+        # soft-deleted rows so repeated deletes are idempotent) and soft-delete it
+        # with an audit trail and archival retention.
+        doc = self.repo.get_document_any_state(document_id)
         if not doc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-        self.repo.delete_document(doc)
+        if doc.is_deleted:
+            return
+
+        deleted_by = f"{_actor_name(user)} ({_actor_role(user)})".strip()
+        self.repo.soft_delete_document(doc, deleted_by=deleted_by)
+
+        # FLAW-018/029: write the deletion audit record autonomously so it is
+        # committed immediately and survives any later rollback of this session.
+        from shared.audit.service import write_audit_log_autonomous
+
+        write_audit_log_autonomous(
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="delete",
+            entity_type="patient_document",
+            entity_id=document_id,
+            summary=f"Deleted document '{doc.title}' for patient {doc.patient_id} (soft delete)",
+            details={
+                "document_id": str(document_id),
+                "patient_id": str(doc.patient_id),
+                "category": doc.category.value if hasattr(doc.category, "value") else str(doc.category),
+                "file_name": doc.file_name,
+                "deleted_by": deleted_by,
+            },
+        )
 
 
 class DownloadDmsFileAction:

@@ -35,7 +35,7 @@ from modules.equipment.contracts.equipment_contracts import (
     ServiceLogCreate,
     ServiceLogResponse,
 )
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/equipment", tags=["equipment"])
 
@@ -62,7 +62,8 @@ def list_categories(
     return EquipmentActions(db, hospital_id, user).list_categories()
 
 
-@router.post("/categories", response_model=EquipCategoryResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/categories", response_model=EquipCategoryResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def create_category(
     payload: EquipCategoryCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -72,7 +73,7 @@ def create_category(
     return EquipmentActions(db, hospital_id, user).create_category(payload)
 
 
-@router.put("/categories/{category_id}", response_model=EquipCategoryResponse)
+@router.put("/categories/{category_id}", response_model=EquipCategoryResponse, dependencies=[Depends(require_permission("equipment", "edit"))])
 def update_category(
     category_id: UUID,
     payload: EquipCategoryUpdate,
@@ -83,7 +84,8 @@ def update_category(
     return EquipmentActions(db, hospital_id, user).update_category(category_id, payload)
 
 
-@router.delete("/categories/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/categories/{category_id}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def delete_category(
     category_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -113,7 +115,8 @@ def list_items(
     )
 
 
-@router.post("/items", response_model=EquipmentResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/items", response_model=EquipmentResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def create_item(
     payload: EquipmentCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -123,7 +126,7 @@ def create_item(
     return EquipmentActions(db, hospital_id, user).create_item(payload)
 
 
-@router.put("/items/{item_id}", response_model=EquipmentResponse)
+@router.put("/items/{item_id}", response_model=EquipmentResponse, dependencies=[Depends(require_permission("equipment", "edit"))])
 def update_item(
     item_id: UUID,
     payload: EquipmentUpdate,
@@ -134,7 +137,7 @@ def update_item(
     return EquipmentActions(db, hospital_id, user).update_item(item_id, payload)
 
 
-@router.delete("/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("equipment", "edit"))])
 def delete_item(
     item_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -145,7 +148,7 @@ def delete_item(
     return None
 
 
-@router.put("/items/{item_id}/amc", response_model=EquipmentResponse)
+@router.put("/items/{item_id}/amc", response_model=EquipmentResponse, dependencies=[Depends(require_permission("equipment", "edit"))])
 def update_amc(
     item_id: UUID,
     payload: AmcUpdate,
@@ -168,7 +171,8 @@ def list_assignments(
     return EquipmentActions(db, hospital_id, user).list_assignments(active_only=active_only)
 
 
-@router.post("/assignments", response_model=AssignmentResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/assignments", response_model=AssignmentResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def create_assignment(
     payload: AssignmentCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -178,7 +182,8 @@ def create_assignment(
     return EquipmentActions(db, hospital_id, user).create_assignment(payload)
 
 
-@router.post("/assignments/{assignment_id}/return", response_model=AssignmentResponse)
+@router.post("/assignments/{assignment_id}/return", response_model=AssignmentResponse,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def return_assignment(
     assignment_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -199,7 +204,8 @@ def list_maintenance(
     return EquipmentActions(db, hospital_id, user).list_maintenance()
 
 
-@router.post("/maintenance", response_model=MaintenanceResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/maintenance", response_model=MaintenanceResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def schedule_maintenance(
     payload: MaintenanceCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -209,7 +215,8 @@ def schedule_maintenance(
     return EquipmentActions(db, hospital_id, user).schedule_maintenance(payload)
 
 
-@router.post("/maintenance/{maintenance_id}/complete", response_model=MaintenanceResponse)
+@router.post("/maintenance/{maintenance_id}/complete", response_model=MaintenanceResponse,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def complete_maintenance(
     maintenance_id: UUID,
     payload: MaintenanceComplete,
@@ -232,7 +239,8 @@ def list_service_logs(
     return EquipmentActions(db, hospital_id, user).list_service_logs(equipment_id=equipment_id)
 
 
-@router.post("/service-logs", response_model=ServiceLogResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/service-logs", response_model=ServiceLogResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def create_service_log(
     payload: ServiceLogCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -254,7 +262,8 @@ def list_requests(
     return EquipmentActions(db, hospital_id, user).list_requests(status_filter=status_filter)
 
 
-@router.post("/requests", response_model=RequestResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/requests", response_model=RequestResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("equipment", "edit"))])
 def create_request(
     payload: RequestCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -264,7 +273,7 @@ def create_request(
     return EquipmentActions(db, hospital_id, user).create_request(payload)
 
 
-@router.post("/requests/{request_id}/approve", response_model=RequestResponse)
+@router.post("/requests/{request_id}/approve", response_model=RequestResponse, dependencies=[Depends(require_permission("equipment", "edit"))])
 def approve_request(
     request_id: UUID,
     payload: RequestAction | None = None,
@@ -275,7 +284,7 @@ def approve_request(
     return EquipmentActions(db, hospital_id, user).approve_request(request_id, payload)
 
 
-@router.post("/requests/{request_id}/reject", response_model=RequestResponse)
+@router.post("/requests/{request_id}/reject", response_model=RequestResponse, dependencies=[Depends(require_permission("equipment", "edit"))])
 def reject_request(
     request_id: UUID,
     payload: RequestAction | None = None,
@@ -286,7 +295,7 @@ def reject_request(
     return EquipmentActions(db, hospital_id, user).reject_request(request_id, payload)
 
 
-@router.post("/requests/{request_id}/assign", response_model=RequestResponse)
+@router.post("/requests/{request_id}/assign", response_model=RequestResponse, dependencies=[Depends(require_permission("equipment", "edit"))])
 def assign_request(
     request_id: UUID,
     payload: RequestAction,

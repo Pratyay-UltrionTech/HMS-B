@@ -56,7 +56,7 @@ from modules.billing.entities.billing_entities import (
     BillingPaymentMethod,
     BillingSourceType,
 )
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -109,7 +109,7 @@ def list_charges(
     )
 
 
-@router.post("/charges", response_model=BillingChargeResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/charges", response_model=BillingChargeResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_permission("billing", "edit"))])
 def create_charge(
     payload: BillingChargeCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -119,7 +119,7 @@ def create_charge(
     return CreateChargeAction(db, hospital_id).execute(payload, user)
 
 
-@router.put("/charges/{charge_id}", response_model=BillingChargeResponse)
+@router.put("/charges/{charge_id}", response_model=BillingChargeResponse, dependencies=[Depends(require_permission("billing", "edit"))])
 def update_charge(
     charge_id: UUID,
     payload: BillingChargeUpdate,
@@ -130,7 +130,7 @@ def update_charge(
     return UpdateChargeAction(db, hospital_id).execute(charge_id, payload, user)
 
 
-@router.post("/charges/{charge_id}/cancel", response_model=BillingChargeResponse)
+@router.post("/charges/{charge_id}/cancel", response_model=BillingChargeResponse, dependencies=[Depends(require_permission("billing", "edit"))])
 def cancel_charge(
     charge_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -164,7 +164,7 @@ def list_payments(
     )
 
 
-@router.post("/payments", response_model=BillingPaymentResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/payments", response_model=BillingPaymentResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_permission("billing", "edit"))])
 def record_payment(
     payload: BillingPaymentCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -210,7 +210,7 @@ def get_invoice(
     return GetInvoiceAction(db, hospital_id).execute(invoice_id)
 
 
-@router.post("/invoices", response_model=BillingInvoiceResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/invoices", response_model=BillingInvoiceResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_permission("billing", "edit"))])
 def create_invoice(
     payload: BillingInvoiceCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -220,7 +220,7 @@ def create_invoice(
     return CreateInvoiceAction(db, hospital_id).execute(payload, user)
 
 
-@router.post("/invoices/{invoice_id}/cancel", response_model=BillingInvoiceResponse)
+@router.post("/invoices/{invoice_id}/cancel", response_model=BillingInvoiceResponse, dependencies=[Depends(require_permission("billing", "edit"))])
 def cancel_invoice(
     invoice_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -281,7 +281,7 @@ def get_receipt(
     return GetReceiptAction(db, hospital_id).execute(receipt_id)
 
 
-@router.post("/receipts", response_model=BillingReceiptResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/receipts", response_model=BillingReceiptResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_permission("billing", "edit"))])
 def create_receipt(
     payload: BillingReceiptCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -291,7 +291,7 @@ def create_receipt(
     return CreateReceiptAction(db, hospital_id).execute(payload, user)
 
 
-@router.post("/receipts/{receipt_id}/cancel", response_model=BillingReceiptResponse)
+@router.post("/receipts/{receipt_id}/cancel", response_model=BillingReceiptResponse, dependencies=[Depends(require_permission("billing", "edit"))])
 def cancel_receipt(
     receipt_id: UUID,
     db: Session = Depends(get_transitional_sync_session),

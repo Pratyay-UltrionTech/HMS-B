@@ -340,7 +340,7 @@ class BloodBankActions:
     # -----------------------------------------------------------------------
 
     def issue_blood_unit(self, payload: BloodIssueCreate) -> BloodIssueResponse:
-        unit = self.repo.get_unit_by_id(payload.blood_unit_id)
+        unit = self.repo.get_unit_by_id(payload.blood_unit_id, for_update=True)
         if not unit:
             raise NotFoundError("Blood unit not found")
 

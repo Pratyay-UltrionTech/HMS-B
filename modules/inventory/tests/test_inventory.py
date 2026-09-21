@@ -238,25 +238,28 @@ def test_full_transfer_lifecycle_moves_stock_and_creates_two_ledger_entries_only
     # Central stock must be unchanged at approved stage
     central_after_approve = client.get("/api/inventory/central-stock").json()
     assert central_after_approve[0]["total_quantity"] == 200
+    assert central_after_approve[0]["in_transit_quantity"] == 0
 
-    # Dispatch
+    # Dispatch -> FLAW-019: source available decremented into in-transit holding
     dispatched = client.post(f"/api/inventory/transfers/{tid}/dispatch").json()
     assert dispatched["status"] == "dispatched"
 
-    # Central stock must still be unchanged at dispatched stage
     central_after_dispatch = client.get("/api/inventory/central-stock").json()
-    assert central_after_dispatch[0]["total_quantity"] == 200
+    assert central_after_dispatch[0]["total_quantity"] == 140
+    assert central_after_dispatch[0]["in_transit_quantity"] == 60
 
-    # Complete -> stock actually moves
+    # Complete -> stock lands at destination, in-transit cleared
     completed = client.post(f"/api/inventory/transfers/{tid}/complete").json()
     assert completed["status"] == "completed"
     assert completed["completed_at"] is not None
 
     central_after_complete = client.get("/api/inventory/central-stock").json()
     assert central_after_complete[0]["total_quantity"] == 140
+    assert central_after_complete[0]["in_transit_quantity"] == 0
 
     dept_stock = client.get("/api/inventory/departmental-stock", params={"department": "OT-1"}).json()
     assert dept_stock[0]["quantity"] == 60
+    assert dept_stock[0]["in_transit_quantity"] == 0
 
 
 def test_transfer_ledger_has_exactly_two_entries_only_after_completion(inv_client, inventory_db):
@@ -283,12 +286,14 @@ def test_transfer_ledger_has_exactly_two_entries_only_after_completion(inv_clien
     client.post(f"/api/inventory/transfers/{tid}/approve", json={})
     client.post(f"/api/inventory/transfers/{tid}/dispatch")
 
-    rows_still_before = (
+    # FLAW-019: dispatch already writes the transfer_out ledger entry (in transit).
+    rows_after_dispatch = (
         inventory_db.query(InventoryStockTransaction)
         .filter(InventoryStockTransaction.reference_type == "inventory_transfer")
         .all()
     )
-    assert len(rows_still_before) == 0
+    assert len(rows_after_dispatch) == 1
+    assert rows_after_dispatch[0].transaction_type.value == "transfer_out"
 
     client.post(f"/api/inventory/transfers/{tid}/complete")
 
@@ -315,13 +320,15 @@ def test_transfer_with_insufficient_stock_blocked(inv_client):
     ).json()
     tid = transfer["id"]
     client.post(f"/api/inventory/transfers/{tid}/approve", json={})
-    client.post(f"/api/inventory/transfers/{tid}/dispatch")
-    res = client.post(f"/api/inventory/transfers/{tid}/complete")
+    # FLAW-019: insufficient stock is now rejected at DISPATCH (source must have
+    # the stock to move it in transit), not at completion.
+    res = client.post(f"/api/inventory/transfers/{tid}/dispatch")
     assert res.status_code == 400
 
-    # Central stock unaffected by the blocked completion
+    # Central stock unaffected by the blocked dispatch
     central = client.get("/api/inventory/central-stock").json()
     assert central[0]["total_quantity"] == 10
+    assert central[0]["in_transit_quantity"] == 0
 
 
 def test_rejected_transfer_does_not_move_stock(inv_client):
@@ -363,6 +370,114 @@ def test_cannot_skip_transfer_states(inv_client):
     # Cannot complete before dispatch
     res2 = client.post(f"/api/inventory/transfers/{tid}/complete")
     assert res2.status_code == 400
+
+
+# ── FLAW-019: in-transit transfer holding ────────────────────────────────────
+
+
+def test_dispatch_decrements_source_and_tracks_in_transit(inv_client):
+    client, _, _ = inv_client
+    item = _create_item(client)
+    _receive(client, item["id"], quantity=100)
+
+    transfer = client.post(
+        "/api/inventory/transfers",
+        json={"item_id": item["id"], "from_location": "Central", "to_department": "ICU", "quantity": 40},
+    ).json()
+    tid = transfer["id"]
+    client.post(f"/api/inventory/transfers/{tid}/approve", json={})
+    client.post(f"/api/inventory/transfers/{tid}/dispatch")
+
+    central = client.get("/api/inventory/central-stock").json()[0]
+    # Available dropped by 40, in transit = 40
+    assert central["total_quantity"] == 60
+    assert central["in_transit_quantity"] == 40
+
+
+def test_in_transit_stock_cannot_be_over_consumed_by_second_request(inv_client):
+    """The FLAW-019 scenario: after dispatching 10, central available is 0, so a
+    second department requesting the same 10 cannot dispatch (no phantom stock)."""
+    client, _, _ = inv_client
+    item = _create_item(client)
+    _receive(client, item["id"], quantity=10)
+
+    # OT requests and dispatches all 10
+    t1 = client.post(
+        "/api/inventory/transfers",
+        json={"item_id": item["id"], "from_location": "Central", "to_department": "OT", "quantity": 10},
+    ).json()
+    client.post(f"/api/inventory/transfers/{t1['id']}/approve", json={})
+    client.post(f"/api/inventory/transfers/{t1['id']}/dispatch")
+
+    # ER tries to request the same 10 -> dispatch blocked, no phantom stock
+    t2 = client.post(
+        "/api/inventory/transfers",
+        json={"item_id": item["id"], "from_location": "Central", "to_department": "ER", "quantity": 10},
+    ).json()
+    client.post(f"/api/inventory/transfers/{t2['id']}/approve", json={})
+    res = client.post(f"/api/inventory/transfers/{t2['id']}/dispatch")
+    assert res.status_code == 400
+
+
+def test_reject_after_dispatch_returns_in_transit_stock(inv_client):
+    client, _, _ = inv_client
+    item = _create_item(client)
+    _receive(client, item["id"], quantity=80)
+
+    transfer = client.post(
+        "/api/inventory/transfers",
+        json={"item_id": item["id"], "from_location": "Central", "to_department": "Radiology", "quantity": 20},
+    ).json()
+    tid = transfer["id"]
+    client.post(f"/api/inventory/transfers/{tid}/approve", json={})
+    client.post(f"/api/inventory/transfers/{tid}/dispatch")
+
+    central_before = client.get("/api/inventory/central-stock").json()[0]
+    assert central_before["total_quantity"] == 60
+    assert central_before["in_transit_quantity"] == 20
+
+    # Reject AFTER dispatch -> stock returned to source
+    rejected = client.post(
+        f"/api/inventory/transfers/{tid}/reject", json={"rejection_reason": "dispatch cancelled"}
+    ).json()
+    assert rejected["status"] == "rejected"
+
+    central_after = client.get("/api/inventory/central-stock").json()[0]
+    assert central_after["total_quantity"] == 80
+    assert central_after["in_transit_quantity"] == 0
+
+
+def test_department_to_department_in_transit_holding(inv_client):
+    client, _, _ = inv_client
+    item = _create_item(client)
+    _receive(client, item["id"], quantity=100)
+
+    # Move 50 into dept "Ward-A"
+    t1 = client.post(
+        "/api/inventory/transfers",
+        json={"item_id": item["id"], "from_location": "Central", "to_department": "Ward-A", "quantity": 50},
+    ).json()
+    client.post(f"/api/inventory/transfers/{t1['id']}/approve", json={})
+    client.post(f"/api/inventory/transfers/{t1['id']}/dispatch")
+    client.post(f"/api/inventory/transfers/{t1['id']}/complete")
+
+    # Dispatch 30 out of Ward-A to Ward-B
+    t2 = client.post(
+        "/api/inventory/transfers",
+        json={"item_id": item["id"], "from_location": "Ward-A", "to_department": "Ward-B", "quantity": 30},
+    ).json()
+    client.post(f"/api/inventory/transfers/{t2['id']}/approve", json={})
+    client.post(f"/api/inventory/transfers/{t2['id']}/dispatch")
+
+    ward_a = client.get("/api/inventory/departmental-stock", params={"department": "Ward-A"}).json()[0]
+    assert ward_a["quantity"] == 20
+    assert ward_a["in_transit_quantity"] == 30
+
+    client.post(f"/api/inventory/transfers/{t2['id']}/complete")
+    ward_a = client.get("/api/inventory/departmental-stock", params={"department": "Ward-A"}).json()[0]
+    ward_b = client.get("/api/inventory/departmental-stock", params={"department": "Ward-B"}).json()[0]
+    assert ward_a["in_transit_quantity"] == 0
+    assert ward_b["quantity"] == 30
 
 
 # ── Tenant isolation ─────────────────────────────────────────────────────────

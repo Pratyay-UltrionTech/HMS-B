@@ -28,6 +28,11 @@ from modules.billing.entities.billing_entities import (
     BillingPayment,
     BillingPaymentMethod,
 )
+from modules.billing.services.billing_service import create_payment
+from modules.billing.services.invoice_service import (
+    issue_receipt_for_payment,
+    refresh_invoice_paid_status,
+)
 from modules.inpatient.entities.admission import Admission
 from modules.insurance.contracts.insurance_contracts import (
     AdmissionPolicyLinkCreate,
@@ -534,11 +539,12 @@ class InsuranceActions:
 
         settled_dt = payload.settled_date or date.today()
 
-        # Creates payment in canonical billing system (Correction #5)
+        # Creates payment in canonical billing system with FIFO allocation and receipt
         billing_payment = None
         if net_insurer > 0:
             actor_name = str(self.actor.get("email") or self.actor.get("username") or "Insurance System")
-            billing_payment = BillingPayment(
+            billing_payment = create_payment(
+                self.db,
                 hospital_id=self.hospital_id,
                 patient_id=invoice.patient_id,
                 amount=net_insurer,
@@ -546,9 +552,15 @@ class InsuranceActions:
                 payment_method=BillingPaymentMethod.bank_transfer,
                 notes=f"Cashless insurance settlement {settlement_num} for claim {claim.claim_number}",
                 received_by_name=actor_name,
+                allocate=True,
             )
-            self.db.add(billing_payment)
-            self.db.flush()
+            issue_receipt_for_payment(
+                self.db,
+                billing_payment,
+                linked_invoice_id=invoice.id,
+                reference_number=payload.payment_reference,
+            )
+            refresh_invoice_paid_status(self.db, self.hospital_id, invoice.patient_id)
 
         settlement = InsuranceCashlessSettlement(
             hospital_id=self.hospital_id,

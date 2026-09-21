@@ -8,15 +8,17 @@ paired with an `InventoryStockTransaction` ledger entry in the same DB transacti
 
 Enforced lifecycle rules (Feature 48):
 - InventoryTransfer: requested -> approved -> dispatched -> completed, or
-  requested/approved -> rejected. No other transition is permitted.
-- Stock only actually moves on the dispatched -> completed transition. This is a
-  deliberate choice (see spec) so that a transfer rejected or stalled at
-  approved/dispatched never double-counts stock that was never physically moved.
-- On completion: source stock (CentralInventoryStock if from_location == "Central",
-  else the source DepartmentalStock row) is decremented, the destination
-  DepartmentalStock row is incremented (created if missing), and two ledger rows
-  are written (transfer_out from source, transfer_in to destination), both carrying
-  reference_type="inventory_transfer" / reference_id=transfer.id.
+  requested/approved -> rejected (dispatched -> rejected is also permitted so a
+  stalled dispatch can be returned to source).
+- Stock movement (FLAW-019): on dispatch, the source stock is atomically
+  decremented from its available balance and moved into an `in_transit_quantity`
+  holding state with a `transfer_out` ledger entry. On completion, the in-transit
+  quantity is cleared and the destination stock is incremented with a
+  `transfer_in` ledger entry. On rejection after dispatch, the in-transit
+  quantity is returned to the source's available balance. This prevents the same
+  stock from being double-consumed while a transfer is in transit (previously
+  central stock stayed 10 units after dispatching 10, so a second department
+  could over-request and the OT could never receive).
 
 Departmental consumption (`consume_departmental_stock`) uses transaction_type=
 `consumption` (distinct from `issue_to_department`, which is reserved for the
@@ -62,10 +64,13 @@ from modules.inventory.entities.inventory_entities import (
 from shared.audit import write_audit_log
 
 # Valid forward transitions for an inventory transfer's status.
+# FLAW-019: dispatched transfers may also be rejected; on dispatch the source
+# stock is moved into an in-transit holding state, so a rejection after dispatch
+# must return that stock to the source.
 _TRANSFER_TRANSITIONS: dict[InventoryTransferStatus, set[InventoryTransferStatus]] = {
     InventoryTransferStatus.requested: {InventoryTransferStatus.approved, InventoryTransferStatus.rejected},
     InventoryTransferStatus.approved: {InventoryTransferStatus.dispatched, InventoryTransferStatus.rejected},
-    InventoryTransferStatus.dispatched: {InventoryTransferStatus.completed},
+    InventoryTransferStatus.dispatched: {InventoryTransferStatus.completed, InventoryTransferStatus.rejected},
     InventoryTransferStatus.completed: set(),
     InventoryTransferStatus.rejected: set(),
 }
@@ -85,6 +90,7 @@ def _central_to_response(row: CentralInventoryStock) -> CentralInventoryStockRes
         item_id=row.item_id,
         item_name=row.item.item_name if row.item else None,
         total_quantity=row.total_quantity,
+        in_transit_quantity=row.in_transit_quantity,
         location=row.location,
         updated_at=row.updated_at,
     )
@@ -97,6 +103,7 @@ def _dept_to_response(row: DepartmentalStock) -> DepartmentalStockResponse:
         item_name=row.item.item_name if row.item else None,
         department=row.department,
         quantity=row.quantity,
+        in_transit_quantity=row.in_transit_quantity,
         updated_at=row.updated_at,
     )
 
@@ -437,8 +444,82 @@ class InventoryActions:
         self.db.refresh(row)
         return _transfer_to_response(row)
 
+    def _resolve_source(self, row: InventoryTransfer):
+        """Return (source_stock, is_central, available) for a transfer's source.
+
+        Raises HTTP 400 if the source has insufficient available stock.
+        """
+        quantity = float(row.quantity)
+        if row.from_location.strip().lower() == "central":
+            central = self.repo.get_central_stock(row.item_id, self.hospital_id, for_update=True)
+            if not central:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No central stock record exists for this item",
+                )
+            available = float(central.total_quantity)
+            if available < quantity - 1e-9:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Insufficient central stock for {central.item.item_name if central.item else 'item'} "
+                        f"(available {available}, requested {quantity})"
+                    ),
+                )
+            return central, True, available
+        dept = self.repo.get_departmental_stock(
+            row.item_id, row.from_location, self.hospital_id, for_update=True
+        )
+        if not dept:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No stock record exists for {row.from_location}",
+            )
+        available = float(dept.quantity)
+        if available < quantity - 1e-9:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Insufficient stock in {row.from_location} for "
+                    f"{dept.item.item_name if dept.item else 'item'} "
+                    f"(available {available}, requested {quantity})"
+                ),
+            )
+        return dept, False, available
+
     def dispatch_transfer(self, transfer_id: UUID) -> InventoryTransferResponse:
+        """Dispatch a transfer.
+
+        FLAW-019: atomically moves the requested quantity out of the source's
+        available balance into an in-transit holding state and writes a
+        transfer_out ledger entry, so the stock is no longer available for a
+        second department to request while it is physically in transit.
+        """
         row = self._transition_transfer(transfer_id, InventoryTransferStatus.dispatched, "dispatch")
+        quantity = float(row.quantity)
+        item = self.repo.get_item_by_id(row.item_id, self.hospital_id)
+
+        source, is_central, _ = self._resolve_source(row)
+        if is_central:
+            source.total_quantity = round(float(source.total_quantity) - quantity, 4)
+            source.in_transit_quantity = round(float(source.in_transit_quantity or 0) + quantity, 4)
+        else:
+            source.quantity = round(float(source.quantity) - quantity, 4)
+            source.in_transit_quantity = round(float(source.in_transit_quantity or 0) + quantity, 4)
+
+        out_txn = InventoryStockTransaction(
+            hospital_id=self.hospital_id,
+            item_id=row.item_id,
+            batch_id=None,
+            transaction_type=InventoryStockTransactionType.transfer_out,
+            quantity=-round(quantity, 4),
+            from_location=row.from_location,
+            to_location=row.to_department,
+            reference_type="inventory_transfer",
+            reference_id=row.id,
+        )
+        self.db.add(out_txn)
+
         row.status = InventoryTransferStatus.dispatched
         row.dispatched_at = datetime.now(timezone.utc)
 
@@ -449,22 +530,58 @@ class InventoryActions:
             action="update",
             entity_type="inventory_transfer",
             entity_id=row.id,
-            summary=f"Dispatched transfer {row.id}",
+            summary=(
+                f"Dispatched transfer {row.id}: {quantity} {item.item_code if item else 'item'} "
+                f"from {row.from_location} to {row.to_department} (in transit)"
+            ),
         )
         self.db.commit()
         self.db.refresh(row)
         return _transfer_to_response(row)
 
     def reject_transfer(self, transfer_id: UUID, payload: InventoryTransferReject) -> InventoryTransferResponse:
-        """requested or approved -> rejected. No stock has moved yet, so nothing to undo."""
+        """requested/approved -> rejected (no stock moved), or dispatched -> rejected.
+
+        FLAW-019: if a transfer is rejected AFTER dispatch, the in-transit stock
+        is returned to the source's available balance and the in-transit holding
+        is cleared, so the stock is not lost or double-counted.
+        """
         row = self.repo.get_transfer_by_id(transfer_id, self.hospital_id)
         if not row:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transfer not found")
-        if row.status not in (InventoryTransferStatus.requested, InventoryTransferStatus.approved):
+        if row.status not in (
+            InventoryTransferStatus.requested,
+            InventoryTransferStatus.approved,
+            InventoryTransferStatus.dispatched,
+        ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only a requested or approved transfer can be rejected",
+                detail="Only a requested, approved, or dispatched transfer can be rejected",
             )
+
+        was_dispatched = row.status == InventoryTransferStatus.dispatched
+        if was_dispatched:
+            quantity = float(row.quantity)
+            item = self.repo.get_item_by_id(row.item_id, self.hospital_id)
+            source, is_central, _ = self._resolve_source_for_completion(row)
+            if is_central:
+                source.total_quantity = round(float(source.total_quantity) + quantity, 4)
+                source.in_transit_quantity = round(float(source.in_transit_quantity or 0) - quantity, 4)
+            else:
+                source.quantity = round(float(source.quantity) + quantity, 4)
+                source.in_transit_quantity = round(float(source.in_transit_quantity or 0) - quantity, 4)
+            return_txn = InventoryStockTransaction(
+                hospital_id=self.hospital_id,
+                item_id=row.item_id,
+                batch_id=None,
+                transaction_type=InventoryStockTransactionType.transfer_in,
+                quantity=round(quantity, 4),
+                from_location=row.from_location,
+                to_location=row.from_location,
+                reference_type="inventory_transfer",
+                reference_id=row.id,
+            )
+            self.db.add(return_txn)
 
         row.status = InventoryTransferStatus.rejected
         row.rejection_reason = payload.rejection_reason
@@ -476,45 +593,53 @@ class InventoryActions:
             action="update",
             entity_type="inventory_transfer",
             entity_id=row.id,
-            summary=f"Rejected transfer {row.id}: {payload.rejection_reason or ''}".strip(),
+            summary=(
+                f"Rejected transfer {row.id}: {payload.rejection_reason or ''}"
+                + (" (returned in-transit stock to source)" if was_dispatched else "")
+            ).strip(),
         )
         self.db.commit()
         self.db.refresh(row)
         return _transfer_to_response(row)
 
+    def _resolve_source_for_completion(self, row: InventoryTransfer):
+        """Resolve the source row for a completion/reject-after-dispatch.
+
+        Only used to clear/restore the in-transit holding; the source available
+        balance was already decremented at dispatch (FLAW-019).
+        """
+        if row.from_location.strip().lower() == "central":
+            central = self.repo.get_central_stock(row.item_id, self.hospital_id, for_update=True)
+            if not central:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No central stock record exists for this item",
+                )
+            return central, True, float(central.total_quantity)
+        dept = self.repo.get_departmental_stock(
+            row.item_id, row.from_location, self.hospital_id, for_update=True
+        )
+        if not dept:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No stock record exists for {row.from_location}",
+            )
+        return dept, False, float(dept.quantity)
+
     def complete_transfer(self, transfer_id: UUID) -> InventoryTransferResponse:
-        """Only transition that actually moves stock. Decrements the source
-        (CentralInventoryStock if from_location == 'Central', else the source
-        department's DepartmentalStock), increments/creates the destination
-        DepartmentalStock, and writes both a transfer_out and a transfer_in ledger
-        entry referencing this transfer's id."""
+        """Complete a transfer and land stock at the destination.
+
+        FLAW-019: the source available balance was already decremented and moved
+        into in_transit_quantity at dispatch. On completion we clear the
+        in-transit holding, increment (or create) the destination DepartmentalStock,
+        and write the transfer_in ledger entry.
+        """
         row = self._transition_transfer(transfer_id, InventoryTransferStatus.completed, "complete")
         item = self.repo.get_item_by_id(row.item_id, self.hospital_id)
         quantity = float(row.quantity)
 
-        if row.from_location.strip().lower() == "central":
-            source_central = self.repo.get_central_stock(row.item_id, self.hospital_id, for_update=True)
-            available = float(source_central.total_quantity) if source_central else 0.0
-            if available < quantity - 1e-9:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Insufficient central stock for {item.item_code} (available {available}, requested {quantity})",
-                )
-            source_central.total_quantity = round(available - quantity, 4)
-        else:
-            source_dept = self.repo.get_departmental_stock(
-                row.item_id, row.from_location, self.hospital_id, for_update=True
-            )
-            available = float(source_dept.quantity) if source_dept else 0.0
-            if available < quantity - 1e-9:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        f"Insufficient stock in {row.from_location} for {item.item_code} "
-                        f"(available {available}, requested {quantity})"
-                    ),
-                )
-            source_dept.quantity = round(available - quantity, 4)
+        source, is_central, _ = self._resolve_source_for_completion(row)
+        source.in_transit_quantity = round(float(source.in_transit_quantity or 0) - quantity, 4)
 
         dest_dept = self.repo.get_departmental_stock(row.item_id, row.to_department, self.hospital_id, for_update=True)
         if not dest_dept:
@@ -528,17 +653,6 @@ class InventoryActions:
             self.db.flush()
         dest_dept.quantity = round(float(dest_dept.quantity or 0) + quantity, 4)
 
-        out_txn = InventoryStockTransaction(
-            hospital_id=self.hospital_id,
-            item_id=row.item_id,
-            batch_id=None,
-            transaction_type=InventoryStockTransactionType.transfer_out,
-            quantity=-round(quantity, 4),
-            from_location=row.from_location,
-            to_location=row.to_department,
-            reference_type="inventory_transfer",
-            reference_id=row.id,
-        )
         in_txn = InventoryStockTransaction(
             hospital_id=self.hospital_id,
             item_id=row.item_id,
@@ -550,7 +664,6 @@ class InventoryActions:
             reference_type="inventory_transfer",
             reference_id=row.id,
         )
-        self.db.add(out_txn)
         self.db.add(in_txn)
 
         row.status = InventoryTransferStatus.completed
@@ -564,8 +677,8 @@ class InventoryActions:
             entity_type="inventory_transfer",
             entity_id=row.id,
             summary=(
-                f"Completed transfer {row.id}: moved {quantity} {item.item_code} "
-                f"from {row.from_location} to {row.to_department}"
+                f"Completed transfer {row.id}: landed {quantity} {item.item_code if item else 'item'} "
+                f"at {row.to_department}"
             ),
         )
         self.db.commit()

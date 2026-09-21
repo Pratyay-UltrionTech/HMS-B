@@ -33,7 +33,7 @@ from modules.dms.contracts.dms_contracts import (
     DmsPatientItem,
     DmsTimelineEvent,
 )
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/dms", tags=["dms"])
 
@@ -97,6 +97,7 @@ def list_documents(
     "/patients/{patient_id}/documents",
     response_model=DmsDocumentResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("dms", "edit"))],
 )
 def upload_document(
     patient_id: UUID,
@@ -109,7 +110,11 @@ def upload_document(
 
 
 # ── 6. Delete Document ─────────────────────────────────────────────────────────
-@router.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("dms", "edit"))],
+)
 def delete_document(
     document_id: UUID,
     db: Session = Depends(get_transitional_sync_session),

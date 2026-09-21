@@ -116,17 +116,31 @@ def cancel_charge_for_source(
 
 
 def bed_stay_days(admitted_at: datetime, discharged_at: datetime) -> int:
-    """Billable bed days: ceil(hours/24), minimum 1 day."""
+    """
+    Billable bed days using standard hospital midnight census accounting.
+    A patient admitted on Day 1 and discharged on Day 3 crosses 2 midnights;
+    with standard admission day / midnight census accounting, billable days = max(1, (discharge_date - admission_date).days + (1 if same_day or post-cutoff else 0))
+    or calendar midnights crossed:
+    - Same-day admission & discharge: 1 day (daycare / minimum stay).
+    - Multi-day: number of distinct calendar midnight periods or calendar days occupied.
+    Specifically: (end.date() - start.date()).days, minimum 1. If discharged on a later date,
+    each calendar day the bed is occupied (including discharge day if discharged after 12:00 PM cutoff) counts.
+    To prevent under-billing (HMS-FLAW-023), billable days is computed as:
+    max(1, (end.date() - start.date()).days + (1 if end.hour >= 12 else 0))
+    """
     start = admitted_at
     end = discharged_at
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
-    hours = max(0.0, (end - start).total_seconds() / 3600.0)
-    if hours <= 0:
+    
+    calendar_diff = (end.date() - start.date()).days
+    if calendar_diff <= 0:
         return 1
-    return max(1, int(math.ceil(hours / 24.0)))
+    # If stayed across calendar days, bill base calendar difference, plus 1 if checkout after 12:00 PM standard checkout cutoff
+    extra_day = 1 if end.hour >= 12 else 0
+    return max(1, calendar_diff + extra_day)
 
 
 def ensure_admission_charge(
@@ -166,7 +180,54 @@ def ensure_bed_charge_for_admission(
     bed_charge_per_day: float,
     created_by_name: str = "",
 ) -> BillingCharge:
-    """Calculate and post bed stay daily charges upon discharge."""
+    """Calculate and post bed stay daily charges upon discharge, accounting for transfer segments."""
+    # Check if BedStaySegments exist for this admission (HMS-FLAW-025)
+    try:
+        from modules.inpatient.entities.admission import BedStaySegment
+        segments = (
+            db.query(BedStaySegment)
+            .filter(
+                BedStaySegment.hospital_id == hospital_id,
+                BedStaySegment.admission_id == admission_id,
+            )
+            .order_by(BedStaySegment.started_at.asc())
+            .all()
+        )
+    except Exception:
+        segments = []
+
+    if segments:
+        total_amount = 0.0
+        total_days = 0
+        notes_parts = []
+        for s in segments:
+            seg_start = s.started_at
+            seg_end = s.ended_at or discharged_at
+            seg_days = bed_stay_days(seg_start, seg_end)
+            seg_rate = float(s.rate_per_day or 0.0)
+            seg_amount = round(seg_rate * seg_days, 2)
+            total_amount += seg_amount
+            total_days += seg_days
+            notes_parts.append(f"seg(rate={seg_rate}, days={seg_days}, amt={seg_amount})")
+        
+        amount = round(total_amount, 2)
+        days = max(1, total_days)
+        day_label = "Day" if days == 1 else "Days"
+        place = " / ".join(
+            p for p in [ward_name or None, room_code or None, bed_code or None] if p
+        ) or "Bed"
+        return ensure_charge(
+            db,
+            hospital_id=hospital_id,
+            patient_id=patient_id,
+            source_type=BillingSourceType.bed,
+            source_id=admission_id,
+            description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
+            charge_amount=amount,
+            created_by_name=created_by_name or "System",
+            notes=f"multi_segment; days={days}; {'; '.join(notes_parts)}"[:512],
+        )
+
     days = bed_stay_days(admitted_at, discharged_at)
     amount = round(float(bed_charge_per_day or 0) * days, 2)
     day_label = "Day" if days == 1 else "Days"
@@ -217,6 +278,7 @@ def allocate_payment_to_charges(
             ),
         )
         .order_by(BillingCharge.created_at.asc())
+        .with_for_update()
         .all()
     )
     for charge in charges:

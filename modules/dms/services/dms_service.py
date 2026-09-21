@@ -11,6 +11,7 @@ import base64
 from datetime import date, datetime, time, timezone
 from io import BytesIO
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -67,6 +68,17 @@ def _normalize_dt(val: Any) -> datetime:
     return val.astimezone(timezone.utc)
 
 
+def _sanitize_filename(name: str) -> str:
+    """FLAW-018: strip CR/LF, double quotes, and control chars from a filename.
+
+    Prevents HTTP response splitting / header injection when the user-controlled
+    `file_name` is placed into the Content-Disposition header.
+    """
+    cleaned = "".join(ch for ch in name if ch not in ('\r', '\n', '"') and ord(ch) >= 0x20)
+    cleaned = cleaned.strip().strip(".;")
+    return cleaned or "document"
+
+
 def stream_data_url(data: str, name: str) -> StreamingResponse:
     """Stream base64 data-URL payload as binary file attachment."""
     if not data.startswith("data:"):
@@ -74,10 +86,17 @@ def stream_data_url(data: str, name: str) -> StreamingResponse:
     header, b64 = data.split(",", 1)
     mime = header.split(";")[0].replace("data:", "") or "application/octet-stream"
     raw = base64.b64decode(b64)
+    safe_name = _sanitize_filename(name or "document")
+    # RFC 5987 percent-encoded filename* cannot inject header breaks; the plain
+    # `filename` fallback only carries already-sanitized characters.
     return StreamingResponse(
         BytesIO(raw),
         media_type=mime,
-        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{quote(safe_name)}"
+            )
+        },
     )
 
 
@@ -88,7 +107,11 @@ def build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[Dm
     # 1. PatientDocument (DMS native)
     for d in (
         db.query(PatientDocument)
-        .filter(PatientDocument.hospital_id == hospital_id, PatientDocument.patient_id == patient_id)
+        .filter(
+            PatientDocument.hospital_id == hospital_id,
+            PatientDocument.patient_id == patient_id,
+            PatientDocument.is_deleted.is_(False),
+        )
         .order_by(PatientDocument.created_at.desc())
         .all()
     ):
@@ -350,7 +373,11 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
     # 7. Patient Documents
     for d in (
         db.query(PatientDocument)
-        .filter(PatientDocument.hospital_id == hospital_id, PatientDocument.patient_id == patient.id)
+        .filter(
+            PatientDocument.hospital_id == hospital_id,
+            PatientDocument.patient_id == patient.id,
+            PatientDocument.is_deleted.is_(False),
+        )
         .all()
     ):
         events.append(

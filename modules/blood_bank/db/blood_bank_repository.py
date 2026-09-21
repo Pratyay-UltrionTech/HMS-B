@@ -72,11 +72,13 @@ class BloodBankRepository:
     # Feature 33 & 34: Units & Components
     # -----------------------------------------------------------------------
 
-    def get_unit_by_id(self, unit_id: UUID) -> BloodUnit | None:
+    def get_unit_by_id(self, unit_id: UUID, for_update: bool = False) -> BloodUnit | None:
         stmt = select(BloodUnit).where(
             BloodUnit.id == unit_id,
             BloodUnit.hospital_id == self.hospital_id,
         )
+        if for_update:
+            stmt = stmt.with_for_update()
         return self.db.scalars(stmt).first()
 
     def get_units(

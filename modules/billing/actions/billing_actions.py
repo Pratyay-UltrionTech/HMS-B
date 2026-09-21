@@ -279,7 +279,16 @@ class CancelChargeAction:
         charge = self.repo.get_charge_by_id(charge_id)
         if not charge:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Charge not found")
+        
+        paid_amount = round(float(charge.amount_paid or 0.0), 2)
         charge.status = BillingChargeStatus.cancelled
+        charge.amount_paid = 0.0
+        self.db.flush()
+
+        # If money was paid towards this charge, reallocate to other pending charges
+        if paid_amount > 0:
+            allocate_payment_to_charges(self.db, self.repo.hospital_id, charge.patient_id, paid_amount)
+
         self.db.commit()
         self.db.refresh(charge)
         write_audit_log(
@@ -289,7 +298,7 @@ class CancelChargeAction:
             action="cancel",
             entity_type="billing_charge",
             entity_id=charge.id,
-            summary=f"Cancelled charge {charge.id} ({charge.description[:32]})",
+            summary=f"Cancelled charge {charge.id} ({charge.description[:32]}). Released paid amount ₹{paid_amount:.2f} back to patient credit/reallocation.",
         )
         self.db.commit()
         return BillingChargeResponse.model_validate(charge_to_dict(charge))

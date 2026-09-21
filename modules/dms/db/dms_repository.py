@@ -129,6 +129,17 @@ class DmsRepository:
             .filter(
                 PatientDocument.id == document_id,
                 PatientDocument.hospital_id == self.hospital_id,
+                PatientDocument.is_deleted.is_(False),
+            )
+            .first()
+        )
+
+    def get_document_any_state(self, document_id: UUID) -> PatientDocument | None:
+        return (
+            self.db.query(PatientDocument)
+            .filter(
+                PatientDocument.id == document_id,
+                PatientDocument.hospital_id == self.hospital_id,
             )
             .first()
         )
@@ -172,6 +183,15 @@ class DmsRepository:
         self.db.refresh(doc)
         return doc
 
-    def delete_document(self, doc: PatientDocument) -> None:
-        self.db.delete(doc)
+    def soft_delete_document(self, doc: PatientDocument, deleted_by: str | None = None) -> None:
+        """FLAW-018: soft-delete a document instead of permanently purging it.
+
+        Retains the binary payload for archival retention and records the actor
+        responsible for the deletion.
+        """
+        from datetime import datetime, timezone
+
+        doc.is_deleted = True
+        doc.deleted_by = deleted_by
+        doc.deleted_at = datetime.now(timezone.utc)
         self.db.commit()

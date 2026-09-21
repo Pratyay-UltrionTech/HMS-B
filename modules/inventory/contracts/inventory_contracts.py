@@ -90,6 +90,7 @@ class CentralInventoryStockResponse(BaseModel):
     item_id: UUID
     item_name: str | None = None
     total_quantity: float
+    in_transit_quantity: float = 0.0
     location: str
     updated_at: datetime
 
@@ -122,6 +123,7 @@ class DepartmentalStockResponse(BaseModel):
     item_name: str | None = None
     department: str
     quantity: float
+    in_transit_quantity: float = 0.0
     updated_at: datetime
 
     model_config = {"from_attributes": True}
