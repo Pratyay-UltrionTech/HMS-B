@@ -450,3 +450,113 @@ def test_doctor_signature_update_and_persistence(
     assert res_clear.json()["digital_signature"] is None
 
 
+def test_doctor_appointments_and_calendar_reflect_bed_allocation(
+    client: TestClient,
+    doctor_auth_headers: dict[str, str],
+    doctor_user: HospitalUser,
+    db_session: Session,
+    hospital: Hospital,
+):
+    """Verify GET /api/doctors/{id}/appointments and /calendar reflect admission_ward, admission_bed, ip_id, and admission_status."""
+    patient = Patient(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        uhid="P8888",
+        name="Jane Admitted",
+        gender="Female",
+        mobile="9991112223",
+    )
+    db_session.add(patient)
+
+    from modules.beds.entities.bed import Bed, Room, Ward, WardType
+    from modules.inpatient.entities.admission import Admission, AdmissionStatus
+
+    ward = Ward(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        name="ICU Ward",
+        ward_type=WardType.icu,
+    )
+    db_session.add(ward)
+
+    room = Room(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        ward_id=ward.id,
+        room_code="ICU-R1",
+    )
+    db_session.add(room)
+
+    bed = Bed(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        ward_id=ward.id,
+        room_id=room.id,
+        bed_code="ICU-B01",
+    )
+    db_session.add(bed)
+
+    adm = Admission(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        patient_id=patient.id,
+        doctor_id=doctor_user.id,
+        ward_id=ward.id,
+        room_id=room.id,
+        bed_id=bed.id,
+        ip_id="IP9999",
+        status=AdmissionStatus.admitted,
+    )
+    db_session.add(adm)
+    db_session.commit()
+
+    from modules.appointments.entities.appointment import Appointment
+    from modules.appointments.entities.enums import AppointmentStatus
+
+    today = date.today()
+    appt = Appointment(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        doctor_id=doctor_user.id,
+        patient_id=patient.id,
+        admission_id=adm.id,
+        appointment_date=today,
+        appointment_time=time(11, 30),
+        purpose="Inpatient Rounds",
+        status=AppointmentStatus.transferred_to_inpatient,
+    )
+    db_session.add(appt)
+    db_session.commit()
+
+    # 1. Test /api/doctors/{id}/appointments
+    res_appt = client.get(
+        f"/api/doctors/{doctor_user.id}/appointments?date={today.isoformat()}",
+        headers=doctor_auth_headers,
+    )
+    assert res_appt.status_code == 200, res_appt.text
+    appts = res_appt.json()
+    match = next((a for a in appts if a["id"] == str(appt.id)), None)
+    assert match is not None
+    assert match["admission_id"] == str(adm.id)
+    assert match["ip_id"] == "IP9999"
+    assert match["admission_ward"] == "ICU Ward"
+    assert match["admission_bed"] == "ICU-B01"
+    assert match["admission_status"] == "admitted"
+
+    # 2. Test /api/doctors/{id}/calendar
+    monday = today - timedelta(days=today.weekday())
+    res_cal = client.get(
+        f"/api/doctors/{doctor_user.id}/calendar?week_start={monday.isoformat()}",
+        headers=doctor_auth_headers,
+    )
+    assert res_cal.status_code == 200, res_cal.text
+    cal_appts = res_cal.json()
+    cal_match = next((a for a in cal_appts if a["id"] == str(appt.id)), None)
+    assert cal_match is not None
+    assert cal_match["admission_id"] == str(adm.id)
+    assert cal_match["ip_id"] == "IP9999"
+    assert cal_match["admission_ward"] == "ICU Ward"
+    assert cal_match["admission_bed"] == "ICU-B01"
+    assert cal_match["admission_status"] == "admitted"
+
+

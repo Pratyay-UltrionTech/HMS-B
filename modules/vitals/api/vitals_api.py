@@ -29,6 +29,7 @@ from modules.vitals.permissions.vitals_permissions import (
     get_vitals_hospital_context,
     require_vitals_access,
 )
+from shared.auth import require_permission
 
 router = APIRouter(prefix="/vitals", tags=["vitals"])
 
@@ -60,7 +61,8 @@ def list_vitals(
     )
 
 
-@router.post("", response_model=list[VitalReadingResponse], status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=list[VitalReadingResponse], status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("vitals", "edit"))])
 def create_vitals(
     payload: VitalBatchCreate,
     db: Session = Depends(get_db),
@@ -72,7 +74,7 @@ def create_vitals(
     return CreateVitalsAction(repo).execute(payload=payload, user=user)
 
 
-@router.put("/{vital_id}", response_model=VitalReadingResponse)
+@router.put("/{vital_id}", response_model=VitalReadingResponse, dependencies=[Depends(require_permission("vitals", "edit"))])
 def update_vital(
     vital_id: UUID,
     payload: VitalItemUpdate,
@@ -89,7 +91,7 @@ def update_vital(
     )
 
 
-@router.delete("/{vital_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{vital_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("vitals", "edit"))])
 def delete_vital(
     vital_id: UUID,
     db: Session = Depends(get_db),

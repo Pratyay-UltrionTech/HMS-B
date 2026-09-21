@@ -353,4 +353,253 @@ def prescription_investigation_names(
             if item.test_name and item.test_name not in lab_names:
                 lab_names.append(item.test_name)
 
+    # Radiology investigations
+    try:
+        from modules.radiology.entities.radiology_entities import (
+            RadiologyOrder,
+            RadPrescriptionRequest,
+        )
+
+        rad_reqs = (
+            db.query(RadPrescriptionRequest)
+            .options(joinedload(RadPrescriptionRequest.items))
+            .filter(RadPrescriptionRequest.prescription_id == rx.id)
+            .all()
+        )
+        for req in rad_reqs:
+            for item in req.items or []:
+                if item.scan_name and item.scan_name not in rad_names:
+                    rad_names.append(item.scan_name)
+
+        rad_orders = (
+            db.query(RadiologyOrder)
+            .filter(
+                RadiologyOrder.hospital_id == rx.hospital_id,
+                RadiologyOrder.patient_id == rx.patient_id,
+            )
+        )
+        if hasattr(RadiologyOrder, "prescription_id"):
+            rad_rx_orders = rad_orders.filter(RadiologyOrder.prescription_id == rx.id).all()
+            for order in rad_rx_orders:
+                if order.scan_name and order.scan_name not in rad_names:
+                    rad_names.append(order.scan_name)
+        if rx.appointment_id:
+            rad_appt_orders = (
+                rad_orders.filter(
+                    RadiologyOrder.appointment_id == rx.appointment_id,
+                    RadiologyOrder.doctor_id == rx.doctor_id,
+                ).all()
+            )
+            for order in rad_appt_orders:
+                if order.scan_name and order.scan_name not in rad_names:
+                    rad_names.append(order.scan_name)
+    except Exception:
+        pass
+
     return lab_names, rad_names
+
+
+def get_prescription_investigation_ids(
+    db: Session, rx_id: UUID
+) -> tuple[list[UUID], list[UUID], list[UUID]]:
+    """Retrieve the current test_ids, panel_ids, and scan_ids for a prescription."""
+    test_ids: list[UUID] = []
+    panel_ids: list[UUID] = []
+    scan_ids: list[UUID] = []
+
+    lab_req = (
+        db.query(LabPrescriptionRequest)
+        .filter(LabPrescriptionRequest.prescription_id == rx_id)
+        .first()
+    )
+    if lab_req:
+        for tid_str in (lab_req.prescribed_test_ids or []):
+            try:
+                test_ids.append(UUID(str(tid_str)))
+            except Exception:
+                pass
+        for pid_str in (lab_req.prescribed_panel_ids or []):
+            try:
+                panel_ids.append(UUID(str(pid_str)))
+            except Exception:
+                pass
+
+    try:
+        from modules.radiology.entities.radiology_entities import RadPrescriptionRequest
+        rad_req = (
+            db.query(RadPrescriptionRequest)
+            .filter(RadPrescriptionRequest.prescription_id == rx_id)
+            .first()
+        )
+        if rad_req:
+            for sid_str in (rad_req.prescribed_scan_ids or []):
+                try:
+                    scan_ids.append(UUID(str(sid_str)))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return test_ids, panel_ids, scan_ids
+
+
+def update_investigation_requests_for_prescription(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    doctor_id: UUID,
+    patient_id: UUID,
+    appointment_id: UUID | None,
+    prescription_id: UUID,
+    test_ids: list[UUID] | None = None,
+    panel_ids: list[UUID] | None = None,
+    scan_ids: list[UUID] | None = None,
+    clinical_notes: str | None = None,
+) -> None:
+    """
+    Synchronize prescription investigations upon prescription edit.
+    - If an investigation item was already accessioned into a departmental LabOrder or RadiologyOrder,
+      it MUST NOT be deleted or modified; the departmental order and billing charge remain untouched.
+    - If a pending request item is removed by the doctor, it is safely removed/cancelled.
+    - If new investigations are added, pending request items are created.
+    """
+    lab_req = (
+        db.query(LabPrescriptionRequest)
+        .options(joinedload(LabPrescriptionRequest.items))
+        .filter(LabPrescriptionRequest.prescription_id == prescription_id)
+        .first()
+    )
+
+    if test_ids is not None or panel_ids is not None:
+        target_tids = test_ids if test_ids is not None else []
+        target_pids = panel_ids if panel_ids is not None else []
+        tests_resolved = resolve_lab_selection(
+            db, hospital_id, target_tids, target_pids, require_non_empty=False
+        )
+
+        if not lab_req and (target_tids or target_pids):
+            create_investigation_requests_for_prescription(
+                db,
+                hospital_id=hospital_id,
+                doctor_id=doctor_id,
+                patient_id=patient_id,
+                appointment_id=appointment_id,
+                prescription_id=prescription_id,
+                test_ids=target_tids,
+                panel_ids=target_pids,
+                clinical_notes=clinical_notes,
+            )
+        elif lab_req:
+            lab_req.prescribed_test_ids = [str(tid) for tid in target_tids]
+            lab_req.prescribed_panel_ids = [str(pid) for pid in target_pids]
+            if clinical_notes is not None:
+                lab_req.clinical_notes = clinical_notes
+
+            # Map resolved target tests: (test_id, panel_id)
+            target_tuples = {(r.test.id, r.panel.id if r.panel else None): r for r in tests_resolved}
+
+            existing_items = lab_req.items or []
+            # Keep track of which existing items match target
+            for item in existing_items:
+                key = (item.test_id, item.panel_id)
+                if key in target_tuples:
+                    # Item stays
+                    pass
+                else:
+                    # Item removed from prescription
+                    # RULE: If item is pending, cancel/remove it.
+                    # If already ordered (departmental order exists), DO NOT delete or cancel order!
+                    if item.status == LabRequestItemStatus.pending:
+                        db.delete(item)
+
+            # Add any newly added tests
+            existing_keys = {(i.test_id, i.panel_id) for i in existing_items}
+            idx_start = len(existing_items)
+            for idx, ((tid, pid), r) in enumerate(target_tuples.items()):
+                if (tid, pid) not in existing_keys:
+                    t = r.test
+                    new_item = LabPrescriptionRequestItem(
+                        hospital_id=hospital_id,
+                        request_id=lab_req.id,
+                        test_id=t.id,
+                        panel_id=r.panel.id if r.panel else None,
+                        panel_name=r.panel.panel_name if r.panel else None,
+                        test_code=t.test_code,
+                        test_name=t.test_name,
+                        department=t.department,
+                        price=t.price,
+                        sort_order=idx_start + idx,
+                        status=LabRequestItemStatus.pending,
+                    )
+                    db.add(new_item)
+
+            db.flush()
+
+    # Handle Radiology Investigations
+    if scan_ids is not None:
+        try:
+            from modules.radiology.entities.radiology_entities import (
+                RadPrescriptionRequest,
+                RadPrescriptionRequestItem,
+                RadPrescriptionRequestStatus,
+                RadRequestItemStatus,
+            )
+            from modules.radiology.services.rad_prescription_service import resolve_rad_selection
+
+            rad_req = (
+                db.query(RadPrescriptionRequest)
+                .options(joinedload(RadPrescriptionRequest.items))
+                .filter(RadPrescriptionRequest.prescription_id == prescription_id)
+                .first()
+            )
+
+            target_sids = scan_ids
+            scans_resolved = resolve_rad_selection(db, hospital_id, target_sids)
+
+            if not rad_req and target_sids:
+                create_investigation_requests_for_prescription(
+                    db,
+                    hospital_id=hospital_id,
+                    doctor_id=doctor_id,
+                    patient_id=patient_id,
+                    appointment_id=appointment_id,
+                    prescription_id=prescription_id,
+                    scan_ids=target_sids,
+                    clinical_notes=clinical_notes,
+                )
+            elif rad_req:
+                rad_req.prescribed_scan_ids = [str(sid) for sid in target_sids]
+                if clinical_notes is not None:
+                    rad_req.clinical_notes = clinical_notes
+
+                target_scan_ids = {s.id: s for s in scans_resolved}
+                existing_items = rad_req.items or []
+
+                for item in existing_items:
+                    if item.scan_id in target_scan_ids:
+                        pass
+                    else:
+                        if item.status == RadRequestItemStatus.pending:
+                            db.delete(item)
+
+                existing_sids = {i.scan_id for i in existing_items}
+                idx_start = len(existing_items)
+                for idx, (sid, s) in enumerate(target_scan_ids.items()):
+                    if sid not in existing_sids:
+                        new_item = RadPrescriptionRequestItem(
+                            hospital_id=hospital_id,
+                            request_id=rad_req.id,
+                            scan_id=s.id,
+                            scan_code=s.scan_code,
+                            scan_name=s.scan_name,
+                            category=s.category,
+                            price=s.price,
+                            sort_order=idx_start + idx,
+                            status=RadRequestItemStatus.pending,
+                        )
+                        db.add(new_item)
+
+                db.flush()
+        except Exception:
+            pass
+

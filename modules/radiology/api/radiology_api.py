@@ -53,10 +53,11 @@ from modules.radiology.entities.radiology_entities import (
 )
 from modules.radiology.services.radiology_service import (
     generate_radiology_report_html,
+    generate_radiology_report_pdf,
     stream_radiology_file,
 )
 from modules.tenancy.entities.hospital import Hospital
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/radiology", tags=["radiology"])
 
@@ -85,7 +86,7 @@ def list_scans(
     return [RadScanResponse.model_validate(s) for s in scans]
 
 
-@router.post("/catalogue/seed-standard", response_model=RadCatalogueSeedResult)
+@router.post("/catalogue/seed-standard", response_model=RadCatalogueSeedResult, dependencies=[Depends(require_permission("radiology", "edit"))])
 def seed_standard_radiology_catalogue(
     db: Session = Depends(get_transitional_sync_session),
     user: dict[str, Any] = Depends(require_hospital_user),
@@ -94,7 +95,8 @@ def seed_standard_radiology_catalogue(
     return SeedStandardCatalogueAction(db, hospital_id, user).execute()
 
 
-@router.post("/scans", response_model=RadScanResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/scans", response_model=RadScanResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("radiology", "edit"))])
 def create_scan(
     payload: RadScanCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -105,7 +107,7 @@ def create_scan(
     return RadScanResponse.model_validate(scan)
 
 
-@router.put("/scans/{scan_id}", response_model=RadScanResponse)
+@router.put("/scans/{scan_id}", response_model=RadScanResponse, dependencies=[Depends(require_permission("radiology", "edit"))])
 def update_scan(
     scan_id: UUID,
     payload: RadScanUpdate,
@@ -117,7 +119,7 @@ def update_scan(
     return RadScanResponse.model_validate(scan)
 
 
-@router.delete("/scans/{scan_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/scans/{scan_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("radiology", "edit"))])
 def delete_scan(
     scan_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -154,7 +156,8 @@ def get_prescription_request(
     return GetRadPrescriptionRequestAction(db, hospital_id).execute(request_id)
 
 
-@router.post("/prescription-requests/{request_id}/cancel", response_model=RadPrescriptionRequestResponse)
+@router.post("/prescription-requests/{request_id}/cancel", response_model=RadPrescriptionRequestResponse,
+    dependencies=[Depends(require_permission("radiology", "edit"))])
 def cancel_prescription_request(
     request_id: UUID,
     payload: RadRequestCancelBody,
@@ -168,7 +171,8 @@ def cancel_prescription_request(
 @router.post(
     "/prescription-requests/{request_id}/items/{item_id}/unavailable",
     response_model=RadPrescriptionRequestResponse,
-)
+
+    dependencies=[Depends(require_permission("radiology", "edit"))])
 def mark_request_item_unavailable(
     request_id: UUID,
     item_id: UUID,
@@ -210,7 +214,8 @@ def get_order(
     return GetOrderAction(db, hospital_id).execute(order_id)
 
 
-@router.post("/orders", response_model=list[RadOrderResponse], status_code=status.HTTP_201_CREATED)
+@router.post("/orders", response_model=list[RadOrderResponse], status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("radiology", "edit"))])
 def create_orders(
     payload: RadOrderCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -220,7 +225,7 @@ def create_orders(
     return CreateOrdersAction(db, hospital_id, user).execute(payload)
 
 
-@router.post("/orders/{order_id}/cancel", response_model=RadOrderResponse)
+@router.post("/orders/{order_id}/cancel", response_model=RadOrderResponse, dependencies=[Depends(require_permission("radiology", "edit"))])
 def cancel_order(
     order_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -230,7 +235,7 @@ def cancel_order(
     return CancelOrderAction(db, hospital_id, user).execute(order_id)
 
 
-@router.post("/orders/{order_id}/schedule", response_model=RadOrderResponse)
+@router.post("/orders/{order_id}/schedule", response_model=RadOrderResponse, dependencies=[Depends(require_permission("radiology", "edit"))])
 def schedule_order(
     order_id: UUID,
     payload: RadScheduleRequest,
@@ -241,7 +246,7 @@ def schedule_order(
     return ScheduleOrderAction(db, hospital_id, user).execute(order_id, payload)
 
 
-@router.post("/orders/{order_id}/start", response_model=RadOrderResponse)
+@router.post("/orders/{order_id}/start", response_model=RadOrderResponse, dependencies=[Depends(require_permission("radiology", "edit"))])
 def start_scan(
     order_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -251,7 +256,8 @@ def start_scan(
     return StartScanAction(db, hospital_id, user).execute(order_id)
 
 
-@router.post("/orders/{order_id}/complete-scan", response_model=RadOrderResponse)
+@router.post("/orders/{order_id}/complete-scan", response_model=RadOrderResponse,
+    dependencies=[Depends(require_permission("radiology", "edit"))])
 def complete_scan(
     order_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -261,7 +267,7 @@ def complete_scan(
     return CompleteScanAction(db, hospital_id, user).execute(order_id)
 
 
-@router.post("/orders/{order_id}/report", response_model=RadOrderResponse)
+@router.post("/orders/{order_id}/report", response_model=RadOrderResponse, dependencies=[Depends(require_permission("radiology", "edit"))])
 def upload_report(
     order_id: UUID,
     payload: RadReportRequest,
@@ -283,12 +289,66 @@ def report_html(
     order = repo.get_order(order_id)
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
+
+    from modules.billing.entities.billing_entities import BillingSourceType
+    from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+    assert_service_financially_cleared(
+        db,
+        hospital_id,
+        BillingSourceType.radiology,
+        order.id,
+        action_description="view radiology report",
+    )
+
     hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
-    html = generate_radiology_report_html(order, hospital.name if hospital else None)
+    html = generate_radiology_report_html(
+        order,
+        hospital.name if hospital else None,
+        hospital.address if hospital else None,
+        hospital.phone if hospital else None,
+        hospital.email if hospital else None,
+    )
     return StreamingResponse(
         BytesIO(html.encode("utf-8")),
         media_type="text/html",
         headers={"Content-Disposition": f'inline; filename="{order.order_no}-radiology.html"'},
+    )
+
+
+@router.get("/orders/{order_id}/report/pdf")
+def report_pdf(
+    order_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> StreamingResponse:
+    repo = RadiologyRepository(db, hospital_id)
+    order = repo.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
+
+    from modules.billing.entities.billing_entities import BillingSourceType
+    from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+    assert_service_financially_cleared(
+        db,
+        hospital_id,
+        BillingSourceType.radiology,
+        order.id,
+        action_description="download radiology report PDF",
+    )
+
+    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    pdf = generate_radiology_report_pdf(
+        order,
+        hospital.name if hospital else None,
+        hospital.address if hospital else None,
+        hospital.phone if hospital else None,
+        hospital.email if hospital else None,
+    )
+    return StreamingResponse(
+        BytesIO(pdf),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{order.order_no}-radiology-report.pdf"'},
     )
 
 
@@ -304,4 +364,12 @@ def download_file(
     order = repo.get_order(order_id)
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
-    return stream_radiology_file(order, kind)
+    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    return stream_radiology_file(
+        order,
+        kind,
+        hospital.name if hospital else None,
+        hospital.address if hospital else None,
+        hospital.phone if hospital else None,
+        hospital.email if hospital else None,
+    )

@@ -172,6 +172,8 @@ class RadiologyOrder(Base):
     )
     report_uploaded_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     report_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_amended: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    amendment_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     ordered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

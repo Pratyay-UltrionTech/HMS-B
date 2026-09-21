@@ -194,6 +194,7 @@ class LabResultResponse(BaseModel):
     reference_range: str | None
     remarks: str | None
     sort_order: int
+    is_panic: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -218,6 +219,8 @@ class LabOrderResponse(BaseModel):
     collection_remarks: str | None
     ordered_at: datetime
     completed_at: datetime | None
+    is_amended: bool = False
+    amendment_reason: str | None = None
     patient_name: str | None = None
     patient_uhid: str | None = None
     patient_mobile: str | None = None
@@ -226,6 +229,11 @@ class LabOrderResponse(BaseModel):
     panel_names: str | None = None
     items: list[LabOrderItemResponse] = []
     results: list[LabResultResponse] = []
+    payment_status: str = "pending"
+    is_financially_cleared: bool = False
+    net_amount: float = 0.0
+    amount_paid: float = 0.0
+    outstanding_amount: float = 0.0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -249,11 +257,13 @@ class LabResultInput(BaseModel):
     reference_range: str | None = Field(default=None, max_length=128)
     remarks: str | None = None
     sort_order: int = 0
+    is_panic: bool = False
 
 
 class LabReportSaveRequest(BaseModel):
     results: list[LabResultInput] = Field(min_length=1)
     mark_completed: bool = True
+    amendment_reason: str | None = None
 
 
 class LabDashboardResponse(BaseModel):

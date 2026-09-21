@@ -31,6 +31,7 @@ from modules.radiology.entities.radiology_entities import (
     RadiologyOrderStatus,
     RadiologyScanCatalog,
 )
+import tests.conftest  # noqa: F401
 from modules.tenancy.entities.hospital import Hospital
 from shared.auth import get_hospital_context, require_hospital_user
 
@@ -233,7 +234,23 @@ def test_radiology_order_full_lifecycle(rad_client, rad_db):
     assert charge.charge_amount == 500.0
     assert charge.status == BillingChargeStatus.pending
 
-    # 2. Schedule order
+    # 2. Payment gating check: scheduling unpaid order raises 402
+    unpaid_sch = rad_client.post(
+        f"/api/radiology/orders/{order_id}/schedule",
+        json={
+            "scheduled_at": datetime.now(timezone.utc).isoformat(),
+            "machine": "Siemens X-Ray Room 2",
+            "technician_name": "Ravi Kumar",
+        },
+    )
+    assert unpaid_sch.status_code == 402
+    assert "payment" in str(unpaid_sch.json()["detail"]).lower()
+
+    # Clear charge financially
+    charge.status = BillingChargeStatus.paid
+    rad_db.commit()
+
+    # 3. Schedule order after financial clearance
     sch_resp = rad_client.post(
         f"/api/radiology/orders/{order_id}/schedule",
         json={
@@ -245,6 +262,7 @@ def test_radiology_order_full_lifecycle(rad_client, rad_db):
     assert sch_resp.status_code == 200
     assert sch_resp.json()["status"] == "scheduled"
     assert sch_resp.json()["machine"] == "Siemens X-Ray Room 2"
+    assert sch_resp.json()["is_financially_cleared"] is True
 
     # 3. Start scan
     st_resp = rad_client.post(f"/api/radiology/orders/{order_id}/start")
@@ -300,6 +318,58 @@ def test_radiology_order_full_lifecycle(rad_client, rad_db):
     file_resp = rad_client.get(f"/api/radiology/orders/{order_id}/file/image")
     assert file_resp.status_code == 200
     assert file_resp.content == b"dummy_png_bytes"
+
+    # 8. Report file streaming when uploaded
+    rep_file_resp = rad_client.get(f"/api/radiology/orders/{order_id}/file/report")
+    assert rep_file_resp.status_code == 200
+    assert rep_file_resp.content == b"dummy_pdf_bytes"
+
+    # 9. Test order reported without uploaded report file (UI workflow)
+    # create another order and report it with findings + image only (no report_file_data)
+    o2_resp = rad_client.post(
+        "/api/radiology/orders",
+        json={
+            "patient_id": str(patient.id),
+            "doctor_id": str(rad_client.test_user_id),
+            "scan_ids": [str(scan.id)],
+        },
+    )
+    assert o2_resp.status_code == 201
+    o2_id = o2_resp.json()[0]["id"]
+    c2 = (
+        rad_db.query(BillingCharge)
+        .filter(
+            BillingCharge.hospital_id == h_id,
+            BillingCharge.source_id == UUID(o2_id),
+            BillingCharge.source_type == BillingSourceType.radiology,
+        )
+        .first()
+    )
+    if c2:
+        c2.status = BillingChargeStatus.paid
+        rad_db.commit()
+
+    rad_client.post(f"/api/radiology/orders/{o2_id}/schedule", json={"scheduled_at": datetime.now(timezone.utc).isoformat()})
+    rad_client.post(f"/api/radiology/orders/{o2_id}/start")
+    rad_client.post(f"/api/radiology/orders/{o2_id}/complete-scan")
+    rep2_resp = rad_client.post(
+        f"/api/radiology/orders/{o2_id}/report",
+        json={
+            "findings": "Mild cardiomegaly noted. No pulmonary edema.",
+            "impression": "Cardiomegaly.",
+            "remarks": "Echocardiogram advised.",
+            "image_file_name": "echo_scan.png",
+            "image_file_data": sample_img,
+        },
+    )
+    assert rep2_resp.status_code == 200
+    assert rep2_resp.json()["has_report_file"] is False
+
+    # GET /file/report must succeed and return generated HTML report even without report_file_data
+    stream_html_resp = rad_client.get(f"/api/radiology/orders/{o2_id}/file/report")
+    assert stream_html_resp.status_code == 200
+    assert "text/html" in stream_html_resp.headers["content-type"]
+    assert "Cardiomegaly" in stream_html_resp.text
 
 
 def test_radiology_cancellation_and_billing_sync(rad_client, rad_db):

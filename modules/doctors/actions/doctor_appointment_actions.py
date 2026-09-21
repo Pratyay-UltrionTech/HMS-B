@@ -30,6 +30,7 @@ from modules.doctors.services.doctor_schedule_service import (
     get_shift_bounds,
     slot_duration_minutes,
 )
+from modules.inpatient.entities.admission import Admission
 from modules.patients.entities.patient import Patient
 from shared.audit.service import write_audit_log
 
@@ -40,6 +41,8 @@ def appt_load_options():
         joinedload(Appointment.doctor),
         joinedload(Appointment.nurse),
         joinedload(Appointment.appointment_type),
+        joinedload(Appointment.admission).joinedload(Admission.ward),
+        joinedload(Appointment.admission).joinedload(Admission.bed),
     ]
 
 
@@ -48,6 +51,11 @@ def to_doctor_appointment_response(a: Appointment) -> DoctorAppointmentResponse:
     doctor = a.doctor
     nurse = a.nurse
     appt_type = getattr(a, "appointment_type", None)
+    adm = getattr(a, "admission", None)
+    adm_status = None
+    if adm and getattr(adm, "status", None) is not None:
+        adm_status = adm.status.value if hasattr(adm.status, "value") else str(adm.status)
+
     return DoctorAppointmentResponse(
         id=a.id,
         hospital_id=a.hospital_id,
@@ -76,6 +84,11 @@ def to_doctor_appointment_response(a: Appointment) -> DoctorAppointmentResponse:
         slot_duration_minutes=appt_type.slot_duration_minutes if appt_type else 15,
         consultation_fee=float(getattr(a, "consultation_fee", 0) or 0),
         followup_eligibility=getattr(a, "followup_eligibility", None),
+        admission_id=a.admission_id,
+        ip_id=getattr(adm, "ip_id", None) if adm else None,
+        admission_ward=adm.ward.name if (adm and getattr(adm, "ward", None)) else None,
+        admission_bed=adm.bed.bed_code if (adm and getattr(adm, "bed", None)) else None,
+        admission_status=adm_status,
     )
 
 

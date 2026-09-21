@@ -536,3 +536,73 @@ def test_cross_doctor_patient_diagnostic_records_and_history(
     file_info = file_res.json()
     assert file_info["file_name"] == "lipid_profile.pdf"
     assert "base64" in file_info["file_data"]
+
+
+def test_prescription_pdf_includes_radiology_and_lab_investigations(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    doctor_with_role: HospitalUser,
+    test_patient: Patient,
+    db_session: Session,
+    hospital: Hospital,
+):
+    """Prescription PDF/HTML includes prescribed radiology scans and lab tests."""
+    from modules.radiology.entities.radiology_entities import RadiologyScanCatalog
+    from modules.laboratory.entities.lab_entities import LabTestCatalog
+
+    doc_id = str(doctor_with_role.id)
+
+    # 1. Create a scan in catalog
+    scan = RadiologyScanCatalog(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        scan_code="RAD-XRAY-CHEST",
+        scan_name="Chest X-Ray PA View",
+        category="X-Ray",
+        price=500.0,
+        is_active=True,
+    )
+    # 2. Create a lab test in catalog
+    lab = LabTestCatalog(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        test_code="LAB-CBC",
+        test_name="Complete Blood Count",
+        department="Hematology",
+        price=350.0,
+        is_active=True,
+    )
+    db_session.add_all([scan, lab])
+    db_session.commit()
+
+    # 3. Create prescription with scan_ids and test_ids
+    create_payload = {
+        "patient_id": str(test_patient.id),
+        "symptoms": "Cough and mild shortness of breath",
+        "diagnosis": "Suspected Pneumonia",
+        "medicines": "Azithromycin 500mg",
+        "dosage": "1 OD x 3 days",
+        "advice": "Rest and monitor oxygen",
+        "test_ids": [str(lab.id)],
+        "scan_ids": [str(scan.id)],
+    }
+    res = client.post(
+        f"/api/doctors/{doc_id}/prescriptions",
+        json=create_payload,
+        headers=auth_headers,
+    )
+    assert res.status_code == 201, res.text
+    rx_id = res.json()["id"]
+
+    # 4. Fetch the printable HTML/PDF
+    pdf_res = client.get(
+        f"/api/doctors/{doc_id}/prescriptions/{rx_id}/pdf",
+        headers=auth_headers,
+    )
+    assert pdf_res.status_code == 200
+    html = pdf_res.text
+    assert "Chest X-Ray PA View" in html
+    assert "Complete Blood Count" in html
+    assert "Radiology / Imaging Prescribed" in html
+    assert "Laboratory Tests Prescribed" in html
+

@@ -183,6 +183,9 @@ class HospitalUser(Base):
         JSONB().with_variant(JSON, "sqlite"), nullable=False, default=dict
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # FLAW-024: Session revocation version. Incremented whenever a user's role or
+    # active status changes so previously-issued JWTs can be rejected server-side.
+    token_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

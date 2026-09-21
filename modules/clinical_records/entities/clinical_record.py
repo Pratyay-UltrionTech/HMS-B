@@ -12,6 +12,7 @@ import enum
 import uuid
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Enum,
@@ -58,7 +59,7 @@ class Prescription(Base):
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     patient_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
@@ -94,7 +95,7 @@ class MedicalRecord(Base):
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     patient_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
@@ -106,6 +107,7 @@ class MedicalRecord(Base):
         UUID(as_uuid=True), nullable=True, index=True
     )
     report_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    provenance: Mapped[str] = mapped_column(String(32), default="internal", server_default="internal", nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -130,7 +132,7 @@ class PatientDocument(Base):
         UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     patient_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     category: Mapped[PatientDocumentCategory] = mapped_column(
         Enum(PatientDocumentCategory, name="patient_document_category"),
@@ -143,6 +145,11 @@ class PatientDocument(Base):
     file_data: Mapped[str | None] = mapped_column(Text, nullable=True)
     uploaded_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     uploaded_by_role: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # FLAW-018: soft-delete + archival retention columns so clinical documents are
+    # never permanently purged without an audit trail.
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    deleted_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

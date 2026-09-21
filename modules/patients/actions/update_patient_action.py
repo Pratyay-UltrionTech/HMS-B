@@ -27,6 +27,7 @@ from modules.patients.validators.patients_validator import (
     format_display_name,
     validate_update_emergency_contact,
 )
+from modules.inpatient.entities.admission import Admission, AdmissionStatus
 from shared.audit import write_audit_log
 
 
@@ -51,6 +52,16 @@ class UpdatePatientAction:
             )
 
         data = payload.model_dump(exclude_unset=True)
+
+        # FLAW-010: capture the demographic identity before this update so we can
+        # detect corrections and propagate them to ACTIVE encounters' snapshots
+        # (audit-logged) without rewriting discharged / historical encounters.
+        before_demo = {
+            "name": patient.name,
+            "gender": patient.gender,
+            "age": patient.age,
+            "date_of_birth": patient.date_of_birth,
+        }
 
         if "mobile" in data and data["mobile"]:
             mobile = data["mobile"].strip()
@@ -131,6 +142,8 @@ class UpdatePatientAction:
             summary=f"Updated patient {patient.uhid} {patient.name}",
         )
 
+        self._propagate_demographic_amendment(patient, before_demo, user)
+
         self.repo.commit()
         self.repo.refresh(patient)
 
@@ -151,3 +164,71 @@ class UpdatePatientAction:
             last_visit=last_visit,
             created_at=patient.created_at,
         )
+
+    def _propagate_demographic_amendment(
+        self,
+        patient: Any,
+        before: dict[str, Any],
+        user: dict[str, Any],
+    ) -> None:
+        """FLAW-010 demographic amendment propagation.
+
+        When the canonical Patient identity (name / gender / age) changes, the
+        immutable snapshots of ACTIVE (non-discharged) admissions are refreshed
+        so wristbands / worklists reflect the corrected identity, and a dedicated
+        ``amend_demographics`` audit entry records the before/after values so
+        nursing can reprint labels. Discharged / historical admissions keep the
+        snapshot they were frozen with at admission/discharge time.
+        """
+        after = {
+            "name": patient.name,
+            "gender": patient.gender,
+            "age": patient.age,
+            "date_of_birth": patient.date_of_birth,
+        }
+        changed = {
+            k: (before.get(k), after.get(k))
+            for k in ("name", "gender", "age", "date_of_birth")
+            if before.get(k) != after.get(k)
+        }
+        if not changed:
+            return
+
+        active = (
+            self.repo.db.query(Admission)
+            .filter(
+                Admission.patient_id == patient.id,
+                Admission.hospital_id == self.repo.hospital_id,
+                Admission.status.in_(
+                    [AdmissionStatus.admitted, AdmissionStatus.discharge_requested]
+                ),
+            )
+            .all()
+        )
+        for adm in active:
+            adm.patient_name = patient.name
+            adm.gender = patient.gender
+            adm.age_at_admission = patient.age
+
+        changed_desc = "; ".join(
+            f"{k}: {_fmt(old)} -> {_fmt(new)}" for k, (old, new) in changed.items()
+        )
+        write_audit_log(
+            self.repo.db,
+            hospital_id=self.repo.hospital_id,
+            actor=user,
+            action="amend_demographics",
+            entity_type="patient",
+            entity_id=patient.id,
+            summary=(
+                f"Demographics amended for {patient.uhid} {patient.name} "
+                f"({changed_desc}); refreshed {len(active)} active admission snapshot(s); "
+                "reprint wristbands/labels"
+            ),
+        )
+
+
+def _fmt(value: Any) -> str:
+    if value is None:
+        return "<none>"
+    return str(value)

@@ -11,7 +11,7 @@ from io import BytesIO
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,7 @@ from infrastructure.postgres.session import get_transitional_sync_session
 from shared.auth import (
     get_hospital_context,
     require_hospital_user,
+    require_permission,
 )
 from modules.laboratory.actions.laboratory_actions import (
     CancelLabOrderAction,
@@ -67,6 +68,9 @@ from modules.laboratory.entities.lab_entities import (
     LabOrderStatus,
     LabPrescriptionRequestStatus,
 )
+from modules.laboratory.db.laboratory_repository import LaboratoryRepository
+from modules.laboratory.services.lab_report_service import generate_lab_report_pdf
+from modules.tenancy.entities.hospital import Hospital
 
 router = APIRouter(prefix="/laboratory", tags=["laboratory"])
 
@@ -96,7 +100,7 @@ def list_tests(
     )
 
 
-@router.post("/catalogue/seed-standard", response_model=LabCatalogueSeedResult)
+@router.post("/catalogue/seed-standard", response_model=LabCatalogueSeedResult, dependencies=[Depends(require_permission("laboratory", "edit"))])
 def seed_standard_catalogue(
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
@@ -105,7 +109,8 @@ def seed_standard_catalogue(
     return SeedStandardCatalogueAction(db, hospital_id).execute(user)
 
 
-@router.post("/tests", response_model=LabTestResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/tests", response_model=LabTestResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("laboratory", "edit"))])
 def create_test(
     payload: LabTestCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -115,7 +120,7 @@ def create_test(
     return CreateLabTestAction(db, hospital_id).execute(payload, user)
 
 
-@router.put("/tests/{test_id}", response_model=LabTestResponse)
+@router.put("/tests/{test_id}", response_model=LabTestResponse, dependencies=[Depends(require_permission("laboratory", "edit"))])
 def update_test(
     test_id: UUID,
     payload: LabTestUpdate,
@@ -126,7 +131,8 @@ def update_test(
     return UpdateLabTestAction(db, hospital_id).execute(test_id, payload, user)
 
 
-@router.delete("/tests/{test_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.delete("/tests/{test_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response,
+    dependencies=[Depends(require_permission("laboratory", "edit"))])
 def delete_test(
     test_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -148,7 +154,7 @@ def list_panels(
     return ListLabPanelsAction(db, hospital_id).execute(is_active=is_active)
 
 
-@router.post("/panels/seed-defaults", response_model=list[LabPanelResponse])
+@router.post("/panels/seed-defaults", response_model=list[LabPanelResponse], dependencies=[Depends(require_permission("laboratory", "edit"))])
 def seed_default_panels(
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
@@ -168,7 +174,8 @@ def get_panel(
     return GetLabPanelAction(db, hospital_id).execute(panel_id)
 
 
-@router.post("/panels", response_model=LabPanelResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/panels", response_model=LabPanelResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("laboratory", "edit"))])
 def create_panel(
     payload: LabPanelCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -178,7 +185,7 @@ def create_panel(
     return CreateLabPanelAction(db, hospital_id).execute(payload, user)
 
 
-@router.put("/panels/{panel_id}", response_model=LabPanelResponse)
+@router.put("/panels/{panel_id}", response_model=LabPanelResponse, dependencies=[Depends(require_permission("laboratory", "edit"))])
 def update_panel(
     panel_id: UUID,
     payload: LabPanelUpdate,
@@ -189,7 +196,7 @@ def update_panel(
     return UpdateLabPanelAction(db, hospital_id).execute(panel_id, payload, user)
 
 
-@router.delete("/panels/{panel_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/panels/{panel_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_permission("laboratory", "edit"))])
 def delete_panel(
     panel_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -224,7 +231,8 @@ def get_prescription_request_endpoint(
     return GetLabPrescriptionRequestAction(db, hospital_id).execute(request_id)
 
 
-@router.post("/prescription-requests/{request_id}/cancel", response_model=LabPrescriptionRequestResponse)
+@router.post("/prescription-requests/{request_id}/cancel", response_model=LabPrescriptionRequestResponse,
+    dependencies=[Depends(require_permission("laboratory", "edit"))])
 def cancel_prescription_request(
     request_id: UUID,
     body: LabRequestCancelBody | None = None,
@@ -239,7 +247,8 @@ def cancel_prescription_request(
 @router.post(
     "/prescription-requests/{request_id}/items/{item_id}/unavailable",
     response_model=LabPrescriptionRequestResponse,
-)
+
+    dependencies=[Depends(require_permission("laboratory", "edit"))])
 def mark_request_item_unavailable(
     request_id: UUID,
     item_id: UUID,
@@ -287,7 +296,8 @@ def get_order(
     return GetLabOrderAction(db, hospital_id).execute(order_id)
 
 
-@router.post("/orders", response_model=LabOrderResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/orders", response_model=LabOrderResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("laboratory", "edit"))])
 def create_order(
     payload: LabOrderCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -297,7 +307,7 @@ def create_order(
     return CreateLabOrderAction(db, hospital_id).execute(payload, user)
 
 
-@router.post("/orders/{order_id}/cancel", response_model=LabOrderResponse)
+@router.post("/orders/{order_id}/cancel", response_model=LabOrderResponse, dependencies=[Depends(require_permission("laboratory", "edit"))])
 def cancel_order(
     order_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -307,7 +317,8 @@ def cancel_order(
     return CancelLabOrderAction(db, hospital_id).execute(order_id, user)
 
 
-@router.post("/orders/{order_id}/collect-sample", response_model=LabOrderResponse)
+@router.post("/orders/{order_id}/collect-sample", response_model=LabOrderResponse,
+    dependencies=[Depends(require_permission("laboratory", "edit"))])
 def collect_sample(
     order_id: UUID,
     payload: SampleCollectRequest,
@@ -318,7 +329,8 @@ def collect_sample(
     return CollectSampleAction(db, hospital_id).execute(order_id, payload, user)
 
 
-@router.put("/orders/{order_id}/items/{item_id}/status", response_model=LabOrderResponse)
+@router.put("/orders/{order_id}/items/{item_id}/status", response_model=LabOrderResponse,
+    dependencies=[Depends(require_permission("laboratory", "edit"))])
 def update_item_status(
     order_id: UUID,
     item_id: UUID,
@@ -330,7 +342,7 @@ def update_item_status(
     return UpdateItemStatusAction(db, hospital_id).execute(order_id, item_id, payload, user)
 
 
-@router.post("/orders/{order_id}/results", response_model=LabOrderResponse)
+@router.post("/orders/{order_id}/results", response_model=LabOrderResponse, dependencies=[Depends(require_permission("laboratory", "edit"))])
 def save_results(
     order_id: UUID,
     payload: LabReportSaveRequest,
@@ -353,4 +365,41 @@ def report_html(
         BytesIO(html.encode("utf-8")),
         media_type="text/html",
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@router.get("/orders/{order_id}/report/pdf")
+def report_pdf(
+    order_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> StreamingResponse:
+    repo = LaboratoryRepository(db, hospital_id)
+    order = repo.get_order(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Lab order not found")
+
+    from modules.billing.entities.billing_entities import BillingSourceType
+    from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+    assert_service_financially_cleared(
+        db,
+        hospital_id,
+        BillingSourceType.laboratory,
+        order.id,
+        action_description="download laboratory report PDF",
+    )
+
+    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    pdf = generate_lab_report_pdf(
+        order,
+        hospital_name=hospital.name if hospital else "Hospital",
+        hospital_address=hospital.address if hospital else "",
+        hospital_phone=hospital.phone if hospital else "",
+        hospital_email=hospital.email if hospital else "",
+    )
+    return StreamingResponse(
+        BytesIO(pdf),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{order.order_no}-report.pdf"'},
     )

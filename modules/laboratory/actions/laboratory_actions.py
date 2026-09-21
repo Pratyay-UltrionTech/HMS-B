@@ -75,6 +75,9 @@ from modules.laboratory.services.lab_prescription_service import (
     request_to_response_dict,
     sync_request_after_order_change,
 )
+from modules.billing.services.service_financial_clearance import (
+    assert_service_financially_cleared,
+)
 from modules.laboratory.services.lab_report_service import (
     generate_lab_report_html,
     sync_lab_order_medical_record,
@@ -115,6 +118,8 @@ def _order_to_response(order: LabOrder) -> LabOrderResponse:
         collection_remarks=order.collection_remarks,
         ordered_at=order.ordered_at,
         completed_at=order.completed_at,
+        is_amended=getattr(order, "is_amended", False),
+        amendment_reason=getattr(order, "amendment_reason", None),
         patient_name=order.patient.name if order.patient else None,
         patient_uhid=order.patient.uhid if order.patient else None,
         patient_mobile=getattr(order.patient, "mobile", None) if order.patient else None,
@@ -145,6 +150,7 @@ def _order_to_response(order: LabOrder) -> LabOrderResponse:
                 reference_range=r.reference_range,
                 remarks=r.remarks,
                 sort_order=r.sort_order,
+                is_panic=getattr(r, "is_panic", False),
             )
             for r in (order.results or [])
         ],
@@ -838,6 +844,15 @@ class CollectSampleAction:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot collect sample for this order",
             )
+
+        assert_service_financially_cleared(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.laboratory,
+            order.id,
+            action_description="collect specimen",
+        )
+
         order.collected_at = payload.collected_at or datetime.now(timezone.utc)
         order.collected_by = payload.collected_by.strip()
         order.collection_remarks = (
@@ -898,6 +913,16 @@ class SaveLabResultsAction:
         if order.status == LabOrderStatus.cancelled:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is cancelled")
 
+        is_completed_edit = (order.status == LabOrderStatus.completed)
+        if is_completed_edit:
+            if not payload.amendment_reason or not payload.amendment_reason.strip():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Amendment reason is mandatory when amending completed laboratory results.",
+                )
+            order.is_amended = True
+            order.amendment_reason = payload.amendment_reason.strip()
+
         self.db.query(LabResult).filter(LabResult.order_id == order.id).delete()
         for idx, row in enumerate(payload.results):
             self.db.add(
@@ -911,6 +936,7 @@ class SaveLabResultsAction:
                     reference_range=row.reference_range.strip() if row.reference_range else None,
                     remarks=row.remarks.strip() if row.remarks else None,
                     sort_order=row.sort_order if row.sort_order else idx,
+                    is_panic=bool(row.is_panic),
                 )
             )
 

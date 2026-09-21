@@ -33,6 +33,8 @@ from modules.pharmacy.contracts.pharmacy_contracts import (
     PurchaseResponse,
     PurchaseReturnCreate,
     ReturnResponse,
+    RxRequestCreate,
+    RxRequestResponse,
     SaleCreate,
     SaleResponse,
     SearchHit,
@@ -44,7 +46,7 @@ from modules.pharmacy.entities.pharmacy_entities import (
     PharmacyPaymentStatus,
     PharmacySaleType,
 )
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/pharmacy", tags=["pharmacy"])
 
@@ -72,7 +74,8 @@ def list_categories(
     return PharmacyActions(db, hospital_id, user).list_categories(active_only)
 
 
-@router.post("/categories", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/categories", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def create_category(
     payload: CategoryCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -82,7 +85,7 @@ def create_category(
     return PharmacyActions(db, hospital_id, user).create_category(payload)
 
 
-@router.patch("/categories/{category_id}", response_model=CategoryResponse)
+@router.patch("/categories/{category_id}", response_model=CategoryResponse, dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def update_category(
     category_id: UUID,
     payload: CategoryUpdate,
@@ -105,7 +108,8 @@ def list_suppliers(
     return PharmacyActions(db, hospital_id, user).list_suppliers(active_only)
 
 
-@router.post("/suppliers", response_model=SupplierResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/suppliers", response_model=SupplierResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def create_supplier(
     payload: SupplierCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -115,7 +119,7 @@ def create_supplier(
     return PharmacyActions(db, hospital_id, user).create_supplier(payload)
 
 
-@router.patch("/suppliers/{supplier_id}", response_model=SupplierResponse)
+@router.patch("/suppliers/{supplier_id}", response_model=SupplierResponse, dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def update_supplier(
     supplier_id: UUID,
     payload: SupplierUpdate,
@@ -148,7 +152,8 @@ def list_medicines(
     )
 
 
-@router.post("/medicines", response_model=MedicineResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/medicines", response_model=MedicineResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def create_medicine(
     payload: MedicineCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -168,7 +173,7 @@ def get_medicine(
     return PharmacyActions(db, hospital_id, user).get_medicine(medicine_id)
 
 
-@router.patch("/medicines/{medicine_id}", response_model=MedicineResponse)
+@router.patch("/medicines/{medicine_id}", response_model=MedicineResponse, dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def update_medicine(
     medicine_id: UUID,
     payload: MedicineUpdate,
@@ -248,7 +253,8 @@ def get_purchase(
     return PharmacyActions(db, hospital_id, user).get_purchase(purchase_id)
 
 
-@router.post("/purchases", response_model=PurchaseResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/purchases", response_model=PurchaseResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def create_purchase(
     payload: PurchaseCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -294,7 +300,8 @@ def get_sale(
     return PharmacyActions(db, hospital_id, user).get_sale(sale_id)
 
 
-@router.post("/sales", response_model=SaleResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/sales", response_model=SaleResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def create_sale(
     payload: SaleCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -304,7 +311,7 @@ def create_sale(
     return PharmacyActions(db, hospital_id, user).create_sale(payload)
 
 
-@router.post("/sales/{sale_id}/cancel", response_model=SaleResponse)
+@router.post("/sales/{sale_id}/cancel", response_model=SaleResponse, dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def cancel_sale(
     sale_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -327,7 +334,8 @@ def list_adjustments(
     return PharmacyActions(db, hospital_id, user).list_adjustments(medicine_id, limit)
 
 
-@router.post("/adjustments", response_model=AdjustmentResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/adjustments", response_model=AdjustmentResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def create_adjustment(
     payload: AdjustmentCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -339,7 +347,8 @@ def create_adjustment(
 
 # ── Returns ───────────────────────────────────────────────────────────────
 
-@router.post("/returns/customer", response_model=ReturnResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/returns/customer", response_model=ReturnResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def customer_return(
     payload: CustomerReturnCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -349,7 +358,8 @@ def customer_return(
     return PharmacyActions(db, hospital_id, user).customer_return(payload)
 
 
-@router.post("/returns/purchase", response_model=ReturnResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/returns/purchase", response_model=ReturnResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
 def purchase_return(
     payload: PurchaseReturnCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -367,6 +377,43 @@ def list_returns(
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[ReturnResponse]:
     return PharmacyActions(db, hospital_id, user).list_returns(limit)
+
+
+# ── Rx requests ────────────────────────────────────────────────────────────
+
+@router.get("/rx-requests", response_model=list[RxRequestResponse])
+def list_rx_requests(
+    status: str | None = Query(None),
+    prescription_id: UUID | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> list[RxRequestResponse]:
+    return PharmacyActions(db, hospital_id, user).list_rx_requests(
+        status=status, prescription_id=prescription_id, limit=limit
+    )
+
+
+@router.get("/rx-requests/{rx_request_id}", response_model=RxRequestResponse)
+def get_rx_request(
+    rx_request_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> RxRequestResponse:
+    return PharmacyActions(db, hospital_id, user).get_rx_request(rx_request_id)
+
+
+@router.post("/rx-requests", response_model=RxRequestResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("pharmacy", "edit"))])
+def create_rx_request(
+    payload: RxRequestCreate,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> RxRequestResponse:
+    return PharmacyActions(db, hospital_id, user).create_rx_request(payload)
 
 
 # ── Reports ───────────────────────────────────────────────────────────────

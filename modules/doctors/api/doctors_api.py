@@ -74,7 +74,7 @@ from modules.doctors.permissions.doctor_permissions import resolve_doctor_id
 from modules.inpatient.actions.admission_actions import to_admission_detail
 from modules.inpatient.contracts.inpatient_contracts import AdmissionDetail
 from modules.inpatient.db.admissions_repository import AdmissionsRepository
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
 
@@ -112,7 +112,7 @@ def search_patients(
     return SearchPatientsAction(db).execute(hospital_id, q)
 
 
-@router.put("/patients/{patient_id}", response_model=DoctorPatientResponse)
+@router.put("/patients/{patient_id}", response_model=DoctorPatientResponse, dependencies=[Depends(require_permission("doctors", "edit"))])
 def update_patient(
     patient_id: UUID,
     payload: DoctorPatientUpdate,
@@ -123,7 +123,8 @@ def update_patient(
     return UpdateDoctorPatientAction(db).execute(hospital_id, patient_id, payload, user)
 
 
-@router.post("/patients", response_model=DoctorPatientResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/patients", response_model=DoctorPatientResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def create_patient(
     payload: DoctorPatientCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -165,7 +166,8 @@ def doctor_patient_history(
     "/{doctor_id}/appointments",
     response_model=DoctorAppointmentResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def create_doctor_appointment(
     doctor_id: UUID,
     payload: DoctorAppointmentCreate,
@@ -247,7 +249,8 @@ def list_doctor_leaves(
     "/{doctor_id}/leaves",
     response_model=DoctorLeaveResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def create_doctor_leave(
     doctor_id: UUID,
     payload: DoctorLeaveCreate,
@@ -263,7 +266,8 @@ def create_doctor_leave(
     "/{doctor_id}/leaves/range",
     response_model=list[DoctorLeaveResponse],
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def create_doctor_leave_range(
     doctor_id: UUID,
     payload: DoctorLeaveRangeCreate,
@@ -275,7 +279,8 @@ def create_doctor_leave_range(
     return CreateDoctorLeaveRangeAction(db).execute(hospital_id, resolved, payload, user)
 
 
-@router.delete("/{doctor_id}/leaves/{leave_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{doctor_id}/leaves/{leave_id}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def delete_doctor_leave(
     doctor_id: UUID,
     leave_id: UUID,
@@ -289,7 +294,8 @@ def delete_doctor_leave(
 
 # ── Appointment Modifications & Transfer ───────────────────────────────────
 
-@router.put("/{doctor_id}/appointments/{appointment_id}", response_model=DoctorAppointmentResponse)
+@router.put("/{doctor_id}/appointments/{appointment_id}", response_model=DoctorAppointmentResponse,
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def update_doctor_appointment(
     doctor_id: UUID,
     appointment_id: UUID,
@@ -307,7 +313,8 @@ def update_doctor_appointment(
 @router.post(
     "/{doctor_id}/appointments/{appointment_id}/transfer-to-inpatient",
     response_model=DoctorAppointmentResponse,
-)
+
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def transfer_appointment_to_inpatient(
     doctor_id: UUID,
     appointment_id: UUID,
@@ -328,7 +335,8 @@ def transfer_appointment_to_inpatient(
     "/{doctor_id}/prescriptions",
     response_model=PrescriptionResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def create_prescription(
     doctor_id: UUID,
     payload: PrescriptionCreate,
@@ -340,7 +348,8 @@ def create_prescription(
     return CreatePrescriptionAction(db).execute(hospital_id, resolved, payload, user)
 
 
-@router.put("/{doctor_id}/prescriptions/{prescription_id}", response_model=PrescriptionResponse)
+@router.put("/{doctor_id}/prescriptions/{prescription_id}", response_model=PrescriptionResponse,
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def update_prescription(
     doctor_id: UUID,
     prescription_id: UUID,
@@ -385,7 +394,8 @@ def prescription_pdf(
     "/{doctor_id}/records",
     response_model=MedicalRecordResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("doctors", "edit"))])
 def create_medical_record(
     doctor_id: UUID,
     payload: MedicalRecordCreate,
@@ -421,7 +431,7 @@ def get_record_file(
     return GetRecordFileAction(db).execute(hospital_id, resolved, record_id)
 
 
-@router.put("/{doctor_id}/signature")
+@router.put("/{doctor_id}/signature", dependencies=[Depends(require_permission("doctors", "edit"))])
 def update_doctor_signature(
     doctor_id: UUID,
     payload: DoctorSignatureUpdate,

@@ -568,6 +568,20 @@ class ClinicalDecisionActions:
                 self.db.flush()
                 created_rad_ids.append(rad_order.id)
 
+                # Ensure billing charge exists for billable radiology order
+                from modules.billing.entities.billing_entities import BillingSourceType
+                from modules.billing.services.billing_service import ensure_charge
+                ensure_charge(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    patient_id=patient.id,
+                    source_type=BillingSourceType.radiology,
+                    source_id=rad_order.id,
+                    description=f"Radiology {rad_order.order_no} — {rad_order.scan_name}",
+                    charge_amount=float(rad_order.price or 0.0),
+                    created_by_name=actor_name,
+                )
+
         # Reuses canonical Prescription workflow when physician context is present (Finding F-01)
         created_prescription_id: UUID | None = None
         if med_items and doctor_uuid:

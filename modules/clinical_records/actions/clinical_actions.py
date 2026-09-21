@@ -33,14 +33,34 @@ from modules.clinical_records.entities.clinical_record import (
     Prescription,
 )
 from modules.clinical_records.services.prescription_html_service import PrescriptionHtmlService
+from modules.patients.actions.allergy_actions import CheckPatientAllergyAlertAction
+from modules.patients.contracts.allergy_contracts import CheckAllergyAlertRequest
+from modules.pharmacy.actions.drug_interaction_actions import CheckDrugInteractionsAction
+from modules.pharmacy.contracts.drug_interaction_contracts import CheckDrugInteractionsRequest
 from modules.patients.entities.patient import Patient
 from modules.vitals.entities.vital_reading import VitalReading
 from shared.audit.service import write_audit_log
 
 
 def to_prescription_response(
-    p: Prescription, appt_status: AppointmentStatus | None = None
+    p: Prescription,
+    appt_status: AppointmentStatus | None = None,
+    db: Session | None = None,
 ) -> PrescriptionResponse:
+    test_ids: list[UUID] = []
+    panel_ids: list[UUID] = []
+    scan_ids: list[UUID] = []
+
+    target_db = db or (p._sa_instance_state.session if hasattr(p, "_sa_instance_state") else None)
+    if target_db:
+        try:
+            from modules.laboratory.services.lab_prescription_service import (
+                get_prescription_investigation_ids,
+            )
+            test_ids, panel_ids, scan_ids = get_prescription_investigation_ids(target_db, p.id)
+        except Exception:
+            pass
+
     return PrescriptionResponse(
         id=p.id,
         hospital_id=p.hospital_id,
@@ -61,6 +81,9 @@ def to_prescription_response(
         patient_mobile=p.patient.mobile if p.patient else None,
         doctor_name=p.doctor.name if p.doctor else None,
         appointment_status=appt_status,
+        test_ids=test_ids,
+        panel_ids=panel_ids,
+        scan_ids=scan_ids,
     )
 
 
@@ -74,6 +97,7 @@ def to_record_response(r: MedicalRecord) -> MedicalRecordResponse:
         lab_order_id=r.lab_order_id,
         radiology_order_id=r.radiology_order_id,
         report_type=r.report_type,
+        provenance=getattr(r, "provenance", "internal") or "internal",
         title=r.title,
         notes=r.notes,
         file_name=r.file_name,
@@ -128,6 +152,55 @@ class CreatePrescriptionAction:
                 raise HTTPException(status_code=400, detail="Medicines are required to issue prescription")
             if not payload.dosage.strip():
                 raise HTTPException(status_code=400, detail="Dosage is required to issue prescription")
+        # Feature 16 & 17 Clinical Safety Validation: Allergy alerts & Drug Interactions
+        med_list = [m.strip() for m in payload.medicines.replace(";", ",").replace("\n", ",").split(",") if m.strip()]
+        allergy_checker = CheckPatientAllergyAlertAction(self.db, hospital_id)
+        for med in med_list:
+            warning = allergy_checker.execute(payload.patient_id, CheckAllergyAlertRequest(medicine_name=med))
+            if warning.has_conflict and warning.requires_clinical_override:
+                if not payload.override_confirmed:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "type": "allergy_conflict",
+                            "message": warning.message,
+                            "matched_allergen": warning.matched_allergen,
+                            "severity": warning.severity.value if warning.severity else "unknown",
+                            "requires_clinical_override": True,
+                        },
+                    )
+                write_audit_log(
+                    self.db,
+                    hospital_id=hospital_id,
+                    actor=actor,
+                    action="CLINICAL_SAFETY_OVERRIDE_ALLERGY",
+                    entity_type="prescriptions",
+                    summary=f"Prescription allergy warning overridden for '{med}' against allergen '{warning.matched_allergen}'. Reason: {payload.override_reason or 'Not specified'}",
+                )
+
+        if len(med_list) >= 2:
+            interaction_checker = CheckDrugInteractionsAction(self.db, hospital_id)
+            report = interaction_checker.execute(CheckDrugInteractionsRequest(medicines=med_list))
+            if report.requires_clinical_override:
+                if not payload.override_confirmed:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "type": "drug_interaction_conflict",
+                            "message": "Major drug-drug interaction detected in prescribed medication cocktail.",
+                            "highest_severity": report.highest_severity.value if report.highest_severity else "major",
+                            "alerts": [a.model_dump() for a in report.alerts],
+                            "requires_clinical_override": True,
+                        },
+                    )
+                write_audit_log(
+                    self.db,
+                    hospital_id=hospital_id,
+                    actor=actor,
+                    action="CLINICAL_SAFETY_OVERRIDE_DRUG_INTERACTION",
+                    entity_type="prescriptions",
+                    summary=f"Prescription major drug interaction warning overridden. Reason: {payload.override_reason or 'Not specified'}",
+                )
 
         rx = Prescription(
             hospital_id=hospital_id,
@@ -178,7 +251,7 @@ class CreatePrescriptionAction:
         )
         self.db.commit()
         refreshed = self.repo.get_prescription(hospital_id, doctor_id, rx.id)
-        return to_prescription_response(refreshed or rx, appt_status)
+        return to_prescription_response(refreshed or rx, appt_status, db=self.db)
 
 
 class UpdatePrescriptionAction:
@@ -253,6 +326,25 @@ class UpdatePrescriptionAction:
         if payload.status is not None:
             rx.status = payload.status
 
+        if payload.test_ids is not None or payload.panel_ids is not None or payload.scan_ids is not None:
+            try:
+                from modules.laboratory.services.lab_prescription_service import (
+                    update_investigation_requests_for_prescription,
+                )
+                update_investigation_requests_for_prescription(
+                    self.db,
+                    hospital_id=hospital_id,
+                    doctor_id=doctor_id,
+                    patient_id=rx.patient_id,
+                    appointment_id=rx.appointment_id,
+                    prescription_id=rx.id,
+                    test_ids=payload.test_ids,
+                    panel_ids=payload.panel_ids,
+                    scan_ids=payload.scan_ids,
+                )
+            except Exception:
+                pass
+
         write_audit_log(
             self.db,
             hospital_id=hospital_id,
@@ -264,7 +356,7 @@ class UpdatePrescriptionAction:
         )
         self.db.commit()
         refreshed = self.repo.get_prescription(hospital_id, doctor_id, rx.id)
-        return to_prescription_response(refreshed or rx, appt_status)
+        return to_prescription_response(refreshed or rx, appt_status, db=self.db)
 
 
 class ListPrescriptionsAction:
@@ -289,7 +381,7 @@ class ListPrescriptionsAction:
             )
             status_map = {row[0]: row[1] for row in appts}
         return [
-            to_prescription_response(p, status_map.get(p.appointment_id) if p.appointment_id else None)
+            to_prescription_response(p, status_map.get(p.appointment_id) if p.appointment_id else None, db=self.db)
             for p in rows
         ]
 
@@ -391,12 +483,14 @@ class CreateMedicalRecordAction:
         if file_data and len(file_data) > 2_500_000:
             raise HTTPException(status_code=400, detail="File too large (max ~1.5MB)")
 
+        provenance_val = getattr(payload, "provenance", None) or "external"
         record = MedicalRecord(
             hospital_id=hospital_id,
             doctor_id=doctor_id,
             patient_id=payload.patient_id,
             appointment_id=payload.appointment_id,
             report_type=payload.report_type.strip(),
+            provenance=provenance_val.strip()[:32],
             title=payload.title.strip(),
             notes=payload.notes.strip() if payload.notes else None,
             file_name=payload.file_name,

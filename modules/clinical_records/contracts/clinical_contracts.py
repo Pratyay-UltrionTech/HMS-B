@@ -28,6 +28,8 @@ class PrescriptionCreate(BaseModel):
     test_ids: list[UUID] = Field(default_factory=list)
     panel_ids: list[UUID] = Field(default_factory=list)
     scan_ids: list[UUID] = Field(default_factory=list)
+    override_confirmed: bool = False
+    override_reason: str | None = None
 
 
 class PrescriptionUpdate(BaseModel):
@@ -40,6 +42,11 @@ class PrescriptionUpdate(BaseModel):
     follow_up_date: date | None = None
     signature_data: str | None = None
     status: str | None = None
+    test_ids: list[UUID] | None = None
+    panel_ids: list[UUID] | None = None
+    scan_ids: list[UUID] | None = None
+    override_confirmed: bool = False
+    override_reason: str | None = None
 
 
 class PrescriptionResponse(BaseModel):
@@ -62,6 +69,9 @@ class PrescriptionResponse(BaseModel):
     patient_mobile: str | None = None
     doctor_name: str | None = None
     appointment_status: AppointmentStatus | None = None
+    test_ids: list[UUID] = []
+    panel_ids: list[UUID] = []
+    scan_ids: list[UUID] = []
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -70,6 +80,7 @@ class MedicalRecordCreate(BaseModel):
     patient_id: UUID
     appointment_id: UUID | None = None
     report_type: str = Field(min_length=1, max_length=64)
+    provenance: str = Field(default="external", max_length=32)
     title: str = Field(min_length=1, max_length=255)
     notes: str | None = None
     file_name: str | None = None
@@ -85,6 +96,7 @@ class MedicalRecordResponse(BaseModel):
     lab_order_id: UUID | None = None
     radiology_order_id: UUID | None = None
     report_type: str
+    provenance: str = "internal"
     title: str
     notes: str | None = None
     file_name: str | None = None

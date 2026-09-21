@@ -26,7 +26,7 @@ from modules.patients.contracts.allergy_contracts import (
     PatientAllergyCreate,
     PatientAllergyResponse,
 )
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/patients", tags=["patients", "allergies"])
 
@@ -35,7 +35,8 @@ router = APIRouter(prefix="/patients", tags=["patients", "allergies"])
     "/{patient_id}/allergies",
     response_model=PatientAllergyResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("registration", "edit"))])
 def add_patient_allergy(
     patient_id: UUID,
     payload: PatientAllergyCreate,
@@ -65,7 +66,8 @@ def list_patient_allergies(
 @router.delete(
     "/allergies/{allergy_id}",
     response_model=PatientAllergyResponse,
-)
+
+    dependencies=[Depends(require_permission("registration", "edit"))])
 def deactivate_patient_allergy(
     allergy_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -79,7 +81,8 @@ def deactivate_patient_allergy(
 @router.post(
     "/{patient_id}/check-allergy-alert",
     response_model=AllergyAlertWarning,
-)
+
+    dependencies=[Depends(require_permission("registration", "edit"))])
 def check_allergy_alert(
     patient_id: UUID,
     payload: CheckAllergyAlertRequest,

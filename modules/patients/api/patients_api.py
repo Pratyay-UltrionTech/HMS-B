@@ -36,7 +36,7 @@ from modules.patients.contracts.patients_contracts import (
     PatientStatus,
 )
 from modules.patients.db.patients_repository import PatientRepository
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/registration/patients", tags=["patients"])
 
@@ -46,7 +46,8 @@ router = APIRouter(prefix="/registration/patients", tags=["patients"])
     response_model=PatientDirectoryItem,
     status_code=status.HTTP_201_CREATED,
     summary="Register a new patient",
-)
+
+    dependencies=[Depends(require_permission("registration", "edit"))])
 def register_patient(
     payload: PatientRegister,
     db: Session = Depends(get_db),
@@ -99,7 +100,8 @@ def get_patient_profile(
     "/{patient_id}",
     response_model=PatientDirectoryItem,
     summary="Update patient record",
-)
+
+    dependencies=[Depends(require_permission("registration", "edit"))])
 def update_patient(
     patient_id: UUID,
     payload: PatientRegisterUpdate,

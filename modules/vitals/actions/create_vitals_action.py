@@ -111,5 +111,30 @@ class CreateVitalsAction:
         )
         self.repo.commit()
 
+        # Feature 20 integration: after vitals are persisted, run the Clinical Decision
+        # rule engine against the patient so matching active rules surface as alerts
+        # automatically instead of requiring a manual evaluate call. Imported lazily
+        # to avoid a circular import (clinical_decision_actions imports VitalReading).
+        self._evaluate_clinical_alerts(appt.patient_id)
+
         rows = self.repo.get_vitals_by_ids([r.id for r in created])
         return [serialize_vital_reading(r) for r in rows]
+
+    def _evaluate_clinical_alerts(self, patient_id: Any) -> None:
+        """Run the Clinical Decision alert engine for the patient after vitals are saved.
+
+        Best-effort: alert evaluation must never break vital recording or the check-in
+        transition, so any failure is swallowed. When no active rules exist, the
+        evaluator returns early without doing any work.
+        """
+        try:
+            from modules.clinical_decision.actions.clinical_decision_actions import (
+                ClinicalDecisionActions,
+            )
+
+            ClinicalDecisionActions(
+                db=self.repo.db, hospital_id=self.repo.hospital_id, actor={}
+            ).evaluate_patient_alerts(patient_id, None)
+        except Exception:
+            # Alert evaluation is a safety side-effect, not a hard dependency of vitals.
+            pass

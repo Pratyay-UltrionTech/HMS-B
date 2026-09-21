@@ -241,7 +241,7 @@ class ListOrdersAction:
             search=search,
             scheduled_only=scheduled_only,
         )
-        return [order_to_response(o) for o in orders]
+        return [order_to_response(o, self.repo.db) for o in orders]
 
 
 class GetOrderAction:
@@ -252,7 +252,7 @@ class GetOrderAction:
         order = self.repo.get_order(order_id)
         if not order:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
-        return order_to_response(order)
+        return order_to_response(order, self.repo.db)
 
 
 class CreateOrdersAction:
@@ -507,6 +507,17 @@ class ScheduleOrderAction:
         if order.status in {RadiologyOrderStatus.cancelled, RadiologyOrderStatus.completed}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot schedule this order")
 
+        # Enforce financial clearance
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+        assert_service_financially_cleared(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.radiology,
+            order.id,
+            action_description="schedule scan",
+        )
+
         order.scheduled_at = payload.scheduled_at
         order.machine = payload.machine.strip()
         order.technician_name = payload.technician_name.strip()
@@ -522,7 +533,7 @@ class ScheduleOrderAction:
             summary=f"Scheduled {order.order_no} on {order.machine} at {payload.scheduled_at.isoformat()}",
         )
         self.db.commit()
-        return order_to_response(self.repo.get_order(order_id))
+        return order_to_response(self.repo.get_order(order_id), self.repo.db)
 
 
 class StartScanAction:
@@ -542,6 +553,17 @@ class StartScanAction:
                 detail="Order must be scheduled (or ordered) to start",
             )
 
+        # Enforce financial clearance
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+        assert_service_financially_cleared(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.radiology,
+            order.id,
+            action_description="start scan acquisition",
+        )
+
         order.status = RadiologyOrderStatus.in_progress
         order.started_at = datetime.now(timezone.utc)
 
@@ -555,7 +577,7 @@ class StartScanAction:
             summary=f"Started scan for {order.order_no}",
         )
         self.db.commit()
-        return order_to_response(self.repo.get_order(order_id))
+        return order_to_response(self.repo.get_order(order_id), self.repo.db)
 
 
 class CompleteScanAction:
@@ -574,6 +596,17 @@ class CompleteScanAction:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Scan is not in progress",
             )
+
+        # Enforce financial clearance
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+        assert_service_financially_cleared(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.radiology,
+            order.id,
+            action_description="complete scan acquisition",
+        )
 
         order.status = RadiologyOrderStatus.completed
         order.completed_at = datetime.now(timezone.utc)
@@ -594,7 +627,7 @@ class CompleteScanAction:
             sync_appointment_after_clinical_change(self.db, self.hospital_id, order.appointment_id)
             self.db.commit()
 
-        return order_to_response(self.repo.get_order(order_id))
+        return order_to_response(self.repo.get_order(order_id), self.repo.db)
 
 
 class UploadReportAction:
@@ -610,12 +643,35 @@ class UploadReportAction:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
         if order.status == RadiologyOrderStatus.cancelled:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is cancelled")
+
+        # Enforce financial clearance before uploading/signing report
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+        assert_service_financially_cleared(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.radiology,
+            order.id,
+            action_description="finalize and sign off radiology report",
+        )
+
         if payload.report_file_data and len(payload.report_file_data) > 2_500_000:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Report file too large (max ~1.5MB)")
         if payload.image_file_data and len(payload.image_file_data) > 2_500_000:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image file too large (max ~1.5MB)")
         if not payload.image_file_data and not order.image_file_data:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scan image is required")
+
+        # FLAW-009: Diagnostic immutability & amendment tracking
+        is_prior_completed = order.status == RadiologyOrderStatus.completed or bool(order.findings or order.impression)
+        if is_prior_completed:
+            if not payload.amendment_reason or not payload.amendment_reason.strip():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Finalized radiology report cannot be modified without providing an amendment reason.",
+                )
+            order.is_amended = True
+            order.amendment_reason = payload.amendment_reason.strip()
 
         order.findings = payload.findings.strip()
         order.impression = payload.impression.strip()

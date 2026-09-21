@@ -24,6 +24,8 @@ from modules.pharmacy.entities.pharmacy_entities import (
     PharmacyPurchase,
     PharmacyPurchaseItem,
     PharmacyReturn,
+    PharmacyRxRequest,
+    PharmacyRxRequestItem,
     PharmacySale,
     PharmacySaleItem,
     PharmacySaleStatus,
@@ -436,6 +438,38 @@ class PharmacyRepository:
             .filter(StockAdjustment.id == adjustment_id, StockAdjustment.hospital_id == hospital_id)
             .first()
         )
+
+    # ── Rx requests ───────────────────────────────────────────────────────────
+
+    def get_rx_request_by_id(
+        self, rx_request_id: UUID, hospital_id: UUID, *, for_update: bool = False
+    ) -> PharmacyRxRequest | None:
+        q = self.db.query(PharmacyRxRequest).options(
+            joinedload(PharmacyRxRequest.items).joinedload(PharmacyRxRequestItem.medicine)
+        )
+        if for_update:
+            q = q.with_for_update()
+        return (
+            q.filter(PharmacyRxRequest.id == rx_request_id, PharmacyRxRequest.hospital_id == hospital_id)
+            .first()
+        )
+
+    def list_rx_requests(
+        self,
+        hospital_id: UUID,
+        status: str | None = None,
+        prescription_id: UUID | None = None,
+        limit: int = 100,
+    ) -> Sequence[PharmacyRxRequest]:
+        q = self.db.query(PharmacyRxRequest).options(
+            joinedload(PharmacyRxRequest.items).joinedload(PharmacyRxRequestItem.medicine)
+        )
+        q = q.filter(PharmacyRxRequest.hospital_id == hospital_id)
+        if status:
+            q = q.filter(PharmacyRxRequest.status == status)
+        if prescription_id:
+            q = q.filter(PharmacyRxRequest.prescription_id == prescription_id)
+        return q.order_by(PharmacyRxRequest.created_at.desc()).limit(limit).all()
 
     # ── Returns ───────────────────────────────────────────────────────────────
 

@@ -434,7 +434,7 @@ class RxRequestCreate(BaseModel):
     patient_phone: str = ""
     doctor_name: str = ""
     notes: str | None = None
-    items: list[RxRequestItemCreate] = Field(min_length=1)
+    items: list[RxRequestItemCreate] | None = None
 
 
 class RxRequestItemResponse(BaseModel):

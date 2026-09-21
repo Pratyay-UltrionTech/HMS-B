@@ -136,6 +136,9 @@ class DoctorAppointmentResponse(BaseModel):
     admission_status: str | None = None
     nurse_id: UUID | None = None
     nurse_name: str | None = None
+    visit_type: str | None = None
+    queue_token: int | None = None
+    checked_in_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -12,7 +12,6 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from modules.appointments.entities.appointment import Appointment
@@ -31,6 +30,8 @@ from modules.doctors.actions.doctor_appointment_actions import (
     ListDoctorAppointmentsAction,
     TransferAppointmentToInpatientAction,
     UpdateDoctorAppointmentAction,
+    appt_load_options,
+    to_doctor_appointment_response,
 )
 from modules.doctors.contracts.doctor_contracts import (
     DoctorAppointmentResponse,
@@ -50,6 +51,7 @@ from modules.patients.entities.patient import Patient
 from modules.vitals.contracts.vitals_contracts import VitalReadingResponse
 from modules.vitals.entities.vital_reading import VitalReading
 from shared.audit.service import write_audit_log
+from shared.database.sequences import next_uhid
 
 
 def to_doctor_patient_response(
@@ -75,50 +77,15 @@ def to_doctor_patient_response(
     )
 
 
-def to_doctor_appointment_response(a: Appointment) -> DoctorAppointmentResponse:
-    adm = getattr(a, "admission", None)
-    return DoctorAppointmentResponse(
-        id=a.id,
-        hospital_id=a.hospital_id,
-        doctor_id=a.doctor_id,
-        patient_id=a.patient_id,
-        appointment_date=a.appointment_date,
-        appointment_time=a.appointment_time,
-        purpose=a.purpose,
-        status=a.status,
-        notes=a.notes,
-        created_at=a.created_at,
-        patient_name=a.patient.name if a.patient else None,
-        patient_mobile=a.patient.mobile if a.patient else None,
-        doctor_name=a.doctor.name if a.doctor else None,
-        patient_uhid=getattr(a.patient, "uhid", None) if a.patient else None,
-        op_id=getattr(a, "op_id", None),
-        admission_id=a.admission_id,
-        ip_id=getattr(adm, "ip_id", None) if adm else None,
-        admission_ward=adm.ward.name if adm and adm.ward else None,
-        admission_bed=adm.bed.bed_code if adm and adm.bed else None,
-        admission_status=adm.status.value if adm else None,
-        nurse_id=a.nurse_id,
-        nurse_name=None,
-    )
-
-
-def appt_load_options():
-    return (
-        joinedload(Appointment.patient),
-        joinedload(Appointment.doctor),
-        joinedload(Appointment.admission).joinedload(Admission.ward),
-        joinedload(Appointment.admission).joinedload(Admission.bed),
-    )
 
 
 def generate_uhid(db: Session, hospital_id: UUID) -> str:
-    count = db.query(func.count(Patient.id)).filter(Patient.hospital_id == hospital_id).scalar() or 0
-    for i in range(1, 100_000):
-        uhid = f"P{count + i:04d}"
-        if not db.query(Patient.id).filter(Patient.hospital_id == hospital_id, Patient.uhid == uhid).first():
-            return uhid
-    raise HTTPException(status_code=500, detail="Unable to generate UHID")
+    """Generate the next unique UHID for a hospital atomically (HMS-FLAW-028).
+
+    Replaces the previous brute-force O(N) loop with a single atomic
+    tenant-scoped counter upsert, so concurrent registrations cannot collide.
+    """
+    return next_uhid(db, hospital_id)
 
 
 def split_name(full: str) -> tuple[str, str]:

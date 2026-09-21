@@ -27,6 +27,7 @@ from modules.billing.entities.billing_entities import (
     BillingSourceType,
 )
 from modules.clinical_records.entities.clinical_record import MedicalRecord
+import tests.conftest  # noqa: F401
 from modules.laboratory.api.laboratory_api import router as laboratory_router
 from modules.laboratory.entities.lab_entities import (
     LabItemStatus,
@@ -79,7 +80,7 @@ def lab_client(lab_db):
         "id": str(uuid4()),
         "sub": "lab_tech",
         "name": "Alex Pathologist",
-        "role": "lab_technician",
+        "role": "hospital_admin",
         "staff_role_name": "Lab Technician",
         "hospital_id": str(test_hospital_id),
     }
@@ -220,7 +221,22 @@ def test_order_creation_sample_collection_results_and_billing(lab_client, lab_db
     assert charge.charge_amount == 600.0  # 150 + 450
     assert charge.status == BillingChargeStatus.pending
 
-    # 5. Collect Sample
+    # 5. Verify sample collection is payment-gated (fails with 402 Payment Required)
+    blocked_resp = lab_client.post(
+        f"/api/laboratory/orders/{order_id}/collect-sample",
+        json={
+            "collected_by": "Nurse Priya",
+            "sample_type": "blood",
+            "collection_remarks": "Fasting sample collected at 8am",
+        },
+    )
+    assert blocked_resp.status_code == 402
+
+    # Simulate billing payment clearance
+    charge.status = BillingChargeStatus.paid
+    lab_db.commit()
+
+    # Collect Sample after payment clearance
     collect_resp = lab_client.post(
         f"/api/laboratory/orders/{order_id}/collect-sample",
         json={

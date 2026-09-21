@@ -5,6 +5,7 @@ Pharmacy business action orchestrator.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -35,6 +36,9 @@ from modules.pharmacy.contracts.pharmacy_contracts import (
     PurchaseResponse,
     PurchaseReturnCreate,
     ReturnResponse,
+    RxRequestCreate,
+    RxRequestItemResponse,
+    RxRequestResponse,
     SaleCreate,
     SaleItemResponse,
     SaleResponse,
@@ -56,6 +60,7 @@ from modules.pharmacy.entities.pharmacy_entities import (
     PharmacyPurchaseItem,
     PharmacyReturn,
     PharmacyRxRequest,
+    PharmacyRxRequestItem,
     PharmacyRxRequestStatus,
     PharmacySale,
     PharmacySaleItem,
@@ -125,6 +130,14 @@ class PharmacyActions:
             items.append(row)
         data = PurchaseResponse.model_validate(p)
         data.supplier_name = p.supplier.company_name if p.supplier else None
+        data.items = items
+        return data
+
+    def _rx_request_to_response(self, rx: PharmacyRxRequest) -> RxRequestResponse:
+        items = []
+        for it in rx.items or []:
+            items.append(RxRequestItemResponse.model_validate(it))
+        data = RxRequestResponse.model_validate(rx)
         data.items = items
         return data
 
@@ -755,18 +768,75 @@ class PharmacyActions:
         actor = actor_name(self.user)
         today = payload.sale_date or date.today()
 
+        rx_obj = None
         if payload.prescription_id:
             from modules.clinical_records.entities.clinical_record import Prescription
-            rx = (
+            rx_obj = (
                 self.db.query(Prescription)
                 .filter(Prescription.id == payload.prescription_id, Prescription.hospital_id == self.hospital_id)
+                .with_for_update()
                 .first()
             )
-            if rx and getattr(rx, "status", None) == "draft":
+            if rx_obj and getattr(rx_obj, "status", None) == "draft":
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Cannot dispense medication for a draft prescription. Prescription must be issued.",
                 )
+            if rx_obj and getattr(rx_obj, "status", None) in ("dispensed", "fully_dispensed"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Prescription has already been fully dispensed.",
+                )
+
+        # Load the pharmacy Rx request (per-prescription fulfillment record) if dispensing against one.
+        rx_request = None
+        rx_item_by_medicine: dict[UUID, PharmacyRxRequestItem] = {}
+        rx_dispense_map: dict[UUID, float] = {}
+        if payload.pharmacy_rx_request_id:
+            rx_request = self.repo.get_rx_request_by_id(
+                payload.pharmacy_rx_request_id, self.hospital_id, for_update=True
+            )
+            if not rx_request:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Pharmacy Rx request not found"
+                )
+            if rx_request.status == PharmacyRxRequestStatus.cancelled:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Pharmacy Rx request has been cancelled and cannot be dispensed.",
+                )
+            for rit in rx_request.items or []:
+                if rit.medicine_id:
+                    rx_item_by_medicine[rit.medicine_id] = rit
+            # Block if every item is already fully dispensed.
+            if all(
+                float(rit.quantity or 0) - float(rit.dispensed_quantity or 0) <= 0.0001
+                for rit in rx_request.items or []
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Pharmacy Rx request is already fully dispensed.",
+                )
+            # Validate requested sale quantities against remaining per-item quantity.
+            for it in payload.items:
+                rit = rx_item_by_medicine.get(it.medicine_id)
+                if rit is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"Medicine {it.medicine_id} is not part of the linked pharmacy Rx request "
+                            f"{payload.pharmacy_rx_request_id}."
+                        ),
+                    )
+                remaining = float(rit.quantity or 0) - float(rit.dispensed_quantity or 0)
+                if it.quantity > remaining + 0.0001:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"Cannot dispense {it.quantity} of '{rit.medicine_name}'; only {remaining} "
+                            f"remaining on the Rx request."
+                        ),
+                    )
 
         invoice_number = next_doc_number(self.db, self.hospital_id, PharmacySale, "invoice_number", "SAL")
 
@@ -868,6 +938,26 @@ class PharmacyActions:
                     created_by_name=actor,
                 )
 
+            if rx_request:
+                rx_dispense_map[it.medicine_id] = rx_dispense_map.get(it.medicine_id, 0.0) + float(it.quantity)
+
+        # Apply dispensed quantity tracking against the linked pharmacy Rx request (FLAW-004)
+        if rx_request:
+            for medicine_id, qty in rx_dispense_map.items():
+                rit = rx_item_by_medicine.get(medicine_id)
+                if rit is not None:
+                    rit.dispensed_quantity = float(rit.dispensed_quantity or 0) + qty
+                    self._sync_item_status(rit)
+            new_status = self._recompute_rx_status(rx_request)
+            rx_request.status = new_status
+            if rx_obj:
+                if new_status == PharmacyRxRequestStatus.completed:
+                    rx_obj.status = "fully_dispensed"
+                elif new_status == PharmacyRxRequestStatus.partially_dispensed:
+                    rx_obj.status = "partially_dispensed"
+                else:
+                    rx_obj.status = "issued"
+
         final_net = max(0.0, round(total_net - payload.discount_amount, 2))
         sale.subtotal = round(total_subtotal, 2)
         sale.gst_amount = round(total_gst, 2)
@@ -896,6 +986,12 @@ class PharmacyActions:
                 created_by_name=actor,
             )
             sale.billing_charge_id = charge.id
+
+        # Transition prescription status (FLAW-004). When dispensing against a pharmacy
+        # Rx request, the request-level recompute above already mirrored the clinical
+        # Prescription status; only handle the legacy prescription-only path here.
+        if rx_obj and not rx_request:
+            rx_obj.status = "dispensed"
 
         write_audit_log(
             self.db,
@@ -1069,6 +1165,25 @@ class PharmacyActions:
         self.db.add(row)
         self.db.flush()
 
+        # Reconcile with billing ledger if sale belongs to a registered patient (FLAW-005)
+        if sale.patient_id and refund > 0:
+            from modules.billing.entities.billing_entities import BillingCharge, BillingChargeStatus, BillingSourceType
+            credit_charge = BillingCharge(
+                hospital_id=self.hospital_id,
+                patient_id=sale.patient_id,
+                source_type=BillingSourceType.pharmacy,
+                source_id=row.id,
+                description=f"Pharmacy Return Credit - {sale.invoice_number} ({payload.reason or 'Return'})",
+                charge_amount=-abs(refund),
+                net_amount=-abs(refund),
+                amount_paid=-abs(refund),
+                status=BillingChargeStatus.paid,
+                notes=f"Return credit for sale {sale.invoice_number} item {item.id}",
+                created_by_name=actor or "Pharmacy Staff",
+            )
+            self.db.add(credit_charge)
+            self.db.flush()
+
         write_audit_log(
             self.db,
             hospital_id=self.hospital_id,
@@ -1135,6 +1250,152 @@ class PharmacyActions:
     def list_returns(self, limit: int = 100) -> list[ReturnResponse]:
         rows = self.repo.list_returns(self.hospital_id, limit)
         return [ReturnResponse.model_validate(r) for r in rows]
+
+    # ── Rx requests ───────────────────────────────────────────────────────────
+
+    def list_rx_requests(
+        self,
+        status: str | None = None,
+        prescription_id: UUID | None = None,
+        limit: int = 100,
+    ) -> list[RxRequestResponse]:
+        rows = self.repo.list_rx_requests(
+            self.hospital_id, status=status, prescription_id=prescription_id, limit=limit
+        )
+        return [self._rx_request_to_response(r) for r in rows]
+
+    def get_rx_request(self, rx_request_id: UUID) -> RxRequestResponse:
+        row = self.repo.get_rx_request_by_id(rx_request_id, self.hospital_id)
+        if not row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rx request not found")
+        return self._rx_request_to_response(row)
+
+    def create_rx_request(self, payload: RxRequestCreate) -> RxRequestResponse:
+        actor = actor_name(self.user)
+
+        rx_obj = None
+        if payload.prescription_id:
+            from modules.clinical_records.entities.clinical_record import Prescription
+            rx_obj = (
+                self.db.query(Prescription)
+                .filter(
+                    Prescription.id == payload.prescription_id,
+                    Prescription.hospital_id == self.hospital_id,
+                )
+                .first()
+            )
+            if not rx_obj:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Prescription not found"
+                )
+            if getattr(rx_obj, "status", None) == "draft":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot create an Rx request for a draft prescription. Prescription must be issued.",
+                )
+
+        items_payload = payload.items or []
+        if not items_payload:
+            if rx_obj is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="At least one Rx request item is required, or provide a prescription_id to derive items.",
+                )
+            items_payload = self._parse_prescription_items(rx_obj)
+
+        patient_id = payload.patient_id or (rx_obj.patient_id if rx_obj else None)
+        doctor_id = payload.doctor_id or (rx_obj.doctor_id if rx_obj else None)
+        patient_name = payload.patient_name or (rx_obj.patient.name if rx_obj and rx_obj.patient else "")
+        patient_phone = payload.patient_phone or (rx_obj.patient.mobile if rx_obj and rx_obj.patient else "")
+        doctor_name = payload.doctor_name or (rx_obj.doctor.name if rx_obj and rx_obj.doctor else "")
+
+        rx = PharmacyRxRequest(
+            hospital_id=self.hospital_id,
+            prescription_id=payload.prescription_id,
+            patient_id=patient_id,
+            doctor_id=doctor_id,
+            patient_name=patient_name,
+            patient_phone=patient_phone,
+            doctor_name=doctor_name,
+            status=PharmacyRxRequestStatus.pending,
+            notes=payload.notes.strip() if payload.notes else None,
+        )
+        self.db.add(rx)
+        self.db.flush()
+
+        for idx, it in enumerate(items_payload):
+            medicine_id = getattr(it, "medicine_id", None)
+            medicine_name = getattr(it, "medicine_name", None) or ""
+            quantity = float(getattr(it, "quantity", 1.0) or 1.0)
+            dosage = getattr(it, "dosage", None)
+            self.db.add(
+                PharmacyRxRequestItem(
+                    hospital_id=self.hospital_id,
+                    request_id=rx.id,
+                    medicine_id=medicine_id,
+                    medicine_name=medicine_name.strip(),
+                    quantity=quantity,
+                    dosage=dosage.strip() if dosage else None,
+                    dispensed_quantity=0.0,
+                    status=PharmacyRxRequestStatus.pending.value,
+                    sort_order=idx,
+                )
+            )
+
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=self.user,
+            action="create",
+            entity_type="pharmacy_rx_request",
+            entity_id=rx.id,
+            summary=f"Created pharmacy Rx request for {patient_name}",
+        )
+        self.db.commit()
+        created = self.repo.get_rx_request_by_id(rx.id, self.hospital_id)
+        assert created is not None
+        return self._rx_request_to_response(created)
+
+    @staticmethod
+    def _parse_prescription_items(rx_obj: Any) -> list[Any]:
+        """Parse the free-text clinical Prescription.medicines blob into item payloads."""
+        text = getattr(rx_obj, "medicines", "") or ""
+        parts = []
+        for chunk in text.replace(";", ",").replace("\n", ",").split(","):
+            chunk = chunk.strip()
+            if chunk:
+                parts.append(chunk)
+        return [SimpleNamespace(medicine_id=None, medicine_name=p, quantity=1.0, dosage=None) for p in parts]
+
+    @staticmethod
+    def _recompute_rx_status(rx: PharmacyRxRequest) -> PharmacyRxRequestStatus:
+        """Derive the request status from its items' dispensed quantities."""
+        items = rx.items or []
+        if not items:
+            return PharmacyRxRequestStatus.pending
+        any_remaining = False
+        any_dispensed = False
+        for it in items:
+            remaining = float(it.quantity or 0) - float(it.dispensed_quantity or 0)
+            if remaining > 0.0001:
+                any_remaining = True
+            if float(it.dispensed_quantity or 0) > 0.0001:
+                any_dispensed = True
+        if not any_remaining:
+            return PharmacyRxRequestStatus.completed
+        if any_dispensed:
+            return PharmacyRxRequestStatus.partially_dispensed
+        return PharmacyRxRequestStatus.pending
+
+    @staticmethod
+    def _sync_item_status(it: PharmacyRxRequestItem) -> None:
+        remaining = float(it.quantity or 0) - float(it.dispensed_quantity or 0)
+        if remaining <= 0.0001:
+            it.status = PharmacyRxRequestStatus.dispensed.value
+        elif float(it.dispensed_quantity or 0) > 0.0001:
+            it.status = PharmacyRxRequestStatus.partially_dispensed.value
+        else:
+            it.status = PharmacyRxRequestStatus.pending.value
 
     # ── Reports ───────────────────────────────────────────────────────────────
 

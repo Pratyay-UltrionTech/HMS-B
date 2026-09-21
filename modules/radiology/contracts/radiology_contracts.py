@@ -129,6 +129,7 @@ class RadReportRequest(BaseModel):
     report_file_data: str | None = None
     image_file_name: str | None = None
     image_file_data: str | None = None
+    amendment_reason: str | None = None
 
 
 class RadOrderResponse(BaseModel):
@@ -163,11 +164,18 @@ class RadOrderResponse(BaseModel):
     has_image_file: bool = False
     report_uploaded_by: str | None
     report_date: date | None
+    is_amended: bool = False
+    amendment_reason: str | None = None
     ordered_at: datetime
     patient_name: str | None = None
     patient_uhid: str | None = None
     patient_mobile: str | None = None
     doctor_name: str | None = None
+    payment_status: str = "pending"
+    is_financially_cleared: bool = False
+    net_amount: float = 0.0
+    amount_paid: float = 0.0
+    outstanding_amount: float = 0.0
 
     model_config = ConfigDict(from_attributes=True)
 

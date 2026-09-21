@@ -21,6 +21,7 @@ from infrastructure.postgres.base import Base as TargetBase
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.clinical_decision.api.clinical_decision_api import router as clinical_decision_router
 from modules.appointments.entities.appointment import Appointment
+from modules.appointments.entities.enums import AppointmentStatus
 from modules.clinical_records.entities.clinical_record import Prescription
 from modules.doctors.entities.doctor import HospitalUser
 from modules.inpatient.entities.admission import Admission

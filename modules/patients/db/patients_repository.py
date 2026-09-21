@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from infrastructure.postgres.base_repository import BaseRepository
 from modules.patients.db.profile_reader import PatientProfileReader
 from modules.patients.entities.patient import Patient, PatientStatus
+from shared.database.sequences import next_uhid
 
 
 class PatientRepository(BaseRepository[Patient]):
@@ -61,26 +62,33 @@ class PatientRepository(BaseRepository[Patient]):
         )
 
     def generate_next_uhid(self) -> str:
-        """Generate the next unique sequential UHID for this hospital tenant (P0001 format)."""
-        count = (
-            self.db.query(func.count(Patient.id))
-            .filter(Patient.hospital_id == self.hospital_id)
-            .scalar()
-            or 0
-        )
-        for i in range(1, 100_000):
-            uhid = f"P{count + i:04d}"
-            exists = (
-                self.db.query(Patient.id)
-                .filter(
-                    Patient.hospital_id == self.hospital_id,
-                    Patient.uhid == uhid,
-                )
-                .first()
-            )
-            if not exists:
-                return uhid
-        raise HTTPException(status_code=500, detail="Unable to generate UHID")
+        """Generate the next unique sequential UHID for this hospital tenant (P0001 format).
+
+        Atomic: advances a tenant-scoped counter in a single upsert statement
+        (HMS-FLAW-028), so concurrent registrations cannot collide.
+        """
+        return next_uhid(self.db, self.hospital_id)
+
+    def soft_delete_patient(self, patient: Patient) -> Patient:
+        """Soft-delete a patient, anonymizing PII while preserving financial/clinical records.
+
+        The patient row is retained (with ``is_deleted=True``) so every
+        referenced invoice, receipt, payment, prescription, medical record and
+        admission stays referentially intact (HMS-FLAW-015). PII is anonymized
+        to honour erasure/privacy while keeping the audit-linked records valid.
+        """
+        patient.is_deleted = True
+        patient.status = PatientStatus.inactive
+        patient.first_name = "Deleted"
+        patient.last_name = "Patient"
+        patient.name = "Deleted Patient"
+        patient.mobile = f"deleted-{str(patient.id)[:8]}"
+        patient.email = None
+        patient.address = None
+        patient.emergency_contact = None
+        patient.emergency_contact_name = None
+        patient.emergency_contact_relation = None
+        return patient
 
     def list_patients(
         self,
