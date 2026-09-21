@@ -59,7 +59,16 @@ import modules.pharmacy.entities.pharmacy_entities
 import modules.inpatient.entities.admission
 import modules.beds.entities.bed
 import modules.ot.entities.ot_entities
+import modules.masters.entities.organization_entities
+import modules.masters.entities.insurance_entities
+import modules.blood_bank.entities.blood_bank_entities
+import modules.ambulance.entities.ambulance_entities
+import modules.equipment.entities.equipment_entities
+import modules.inventory.entities.inventory_entities
+import modules.patients.entities.allergy
+import modules.pharmacy.entities.drug_interaction_entities
 import shared.audit.entities.audit_log
+import shared.database.sequences
 
 from modules.appointments.entities.appointment import Appointment
 from modules.appointments.entities.enums import AppointmentStatus

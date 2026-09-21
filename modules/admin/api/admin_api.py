@@ -37,6 +37,7 @@ from shared.auth import (
     get_hospital_context,
     require_hospital_admin,
     require_hospital_user,
+    require_permission,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -62,7 +63,8 @@ def list_roles(
     return AdminActions(db, hospital_id).list_roles()
 
 
-@router.post("/roles", response_model=RoleResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/roles", response_model=RoleResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("admin", "edit"))])
 def create_role(
     payload: RoleCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -72,7 +74,7 @@ def create_role(
     return AdminActions(db, hospital_id, actor).create_role(payload)
 
 
-@router.put("/roles/{role_id}", response_model=RoleResponse)
+@router.put("/roles/{role_id}", response_model=RoleResponse, dependencies=[Depends(require_permission("admin", "edit"))])
 def update_role(
     role_id: UUID,
     payload: RoleUpdate,
@@ -83,7 +85,8 @@ def update_role(
     return AdminActions(db, hospital_id, actor).update_role(role_id, payload)
 
 
-@router.delete("/roles/{role_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.delete("/roles/{role_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response,
+    dependencies=[Depends(require_permission("admin", "edit"))])
 def delete_role(
     role_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -104,7 +107,8 @@ def list_users(
     return AdminActions(db, hospital_id).list_users()
 
 
-@router.post("/users", response_model=HospitalUserResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/users", response_model=HospitalUserResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("admin", "edit"))])
 def create_user(
     payload: HospitalUserCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -114,7 +118,7 @@ def create_user(
     return AdminActions(db, hospital_id, actor).create_user(payload)
 
 
-@router.put("/users/{user_id}", response_model=HospitalUserResponse)
+@router.put("/users/{user_id}", response_model=HospitalUserResponse, dependencies=[Depends(require_permission("admin", "edit"))])
 def update_user(
     user_id: UUID,
     payload: HospitalUserUpdate,
@@ -125,7 +129,8 @@ def update_user(
     return AdminActions(db, hospital_id, actor).update_user(user_id, payload)
 
 
-@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response,
+    dependencies=[Depends(require_permission("admin", "edit"))])
 def delete_user(
     user_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -166,7 +171,7 @@ def get_shift_roster(
     return AdminActions(db, hospital_id).get_shift_roster(roster_date)
 
 
-@router.put("/shift-roster", response_model=ShiftRosterEntry)
+@router.put("/shift-roster", response_model=ShiftRosterEntry, dependencies=[Depends(require_permission("admin", "edit"))])
 def assign_shift_roster(
     payload: ShiftRosterAssign,
     db: Session = Depends(get_transitional_sync_session),
@@ -176,7 +181,7 @@ def assign_shift_roster(
     return AdminActions(db, hospital_id, actor).assign_shift_roster(payload)
 
 
-@router.post("/shift-roster/seed", response_model=ShiftRosterResponse)
+@router.post("/shift-roster/seed", response_model=ShiftRosterResponse, dependencies=[Depends(require_permission("admin", "edit"))])
 def seed_shift_roster(
     payload: ShiftRosterSeed,
     db: Session = Depends(get_transitional_sync_session),
@@ -186,7 +191,8 @@ def seed_shift_roster(
     return AdminActions(db, hospital_id, actor).seed_shift_roster(payload)
 
 
-@router.delete("/shift-roster", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.delete("/shift-roster", status_code=status.HTTP_204_NO_CONTENT, response_class=Response,
+    dependencies=[Depends(require_permission("admin", "edit"))])
 def clear_shift_roster_overrides(
     roster_date: date = Query(...),
     db: Session = Depends(get_transitional_sync_session),
@@ -217,7 +223,7 @@ def get_facility_settings(
     return AdminActions(db, hospital_id).get_facility_settings()
 
 
-@router.put("/facility-settings", response_model=HospitalFacilitySettings)
+@router.put("/facility-settings", response_model=HospitalFacilitySettings, dependencies=[Depends(require_permission("admin", "edit"))])
 def update_facility_settings(
     payload: HospitalFacilitySettingsUpdate,
     db: Session = Depends(get_transitional_sync_session),

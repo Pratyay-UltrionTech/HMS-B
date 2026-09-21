@@ -43,6 +43,10 @@ class Hospital(Base):
         Enum(PlanType, name="plan_type"), nullable=False, default=PlanType.basic
     )
     icon_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # IANA timezone identifier for this tenant (FLAW-007). Used by background
+    # jobs (e.g. auto-cancel of missed appointments) to evaluate "local" time
+    # against each hospital's configured timezone rather than server-local time.
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="Asia/Kolkata")
     facility_settings: Mapped[dict | None] = mapped_column(
         JSONB().with_variant(JSON, "sqlite"), nullable=True
     )

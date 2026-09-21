@@ -26,4 +26,5 @@ opentelemetry-instrumentation-httpx==0.64b0
 
 pytest==9.1.1
 
-httpx==0.28.1
+httpx==0.28.1
+

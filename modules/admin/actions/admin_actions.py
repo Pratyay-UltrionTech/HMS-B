@@ -54,6 +54,7 @@ from modules.masters.entities.organization_entities import Department
 from modules.tenancy.entities.hospital import Hospital
 from shared.audit import write_audit_log
 from shared.audit.entities.audit_log import AuditLog
+from shared.auth.dependencies import invalidate_role_permission_cache
 from shared.auth.security import hash_password
 
 
@@ -272,6 +273,19 @@ class AdminActions:
                     )
                 )
 
+        # FLAW-008/024: a change to a role's permissions or active state invalidates
+        # the in-memory permission cache and the sessions of every user holding the
+        # role, so stale JWTs / cached permissions are rejected promptly.
+        if payload.permissions is not None or (payload.is_active is not None and not payload.is_active):
+            members = (
+                self.db.query(HospitalUser)
+                .filter(HospitalUser.hospital_id == self.hospital_id, HospitalUser.role_id == role_id)
+                .all()
+            )
+            for m in members:
+                m.token_version = (m.token_version or 1) + 1
+            invalidate_role_permission_cache(self.hospital_id, role_id)
+
         self._audit("update", "role", role.id, f"Updated role '{role.name}'")
         self.db.commit()
         return self._role_to_response(self._get_role(role.id))
@@ -289,6 +303,7 @@ class AdminActions:
                 detail=f"Cannot delete role: {assigned} active staff user(s) are assigned to it.",
             )
         name = role.name
+        invalidate_role_permission_cache(self.hospital_id, role_id)
         self.db.delete(role)
         self._audit("delete", "role", role_id, f"Deleted role '{name}'")
         self.db.commit()
@@ -439,6 +454,11 @@ class AdminActions:
         if not user:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
+        # FLAW-024: snapshot pre-change role/active so we can detect session-relevant
+        # changes and bump token_version accordingly.
+        original_role_id = user.role_id
+        original_is_active = user.is_active
+
         data = payload.model_dump(exclude_unset=True, exclude={"password", "department_id"})
         raw = payload.model_dump(exclude_unset=True)
         if "role_id" in data and data["role_id"]:
@@ -481,6 +501,14 @@ class AdminActions:
             setattr(user, k, v)
         if payload.password:
             user.password_hash = hash_password(payload.password)
+
+        # FLAW-024: bump the session version whenever the user's role or active
+        # status changes so any already-issued JWT is rejected by GET /auth/me.
+        auth_relevant_change = ("role_id" in data and data["role_id"] != original_role_id) or (
+            "is_active" in data and data["is_active"] != original_is_active
+        )
+        if auth_relevant_change:
+            user.token_version = (user.token_version or 1) + 1
 
         self._audit(
             "update",

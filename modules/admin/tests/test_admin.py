@@ -91,7 +91,8 @@ def admin_client(admin_db):
     admin_payload = {
         "user_id": str(admin_user_id),
         "hospital_id": str(hospital_id),
-        "role": "admin",
+        "hospital_uuid": str(hospital_id),
+        "role": "hospital_admin",
         "email": "admin@admintest.com",
     }
     app.dependency_overrides[require_hospital_user] = lambda: admin_payload

@@ -26,3 +26,19 @@ class LoginResponse(BaseModel):
     staff_role_name: str | None = None
     permissions: list[dict] | None = None
     user_id: str | None = None
+    token_version: int = 1
+
+
+class MeResponse(BaseModel):
+    """Server-authoritative session state returned by GET /api/auth/me."""
+
+    sub: str
+    role: str
+    name: str | None = None
+    hospital_id: str | None = None
+    hospital_uuid: str | None = None
+    staff_role_name: str | None = None
+    user_id: str | None = None
+    is_active: bool = True
+    token_version: int = 1
+    permissions: list[dict] | None = None

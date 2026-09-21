@@ -4,8 +4,10 @@ from shared.auth.dependencies import (
     get_current_user,
     get_hospital_context,
     get_hospital_uuid,
+    invalidate_role_permission_cache,
     require_hospital_admin,
     require_hospital_user,
+    require_permission,
     require_super_admin,
     security,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "require_super_admin",
     "require_hospital_admin",
     "require_hospital_user",
+    "require_permission",
+    "invalidate_role_permission_cache",
     "get_hospital_context",
     "get_hospital_uuid",
 ]
