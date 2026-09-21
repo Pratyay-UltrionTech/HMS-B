@@ -15,11 +15,14 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
+    Integer,
     JSON,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -45,6 +48,24 @@ class Admission(Base):
     __table_args__ = (
         UniqueConstraint("hospital_id", "ip_id", name="uq_admission_hospital_ip_id"),
         UniqueConstraint("hospital_id", "er_id", name="uq_admission_hospital_er_id"),
+        Index(
+            "uq_admissions_active_bed",
+            "hospital_id",
+            "bed_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('admitted', 'discharge_requested')"
+            ),
+        ),
+        Index(
+            "uq_admissions_active_patient",
+            "hospital_id",
+            "patient_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('admitted', 'discharge_requested')"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -54,7 +75,7 @@ class Admission(Base):
         UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     patient_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     ward_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("wards.id", ondelete="RESTRICT"), nullable=False, index=True
@@ -86,6 +107,15 @@ class Admission(Base):
     source_appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
     )
+    # Immutable demographic snapshot captured at admission time (FLAW-010).
+    # These freeze identity for wristbands / worklists / discharge summaries so
+    # a later demographic correction to the Patient row does not retroactively
+    # rewrite an active or discharged encounter. They are refreshed only for
+    # ACTIVE (non-discharged) admissions via the audit-logged amend_demographics
+    # flow; discharged admissions keep the values captured at discharge time.
+    patient_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    age_at_admission: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     patient: Mapped[Patient | None] = relationship("Patient", foreign_keys=[patient_id])
     ward: Mapped[Ward | None] = relationship("Ward", foreign_keys=[ward_id])
@@ -113,7 +143,7 @@ class IpdFormSubmission(Base):
         UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     patient_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     admission_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
@@ -150,3 +180,39 @@ class IpdFormSubmission(Base):
     patient: Mapped[Patient | None] = relationship("Patient", foreign_keys=[patient_id])
     admission: Mapped[Admission | None] = relationship("Admission", foreign_keys=[admission_id])
     filled_by: Mapped[HospitalUser | None] = relationship("HospitalUser", foreign_keys=[filled_by_id])
+
+
+class BedStaySegment(Base):
+    """Tracks duration and billing rate for individual bed occupancy segments during an admission."""
+
+    __tablename__ = "bed_stay_segments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    admission_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ward_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wards.id", ondelete="SET NULL"), nullable=True
+    )
+    room_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rooms.id", ondelete="SET NULL"), nullable=True
+    )
+    bed_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("beds.id", ondelete="SET NULL"), nullable=True
+    )
+    rate_per_day: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    admission: Mapped[Admission] = relationship("Admission", foreign_keys=[admission_id])
+    ward: Mapped[Ward | None] = relationship("Ward", foreign_keys=[ward_id])
+    room: Mapped[Room | None] = relationship("Room", foreign_keys=[room_id])
+    bed: Mapped[Bed | None] = relationship("Bed", foreign_keys=[bed_id])

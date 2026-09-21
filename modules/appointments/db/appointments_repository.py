@@ -11,7 +11,7 @@ from uuid import UUID
 
 from sqlalchemy import Boolean, Date, Integer, String, column, func, or_, select, table
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from infrastructure.postgres.base_repository import BaseRepository
 from modules.appointments.contracts.appointments_contracts import (
@@ -220,12 +220,25 @@ class AppointmentsRepository(BaseRepository[Appointment]):
         )
 
     def list_ipd_requests(self) -> list[Appointment]:
-        """List appointments requesting IPD bed transfer."""
+        """List appointments requesting IPD bed transfer.
+        Excludes appointments for patients who already have an active inpatient admission.
+        """
+        from modules.inpatient.entities.admission import Admission, AdmissionStatus
+
+        active_patient_ids = (
+            self.db.query(Admission.patient_id)
+            .filter(
+                Admission.hospital_id == self.hospital_id,
+                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+            )
+        )
+
         return (
             self.db.query(Appointment)
             .filter(
                 Appointment.hospital_id == self.hospital_id,
                 Appointment.status == AppointmentStatus.ipd_transfer_requested,
+                ~Appointment.patient_id.in_(active_patient_ids),
             )
             .order_by(Appointment.created_at.desc())
             .all()
@@ -376,20 +389,67 @@ class AppointmentsRepository(BaseRepository[Appointment]):
             )
             users_map = {r[0]: r[1] for r in self.db.execute(stmt).all()}
 
-        # Bulk fetch admissions (for ip_id)
-        admissions_map: dict[UUID, str] = {}
+        # Bulk fetch admissions (for ip_id, ward, bed, status)
+        admissions_map: dict[UUID, dict[str, Any]] = {}
         if admission_ids:
-            stmt = select(_admissions.c.id, _admissions.c.ip_id).where(
-                _admissions.c.id.in_(admission_ids)
-            )
-            admissions_map = {r[0]: r[1] for r in self.db.execute(stmt).all()}
+            try:
+                from modules.inpatient.entities.admission import Admission
+                adm_rows = (
+                    self.db.query(Admission)
+                    .options(
+                        joinedload(Admission.ward),
+                        joinedload(Admission.bed),
+                    )
+                    .filter(Admission.id.in_(admission_ids))
+                    .all()
+                )
+                for adm in adm_rows:
+                    adm_st = (
+                        adm.status.value if hasattr(adm.status, "value") else str(adm.status)
+                    ) if getattr(adm, "status", None) is not None else None
+                    admissions_map[adm.id] = {
+                        "ip_id": adm.ip_id,
+                        "ward": adm.ward.name if adm.ward else None,
+                        "bed": adm.bed.bed_code if adm.bed else None,
+                        "status": adm_st,
+                    }
+            except Exception:
+                stmt = select(_admissions.c.id, _admissions.c.ip_id).where(
+                    _admissions.c.id.in_(admission_ids)
+                )
+                admissions_map = {
+                    r[0]: {"ip_id": r[1], "ward": None, "bed": None, "status": None}
+                    for r in self.db.execute(stmt).all()
+                }
+
+        # Bulk fetch ledger totals
+        ledger_map: dict[UUID, dict[str, Any]] = {}
+        if patient_ids:
+            try:
+                from modules.billing.services.billing_service import patient_ledger_totals_bulk
+                ledger_map = patient_ledger_totals_bulk(self.db, self.hospital_id, patient_ids)
+            except Exception:
+                ledger_map = {}
 
         items: list[AppointmentListItem] = []
         for a in appointments:
             pat = patients_map.get(a.patient_id)
             doc_name = users_map.get(a.doctor_id)
             nurse_name = users_map.get(a.nurse_id) if a.nurse_id else None
-            ip_id = admissions_map.get(a.admission_id) if a.admission_id else None
+            adm_info = admissions_map.get(a.admission_id) if a.admission_id else None
+            ip_id = adm_info.get("ip_id") if adm_info else None
+            adm_ward = adm_info.get("ward") if adm_info else None
+            adm_bed = adm_info.get("bed") if adm_info else None
+            adm_status = adm_info.get("status") if adm_info else None
+
+            led = ledger_map.get(a.patient_id, {})
+            out = float(led.get("outstanding", 0.0) or 0.0)
+            tot_chg = float(led.get("total_charges", 0.0) or 0.0)
+            tot_pd = float(led.get("total_paid", 0.0) or 0.0)
+            if out <= 0.009:
+                led_status = "unbilled" if tot_chg == 0 else "cleared"
+            else:
+                led_status = "outstanding"
 
             items.append(
                 AppointmentListItem(
@@ -420,8 +480,15 @@ class AppointmentsRepository(BaseRepository[Appointment]):
                     op_id=a.op_id,
                     admission_id=a.admission_id,
                     ip_id=ip_id,
+                    admission_ward=adm_ward,
+                    admission_bed=adm_bed,
+                    admission_status=adm_status,
                     nurse_id=a.nurse_id,
                     nurse_name=nurse_name,
+                    ledger_outstanding=out,
+                    ledger_total_charges=tot_chg,
+                    ledger_total_paid=tot_pd,
+                    ledger_status=led_status,
                 )
             )
         return items

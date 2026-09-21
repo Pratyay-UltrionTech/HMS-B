@@ -167,9 +167,32 @@ class AdmissionsRepository:
             admitted_at=admitted_at or datetime.now(timezone.utc),
             ip_id=ip_id,
             source_appointment_id=source_appointment_id,
+            # Immutable demographic snapshot (FLAW-010): freeze identity at the
+            # moment of admission so later patient corrections do not rewrite
+            # this encounter's wristband / discharge summary identity.
+            patient_name=patient.name,
+            gender=patient.gender,
+            age_at_admission=patient.age,
         )
         bed.is_occupied = True
         patient.status = PatientStatus.admitted
         self.db.add(admission)
         self.db.flush()
+
+        # Reconcile any pending IPD transfer requests for this patient so they
+        # don't linger in admission queues once the patient has an active bed
+        from modules.appointments.entities.appointment import Appointment, AppointmentStatus
+        pending_appts = (
+            self.db.query(Appointment)
+            .filter(
+                Appointment.hospital_id == hospital_id,
+                Appointment.patient_id == patient.id,
+                Appointment.status == AppointmentStatus.ipd_transfer_requested,
+            )
+            .all()
+        )
+        for appt in pending_appts:
+            appt.status = AppointmentStatus.transferred_to_inpatient
+            appt.admission_id = admission.id
+
         return admission

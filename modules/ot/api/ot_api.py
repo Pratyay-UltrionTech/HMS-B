@@ -44,7 +44,7 @@ from modules.ot.services.ot_service import (
     stream_ot_file,
 )
 from modules.tenancy.entities.hospital import Hospital
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/ot", tags=["ot"])
 
@@ -106,7 +106,8 @@ def get_surgery(
     return GetSurgeryAction(db, hospital_id).execute(surgery_id)
 
 
-@router.post("/surgeries", response_model=OtSurgeryResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/surgeries", response_model=OtSurgeryResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("ot", "edit"))])
 def create_surgery(
     payload: OtSurgeryCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -116,7 +117,7 @@ def create_surgery(
     return CreateSurgeryAction(db, hospital_id, user).execute(payload)
 
 
-@router.put("/surgeries/{surgery_id}", response_model=OtSurgeryResponse)
+@router.put("/surgeries/{surgery_id}", response_model=OtSurgeryResponse, dependencies=[Depends(require_permission("ot", "edit"))])
 def update_surgery(
     surgery_id: UUID,
     payload: OtSurgeryUpdate,
@@ -127,7 +128,8 @@ def update_surgery(
     return UpdateSurgeryAction(db, hospital_id, user).execute(surgery_id, payload)
 
 
-@router.post("/surgeries/{surgery_id}/confirm", response_model=OtSurgeryResponse)
+@router.post("/surgeries/{surgery_id}/confirm", response_model=OtSurgeryResponse,
+    dependencies=[Depends(require_permission("ot", "edit"))])
 def confirm_surgery(
     surgery_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -137,7 +139,8 @@ def confirm_surgery(
     return ConfirmSurgeryAction(db, hospital_id, user).execute(surgery_id)
 
 
-@router.post("/surgeries/{surgery_id}/reschedule", response_model=OtSurgeryResponse)
+@router.post("/surgeries/{surgery_id}/reschedule", response_model=OtSurgeryResponse,
+    dependencies=[Depends(require_permission("ot", "edit"))])
 def reschedule_surgery(
     surgery_id: UUID,
     payload: OtRescheduleRequest,
@@ -148,7 +151,7 @@ def reschedule_surgery(
     return RescheduleSurgeryAction(db, hospital_id, user).execute(surgery_id, payload)
 
 
-@router.post("/surgeries/{surgery_id}/start", response_model=OtSurgeryResponse)
+@router.post("/surgeries/{surgery_id}/start", response_model=OtSurgeryResponse, dependencies=[Depends(require_permission("ot", "edit"))])
 def start_surgery(
     surgery_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -158,7 +161,8 @@ def start_surgery(
     return StartSurgeryAction(db, hospital_id, user).execute(surgery_id)
 
 
-@router.post("/surgeries/{surgery_id}/complete", response_model=OtSurgeryResponse)
+@router.post("/surgeries/{surgery_id}/complete", response_model=OtSurgeryResponse,
+    dependencies=[Depends(require_permission("ot", "edit"))])
 def complete_surgery(
     surgery_id: UUID,
     payload: OtCompleteRequest | None = None,
@@ -169,7 +173,7 @@ def complete_surgery(
     return CompleteSurgeryAction(db, hospital_id, user).execute(surgery_id, payload)
 
 
-@router.post("/surgeries/{surgery_id}/cancel", response_model=OtSurgeryResponse)
+@router.post("/surgeries/{surgery_id}/cancel", response_model=OtSurgeryResponse, dependencies=[Depends(require_permission("ot", "edit"))])
 def cancel_surgery(
     surgery_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
@@ -179,7 +183,7 @@ def cancel_surgery(
     return CancelSurgeryAction(db, hospital_id, user).execute(surgery_id)
 
 
-@router.post("/surgeries/{surgery_id}/notes", response_model=OtSurgeryResponse)
+@router.post("/surgeries/{surgery_id}/notes", response_model=OtSurgeryResponse, dependencies=[Depends(require_permission("ot", "edit"))])
 def save_notes(
     surgery_id: UUID,
     payload: OtNotesRequest,

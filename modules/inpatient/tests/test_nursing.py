@@ -19,7 +19,10 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import Bed, Hospital, HospitalUser, Patient, Room, Ward, WardType
+from modules.beds.entities.bed import Bed, Room, Ward, WardType
+from modules.doctors.entities.doctor import HospitalUser
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.base import Base
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.inpatient.api.nursing_api import router as nursing_router
@@ -52,7 +55,7 @@ def nurse_headers(hospital: Hospital) -> dict[str, str]:
             "sub": "nurse.priya@hospital.test",
             "name": "Nurse Priya",
             "email": "nurse.priya@hospital.test",
-            "role": "hospital_staff",
+            "role": "hospital_admin",
             "staff_role_name": "nurse",
             "hospital_uuid": str(hospital.id),
             "user_id": str(uuid.uuid4()),

@@ -199,7 +199,7 @@ class CreateSurgeryAction:
         if not dept:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
 
-        ot_room = self.repo.resolve_ot_room(payload.ot_room_id, payload.department_id)
+        ot_room = self.repo.resolve_ot_room(payload.ot_room_id, payload.department_id, for_update=True)
         if not ot_room:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

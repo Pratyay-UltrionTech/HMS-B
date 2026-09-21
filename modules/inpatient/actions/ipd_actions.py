@@ -150,6 +150,9 @@ class UpdateFormSubmissionAction:
         if not sub:
             raise NotFoundError("Submission not found")
 
+        if sub.status == IpdFormSubmissionStatus.final:
+            raise ValidationError("Finalized clinical forms cannot be edited. Submit an addendum.")
+
         if payload.admission_id is not None:
             adm = (
                 self.db.query(Admission)

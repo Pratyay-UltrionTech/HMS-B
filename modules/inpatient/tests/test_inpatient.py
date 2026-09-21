@@ -19,7 +19,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Bed, Hospital, HospitalUser, Patient, Room, StaffRole, Ward, WardType
+from modules.beds.entities.bed import Bed, Room, Ward, WardType
+from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.beds.api.beds_api import (
     registration_inpatient_router,
@@ -33,7 +36,10 @@ from tests.conftest import db_session, hospital
 @pytest.fixture(scope="function")
 def inpatient_app(db_session: Session) -> FastAPI:
     """Isolated test app mounting inpatient routes across /beds, /registration, and /ipd."""
+    from shared.exceptions.handlers import register_exception_handlers
+
     test_app = FastAPI(title="Migrated Inpatient Test App")
+    register_exception_handlers(test_app)
     test_app.include_router(beds_router, prefix="/api")
     test_app.include_router(registration_inpatient_router, prefix="/api")
     test_app.include_router(ipd_router, prefix="/api")
@@ -53,9 +59,9 @@ def client(inpatient_app: FastAPI) -> TestClient:
 @pytest.fixture(scope="function")
 def staff_auth(hospital: Hospital) -> dict[str, str]:
     token = create_access_token({
-        "sub": "staff@hospital.com",
-        "name": "Nurse Joy",
-        "role": "hospital_staff",
+        "sub": "admin@hospital.com",
+        "name": "Admin Joy",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital.id),
     })
     return {"Authorization": f"Bearer {token}"}
@@ -232,6 +238,15 @@ def test_ipd_form_submission_lifecycle(
     )
     assert put_res.status_code == 200, put_res.text
     assert put_res.json()["status"] == "final"
+
+    # 2b. Attempt to edit finalized form -> must be rejected (HMS-FLAW-016)
+    edit_final_res = client.put(
+        f"/api/ipd/form-submissions/{form_id}",
+        json={"form_data": {"procedure": "Overwritten Appendectomy"}},
+        headers=staff_auth,
+    )
+    assert edit_final_res.status_code == 400
+    assert "Finalized clinical forms cannot be edited" in edit_final_res.text
 
     # 3. List submissions
     list_res = client.get(

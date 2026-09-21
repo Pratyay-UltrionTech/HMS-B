@@ -133,6 +133,8 @@ class MedicationAdminScheduleCreate(BaseModel):
     route: str = Field(min_length=1)
     scheduled_time: datetime
     is_high_alert: bool = False
+    override_confirmed: bool = False
+    override_reason: str | None = None
 
 
 class MedicationAdminRecordExecution(BaseModel):

@@ -31,7 +31,7 @@ from modules.inpatient.contracts.inpatient_contracts import (
     TransferRequest,
 )
 from modules.inpatient.db.admissions_repository import AdmissionsRepository
-from modules.inpatient.entities.admission import Admission, AdmissionStatus
+from modules.inpatient.entities.admission import Admission, AdmissionStatus, BedStaySegment
 from modules.inpatient.services.inpatient_billing_service import (
     InpatientBillingService,
     next_ip_encounter_id,
@@ -41,12 +41,20 @@ from shared.audit.service import write_audit_log
 
 
 def to_admission_detail(a: Admission) -> AdmissionDetail:
-    """Format Admission entity into AdmissionDetail response contract."""
+    """Format Admission entity into AdmissionDetail response contract.
+
+    FLAW-010: prefer the immutable demographic snapshot captured at admission
+    time (and refreshed via amend_demographics for active admissions) so
+    wristbands / discharge summaries render the identity that was in effect for
+    this encounter. Falls back to the live Patient row for legacy rows created
+    before snapshot columns existed.
+    """
     ward = a.ward
+    snap_name = getattr(a, "patient_name", None) or (a.patient.name if a.patient else None)
     return AdmissionDetail(
         id=a.id,
         patient_id=a.patient_id,
-        patient_name=a.patient.name if a.patient else None,
+        patient_name=snap_name,
         patient_uhid=getattr(a.patient, "uhid", None) if a.patient else None,
         patient_mobile=a.patient.mobile if a.patient else None,
         ward_id=a.ward_id,
@@ -102,7 +110,12 @@ class AdmitPatientAction:
         if active:
             raise ConflictError("Patient is already admitted")
 
-        bed = self.beds_repo.get_bed_by_id(hospital_id, payload.bed_id)
+        bed = (
+            self.db.query(Bed)
+            .filter(Bed.id == payload.bed_id, Bed.hospital_id == hospital_id)
+            .with_for_update()
+            .first()
+        )
         if not bed:
             raise NotFoundError("Bed not found")
         if bed.is_occupied:
@@ -146,6 +159,18 @@ class AdmitPatientAction:
             created_by_name=actor_name,
         )
 
+        initial_segment = BedStaySegment(
+            hospital_id=hospital_id,
+            admission_id=admission.id,
+            ward_id=bed.ward_id,
+            room_id=bed.room_id,
+            bed_id=bed.id,
+            rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
+            started_at=admitted_at,
+            ended_at=None,
+        )
+        self.db.add(initial_segment)
+
         write_audit_log(
             self.db,
             hospital_id=hospital_id,
@@ -181,7 +206,12 @@ class AllocateBedAction:
         if admission.bed_id == payload.bed_id:
             return to_admission_detail(admission)
 
-        new_bed = self.beds_repo.get_bed_by_id(hospital_id, payload.bed_id)
+        new_bed = (
+            self.db.query(Bed)
+            .filter(Bed.id == payload.bed_id, Bed.hospital_id == hospital_id)
+            .with_for_update()
+            .first()
+        )
         if not new_bed:
             raise NotFoundError("Bed not found")
         if new_bed.ward_id != payload.ward_id or new_bed.room_id != payload.room_id:
@@ -255,6 +285,33 @@ class TransferBedAction:
         admission.room_id = payload.to_room_id
         admission.bed_id = payload.to_bed_id
         new_bed.is_occupied = True
+
+        # Close current active BedStaySegment and start new segment for destination bed
+        transfer_now = datetime.now(timezone.utc)
+        current_segment = (
+            self.db.query(BedStaySegment)
+            .filter(
+                BedStaySegment.hospital_id == hospital_id,
+                BedStaySegment.admission_id == admission.id,
+                BedStaySegment.ended_at.is_(None),
+            )
+            .order_by(BedStaySegment.started_at.desc())
+            .first()
+        )
+        if current_segment:
+            current_segment.ended_at = transfer_now
+        
+        new_segment = BedStaySegment(
+            hospital_id=hospital_id,
+            admission_id=admission.id,
+            ward_id=new_bed.ward_id,
+            room_id=new_bed.room_id,
+            bed_id=new_bed.id,
+            rate_per_day=float(getattr(new_bed.ward, "bed_charge_per_day", 0) or 0) if new_bed.ward else 0.0,
+            started_at=transfer_now,
+            ended_at=None,
+        )
+        self.db.add(new_segment)
 
         write_audit_log(
             self.db,

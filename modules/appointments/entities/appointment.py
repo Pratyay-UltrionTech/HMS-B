@@ -12,7 +12,7 @@ from datetime import date, datetime, time
 from typing import TYPE_CHECKING
 import uuid
 
-from sqlalchemy import Date, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import Date, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text, Time, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,6 +33,17 @@ class Appointment(Base):
     __table_args__ = (
         UniqueConstraint("hospital_id", "op_id", name="uq_appointment_hospital_op_id"),
         Index("ix_appointments_hospital_date", "hospital_id", "appointment_date"),
+        Index(
+            "uq_appointments_active_slot",
+            "hospital_id",
+            "doctor_id",
+            "appointment_date",
+            "appointment_time",
+            unique=True,
+            postgresql_where=text(
+                "status NOT IN ('cancelled', 'no_show')"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

@@ -57,7 +57,7 @@ from modules.inpatient.contracts.inpatient_contracts import (
     TransferRequest,
 )
 from modules.inpatient.db.admissions_repository import AdmissionsRepository
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/beds", tags=["beds"])
 registration_inpatient_router = APIRouter(prefix="/registration", tags=["registration"])
@@ -164,7 +164,8 @@ def list_active_admissions(
     return [to_admission_detail(a) for a in rows]
 
 
-@router.post("/admit", response_model=AdmissionDetail, status_code=status.HTTP_201_CREATED)
+@router.post("/admit", response_model=AdmissionDetail, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("bed", "edit"))])
 def admit_patient(
     payload: AdmitRequest,
     db: Session = Depends(get_transitional_sync_session),
@@ -174,7 +175,7 @@ def admit_patient(
     return AdmitPatientAction(db).execute(hospital_id, payload, user)
 
 
-@router.put("/allocate", response_model=AdmissionDetail)
+@router.put("/allocate", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])
 def allocate_bed(
     payload: AllocateRequest,
     db: Session = Depends(get_transitional_sync_session),
@@ -184,7 +185,7 @@ def allocate_bed(
     return AllocateBedAction(db).execute(hospital_id, payload, user)
 
 
-@router.put("/transfer", response_model=AdmissionDetail)
+@router.put("/transfer", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])
 def transfer_bed(
     payload: TransferRequest,
     db: Session = Depends(get_transitional_sync_session),
@@ -194,7 +195,7 @@ def transfer_bed(
     return TransferBedAction(db).execute(hospital_id, payload, user)
 
 
-@router.post("/discharge-request", response_model=AdmissionDetail)
+@router.post("/discharge-request", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])
 def request_discharge(
     payload: DischargeRequestCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -213,7 +214,7 @@ def list_discharge_requests(
     return ListDischargeRequestsAction(db).execute(hospital_id)
 
 
-@router.post("/discharge", response_model=AdmissionDetail)
+@router.post("/discharge", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])
 def discharge_patient(
     payload: DischargeRequest,
     db: Session = Depends(get_transitional_sync_session),
@@ -279,6 +280,7 @@ def list_wards_rooms_registration(
     "/patients/{patient_id}/admit",
     response_model=AdmissionSummary,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("registration", "edit"))],
 )
 def admit_patient_registration(
     patient_id: UUID,
@@ -291,7 +293,9 @@ def admit_patient_registration(
 
 
 @registration_inpatient_router.post(
-    "/admissions/{admission_id}/discharge", response_model=DischargeResponse
+    "/admissions/{admission_id}/discharge",
+    response_model=DischargeResponse,
+    dependencies=[Depends(require_permission("registration", "edit"))],
 )
 def discharge_patient_registration(
     admission_id: UUID,

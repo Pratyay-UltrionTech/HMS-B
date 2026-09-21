@@ -49,7 +49,7 @@ from modules.appointments.db.appointments_repository import AppointmentsReposito
 from modules.appointments.db.availability_reader import AvailabilityReader
 from modules.appointments.db.pricing_reader import PricingReader
 from modules.appointments.entities.enums import AppointmentStatus
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
@@ -147,7 +147,8 @@ def check_doctor_availability(
     return CheckAvailabilityAction(avail_reader).execute(doctor_id, check_date)
 
 
-@router.post("", response_model=AppointmentListItem, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=AppointmentListItem, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("appointment", "edit"))])
 def book_appointment(
     payload: BookAppointmentRequest,
     db: Session = Depends(get_db),
@@ -232,7 +233,7 @@ def appointment_history(
     return items
 
 
-@router.post("/{appointment_id}/check-in", response_model=AppointmentListItem)
+@router.post("/{appointment_id}/check-in", response_model=AppointmentListItem, dependencies=[Depends(require_permission("appointment", "edit"))])
 def check_in(
     appointment_id: UUID,
     db: Session = Depends(get_db),
@@ -243,7 +244,7 @@ def check_in(
     return CheckInAction(db, hospital_id, repo).execute(appointment_id, user)
 
 
-@router.post("/{appointment_id}/complete", response_model=AppointmentListItem)
+@router.post("/{appointment_id}/complete", response_model=AppointmentListItem, dependencies=[Depends(require_permission("appointment", "edit"))])
 def complete_appointment(
     appointment_id: UUID,
     force: bool = False,
@@ -255,7 +256,7 @@ def complete_appointment(
     return CompleteAppointmentAction(db, hospital_id, repo).execute(appointment_id, user, force=force)
 
 
-@router.post("/{appointment_id}/cancel", response_model=AppointmentListItem)
+@router.post("/{appointment_id}/cancel", response_model=AppointmentListItem, dependencies=[Depends(require_permission("appointment", "edit"))])
 def cancel_appointment(
     appointment_id: UUID,
     payload: dict[str, Any] | None = None,
@@ -270,7 +271,7 @@ def cancel_appointment(
     )
 
 
-@router.post("/{appointment_id}/no-show", response_model=AppointmentListItem)
+@router.post("/{appointment_id}/no-show", response_model=AppointmentListItem, dependencies=[Depends(require_permission("appointment", "edit"))])
 def mark_no_show(
     appointment_id: UUID,
     db: Session = Depends(get_db),
@@ -281,7 +282,7 @@ def mark_no_show(
     return NoShowAction(db, hospital_id, repo).execute(appointment_id, user)
 
 
-@router.put("/{appointment_id}/reschedule", response_model=AppointmentListItem)
+@router.put("/{appointment_id}/reschedule", response_model=AppointmentListItem, dependencies=[Depends(require_permission("appointment", "edit"))])
 def reschedule_appointment(
     appointment_id: UUID,
     payload: RescheduleRequest,
@@ -296,7 +297,7 @@ def reschedule_appointment(
     )
 
 
-@router.put("/{appointment_id}/nurse", response_model=AppointmentListItem)
+@router.put("/{appointment_id}/nurse", response_model=AppointmentListItem, dependencies=[Depends(require_permission("appointment", "edit"))])
 def assign_nurse(
     appointment_id: UUID,
     payload: AssignNurseRequest,
@@ -320,7 +321,7 @@ def list_ipd_requests(
     return ListAppointmentsActions(repo).get_ipd_requests()
 
 
-@router.post("/{appointment_id}/admit-ipd")
+@router.post("/{appointment_id}/admit-ipd", dependencies=[Depends(require_permission("appointment", "edit"))])
 def admit_ipd_from_nurse(
     appointment_id: UUID,
     payload: AdmitIpdRequest,
@@ -334,7 +335,8 @@ def admit_ipd_from_nurse(
     )
 
 
-@router.put("/{appointment_id}/initial-findings", response_model=AppointmentListItem)
+@router.put("/{appointment_id}/initial-findings", response_model=AppointmentListItem,
+    dependencies=[Depends(require_permission("appointment", "edit"))])
 def update_initial_findings(
     appointment_id: UUID,
     payload: UpdateInitialFindingsRequest,

@@ -60,7 +60,7 @@ from modules.inpatient.entities.nursing_entities import (
     ClinicalNoteType,
     MedicationAdminStatus,
 )
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/ipd", tags=["nursing", "ipd"])
 
@@ -72,7 +72,8 @@ router = APIRouter(prefix="/ipd", tags=["nursing", "ipd"])
     "/admissions/{admission_id}/care-plans",
     response_model=NursingCarePlanResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("nurses", "edit"))])
 def create_care_plan(
     admission_id: UUID,
     payload: NursingCarePlanCreate,
@@ -112,7 +113,8 @@ def get_care_plan(
 @router.put(
     "/care-plans/{plan_id}/reassess",
     response_model=NursingCarePlanResponse,
-)
+
+    dependencies=[Depends(require_permission("nurses", "edit"))])
 def reassess_care_plan(
     plan_id: UUID,
     payload: NursingCarePlanReassess,
@@ -130,7 +132,8 @@ def reassess_care_plan(
     "/admissions/{admission_id}/clinical-notes",
     response_model=IpdClinicalNoteResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("nurses", "edit"))])
 def create_clinical_note(
     admission_id: UUID,
     payload: IpdClinicalNoteCreate,
@@ -175,7 +178,8 @@ def get_clinical_note(
     "/admissions/{admission_id}/handovers",
     response_model=NursingShiftHandoverResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("nurses", "edit"))])
 def create_shift_handover(
     admission_id: UUID,
     payload: NursingShiftHandoverCreate,
@@ -215,7 +219,8 @@ def get_shift_handover(
 @router.post(
     "/handovers/{handover_id}/acknowledge",
     response_model=NursingShiftHandoverResponse,
-)
+
+    dependencies=[Depends(require_permission("nurses", "edit"))])
 def acknowledge_shift_handover(
     handover_id: UUID,
     payload: NursingShiftHandoverAcknowledge | None = None,
@@ -233,7 +238,8 @@ def acknowledge_shift_handover(
     "/admissions/{admission_id}/emar",
     response_model=MedicationAdminResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("nurses", "edit"))])
 def schedule_medication_emar(
     admission_id: UUID,
     payload: MedicationAdminScheduleCreate,
@@ -263,7 +269,8 @@ def list_medication_emar(
 @router.put(
     "/emar/{record_id}/record",
     response_model=MedicationAdminResponse,
-)
+
+    dependencies=[Depends(require_permission("nurses", "edit"))])
 def record_medication_emar_execution(
     record_id: UUID,
     payload: MedicationAdminRecordExecution,

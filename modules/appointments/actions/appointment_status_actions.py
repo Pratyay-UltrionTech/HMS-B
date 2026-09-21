@@ -150,6 +150,15 @@ class CancelAppointmentAction:
             existing = (appt.notes or "").strip()
             appt.notes = f"{existing}\n{note}".strip() if existing else note
 
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.billing_service import cancel_charge_for_source
+        cancel_charge_for_source(
+            self.db,
+            hospital_id=self.hospital_id,
+            source_type=BillingSourceType.consultation,
+            source_id=appt.id,
+        )
+
         write_audit_log(
             self.db,
             hospital_id=self.hospital_id,
@@ -333,8 +342,30 @@ class AdmitIpdAction:
         if not appt:
             raise AppointmentNotFoundError()
 
-        from modules.beds.entities.bed import Bed
+        from modules.patients.entities.patient import Patient
+        patient = (
+            self.db.query(Patient)
+            .filter(Patient.id == appt.patient_id, Patient.hospital_id == self.hospital_id)
+            .first()
+        )
+        if not patient:
+            raise AppointmentNotFoundError("Patient not found")
+
         from modules.inpatient.entities.admission import Admission, AdmissionStatus
+        active = (
+            self.db.query(Admission)
+            .filter(
+                Admission.patient_id == appt.patient_id,
+                Admission.hospital_id == self.hospital_id,
+                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+            )
+            .first()
+        )
+        if active:
+            raise AppointmentConflictError("Patient is already admitted to another bed")
+
+        from modules.beds.entities.bed import Bed
+        # Row-level lock on the target bed to prevent concurrent double-booking
         bed = (
             self.db.query(Bed)
             .filter(
@@ -343,31 +374,45 @@ class AdmitIpdAction:
                 Bed.room_id == payload.room_id,
                 Bed.ward_id == payload.ward_id,
             )
+            .with_for_update()
             .first()
         )
         if not bed:
             raise AppointmentNotFoundError("Selected bed not found")
         if bed.is_occupied:
-            raise AppointmentValidationError("Selected bed is already occupied")
+            raise AppointmentConflictError("Selected bed is already occupied or was just taken")
 
-        bed.is_occupied = True
-        ip_id = self.repo.next_encounter_id("IP")
+        from modules.inpatient.db.admissions_repository import AdmissionsRepository
+        from modules.inpatient.services.inpatient_billing_service import (
+            InpatientBillingService,
+            next_ip_encounter_id,
+        )
 
-        admission = Admission(
+        ip_id = next_ip_encounter_id(self.db, self.hospital_id)
+
+        admissions_repo = AdmissionsRepository(self.db)
+        admission = admissions_repo.create_admission(
             hospital_id=self.hospital_id,
-            patient_id=appt.patient_id,
-            doctor_id=appt.doctor_id,
+            patient=patient,
+            bed=bed,
             ward_id=payload.ward_id,
             room_id=payload.room_id,
-            bed_id=payload.bed_id,
-            admission_date=date.today(),
-            admitted_at=datetime.now(timezone.utc),
-            status=AdmissionStatus.admitted,
-            notes=payload.notes,
+            doctor_id=appt.doctor_id,
             ip_id=ip_id,
+            notes=payload.notes,
+            source_appointment_id=appt.id,
         )
-        self.db.add(admission)
-        self.db.flush()
+
+        billing_svc = InpatientBillingService(self.db)
+        actor_name = str(user.get("name") or "Nurse")
+        billing_svc.ensure_admission_charge(
+            hospital_id=self.hospital_id,
+            patient_id=patient.id,
+            admission_id=admission.id,
+            ward_name=bed.ward.name if bed.ward else None,
+            admission_fee=float(getattr(bed.ward, "admission_fee", 0) or 0) if bed.ward else 0.0,
+            created_by_name=actor_name,
+        )
 
         appt.status = AppointmentStatus.transferred_to_inpatient
         appt.admission_id = admission.id
@@ -378,12 +423,13 @@ class AdmitIpdAction:
             actor=user,
             action="create",
             entity_type="admission",
-            entity_id=admission.id,
-            summary=f"Admitted patient from appointment {appt.id} to Bed {bed.bed_code} ({ip_id})",
+            entity_id=str(admission.id),
+            summary=f"Admitted patient {patient.name} ({patient.uhid}) to Bed {bed.bed_code} ({ip_id}) from visit {appt.op_id or str(appt.id)}",
         )
         self.db.commit()
         return {
             "status": "admitted",
             "admission_id": str(admission.id),
             "ip_id": ip_id,
+            "bed_code": bed.bed_code,
         }

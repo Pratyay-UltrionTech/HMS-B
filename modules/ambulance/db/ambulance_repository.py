@@ -49,15 +49,17 @@ class AmbulanceRepository:
                 seq = 0
         return f"{prefix}{seq + 1:05d}"
 
-    def get_vehicle_by_id(self, vehicle_id: UUID) -> AmbulanceVehicle | None:
-        return (
+    def get_vehicle_by_id(self, vehicle_id: UUID, for_update: bool = False) -> AmbulanceVehicle | None:
+        q = (
             self.db.query(AmbulanceVehicle)
             .filter(
                 AmbulanceVehicle.id == vehicle_id,
                 AmbulanceVehicle.hospital_id == self.hospital_id,
             )
-            .first()
         )
+        if for_update:
+            q = q.with_for_update()
+        return q.first()
 
     def get_vehicle_by_reg(self, reg_no: str) -> AmbulanceVehicle | None:
         return (

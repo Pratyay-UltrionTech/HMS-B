@@ -187,6 +187,21 @@ class BookAppointmentAction:
         self.db.add(appt)
         self.db.flush()
 
+        # Generate consultation billing charge (FLAW-006)
+        if fee > 0:
+            from modules.billing.entities.billing_entities import BillingSourceType
+            from modules.billing.services.billing_service import ensure_charge
+            ensure_charge(
+                self.db,
+                hospital_id=self.hospital_id,
+                patient_id=patient.id,
+                source_type=BillingSourceType.consultation,
+                source_id=appt.id,
+                description=f"Consultation Fee - Dr. {doctor['name']} ({appt.op_id})",
+                charge_amount=fee,
+                created_by_name=str(user.get("name") or "System"),
+            )
+
         # Audit log
         write_audit_log(
             self.db,

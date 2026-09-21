@@ -37,7 +37,7 @@ class CreateAmbulanceDispatchAction:
         self.repo = AmbulanceRepository(db, hospital_id)
 
     def execute(self, payload: AmbulanceDispatchCreate, actor: dict[str, Any]) -> AmbulanceDispatchResponse:
-        vehicle = self.repo.get_vehicle_by_id(payload.ambulance_id)
+        vehicle = self.repo.get_vehicle_by_id(payload.ambulance_id, for_update=True)
         if not vehicle:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ambulance not found")
 

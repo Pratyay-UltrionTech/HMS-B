@@ -141,8 +141,15 @@ class AppointmentListItem(BaseModel):
     op_id: str | None = None
     admission_id: uuid.UUID | None = None
     ip_id: str | None = None
+    admission_ward: str | None = None
+    admission_bed: str | None = None
+    admission_status: str | None = None
     nurse_id: uuid.UUID | None = None
     nurse_name: str | None = None
+    ledger_outstanding: float = 0.0
+    ledger_total_charges: float = 0.0
+    ledger_total_paid: float = 0.0
+    ledger_status: str = "cleared"
 
 
 class UpdateInitialFindingsRequest(BaseModel):

@@ -295,37 +295,53 @@ class RecordEmergencyDispositionAction:
             bed = (
                 self.db.query(Bed)
                 .filter(Bed.id == payload.destination_bed_id, Bed.hospital_id == self.hospital_id)
+                .with_for_update()
                 .first()
             )
-            if bed and not bed.is_occupied:
-                admissions_repo = AdmissionsRepository(self.db)
-                billing_svc = InpatientBillingService(self.db)
-                patient = encounter.patient or self.db.query(Patient).filter(Patient.id == encounter.patient_id).first()
-                if patient:
-                    ip_id = next_ip_encounter_id(self.db, self.hospital_id)
-                    admission = admissions_repo.create_admission(
-                        hospital_id=self.hospital_id,
-                        patient=patient,
-                        bed=bed,
-                        ward_id=payload.destination_ward_id,
-                        room_id=bed.room_id,
-                        doctor_id=encounter.attending_doctor_id,
-                        ip_id=ip_id,
-                        notes=f"Admitted via Emergency ({encounter.er_id}). {payload.disposition_notes or ''}".strip(),
-                        admitted_at=datetime.now(timezone.utc),
-                    )
-                    admission.er_id = encounter.er_id
-                    created_admission_id = admission.id
-                    from modules.beds.entities.bed import Ward
-                    ward_obj = self.db.query(Ward).filter(Ward.id == payload.destination_ward_id).first()
-                    billing_svc.ensure_admission_charge(
-                        hospital_id=self.hospital_id,
-                        patient_id=patient.id,
-                        admission_id=admission.id,
-                        ward_name=ward_obj.name if ward_obj else None,
-                        admission_fee=float(getattr(ward_obj, "admission_fee", 0.0) or 0.0),
-                        created_by_name=decider_name,
-                    )
+            if not bed:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Destination bed not found",
+                )
+            if bed.is_occupied:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Selected bed is occupied. Choose another bed.",
+                )
+            if bed.ward_id != payload.destination_ward_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected bed does not belong to the selected destination ward",
+                )
+
+            admissions_repo = AdmissionsRepository(self.db)
+            billing_svc = InpatientBillingService(self.db)
+            patient = encounter.patient or self.db.query(Patient).filter(Patient.id == encounter.patient_id).first()
+            if patient:
+                ip_id = next_ip_encounter_id(self.db, self.hospital_id)
+                admission = admissions_repo.create_admission(
+                    hospital_id=self.hospital_id,
+                    patient=patient,
+                    bed=bed,
+                    ward_id=payload.destination_ward_id,
+                    room_id=bed.room_id,
+                    doctor_id=encounter.attending_doctor_id,
+                    ip_id=ip_id,
+                    notes=f"Admitted via Emergency ({encounter.er_id}). {payload.disposition_notes or ''}".strip(),
+                    admitted_at=datetime.now(timezone.utc),
+                )
+                admission.er_id = encounter.er_id
+                created_admission_id = admission.id
+                from modules.beds.entities.bed import Ward
+                ward_obj = self.db.query(Ward).filter(Ward.id == payload.destination_ward_id).first()
+                billing_svc.ensure_admission_charge(
+                    hospital_id=self.hospital_id,
+                    patient_id=patient.id,
+                    admission_id=admission.id,
+                    ward_name=ward_obj.name if ward_obj else None,
+                    admission_fee=float(getattr(ward_obj, "admission_fee", 0.0) or 0.0),
+                    created_by_name=decider_name,
+                )
 
         disposition = EmergencyDisposition(
             hospital_id=self.hospital_id,

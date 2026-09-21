@@ -27,6 +27,10 @@ from modules.inpatient.entities.nursing_entities import (
     MedicationAdminStatus,
     MedicationAdministrationRecord,
 )
+from modules.patients.actions.allergy_actions import CheckPatientAllergyAlertAction
+from modules.patients.contracts.allergy_contracts import CheckAllergyAlertRequest
+from modules.pharmacy.actions.drug_interaction_actions import CheckDrugInteractionsAction
+from modules.pharmacy.contracts.drug_interaction_contracts import CheckDrugInteractionsRequest
 from shared.audit.service import write_audit_log
 
 
@@ -46,6 +50,68 @@ class ScheduleMedicationAction:
         admission = self.admission_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not admission:
             raise NotFoundError("Admission not found")
+
+        # Feature 16 & 17 Clinical Safety Validation: Patient Allergy & Drug Interaction Gate
+        allergy_checker = CheckPatientAllergyAlertAction(self.db, self.hospital_id)
+        warning = allergy_checker.execute(admission.patient_id, CheckAllergyAlertRequest(medicine_name=payload.medicine_name))
+        if warning.has_conflict and warning.requires_clinical_override:
+            if not payload.override_confirmed:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "type": "allergy_conflict",
+                        "message": warning.message,
+                        "matched_allergen": warning.matched_allergen,
+                        "severity": warning.severity.value if warning.severity else "unknown",
+                        "requires_clinical_override": True,
+                    },
+                )
+            write_audit_log(
+                self.db,
+                hospital_id=self.hospital_id,
+                actor=actor,
+                action="CLINICAL_SAFETY_OVERRIDE_ALLERGY",
+                entity_type="medication_administration_records",
+                summary=f"eMAR allergy warning overridden for '{payload.medicine_name}' against allergen '{warning.matched_allergen}'. Reason: {payload.override_reason or 'Not specified'}",
+            )
+
+        # Evaluate against other actively scheduled medications for this admission
+        active_scheduled = (
+            self.db.query(MedicationAdministrationRecord)
+            .filter(
+                MedicationAdministrationRecord.hospital_id == self.hospital_id,
+                MedicationAdministrationRecord.admission_id == admission.id,
+                MedicationAdministrationRecord.status == MedicationAdminStatus.scheduled,
+            )
+            .all()
+        )
+        active_med_names = list({m.medicine_name.strip() for m in active_scheduled if m.medicine_name})
+        if payload.medicine_name.strip() not in active_med_names:
+            active_med_names.append(payload.medicine_name.strip())
+
+        if len(active_med_names) >= 2:
+            interaction_checker = CheckDrugInteractionsAction(self.db, self.hospital_id)
+            report = interaction_checker.execute(CheckDrugInteractionsRequest(medicines=active_med_names))
+            if report.requires_clinical_override:
+                if not payload.override_confirmed:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "type": "drug_interaction_conflict",
+                            "message": "Major drug-drug interaction detected between proposed medication and active inpatient schedule.",
+                            "highest_severity": report.highest_severity.value if report.highest_severity else "major",
+                            "alerts": [a.model_dump() for a in report.alerts],
+                            "requires_clinical_override": True,
+                        },
+                    )
+                write_audit_log(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    actor=actor,
+                    action="CLINICAL_SAFETY_OVERRIDE_DRUG_INTERACTION",
+                    entity_type="medication_administration_records",
+                    summary=f"eMAR drug interaction warning overridden for '{payload.medicine_name}'. Reason: {payload.override_reason or 'Not specified'}",
+                )
 
         record = MedicationAdministrationRecord(
             hospital_id=self.hospital_id,

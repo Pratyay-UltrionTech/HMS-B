@@ -67,7 +67,13 @@ class RegistrationAdmitAction:
         if active:
             raise ConflictError("Patient is already admitted")
 
-        bed = self.beds_repo.get_bed_by_id(hospital_id, payload.bed_id)
+        from modules.beds.entities.bed import Bed
+        bed = (
+            self.db.query(Bed)
+            .filter(Bed.id == payload.bed_id, Bed.hospital_id == hospital_id)
+            .with_for_update()
+            .first()
+        )
         if not bed:
             raise NotFoundError("Bed not found")
         if bed.is_occupied:
@@ -156,13 +162,6 @@ class RegistrationDischargeAction:
             raise ValidationError("Admission already discharged")
 
         now = datetime.now(timezone.utc)
-        admission.status = AdmissionStatus.discharged
-        admission.discharged_at = now
-        if admission.bed:
-            admission.bed.is_occupied = False
-        if admission.patient:
-            admission.patient.status = PatientStatus.active
-
         ward = admission.ward
         self.billing_svc.ensure_bed_charge(
             hospital_id=hospital_id,
@@ -176,6 +175,17 @@ class RegistrationDischargeAction:
             bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
             created_by_name=actor.get("name") or "System",
         )
+        fin = self.billing_svc.get_ledger_totals(hospital_id, admission.patient_id)
+        outstanding = float(fin.get("outstanding") or 0)
+        if outstanding > 0.009:
+            raise ValidationError(f"Cannot discharge — outstanding balance ₹{outstanding:,.2f}. Clear all dues before discharging.")
+
+        admission.status = AdmissionStatus.discharged
+        admission.discharged_at = now
+        if admission.bed:
+            admission.bed.is_occupied = False
+        if admission.patient:
+            admission.patient.status = PatientStatus.active
 
         write_audit_log(
             self.db,

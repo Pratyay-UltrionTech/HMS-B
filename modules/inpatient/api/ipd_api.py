@@ -26,7 +26,7 @@ from modules.inpatient.contracts.inpatient_contracts import (
     IpdFormSubmissionUpdate,
 )
 from modules.inpatient.entities.admission import IpdFormSubmissionStatus
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
 
 router = APIRouter(prefix="/ipd", tags=["ipd"])
 
@@ -35,7 +35,8 @@ router = APIRouter(prefix="/ipd", tags=["ipd"])
     "/form-submissions",
     response_model=IpdFormSubmissionResponse,
     status_code=status.HTTP_201_CREATED,
-)
+
+    dependencies=[Depends(require_permission("all_ipd", "edit"))])
 def create_form_submission(
     payload: IpdFormSubmissionCreate,
     db: Session = Depends(get_transitional_sync_session),
@@ -45,7 +46,8 @@ def create_form_submission(
     return CreateFormSubmissionAction(db).execute(hospital_id, payload, user)
 
 
-@router.put("/form-submissions/{submission_id}", response_model=IpdFormSubmissionResponse)
+@router.put("/form-submissions/{submission_id}", response_model=IpdFormSubmissionResponse,
+    dependencies=[Depends(require_permission("all_ipd", "edit"))])
 def update_form_submission(
     submission_id: UUID,
     payload: IpdFormSubmissionUpdate,

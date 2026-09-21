@@ -102,7 +102,12 @@ class OtRepository:
             )
         return q.order_by(OtSurgery.scheduled_at.desc()).limit(limit).all()
 
-    def resolve_ot_room(self, ot_room_id: UUID, department_id: UUID | None = None) -> OtRoom | None:
+    def resolve_ot_room(
+        self,
+        ot_room_id: UUID,
+        department_id: UUID | None = None,
+        for_update: bool = False,
+    ) -> OtRoom | None:
         q = self.db.query(OtRoom).filter(
             OtRoom.id == ot_room_id,
             OtRoom.hospital_id == self.hospital_id,
@@ -110,6 +115,8 @@ class OtRepository:
         )
         if department_id:
             q = q.filter(OtRoom.department_id == department_id)
+        if for_update:
+            q = q.with_for_update()
         return q.first()
 
     def check_ot_room_conflict(

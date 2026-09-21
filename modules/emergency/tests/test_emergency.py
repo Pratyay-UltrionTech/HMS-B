@@ -18,7 +18,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Hospital, HospitalUser, Patient, StaffRole
+from modules.tenancy.entities.hospital import Hospital
+from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.patients.entities.patient import Patient
 from infrastructure.postgres.base import Base
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.emergency.api.emergency_api import router as emergency_router
