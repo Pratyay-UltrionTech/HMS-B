@@ -13,6 +13,7 @@ from uuid import UUID
 
 from shared.exceptions.base import ConflictError, NotFoundError, ValidationError
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from modules.beds.db.beds_repository import BedsRepository
 from modules.doctors.entities.doctor import HospitalUser
@@ -60,7 +61,14 @@ class RegistrationAdmitAction:
             .filter(
                 Admission.patient_id == patient_id,
                 Admission.hospital_id == hospital_id,
-                Admission.status == AdmissionStatus.admitted,
+                # Invariant 1: requested/admitted/discharge_requested all block.
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
             )
             .first()
         )
@@ -121,7 +129,11 @@ class RegistrationAdmitAction:
             entity_id=str(admission.id),
             summary=f"Admitted {patient.uhid} {patient.name} ({admission.ip_id})",
         )
-        self.db.commit()
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise ConflictError("Patient already admitted or bed just taken") from exc
         refreshed = self.admissions_repo.get_admission_by_id(hospital_id, admission.id)
         adm = refreshed or admission
         return AdmissionSummary(
@@ -155,7 +167,15 @@ class RegistrationDischargeAction:
         admission_id: UUID,
         actor: dict[str, Any],
     ) -> DischargeResponse:
-        admission = self.admissions_repo.get_admission_by_id(hospital_id, admission_id)
+        admission = (
+            self.db.query(Admission)
+            .filter(
+                Admission.id == admission_id,
+                Admission.hospital_id == hospital_id,
+            )
+            .with_for_update()
+            .first()
+        )
         if not admission:
             raise NotFoundError("Admission not found")
         if admission.status != AdmissionStatus.admitted:
@@ -182,7 +202,15 @@ class RegistrationDischargeAction:
 
         admission.status = AdmissionStatus.discharged
         admission.discharged_at = now
-        if admission.bed:
+        from modules.beds.entities.bed import Bed as _Bed
+
+        if admission.bed_id:
+            locked_bed = (
+                self.db.query(_Bed).filter(_Bed.id == admission.bed_id).with_for_update().first()
+            )
+            if locked_bed:
+                locked_bed.is_occupied = False
+        elif admission.bed:
             admission.bed.is_occupied = False
         if admission.patient:
             admission.patient.status = PatientStatus.active

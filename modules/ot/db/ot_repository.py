@@ -263,7 +263,8 @@ class OtRepository:
             .filter(
                 Admission.hospital_id == self.hospital_id,
                 Admission.patient_id == patient_id,
-                Admission.status == AdmissionStatus.admitted,
+                # Canonical active-inpatient census (spec §14).
+                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
             )
             .first()
             is not None

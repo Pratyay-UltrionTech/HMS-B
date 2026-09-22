@@ -64,15 +64,19 @@ class AdmissionDetail(BaseModel):
     patient_name: str | None = None
     patient_uhid: str | None = None
     patient_mobile: str | None = None
-    ward_id: UUID
-    room_id: UUID
-    bed_id: UUID
+    # Nullable: requested / awaiting-bed admissions have no physical bed yet.
+    ward_id: UUID | None = None
+    room_id: UUID | None = None
+    bed_id: UUID | None = None
     ward_name: str | None = None
     room_code: str | None = None
     bed_code: str | None = None
     doctor_id: UUID | None = None
     doctor_name: str | None = None
     status: AdmissionStatus
+    # Derived flag: admitted without a bed. Frontends must render
+    # "Admitted — Awaiting Bed", never plain "Admitted".
+    is_awaiting_bed: bool = False
     notes: str | None = None
     discharge_notes: str | None = None
     admitted_at: datetime
@@ -100,11 +104,34 @@ class AdmitPatientRequest(BaseModel):
     notes: str | None = None
 
 
+class AdmissionRequestCreate(BaseModel):
+    """Payload for creating an admission request (no bed required)."""
+
+    patient_id: UUID
+    doctor_id: UUID | None = None
+    notes: str | None = None
+    source_appointment_id: UUID | None = None
+
+
+class AdmissionAcceptRequest(BaseModel):
+    """Accept a requested admission, optionally assigning a bed.
+
+    Bed fields all-None → "Admitted — Awaiting Bed".
+    All bed fields set → "Admitted — Bed Assigned".
+    """
+
+    ward_id: UUID | None = None
+    room_id: UUID | None = None
+    bed_id: UUID | None = None
+    doctor_id: UUID | None = None
+    notes: str | None = None
+
+
 class AdmissionSummary(BaseModel):
     id: UUID
-    ward_id: UUID
-    room_id: UUID
-    bed_id: UUID
+    ward_id: UUID | None = None
+    room_id: UUID | None = None
+    bed_id: UUID | None = None
     ward_name: str | None = None
     room_code: str | None = None
     bed_code: str | None = None

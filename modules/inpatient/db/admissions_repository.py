@@ -15,8 +15,22 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from modules.beds.entities.bed import Bed
-from modules.inpatient.entities.admission import Admission, AdmissionStatus
+from modules.inpatient.entities.admission import (
+    ACTIVE_INPATIENT_STATUSES,
+    OPEN_ADMISSION_STATUSES,
+    Admission,
+    AdmissionStatus,
+)
 from modules.patients.entities.patient import Patient, PatientStatus
+
+# Re-exported so action/service layers share one canonical definition of
+# "active inpatient census" (spec §14) instead of hand-rolling predicates.
+ACTIVE_STATUSES = (AdmissionStatus.admitted, AdmissionStatus.discharge_requested)
+OPEN_STATUSES = (
+    AdmissionStatus.requested,
+    AdmissionStatus.admitted,
+    AdmissionStatus.discharge_requested,
+)
 
 
 class AdmissionsRepository:
@@ -195,4 +209,95 @@ class AdmissionsRepository:
             appt.status = AppointmentStatus.transferred_to_inpatient
             appt.admission_id = admission.id
 
+        return admission
+
+    # ── Canonical lifecycle helpers (spec §§18-20) ──────────────────────
+
+    def get_open_admission(
+        self,
+        hospital_id: UUID,
+        patient_id: UUID,
+        for_update: bool = False,
+    ) -> Admission | None:
+        """Return the patient's single open episode (requested/admitted/
+        discharge_requested), optionally locking the row.
+
+        Invariant 1: at most one such row may exist (DB partial index
+        ``uq_admissions_active_patient`` backs this check under concurrency).
+        """
+        q = self.db.query(Admission).filter(
+            Admission.hospital_id == hospital_id,
+            Admission.patient_id == patient_id,
+            Admission.status.in_(OPEN_STATUSES),
+        )
+        if for_update:
+            q = q.with_for_update()
+        return q.first()
+
+    def get_requested_admission(
+        self,
+        hospital_id: UUID,
+        patient_id: UUID,
+        for_update: bool = False,
+    ) -> Admission | None:
+        q = self.db.query(Admission).filter(
+            Admission.hospital_id == hospital_id,
+            Admission.patient_id == patient_id,
+            Admission.status == AdmissionStatus.requested,
+        )
+        if for_update:
+            q = q.with_for_update()
+        return q.first()
+
+    def list_admission_requests(self, hospital_id: UUID) -> list[Admission]:
+        """Canonical admission-request queue (spec §7): requested only."""
+        return (
+            self.db.query(Admission)
+            .options(
+                joinedload(Admission.patient),
+                joinedload(Admission.ward),
+                joinedload(Admission.room),
+                joinedload(Admission.bed),
+                joinedload(Admission.doctor),
+            )
+            .filter(
+                Admission.hospital_id == hospital_id,
+                Admission.status == AdmissionStatus.requested,
+            )
+            .order_by(Admission.admitted_at.asc())
+            .all()
+        )
+
+    def create_request(
+        self,
+        hospital_id: UUID,
+        patient: Patient,
+        doctor_id: UUID | None = None,
+        notes: str | None = None,
+        source_appointment_id: UUID | None = None,
+    ) -> Admission:
+        """Create a bedless admission request (no bed, no occupancy change).
+
+        Caller must hold no conflicting open episode (see
+        ``EnsureAdmissionRequestAction``). Patient stays ``active`` — the
+        patient becomes ``admitted`` only on acceptance (spec §16).
+        """
+        admission = Admission(
+            hospital_id=hospital_id,
+            patient_id=patient.id,
+            ward_id=None,
+            room_id=None,
+            bed_id=None,
+            doctor_id=doctor_id,
+            status=AdmissionStatus.requested,
+            notes=notes.strip() if notes else None,
+            admitted_at=datetime.now(timezone.utc),
+            ip_id=None,
+            source_appointment_id=source_appointment_id,
+            patient_name=patient.name,
+            gender=patient.gender,
+            age_at_admission=patient.age,
+        )
+        self.db.add(admission)
+        self.db.flush()
         return admission

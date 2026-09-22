@@ -34,11 +34,27 @@ from modules.patients.entities.patient import Patient
 
 
 class AdmissionStatus(str, enum.Enum):
-    """Clinical status of an inpatient admission."""
+    """Clinical status of an inpatient admission.
 
+    Canonical lifecycle: requested → admitted → discharge_requested → discharged.
+    ``requested`` is the authoritative admission-intent state (admission episode
+    decided but not yet operationally accepted). ``admitted`` with ``bed_id``
+    NULL means "Admitted — Awaiting Bed".
+    """
+
+    requested = "requested"
     admitted = "admitted"
     discharge_requested = "discharge_requested"
     discharged = "discharged"
+
+
+# Statuses in which the patient counts as having an open inpatient episode
+# (exactly one such row per patient enforced by uq_admissions_open_patient).
+OPEN_ADMISSION_STATUSES = ("requested", "admitted", "discharge_requested")
+
+# Statuses in which the patient counts as an active inpatient for census,
+# bed occupancy, billing, and cross-role "is inpatient?" derivation.
+ACTIVE_INPATIENT_STATUSES = ("admitted", "discharge_requested")
 
 
 class Admission(Base):
@@ -48,23 +64,41 @@ class Admission(Base):
     __table_args__ = (
         UniqueConstraint("hospital_id", "ip_id", name="uq_admission_hospital_ip_id"),
         UniqueConstraint("hospital_id", "er_id", name="uq_admission_hospital_er_id"),
+        # One open episode (requested/admitted/discharge_requested) per bed.
+        # Invariant 6: a bed cannot belong to two open admissions.
         Index(
             "uq_admissions_active_bed",
             "hospital_id",
             "bed_id",
             unique=True,
             postgresql_where=text(
-                "status IN ('admitted', 'discharge_requested')"
+                "status IN ('requested', 'admitted', 'discharge_requested')"
+            ),
+            sqlite_where=text(
+                "status IN ('requested', 'admitted', 'discharge_requested')"
             ),
         ),
+        # Invariant 1: a patient cannot have multiple open/requested admissions.
         Index(
             "uq_admissions_active_patient",
             "hospital_id",
             "patient_id",
             unique=True,
             postgresql_where=text(
-                "status IN ('admitted', 'discharge_requested')"
+                "status IN ('requested', 'admitted', 'discharge_requested')"
             ),
+            sqlite_where=text(
+                "status IN ('requested', 'admitted', 'discharge_requested')"
+            ),
+        ),
+        # At most one canonical admission per source appointment (Invariant 11).
+        Index(
+            "uq_admission_source_appointment",
+            "hospital_id",
+            "source_appointment_id",
+            unique=True,
+            postgresql_where=text("source_appointment_id IS NOT NULL"),
+            sqlite_where=text("source_appointment_id IS NOT NULL"),
         ),
     )
 
@@ -77,14 +111,17 @@ class Admission(Base):
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
-    ward_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("wards.id", ondelete="RESTRICT"), nullable=False, index=True
+    # Location is nullable: requested admissions and "Admitted — Awaiting Bed"
+    # (status=admitted, bed_id NULL) legitimately have no physical bed yet.
+    # Invariant 4/5: bedless admissions remain visible in census/queues.
+    ward_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wards.id", ondelete="RESTRICT"), nullable=True, index=True
     )
-    room_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("rooms.id", ondelete="RESTRICT"), nullable=False, index=True
+    room_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("rooms.id", ondelete="RESTRICT"), nullable=True, index=True
     )
-    bed_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("beds.id", ondelete="RESTRICT"), nullable=False, index=True
+    bed_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("beds.id", ondelete="RESTRICT"), nullable=True, index=True
     )
     doctor_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
@@ -105,7 +142,12 @@ class Admission(Base):
     ip_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     er_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     source_appointment_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True, index=True
+        UUID(as_uuid=True),
+        # use_alter breaks the admissions↔appointments dependency cycle for
+        # DDL sorting (appointments.admission_id points back at admissions).
+        ForeignKey("appointments.id", ondelete="SET NULL", use_alter=True),
+        nullable=True,
+        index=True,
     )
     # Immutable demographic snapshot captured at admission time (FLAW-010).
     # These freeze identity for wristbands / worklists / discharge summaries so
@@ -186,6 +228,17 @@ class BedStaySegment(Base):
     """Tracks duration and billing rate for individual bed occupancy segments during an admission."""
 
     __tablename__ = "bed_stay_segments"
+    __table_args__ = (
+        # Invariant 7: exactly one open segment per active bed-assigned admission.
+        Index(
+            "uq_open_bed_stay_segment_per_admission",
+            "hospital_id",
+            "admission_id",
+            unique=True,
+            postgresql_where=text("ended_at IS NULL"),
+            sqlite_where=text("ended_at IS NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

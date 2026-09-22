@@ -206,7 +206,14 @@ class AdmitToIcuAction:
             .filter(
                 Admission.patient_id == payload.patient_id,
                 Admission.hospital_id == self.hospital_id,
-                Admission.status == AdmissionStatus.admitted,
+                # Invariant 1: requested/admitted/discharge_requested all block.
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
             )
             .first()
         )
@@ -229,21 +236,21 @@ class AdmitToIcuAction:
 
         now = datetime.now(timezone.utc)
         ip_id = next_ip_encounter_id(self.db, self.hospital_id)
-        admission = Admission(
+        # Converged creation: snapshot + occupancy + appointment reconcile via
+        # the canonical repository (spec §18). ICU profile follows below.
+        from modules.inpatient.db.admissions_repository import AdmissionsRepository
+
+        admission = AdmissionsRepository(self.db).create_admission(
             hospital_id=self.hospital_id,
-            patient_id=patient.id,
+            patient=patient,
+            bed=bed,
             ward_id=bed.ward_id,
             room_id=bed.room_id,
-            bed_id=bed.id,
             doctor_id=payload.doctor_id,
-            status=AdmissionStatus.admitted,
             ip_id=ip_id,
             notes=payload.diagnosis or payload.notes or "Direct ICU Admission",
             admitted_at=now,
         )
-        bed.is_occupied = True
-        self.db.add(admission)
-        self.db.flush()
 
         segment = BedStaySegment(
             hospital_id=self.hospital_id,
@@ -307,7 +314,10 @@ class TransferToIcuAction:
             .filter(
                 Admission.id == payload.admission_id,
                 Admission.hospital_id == self.hospital_id,
-                Admission.status == AdmissionStatus.admitted,
+                # Census-eligible episodes may transfer (spec §14).
+                Admission.status.in_(
+                    [AdmissionStatus.admitted, AdmissionStatus.discharge_requested]
+                ),
             )
             .first()
         )
@@ -335,6 +345,19 @@ class TransferToIcuAction:
         bed.is_occupied = True
 
         now = datetime.now(timezone.utc)
+        # Invariant 7: close the outgoing segment before opening the new one.
+        _open = (
+            self.db.query(BedStaySegment)
+            .filter(
+                BedStaySegment.hospital_id == self.hospital_id,
+                BedStaySegment.admission_id == adm.id,
+                BedStaySegment.ended_at.is_(None),
+            )
+            .order_by(BedStaySegment.started_at.desc())
+            .first()
+        )
+        if _open:
+            _open.ended_at = now
         segment = BedStaySegment(
             hospital_id=self.hospital_id,
             admission_id=adm.id,
@@ -416,7 +439,9 @@ class StepDownIcuAction:
             .filter(
                 Admission.id == payload.admission_id,
                 Admission.hospital_id == self.hospital_id,
-                Admission.status == AdmissionStatus.admitted,
+                Admission.status.in_(
+                    [AdmissionStatus.admitted, AdmissionStatus.discharge_requested]
+                ),
             )
             .first()
         )
@@ -444,6 +469,18 @@ class StepDownIcuAction:
         bed.is_occupied = True
 
         now = datetime.now(timezone.utc)
+        _open = (
+            self.db.query(BedStaySegment)
+            .filter(
+                BedStaySegment.hospital_id == self.hospital_id,
+                BedStaySegment.admission_id == adm.id,
+                BedStaySegment.ended_at.is_(None),
+            )
+            .order_by(BedStaySegment.started_at.desc())
+            .first()
+        )
+        if _open:
+            _open.ended_at = now
         segment = BedStaySegment(
             hospital_id=self.hospital_id,
             admission_id=adm.id,

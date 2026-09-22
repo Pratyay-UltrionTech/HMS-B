@@ -40,21 +40,33 @@ _billing_charges = table(
 
 
 def next_ip_encounter_id(db: Session, hospital_id: UUID, year: int | None = None) -> str:
-    """Generate next sequential IP encounter ID: IP-YYYY-NNNNN."""
+    """Generate next sequential IP encounter ID: IP-YYYY-NNNNN.
+
+    Atomic under concurrency: values come from the tenant-scoped
+    ``sequence_counters`` table (single upsert statement per caller, see
+    :func:`shared.database.sequences.next_sequence_value`), so two
+    simultaneous admissions can never receive the same number — unlike the
+    previous MAX(ip_id)+1 read-modify-write. Legacy rows created before the
+    counter existed are skipped rather than reused.
+    """
+    from shared.database.sequences import next_sequence_value
+
     year = year or date.today().year
     prefix = f"IP-{year}-"
-    current = (
-        db.query(func.max(Admission.ip_id))
-        .filter(Admission.hospital_id == hospital_id, Admission.ip_id.like(f"{prefix}%"))
-        .scalar()
-    )
-    seq = 0
-    if current:
-        try:
-            seq = int(str(current).rsplit("-", 1)[-1])
-        except ValueError:
-            seq = 0
-    return f"{prefix}{seq + 1:05d}"
+    counter_name = f"ip_{year}"
+    # Bound the skip loop: normally 1 iteration; legacy backfill at most a
+    # handful since the counter only moves forward.
+    for _ in range(1000):
+        seq = next_sequence_value(db, hospital_id, counter_name)
+        candidate = f"{prefix}{seq:05d}"
+        exists = (
+            db.query(Admission.id)
+            .filter(Admission.hospital_id == hospital_id, Admission.ip_id == candidate)
+            .first()
+        )
+        if not exists:
+            return candidate
+    raise RuntimeError("Unable to allocate unique IP encounter ID")
 
 
 def calculate_bed_stay_days(admitted_at: datetime, discharged_at: datetime) -> int:

@@ -40,11 +40,13 @@ from modules.inpatient.actions.admission_actions import (
     TransferBedAction,
     to_admission_detail,
 )
+from modules.inpatient.actions.admission_lifecycle_actions import AcceptAdmissionAction
 from modules.inpatient.actions.registration_admission_actions import (
     RegistrationAdmitAction,
     RegistrationDischargeAction,
 )
 from modules.inpatient.contracts.inpatient_contracts import (
+    AdmissionAcceptRequest,
     AdmissionDetail,
     AdmissionSummary,
     AdmitPatientRequest,
@@ -162,6 +164,46 @@ def list_active_admissions(
 ):
     rows = AdmissionsRepository(db).list_active_admissions(hospital_id, search=search)
     return [to_admission_detail(a) for a in rows]
+
+
+@router.get("/admission-requests", response_model=list[AdmissionDetail])
+def list_admission_requests(
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Canonical admission-request queue: Admission(status=requested).
+
+    Nurse/Admissions worklist for operational acceptance. Replaces exclusive
+    reliance on Appointment.ipd_transfer_requested (spec §7).
+    """
+    rows = AdmissionsRepository(db).list_admission_requests(hospital_id)
+    return [to_admission_detail(a) for a in rows]
+
+
+@router.post("/admissions/{admission_id}/accept", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])
+def accept_admission(
+    admission_id: UUID,
+    payload: AdmissionAcceptRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Accept a requested admission, with or without a bed.
+
+    No bed fields → "Admitted — Awaiting Bed" (bed_id NULL, stays visible).
+    """
+    action = AcceptAdmissionAction(db)
+    return action.execute(
+        hospital_id,
+        actor=user,
+        admission_id=admission_id,
+        ward_id=payload.ward_id,
+        room_id=payload.room_id,
+        bed_id=payload.bed_id,
+        doctor_id=payload.doctor_id,
+        notes=payload.notes,
+    )
 
 
 @router.post("/admit", response_model=AdmissionDetail, status_code=status.HTTP_201_CREATED,

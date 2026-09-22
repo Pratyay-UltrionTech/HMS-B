@@ -301,9 +301,54 @@ class TransferAppointmentToInpatientAction:
                 detail=f"Cannot transfer a {appt.status.value} visit to inpatient",
             )
 
+        # Pre-check: an already-active episode blocks a new request (Invariant 1).
+        # Only a REQUESTED episode may be reused (idempotent convergence).
+        from modules.inpatient.entities.admission import Admission as _Admission
+        from modules.inpatient.entities.admission import AdmissionStatus as _AdmStatus
+
+        open_episode = (
+            self.db.query(_Admission)
+            .filter(
+                _Admission.hospital_id == hospital_id,
+                _Admission.patient_id == appt.patient_id,
+                _Admission.status.in_(
+                    [
+                        _AdmStatus.requested,
+                        _AdmStatus.admitted,
+                        _AdmStatus.discharge_requested,
+                    ]
+                ),
+            )
+            .first()
+        )
+        if open_episode and open_episode.status != _AdmStatus.requested:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Patient already has an {open_episode.status.value} admission",
+            )
+
         appt.status = AppointmentStatus.ipd_transfer_requested
         if payload.notes:
             appt.notes = payload.notes.strip()
+        self.db.flush()
+
+        # Spec §5: converge on the canonical request lifecycle. The canonical
+        # request state is Admission(status=requested); the appointment flag
+        # above is a derived compatibility mirror synchronized here in the
+        # same transaction. Idempotent: a request created by IPD-form
+        # finalization is reused, never duplicated.
+        from modules.inpatient.actions.admission_lifecycle_actions import (
+            EnsureAdmissionRequestAction,
+        )
+
+        EnsureAdmissionRequestAction(self.db).execute(
+            hospital_id=hospital_id,
+            patient_id=appt.patient_id,
+            actor=actor,
+            doctor_id=doctor_id,
+            notes=payload.notes,
+            source_appointment_id=appt.id,
+        )
 
         write_audit_log(
             self.db,

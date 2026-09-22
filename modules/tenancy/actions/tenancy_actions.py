@@ -542,7 +542,7 @@ class TenancyActions:
 
         admissions = (
             self.db.query(Admission)
-            .filter(Admission.hospital_id == hospital_id, Admission.status == AdmissionStatus.admitted)
+            .filter(Admission.hospital_id == hospital_id, Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]))
             .order_by(Admission.admitted_at.desc())
             .limit(20)
             .all()
@@ -572,7 +572,7 @@ class TenancyActions:
             self.db.query(Admission)
             .filter(
                 Admission.hospital_id == hospital_id,
-                Admission.status == AdmissionStatus.admitted,
+                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
                 Admission.admitted_at >= start,
                 Admission.admitted_at <= end,
             )
@@ -1350,7 +1350,7 @@ class TenancyActions:
 
         admissions_stmt = select(func.count(Admission.id)).where(
             Admission.hospital_id == hospital_id,
-            Admission.status == AdmissionStatus.admitted,
+            Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
         )
         if doctor_id:
             admissions_stmt = admissions_stmt.where(Admission.doctor_id == doctor_id)
@@ -1544,7 +1544,7 @@ class TenancyActions:
         def _job_admissions_detail(db: Session) -> list[Admission]:
             q = db.query(Admission).filter(
                 Admission.hospital_id == hospital_id,
-                Admission.status == AdmissionStatus.admitted,
+                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
             )
             if doctor_id:
                 q = q.filter(Admission.doctor_id == doctor_id)
@@ -1936,7 +1936,7 @@ class TenancyActions:
 
         active_admissions = int(
             self.db.query(func.count(Admission.id))
-            .filter(Admission.hospital_id == hospital_id, Admission.status == AdmissionStatus.admitted)
+            .filter(Admission.hospital_id == hospital_id, Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]))
             .scalar()
             or 0
         )

@@ -139,7 +139,8 @@ class MisActions:
 
         ipd_q = self.db.query(func.count(Admission.id)).filter(
             Admission.hospital_id == self.hospital_id,
-            Admission.status == AdmissionStatus.admitted,
+            # Canonical active-inpatient census (spec §14).
+            Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
         )
         if doctor_id:
             ipd_q = ipd_q.filter(Admission.doctor_id == doctor_id)

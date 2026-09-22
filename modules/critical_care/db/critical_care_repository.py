@@ -67,7 +67,8 @@ class CriticalCareRepository:
             )
             .filter(
                 Admission.hospital_id == self.hospital_id,
-                Admission.status == AdmissionStatus.admitted,
+                # Canonical active-inpatient census (spec §14).
+                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
                 or_(
                     Ward.ward_type == WardType.icu,
                     func.lower(Ward.name).like("%icu%"),

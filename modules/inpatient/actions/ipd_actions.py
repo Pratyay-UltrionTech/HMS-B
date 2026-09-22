@@ -64,6 +64,43 @@ def resolve_actor_id(user: dict[str, Any]) -> UUID | None:
         return None
 
 
+def _ensure_request_for_final(
+    db: Session, hospital_id: UUID, patient: Patient, actor: dict[str, Any]
+) -> UUID:
+    """Find or create the canonical admission request for a finalized form.
+
+    Links the single unambiguous source appointment when exactly one
+    pending transfer request exists (deterministic — never guesses across
+    multiple candidates, spec §13). The request itself is bedless and
+    idempotent: concurrent finalizations converge on one row.
+    """
+    from modules.appointments.entities.appointment import Appointment, AppointmentStatus
+    from modules.inpatient.actions.admission_lifecycle_actions import (
+        EnsureAdmissionRequestAction,
+    )
+
+    pending = (
+        db.query(Appointment)
+        .filter(
+            Appointment.hospital_id == hospital_id,
+            Appointment.patient_id == patient.id,
+            Appointment.status == AppointmentStatus.ipd_transfer_requested,
+        )
+        .order_by(Appointment.created_at.desc())
+        .all()
+    )
+    source_id = pending[0].id if len(pending) == 1 else None
+    admission, _ = EnsureAdmissionRequestAction(db).execute(
+        hospital_id=hospital_id,
+        patient_id=patient.id,
+        actor=actor,
+        doctor_id=pending[0].doctor_id if source_id else None,
+        notes="Admission requested via finalized IPD form",
+        source_appointment_id=source_id,
+    )
+    return admission.id
+
+
 class CreateFormSubmissionAction:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -83,11 +120,12 @@ class CreateFormSubmissionAction:
         if not patient:
             raise NotFoundError("Patient not found")
 
-        if payload.admission_id:
+        admission_id = payload.admission_id
+        if admission_id:
             adm = (
                 self.db.query(Admission)
                 .filter(
-                    Admission.id == payload.admission_id,
+                    Admission.id == admission_id,
                     Admission.hospital_id == hospital_id,
                     Admission.patient_id == payload.patient_id,
                 )
@@ -95,6 +133,14 @@ class CreateFormSubmissionAction:
             )
             if not adm:
                 raise ValidationError("Invalid admission for patient")
+        elif payload.status == IpdFormSubmissionStatus.final:
+            # Spec §3: finalizing a form without an admission means the doctor
+            # has requested/planned inpatient admission. Enter the canonical
+            # lifecycle idempotently so Nurse/Admissions sees the request.
+            # Drafts never touch operational state.
+            admission_id = _ensure_request_for_final(
+                self.db, hospital_id, patient, actor
+            )
 
         actor_id = resolve_actor_id(actor)
         actor_name = str(actor.get("name") or actor.get("sub") or "Staff")
@@ -103,7 +149,7 @@ class CreateFormSubmissionAction:
         sub = IpdFormSubmission(
             hospital_id=hospital_id,
             patient_id=payload.patient_id,
-            admission_id=payload.admission_id,
+            admission_id=admission_id,
             form_id=payload.form_id.strip(),
             form_title=payload.form_title.strip(),
             form_data=payload.form_data or {},
@@ -175,6 +221,26 @@ class UpdateFormSubmissionAction:
             sub.form_title = payload.form_title.strip()
         if payload.status is not None:
             sub.status = payload.status
+
+        # Spec §3: finalization via update (draft → final) carries the same
+        # lifecycle meaning as creating a finalized form. Attach the canonical
+        # request when the form has none.
+        if (
+            sub.status == IpdFormSubmissionStatus.final
+            and sub.admission_id is None
+        ):
+            patient_row = (
+                self.db.query(Patient)
+                .filter(
+                    Patient.id == sub.patient_id,
+                    Patient.hospital_id == hospital_id,
+                )
+                .first()
+            )
+            if patient_row:
+                sub.admission_id = _ensure_request_for_final(
+                    self.db, hospital_id, patient_row, actor
+                )
 
         actor_id = resolve_actor_id(actor)
         sub.filled_by_id = actor_id or sub.filled_by_id

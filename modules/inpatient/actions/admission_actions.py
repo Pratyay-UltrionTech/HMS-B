@@ -12,6 +12,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from shared.exceptions.base import ConflictError, NotFoundError, ValidationError
 
@@ -51,6 +52,7 @@ def to_admission_detail(a: Admission) -> AdmissionDetail:
     """
     ward = a.ward
     snap_name = getattr(a, "patient_name", None) or (a.patient.name if a.patient else None)
+    status = a.status
     return AdmissionDetail(
         id=a.id,
         patient_id=a.patient_id,
@@ -65,7 +67,9 @@ def to_admission_detail(a: Admission) -> AdmissionDetail:
         bed_code=a.bed.bed_code if a.bed else None,
         doctor_id=a.doctor_id,
         doctor_name=a.doctor.name if a.doctor else None,
-        status=a.status,
+        status=status,
+        # Canonical "Admitted — Awaiting Bed": admitted without a bed (§2).
+        is_awaiting_bed=status == AdmissionStatus.admitted and a.bed_id is None,
         notes=a.notes,
         discharge_notes=getattr(a, "discharge_notes", None),
         admitted_at=a.admitted_at,
@@ -103,7 +107,15 @@ class AdmitPatientAction:
             .filter(
                 Admission.patient_id == payload.patient_id,
                 Admission.hospital_id == hospital_id,
-                Admission.status == AdmissionStatus.admitted,
+                # Invariant 1: requested/admitted/discharge_requested all block
+                # a second episode (DB partial index is the backstop).
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
             )
             .first()
         )
@@ -180,7 +192,11 @@ class AdmitPatientAction:
             entity_id=str(admission.id),
             summary=f"Admitted {patient.uhid} {patient.name} ({admission.ip_id})",
         )
-        self.db.commit()
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise ConflictError("Patient already admitted or bed just taken") from exc
         refreshed = self.admissions_repo.get_admission_by_id(hospital_id, admission.id)
         return to_admission_detail(refreshed or admission)
 
@@ -197,8 +213,18 @@ class AllocateBedAction:
         payload: AllocateRequest,
         actor: dict[str, Any],
     ) -> AdmissionDetail:
-        admission = self.admissions_repo.get_active_admission(
-            hospital_id, payload.admission_id, payload.patient_id
+        # Locked admission load: allocate mutates location + occupancy.
+        admission = (
+            self.db.query(Admission)
+            .filter(
+                Admission.hospital_id == hospital_id,
+                (Admission.id == payload.admission_id)
+                if payload.admission_id
+                else (Admission.patient_id == payload.patient_id),
+                Admission.status == AdmissionStatus.admitted,
+            )
+            .with_for_update()
+            .first()
         )
         if not admission:
             raise NotFoundError("Active admission not found")
@@ -219,7 +245,14 @@ class AllocateBedAction:
         if new_bed.is_occupied:
             raise ConflictError("Bed is already occupied")
 
-        old_bed = self.db.query(Bed).filter(Bed.id == admission.bed_id).first()
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        old_bed = (
+            self.db.query(Bed).filter(Bed.id == admission.bed_id).with_for_update().first()
+            if admission.bed_id
+            else None
+        )
         if old_bed:
             old_bed.is_occupied = False
 
@@ -227,6 +260,36 @@ class AllocateBedAction:
         admission.room_id = payload.room_id
         admission.bed_id = payload.bed_id
         new_bed.is_occupied = True
+
+        # Allocate opens a stay segment when none is open (awaiting-bed case);
+        # a spurious extra open segment can never survive thanks to the
+        # partial-unique open-segment index (Invariant 7 backstop).
+        now = _dt.now(_tz.utc)
+        open_segment = (
+            self.db.query(BedStaySegment)
+            .filter(
+                BedStaySegment.hospital_id == hospital_id,
+                BedStaySegment.admission_id == admission.id,
+                BedStaySegment.ended_at.is_(None),
+            )
+            .with_for_update()
+            .first()
+        )
+        if open_segment is None:
+            self.db.add(
+                BedStaySegment(
+                    hospital_id=hospital_id,
+                    admission_id=admission.id,
+                    ward_id=new_bed.ward_id,
+                    room_id=new_bed.room_id,
+                    bed_id=new_bed.id,
+                    rate_per_day=float(getattr(new_bed.ward, "bed_charge_per_day", 0) or 0)
+                    if new_bed.ward
+                    else 0.0,
+                    started_at=now,
+                    ended_at=None,
+                )
+            )
 
         write_audit_log(
             self.db,
@@ -237,7 +300,11 @@ class AllocateBedAction:
             entity_id=str(admission.id),
             summary=f"Allocated bed {new_bed.bed_code} to {admission.patient.name if admission.patient else 'patient'}",
         )
-        self.db.commit()
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise ConflictError("Bed was just taken or segment changed concurrently") from exc
         refreshed = self.admissions_repo.get_admission_by_id(hospital_id, admission.id)
         return to_admission_detail(refreshed or admission)
 
@@ -254,16 +321,33 @@ class TransferBedAction:
         payload: TransferRequest,
         actor: dict[str, Any],
     ) -> AdmissionDetail:
-        admission = self.admissions_repo.get_active_admission(
-            hospital_id, payload.admission_id, payload.patient_id
+        # Spec §10: lock admission + old bed + new bed, single commit.
+        admission = (
+            self.db.query(Admission)
+            .filter(
+                Admission.hospital_id == hospital_id,
+                (Admission.id == payload.admission_id)
+                if payload.admission_id
+                else (Admission.patient_id == payload.patient_id),
+                Admission.status == AdmissionStatus.admitted,
+            )
+            .with_for_update()
+            .first()
         )
         if not admission:
             raise NotFoundError("Active admission not found")
 
         if admission.bed_id == payload.to_bed_id:
             raise ValidationError("Patient is already on this bed")
+        if not admission.bed_id:
+            raise ValidationError("Admission has no bed to transfer from — allocate a bed first")
 
-        new_bed = self.beds_repo.get_bed_by_id(hospital_id, payload.to_bed_id)
+        new_bed = (
+            self.db.query(Bed)
+            .filter(Bed.id == payload.to_bed_id, Bed.hospital_id == hospital_id)
+            .with_for_update()
+            .first()
+        )
         if not new_bed:
             raise NotFoundError("Bed not found")
         if new_bed.ward_id != payload.to_ward_id or new_bed.room_id != payload.to_room_id:
@@ -271,7 +355,9 @@ class TransferBedAction:
         if new_bed.is_occupied:
             raise ConflictError("Bed is already occupied")
 
-        old_bed = self.db.query(Bed).filter(Bed.id == admission.bed_id).first()
+        old_bed = (
+            self.db.query(Bed).filter(Bed.id == admission.bed_id).with_for_update().first()
+        )
         from_label = (
             f"{old_bed.ward.name if old_bed and old_bed.ward else '?'} → {old_bed.room.room_code if old_bed and old_bed.room else '?'} → {old_bed.bed_code if old_bed else '?'}"
         )
@@ -295,6 +381,7 @@ class TransferBedAction:
                 BedStaySegment.admission_id == admission.id,
                 BedStaySegment.ended_at.is_(None),
             )
+            .with_for_update()
             .order_by(BedStaySegment.started_at.desc())
             .first()
         )
@@ -322,7 +409,11 @@ class TransferBedAction:
             entity_id=str(admission.id),
             summary=f"Transferred {admission.patient.name if admission.patient else 'patient'}: {from_label} → {to_label}",
         )
-        self.db.commit()
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise ConflictError("Bed transfer conflicted concurrently; please retry") from exc
         refreshed = self.admissions_repo.get_admission_by_id(hospital_id, admission.id)
         return to_admission_detail(refreshed or admission)
 
@@ -339,8 +430,17 @@ class RequestDischargeAction:
         payload: DischargeRequestCreate,
         actor: dict[str, Any],
     ) -> AdmissionDetail:
-        admission = self.admissions_repo.get_active_admission(
-            hospital_id, payload.admission_id, payload.patient_id
+        admission = (
+            self.db.query(Admission)
+            .filter(
+                Admission.hospital_id == hospital_id,
+                (Admission.id == payload.admission_id)
+                if payload.admission_id
+                else (Admission.patient_id == payload.patient_id),
+                Admission.status == AdmissionStatus.admitted,
+            )
+            .with_for_update()
+            .first()
         )
         if not admission:
             raise NotFoundError("Active admission not found")
@@ -437,11 +537,17 @@ class DischargePatientAction:
         payload: DischargeRequest,
         actor: dict[str, Any],
     ) -> AdmissionDetail:
-        admission = self.admissions_repo.get_active_admission(
-            hospital_id,
-            payload.admission_id,
-            payload.patient_id,
-            statuses=(AdmissionStatus.discharge_requested,),
+        admission = (
+            self.db.query(Admission)
+            .filter(
+                Admission.hospital_id == hospital_id,
+                (Admission.id == payload.admission_id)
+                if payload.admission_id
+                else (Admission.patient_id == payload.patient_id),
+                Admission.status == AdmissionStatus.discharge_requested,
+            )
+            .with_for_update()
+            .first()
         )
         if not admission:
             raise NotFoundError("Active admission not found")
@@ -469,14 +575,36 @@ class DischargePatientAction:
             raise ValidationError(f"Cannot discharge — outstanding balance ₹{outstanding:,.2f}. Clear all dues before discharging.")
 
         admission.status = AdmissionStatus.discharged
+        # Invariant: discharged ⇔ discharged_at set (spec §23).
         admission.discharged_at = discharged_at
         if payload.discharge_notes and payload.discharge_notes.strip():
             admission.discharge_notes = payload.discharge_notes.strip()
 
-        if admission.bed:
+        if admission.bed_id:
+            locked_bed = (
+                self.db.query(Bed).filter(Bed.id == admission.bed_id).with_for_update().first()
+            )
+            if locked_bed:
+                locked_bed.is_occupied = False
+        elif admission.bed:
             admission.bed.is_occupied = False
         if admission.patient:
             admission.patient.status = PatientStatus.active
+
+        # Close any open stay segment at discharge so no open segment survives
+        # the episode (Invariant 7).
+        open_segment = (
+            self.db.query(BedStaySegment)
+            .filter(
+                BedStaySegment.hospital_id == hospital_id,
+                BedStaySegment.admission_id == admission.id,
+                BedStaySegment.ended_at.is_(None),
+            )
+            .with_for_update()
+            .first()
+        )
+        if open_segment:
+            open_segment.ended_at = discharged_at
 
         write_audit_log(
             self.db,

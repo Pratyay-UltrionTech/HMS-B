@@ -89,7 +89,8 @@ class DmsRepository:
             .filter(
                 Admission.hospital_id == self.hospital_id,
                 Admission.patient_id.in_(patient_ids),
-                Admission.status == AdmissionStatus.admitted,
+                # Canonical active-inpatient census (spec §14).
+                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
             )
             .distinct()
             .all()

@@ -24,8 +24,13 @@ from modules.patients.validators.patients_validator import (
 
 
 class AdmissionStatus(str, enum.Enum):
-    """Status of an inpatient admission."""
+    """Status of an inpatient admission.
 
+    Mirrors modules.inpatient.entities.admission.AdmissionStatus (kept local
+    to avoid a cross-module import in contracts).
+    """
+
+    requested = "requested"
     admitted = "admitted"
     discharge_requested = "discharge_requested"
     discharged = "discharged"
@@ -184,9 +189,10 @@ class AdmissionSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
-    ward_id: UUID
-    room_id: UUID
-    bed_id: UUID
+    # Nullable: requested / awaiting-bed admissions have no physical bed yet.
+    ward_id: UUID | None = None
+    room_id: UUID | None = None
+    bed_id: UUID | None = None
     ward_name: str | None = None
     room_code: str | None = None
     bed_code: str | None = None

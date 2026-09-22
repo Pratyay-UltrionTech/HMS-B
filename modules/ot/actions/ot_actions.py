@@ -527,13 +527,13 @@ def sync_ot_icu_transfer(
             db.add(bed)
             db.flush()
 
-    # 2. Check for active admission
+    # 2. Check for active admission (canonical census: admitted + discharge_requested)
     adm = (
         db.query(Admission)
         .filter(
             Admission.patient_id == surgery.patient_id,
             Admission.hospital_id == hospital_id,
-            Admission.status == AdmissionStatus.admitted,
+            Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
         )
         .first()
     )
@@ -560,22 +560,24 @@ def sync_ot_icu_transfer(
         db.add(segment)
     else:
         # Patient was an outpatient / emergency case: create new ICU admission
+        # via the canonical repository (snapshot + occupancy + appointment
+        # reconcile, spec §18) instead of an inline constructor.
+        from modules.inpatient.db.admissions_repository import AdmissionsRepository as _AdmRepo
+        from modules.patients.entities.patient import Patient as _Patient
+
         ip_id = next_ip_encounter_id(db, hospital_id)
-        adm = Admission(
+        _patient = db.query(_Patient).filter(_Patient.id == surgery.patient_id).first()
+        adm = _AdmRepo(db).create_admission(
             hospital_id=hospital_id,
-            patient_id=surgery.patient_id,
+            patient=_patient,
+            bed=bed,
             ward_id=bed.ward_id,
             room_id=bed.room_id,
-            bed_id=bed.id,
             doctor_id=surgery.surgeon_id,
-            status=AdmissionStatus.admitted,
             ip_id=ip_id,
             notes=icu_notes or f"Transferred from OT post-surgery: {surgery.procedure_performed or surgery.surgery_type}",
             admitted_at=now,
         )
-        bed.is_occupied = True
-        db.add(adm)
-        db.flush()
 
         segment = BedStaySegment(
             hospital_id=hospital_id,

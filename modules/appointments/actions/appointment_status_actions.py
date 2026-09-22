@@ -338,6 +338,9 @@ class AdmitIpdAction:
         payload: AdmitIpdRequest,
         user: dict[str, Any],
     ) -> dict[str, Any]:
+        from fastapi import HTTPException, status as http_status
+        from sqlalchemy.exc import IntegrityError
+
         appt = self.repo.get_by_id(appointment_id)
         if not appt:
             raise AppointmentNotFoundError()
@@ -352,17 +355,31 @@ class AdmitIpdAction:
             raise AppointmentNotFoundError("Patient not found")
 
         from modules.inpatient.entities.admission import Admission, AdmissionStatus
-        active = (
+        from modules.patients.entities.patient import PatientStatus as _PatientStatus
+        # Invariant 1: requested/admitted/discharge_requested all block a new
+        # episode. A pre-existing REQUESTED admission (form finalize or
+        # Transfer button) is accepted with this bed instead (Invariant 11).
+        existing = (
             self.db.query(Admission)
             .filter(
                 Admission.patient_id == appt.patient_id,
                 Admission.hospital_id == self.hospital_id,
-                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
             )
+            .with_for_update()
             .first()
         )
-        if active:
+        if existing and existing.status != AdmissionStatus.requested:
             raise AppointmentConflictError("Patient is already admitted to another bed")
+        if existing and existing.source_appointment_id not in (None, appt.id):
+            # Request belongs to a different visit; still a single open episode.
+            raise AppointmentConflictError("Patient already has an admission request")
 
         from modules.beds.entities.bed import Bed
         # Row-level lock on the target bed to prevent concurrent double-booking
@@ -388,23 +405,87 @@ class AdmitIpdAction:
             next_ip_encounter_id,
         )
 
-        ip_id = next_ip_encounter_id(self.db, self.hospital_id)
-
-        admissions_repo = AdmissionsRepository(self.db)
-        admission = admissions_repo.create_admission(
-            hospital_id=self.hospital_id,
-            patient=patient,
-            bed=bed,
-            ward_id=payload.ward_id,
-            room_id=payload.room_id,
-            doctor_id=appt.doctor_id,
-            ip_id=ip_id,
-            notes=payload.notes,
-            source_appointment_id=appt.id,
-        )
-
         billing_svc = InpatientBillingService(self.db)
         actor_name = str(user.get("name") or "Nurse")
+
+        try:
+            if existing is not None:
+                # Converge: accept the canonical request with this bed.
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+
+                now = _dt.now(_tz.utc)
+                existing.status = AdmissionStatus.admitted
+                existing.admitted_at = now
+                existing.ward_id = payload.ward_id
+                existing.room_id = payload.room_id
+                existing.bed_id = bed.id
+                if not existing.ip_id:
+                    existing.ip_id = next_ip_encounter_id(self.db, self.hospital_id)
+                if not existing.source_appointment_id:
+                    existing.source_appointment_id = appt.id
+                bed.is_occupied = True
+                patient.status = _PatientStatus.admitted
+                from modules.inpatient.entities.admission import BedStaySegment
+
+                self.db.add(
+                    BedStaySegment(
+                        hospital_id=self.hospital_id,
+                        admission_id=existing.id,
+                        ward_id=bed.ward_id,
+                        room_id=bed.room_id,
+                        bed_id=bed.id,
+                        rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0)
+                        if bed.ward
+                        else 0.0,
+                        started_at=now,
+                        ended_at=None,
+                    )
+                )
+                admission = existing
+                ip_id = existing.ip_id
+            else:
+                ip_id = next_ip_encounter_id(self.db, self.hospital_id)
+
+                admissions_repo = AdmissionsRepository(self.db)
+                admission = admissions_repo.create_admission(
+                    hospital_id=self.hospital_id,
+                    patient=patient,
+                    bed=bed,
+                    ward_id=payload.ward_id,
+                    room_id=payload.room_id,
+                    doctor_id=appt.doctor_id,
+                    ip_id=ip_id,
+                    notes=payload.notes,
+                    source_appointment_id=appt.id,
+                )
+                # create_admission leaves history to the caller: open the stay
+                # segment for this bed assignment (Invariant 7).
+                from datetime import datetime as _dt2
+                from datetime import timezone as _tz2
+                from modules.inpatient.entities.admission import BedStaySegment as _Seg
+
+                self.db.add(
+                    _Seg(
+                        hospital_id=self.hospital_id,
+                        admission_id=admission.id,
+                        ward_id=bed.ward_id,
+                        room_id=bed.room_id,
+                        bed_id=bed.id,
+                        rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0)
+                        if bed.ward
+                        else 0.0,
+                        started_at=_dt2.now(_tz2.utc),
+                        ended_at=None,
+                    )
+                )
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="Admission was just created or bed just taken; please retry",
+            ) from exc
+
         billing_svc.ensure_admission_charge(
             hospital_id=self.hospital_id,
             patient_id=patient.id,
@@ -426,7 +507,14 @@ class AdmitIpdAction:
             entity_id=str(admission.id),
             summary=f"Admitted patient {patient.name} ({patient.uhid}) to Bed {bed.bed_code} ({ip_id}) from visit {appt.op_id or str(appt.id)}",
         )
-        self.db.commit()
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="Admission was just created or bed just taken; please retry",
+            ) from exc
         return {
             "status": "admitted",
             "admission_id": str(admission.id),
