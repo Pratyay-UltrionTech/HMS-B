@@ -66,6 +66,70 @@ def check_service_financial_clearance(
     )
 
     if not charge:
+        # Fallback cross-link resolution between orders and prescription requests
+        try:
+            if source_type == BillingSourceType.laboratory:
+                from modules.laboratory.entities.lab_entities import LabOrder, LabPrescriptionRequest
+                # If source_id is LabOrder, check linked prescription request
+                order = db.query(LabOrder).filter(LabOrder.id == source_id, LabOrder.hospital_id == hospital_id).first()
+                if order and order.prescription_request_id:
+                    charge = (
+                        db.query(BillingCharge)
+                        .filter(
+                            BillingCharge.hospital_id == hospital_id,
+                            BillingCharge.source_type == source_type,
+                            BillingCharge.source_id == order.prescription_request_id,
+                        )
+                        .order_by(BillingCharge.created_at.desc())
+                        .first()
+                    )
+                elif not order:
+                    # If source_id is LabPrescriptionRequest, check linked LabOrder
+                    req = db.query(LabPrescriptionRequest).filter(LabPrescriptionRequest.id == source_id, LabPrescriptionRequest.hospital_id == hospital_id).first()
+                    if req and req.lab_order_id:
+                        charge = (
+                            db.query(BillingCharge)
+                            .filter(
+                                BillingCharge.hospital_id == hospital_id,
+                                BillingCharge.source_type == source_type,
+                                BillingCharge.source_id == req.lab_order_id,
+                            )
+                            .order_by(BillingCharge.created_at.desc())
+                            .first()
+                        )
+            elif source_type == BillingSourceType.radiology:
+                from modules.radiology.entities.radiology_entities import RadiologyOrder, RadPrescriptionRequest
+                # If source_id is RadiologyOrder, check linked prescription request
+                rad_order = db.query(RadiologyOrder).filter(RadiologyOrder.id == source_id, RadiologyOrder.hospital_id == hospital_id).first()
+                if rad_order and rad_order.prescription_request_id:
+                    charge = (
+                        db.query(BillingCharge)
+                        .filter(
+                            BillingCharge.hospital_id == hospital_id,
+                            BillingCharge.source_type == source_type,
+                            BillingCharge.source_id == rad_order.prescription_request_id,
+                        )
+                        .order_by(BillingCharge.created_at.desc())
+                        .first()
+                    )
+                elif not rad_order:
+                    # If source_id is RadPrescriptionRequest, check any created RadiologyOrder
+                    rad_o = db.query(RadiologyOrder).filter(RadiologyOrder.prescription_request_id == source_id, RadiologyOrder.hospital_id == hospital_id).first()
+                    if rad_o:
+                        charge = (
+                            db.query(BillingCharge)
+                            .filter(
+                                BillingCharge.hospital_id == hospital_id,
+                                BillingCharge.source_type == source_type,
+                                BillingCharge.source_id == rad_o.id,
+                            )
+                            .order_by(BillingCharge.created_at.desc())
+                            .first()
+                        )
+        except Exception:
+            pass
+
+    if not charge:
         return ServiceFinancialState(
             charge_exists=False,
             charge_id=None,
@@ -136,14 +200,29 @@ def assert_service_financially_cleared(
     source_type: BillingSourceType,
     source_id: UUID,
     action_description: str = "proceed with service",
+    is_emergency_override: bool = False,
 ) -> ServiceFinancialState:
     """
     Assert that the service charge is financially cleared.
     Raises HTTPException 402 PAYMENT_REQUIRED (or 400 if cancelled) if blocked.
+    If is_emergency_override is True, emergency/STAT clinical workflow is permitted to proceed.
     """
     state = check_service_financial_clearance(db, hospital_id, source_type, source_id)
     if state.is_cleared:
         return state
+
+    if is_emergency_override:
+        # Permitted under clinical life-safety / emergency STAT exception protocol
+        return ServiceFinancialState(
+            charge_exists=state.charge_exists,
+            charge_id=state.charge_id,
+            status=state.status,
+            net_amount=state.net_amount,
+            amount_paid=state.amount_paid,
+            outstanding_amount=state.outstanding_amount,
+            is_cleared=True,
+            reason="Emergency / STAT clinical override active.",
+        )
 
     if state.status == "cancelled":
         raise HTTPException(

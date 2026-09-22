@@ -13,7 +13,6 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from weasyprint import HTML
 
 from modules.clinical_records.entities.clinical_record import MedicalRecord
 from modules.radiology.contracts.radiology_contracts import RadOrderResponse
@@ -431,21 +430,3 @@ def generate_radiology_report_html(
   <div class="meta">{meta_rows}</div>
   <p class="footer">This is a computer-generated radiology report.</p>
 </body></html>"""
-
-
-def generate_radiology_report_pdf(
-    order: RadiologyOrder,
-    hospital_name: str | None = None,
-    hospital_address: str | None = None,
-    hospital_phone: str | None = None,
-    hospital_email: str | None = None,
-) -> bytes:
-    """Generate a PDF radiology report via WeasyPrint."""
-    html = generate_radiology_report_html(
-        order,
-        hospital_name,
-        hospital_address,
-        hospital_phone,
-        hospital_email,
-    )
-    return HTML(string=html).write_pdf()

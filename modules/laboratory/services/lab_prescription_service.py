@@ -66,6 +66,29 @@ def get_prescription_request(
     return req
 
 
+def apply_cancel_lab_prescription_request(
+    db: Session,
+    request_id: UUID,
+    hospital_id: UUID,
+    reason: str | None,
+) -> LabPrescriptionRequest:
+    """Cancel a lab prescription request in the current session without committing."""
+    req = get_prescription_request(db, request_id, hospital_id)
+    if req.status == LabPrescriptionRequestStatus.cancelled:
+        return req
+    if req.status == LabPrescriptionRequestStatus.completed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Completed prescription requests cannot be cancelled",
+        )
+    req.status = LabPrescriptionRequestStatus.cancelled
+    req.cancel_reason = reason.strip() if reason else "Cancelled by staff"
+    for item in req.items or []:
+        if item.status == LabRequestItemStatus.pending:
+            item.status = LabRequestItemStatus.cancelled
+    return req
+
+
 def request_panel_names(req: LabPrescriptionRequest) -> list[str]:
     return sorted({i.panel_name for i in (req.items or []) if i.panel_name})
 
@@ -167,9 +190,39 @@ def sync_request_after_order_change(db: Session, order: LabOrder) -> None:
         req.status = LabPrescriptionRequestStatus.partially_processed
 
 
-def request_to_response_dict(req: LabPrescriptionRequest) -> dict[str, Any]:
+def is_lab_request_released(db: Session, req: LabPrescriptionRequest) -> bool:
+    """Check if a LabPrescriptionRequest is operationally released to the lab queue."""
+    if req.status == LabPrescriptionRequestStatus.cancelled:
+        return False
+    is_stat = bool(req.clinical_notes and "STAT" in req.clinical_notes.upper())
+    if is_stat:
+        return True
+    from modules.billing.entities.billing_entities import BillingSourceType
+    from modules.billing.services.service_financial_clearance import check_service_financial_clearance
+    fin = check_service_financial_clearance(db, req.hospital_id, BillingSourceType.laboratory, req.id)
+    return fin.is_cleared
+
+
+def request_to_response_dict(req: LabPrescriptionRequest, db: Session | None = None) -> dict[str, Any]:
     items = sorted(req.items or [], key=lambda i: (i.sort_order, str(i.id)))
     panels = request_panel_names(req)
+    payment_status = "pending"
+    is_financially_cleared = False
+    outstanding_amount = 0.0
+
+    target_db = db or (req._sa_instance_state.session if hasattr(req, "_sa_instance_state") else None)
+    if target_db:
+        try:
+            from modules.billing.entities.billing_entities import BillingSourceType
+            from modules.billing.services.service_financial_clearance import check_service_financial_clearance
+            fin = check_service_financial_clearance(target_db, req.hospital_id, BillingSourceType.laboratory, req.id)
+            payment_status = fin.status
+            is_stat = bool(req.clinical_notes and "STAT" in req.clinical_notes.upper())
+            is_financially_cleared = fin.is_cleared or is_stat
+            outstanding_amount = fin.outstanding_amount
+        except Exception:
+            pass
+
     return {
         "id": req.id,
         "hospital_id": req.hospital_id,
@@ -201,6 +254,9 @@ def request_to_response_dict(req: LabPrescriptionRequest) -> dict[str, Any]:
             [i for i in items if i.status == LabRequestItemStatus.pending]
         ),
         "appointment_label": None,
+        "is_financially_cleared": is_financially_cleared,
+        "payment_status": payment_status,
+        "outstanding_amount": outstanding_amount,
         "items": [
             {
                 "id": i.id,
@@ -235,7 +291,11 @@ def create_investigation_requests_for_prescription(
     """
     Create lab investigation request (and order) when doctor prescribes tests.
     Also handles radiology scan order creation when scan_ids are present.
+    Creates corresponding BillingCharge records so investigations enter billing queue immediately.
     """
+    from modules.billing.entities.billing_entities import BillingSourceType
+    from modules.billing.services.billing_service import ensure_charge
+
     lab_req = None
     if test_ids or panel_ids:
         tests_resolved = resolve_lab_selection(
@@ -273,6 +333,20 @@ def create_investigation_requests_for_prescription(
                 )
                 db.add(item)
             db.flush()
+
+            # Auto-create BillingCharge so billing receives investigation immediately
+            lab_total = round(sum(float(r.test.price or 0.0) for r in tests_resolved), 2)
+            desc_names = [r.test.test_name for r in tests_resolved]
+            ensure_charge(
+                db,
+                hospital_id=hospital_id,
+                patient_id=patient_id,
+                source_type=BillingSourceType.laboratory,
+                source_id=lab_req.id,
+                description=f"Lab Investigation — {', '.join(desc_names)}"[:512],
+                charge_amount=lab_total,
+                created_by_name="Prescription Order",
+            )
 
     rad_req = None
     if scan_ids:
@@ -315,6 +389,20 @@ def create_investigation_requests_for_prescription(
                 )
                 db.add(item)
             db.flush()
+
+            # Auto-create BillingCharge for radiology
+            rad_total = round(sum(float(s.price or 0.0) for s in scans_resolved), 2)
+            scan_names = [s.scan_name for s in scans_resolved]
+            ensure_charge(
+                db,
+                hospital_id=hospital_id,
+                patient_id=patient_id,
+                source_type=BillingSourceType.radiology,
+                source_id=rad_req.id,
+                description=f"Radiology Investigation — {', '.join(scan_names)}"[:512],
+                charge_amount=rad_total,
+                created_by_name="Prescription Order",
+            )
 
     return lab_req, rad_req
 
@@ -535,6 +623,42 @@ def update_investigation_requests_for_prescription(
 
             db.flush()
 
+            # Synchronize billing charge with updated lab items
+            from modules.billing.entities.billing_entities import BillingChargeStatus, BillingSourceType
+            from modules.billing.services.billing_service import ensure_charge, find_charge_by_source
+
+            current_items = db.query(LabPrescriptionRequestItem).filter(LabPrescriptionRequestItem.request_id == lab_req.id).all()
+            charge = find_charge_by_source(db, hospital_id, BillingSourceType.laboratory, lab_req.id)
+            if not current_items:
+                if charge:
+                    charge.status = BillingChargeStatus.cancelled
+            else:
+                new_total = round(sum(float(it.price or 0.0) for it in current_items), 2)
+                desc_names = [it.test_name for it in current_items if it.test_name]
+                if charge:
+                    charge.charge_amount = new_total
+                    charge.description = f"Lab Investigation — {', '.join(desc_names)}"[:512]
+                    net = max(0.0, round(new_total - float(charge.discount_amount or 0.0) + float(charge.tax_amount or 0.0), 2))
+                    charge.net_amount = net
+                    paid = float(charge.amount_paid or 0.0)
+                    if net <= 0.0 or paid >= net > 0.0:
+                        charge.status = BillingChargeStatus.paid
+                    elif paid > 0.0:
+                        charge.status = BillingChargeStatus.partially_paid
+                    else:
+                        charge.status = BillingChargeStatus.pending
+                else:
+                    ensure_charge(
+                        db,
+                        hospital_id=hospital_id,
+                        patient_id=patient_id,
+                        source_type=BillingSourceType.laboratory,
+                        source_id=lab_req.id,
+                        description=f"Lab Investigation — {', '.join(desc_names)}"[:512],
+                        charge_amount=new_total,
+                        created_by_name="Prescription Order",
+                    )
+
     # Handle Radiology Investigations
     if scan_ids is not None:
         try:
@@ -600,6 +724,42 @@ def update_investigation_requests_for_prescription(
                         db.add(new_item)
 
                 db.flush()
+
+                # Synchronize billing charge with updated radiology items
+                from modules.billing.entities.billing_entities import BillingChargeStatus, BillingSourceType
+                from modules.billing.services.billing_service import ensure_charge, find_charge_by_source
+
+                current_rad_items = db.query(RadPrescriptionRequestItem).filter(RadPrescriptionRequestItem.request_id == rad_req.id).all()
+                rad_charge = find_charge_by_source(db, hospital_id, BillingSourceType.radiology, rad_req.id)
+                if not current_rad_items:
+                    if rad_charge:
+                        rad_charge.status = BillingChargeStatus.cancelled
+                else:
+                    new_rad_total = round(sum(float(it.price or 0.0) for it in current_rad_items), 2)
+                    desc_scans = [it.scan_name for it in current_rad_items if it.scan_name]
+                    if rad_charge:
+                        rad_charge.charge_amount = new_rad_total
+                        rad_charge.description = f"Radiology Investigation — {', '.join(desc_scans)}"[:512]
+                        net = max(0.0, round(new_rad_total - float(rad_charge.discount_amount or 0.0) + float(rad_charge.tax_amount or 0.0), 2))
+                        rad_charge.net_amount = net
+                        paid = float(rad_charge.amount_paid or 0.0)
+                        if net <= 0.0 or paid >= net > 0.0:
+                            rad_charge.status = BillingChargeStatus.paid
+                        elif paid > 0.0:
+                            rad_charge.status = BillingChargeStatus.partially_paid
+                        else:
+                            rad_charge.status = BillingChargeStatus.pending
+                    else:
+                        ensure_charge(
+                            db,
+                            hospital_id=hospital_id,
+                            patient_id=patient_id,
+                            source_type=BillingSourceType.radiology,
+                            source_id=rad_req.id,
+                            description=f"Radiology Investigation — {', '.join(desc_scans)}"[:512],
+                            charge_amount=new_rad_total,
+                            created_by_name="Prescription Order",
+                        )
         except Exception:
             pass
 

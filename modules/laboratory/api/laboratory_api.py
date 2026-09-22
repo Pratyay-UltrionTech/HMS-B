@@ -69,8 +69,6 @@ from modules.laboratory.entities.lab_entities import (
     LabPrescriptionRequestStatus,
 )
 from modules.laboratory.db.laboratory_repository import LaboratoryRepository
-from modules.laboratory.services.lab_report_service import generate_lab_report_pdf
-from modules.tenancy.entities.hospital import Hospital
 
 router = APIRouter(prefix="/laboratory", tags=["laboratory"])
 
@@ -342,7 +340,7 @@ def update_item_status(
     return UpdateItemStatusAction(db, hospital_id).execute(order_id, item_id, payload, user)
 
 
-@router.post("/orders/{order_id}/results", response_model=LabOrderResponse, dependencies=[Depends(require_permission("laboratory", "edit"))])
+@router.post("/orders/{order_id}/results", response_model=LabOrderResponse, dependencies=[Depends(require_permission("laboratory", "validate"))])
 def save_results(
     order_id: UUID,
     payload: LabReportSaveRequest,
@@ -360,21 +358,6 @@ def report_html(
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> StreamingResponse:
-    html, filename = GetLabReportHtmlAction(db, hospital_id).execute(order_id)
-    return StreamingResponse(
-        BytesIO(html.encode("utf-8")),
-        media_type="text/html",
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
-    )
-
-
-@router.get("/orders/{order_id}/report/pdf")
-def report_pdf(
-    order_id: UUID,
-    db: Session = Depends(get_transitional_sync_session),
-    user: dict = Depends(require_hospital_user),
-    hospital_id: UUID = Depends(get_hospital_context),
-) -> StreamingResponse:
     repo = LaboratoryRepository(db, hospital_id)
     order = repo.get_order(order_id)
     if not order:
@@ -387,19 +370,12 @@ def report_pdf(
         hospital_id,
         BillingSourceType.laboratory,
         order.id,
-        action_description="download laboratory report PDF",
+        action_description="view laboratory report",
     )
 
-    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
-    pdf = generate_lab_report_pdf(
-        order,
-        hospital_name=hospital.name if hospital else "Hospital",
-        hospital_address=hospital.address if hospital else "",
-        hospital_phone=hospital.phone if hospital else "",
-        hospital_email=hospital.email if hospital else "",
-    )
+    html, filename = GetLabReportHtmlAction(db, hospital_id).execute(order_id)
     return StreamingResponse(
-        BytesIO(pdf),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{order.order_no}-report.pdf"'},
+        BytesIO(html.encode("utf-8")),
+        media_type="text/html",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )

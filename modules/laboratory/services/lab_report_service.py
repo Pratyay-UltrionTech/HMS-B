@@ -11,7 +11,6 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy.orm import Session
-from weasyprint import HTML
 
 from modules.clinical_records.entities.clinical_record import MedicalRecord
 from modules.laboratory.entities.lab_entities import LabOrder, LabOrderStatus
@@ -161,18 +160,6 @@ def generate_lab_report_html(
 </div>
 <script>window.onload=function(){{window.print();}}</script>
 </body></html>"""
-
-
-def generate_lab_report_pdf(
-    order: LabOrder,
-    hospital_name: str = "Hospital",
-    hospital_address: str = "",
-    hospital_phone: str = "",
-    hospital_email: str = "",
-) -> bytes:
-    """Generate a PDF laboratory test report via WeasyPrint."""
-    html = generate_lab_report_html(order, hospital_name, hospital_address, hospital_phone, hospital_email)
-    return HTML(string=html).write_pdf()
 
 
 def sync_lab_order_medical_record(db: Session, order: LabOrder) -> None:

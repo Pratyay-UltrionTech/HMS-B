@@ -21,12 +21,19 @@ from modules.billing.contracts.billing_contracts import (
     BillingChargeResponse,
     BillingChargeUpdate,
     BillingDashboardResponse,
+    BillingDepositAllocate,
+    BillingDepositCreate,
+    BillingDepositResponse,
     BillingInvoiceCreate,
     BillingInvoiceResponse,
     BillingPaymentCreate,
     BillingPaymentResponse,
     BillingReceiptCreate,
     BillingReceiptResponse,
+    BillingRefundCreate,
+    BillingRefundResponse,
+    FinancialAccountCreate,
+    FinancialAccountResponse,
     LedgerEntry,
     PatientFinancialSummary,
     PatientLedgerResponse,
@@ -35,23 +42,39 @@ from modules.billing.db.billing_repository import BillingRepository
 from modules.billing.entities.billing_entities import (
     BillingCharge,
     BillingChargeStatus,
+    BillingDeposit,
     BillingInvoice,
     BillingInvoiceLine,
     BillingInvoiceStatus,
     BillingPayment,
+    BillingPaymentAllocation,
     BillingPaymentMethod,
     BillingReceipt,
     BillingReceiptStatus,
+    BillingRefund,
     BillingSourceType,
+    DepositStatus,
+    FinancialAccount,
+    FinancialAccountStatus,
+    FinancialAccountType,
+    RefundStatus,
 )
 from modules.billing.services.billing_service import (
+    account_to_dict,
     build_ledger_entries,
     charge_to_dict,
+    close_financial_account,
     compute_net,
+    create_deposit,
     create_payment,
+    deposit_to_dict,
+    draw_down_deposit_for_charges,
     ensure_charge,
+    get_or_create_financial_account,
     patient_ledger_totals,
     payment_to_dict,
+    process_refund,
+    refund_to_dict,
 )
 from modules.billing.services.invoice_service import (
     create_invoice_from_charges,
@@ -62,6 +85,7 @@ from modules.billing.services.invoice_service import (
     patient_outstanding_for_invoice,
     receipt_html,
     receipt_to_dict,
+    refund_html,
     refresh_invoice_paid_status,
 )
 from modules.patients.entities.patient import Patient
@@ -285,9 +309,20 @@ class CancelChargeAction:
         charge.amount_paid = 0.0
         self.db.flush()
 
-        # If money was paid towards this charge, reallocate to other pending charges
+        # If money was paid towards this charge, convert into an available advance deposit
         if paid_amount > 0:
-            allocate_payment_to_charges(self.db, self.repo.hospital_id, charge.patient_id, paid_amount)
+            create_deposit(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                patient_id=charge.patient_id,
+                account_id=charge.account_id,
+                amount=paid_amount,
+                deposit_date=date.today(),
+                deposit_type="cancellation_credit",
+                payment_method=BillingPaymentMethod.other,
+                notes=f"Credit from cancelled charge {charge.description[:40]}",
+                received_by_name=_actor(user),
+            )
 
         self.db.commit()
         self.db.refresh(charge)
@@ -298,7 +333,7 @@ class CancelChargeAction:
             action="cancel",
             entity_type="billing_charge",
             entity_id=charge.id,
-            summary=f"Cancelled charge {charge.id} ({charge.description[:32]}). Released paid amount ₹{paid_amount:.2f} back to patient credit/reallocation.",
+            summary=f"Cancelled charge {charge.id} ({charge.description[:32]}). Credited paid amount ₹{paid_amount:.2f} as available patient deposit.",
         )
         self.db.commit()
         return BillingChargeResponse.model_validate(charge_to_dict(charge))
@@ -340,6 +375,15 @@ class CreatePaymentAction:
     def execute(self, payload: BillingPaymentCreate, user: dict[str, Any]) -> BillingPaymentResponse:
         patient = _get_patient_or_404(self.repo, payload.patient_id)
         pdate = payload.payment_date or date.today()
+        
+        # Convert Pydantic allocation models if provided
+        allocations_plan = None
+        if payload.allocations:
+            allocations_plan = [
+                {"charge_id": item.charge_id, "amount": item.amount}
+                for item in payload.allocations
+            ]
+
         pay = create_payment(
             self.db,
             hospital_id=self.repo.hospital_id,
@@ -347,9 +391,12 @@ class CreatePaymentAction:
             amount=payload.amount,
             payment_date=pdate,
             payment_method=payload.payment_method,
+            account_id=payload.account_id,
+            reference_number=payload.reference_number,
             notes=payload.notes,
             received_by_name=_actor(user),
             allocate=True,
+            allocations_plan=allocations_plan,
         )
         receipt = issue_receipt_for_payment(
             self.db,
@@ -440,8 +487,12 @@ class CreateInvoiceAction:
                 hospital_id=self.repo.hospital_id,
                 patient_id=payload.patient_id,
                 charge_ids=payload.charge_ids,
+                account_id=payload.account_id,
                 invoice_date=payload.invoice_date,
                 tax_amount=payload.tax_amount,
+                cgst_amount=payload.cgst_amount,
+                sgst_amount=payload.sgst_amount,
+                igst_amount=payload.igst_amount,
                 notes=payload.notes,
                 created_by_name=_actor(user),
             )
@@ -630,6 +681,286 @@ class PrintReceiptAction:
         hospital = self.db.query(Hospital).filter(Hospital.id == self.repo.hospital_id).first()
         patient = self.repo.get_patient(r.patient_id)
         return receipt_html(r, hospital, patient, auto_print=auto_print)
+
+
+# ── Financial Account Actions ───────────────────────────────────────────────
+
+class ListFinancialAccountsAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(
+        self,
+        *,
+        patient_id: UUID | None = None,
+        status: FinancialAccountStatus | None = None,
+        account_type: FinancialAccountType | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[FinancialAccountResponse]:
+        accounts = self.repo.list_accounts(
+            patient_id=patient_id, status=status, account_type=account_type, limit=limit, offset=offset
+        )
+        return [FinancialAccountResponse.model_validate(account_to_dict(acc)) for acc in accounts]
+
+
+class CreateFinancialAccountAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(self, payload: FinancialAccountCreate, user: dict[str, Any]) -> FinancialAccountResponse:
+        patient = _get_patient_or_404(self.repo, payload.patient_id)
+        acc = get_or_create_financial_account(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            patient_id=payload.patient_id,
+            account_type=payload.account_type,
+            admission_id=payload.admission_id,
+            appointment_id=payload.appointment_id,
+            notes=payload.notes,
+            created_by_name=_actor(user),
+        )
+        self.db.commit()
+        self.db.refresh(acc)
+        write_audit_log(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            actor=user,
+            action="create",
+            entity_type="financial_account",
+            entity_id=acc.id,
+            summary=f"Financial account {acc.account_number} ({acc.account_type.value}) created for {patient.name}",
+        )
+        self.db.commit()
+        return FinancialAccountResponse.model_validate(account_to_dict(acc, patient))
+
+
+class CloseFinancialAccountAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(self, account_id: UUID, user: dict[str, Any]) -> FinancialAccountResponse:
+        try:
+            acc = close_financial_account(self.db, hospital_id=self.repo.hospital_id, account_id=account_id)
+            self.db.commit()
+            self.db.refresh(acc)
+        except ValueError as e:
+            self.db.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        write_audit_log(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            actor=user,
+            action="close",
+            entity_type="financial_account",
+            entity_id=acc.id,
+            summary=f"Closed financial account {acc.account_number}",
+        )
+        self.db.commit()
+        return FinancialAccountResponse.model_validate(account_to_dict(acc))
+
+
+# ── Deposit Actions ─────────────────────────────────────────────────────────
+
+class ListDepositsAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(
+        self,
+        *,
+        patient_id: UUID | None = None,
+        account_id: UUID | None = None,
+        status: DepositStatus | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[BillingDepositResponse]:
+        deposits = self.repo.list_deposits(
+            patient_id=patient_id,
+            account_id=account_id,
+            status=status,
+            from_date=from_date,
+            to_date=to_date,
+            limit=limit,
+            offset=offset,
+        )
+        return [BillingDepositResponse.model_validate(deposit_to_dict(d)) for d in deposits]
+
+
+class CreateDepositAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(self, payload: BillingDepositCreate, user: dict[str, Any]) -> BillingDepositResponse:
+        patient = _get_patient_or_404(self.repo, payload.patient_id)
+        dep_date = payload.deposit_date or date.today()
+        deposit = create_deposit(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            patient_id=payload.patient_id,
+            amount=payload.amount,
+            deposit_date=dep_date,
+            deposit_type=payload.deposit_type,
+            payment_method=payload.payment_method,
+            account_id=payload.account_id,
+            reference_number=payload.reference_number,
+            notes=payload.notes,
+            received_by_name=_actor(user),
+        )
+        
+        # Issue corresponding money receipt for the advance deposit
+        rcpt = issue_receipt(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            patient_id=payload.patient_id,
+            amount=payload.amount,
+            payment_date=dep_date,
+            payment_method=payload.payment_method,
+            collected_by_name=_actor(user),
+            reference_number=payload.reference_number,
+            notes=f"Advance Deposit: {deposit.deposit_number}",
+        )
+        rcpt.deposit_id = deposit.id
+        self.db.commit()
+        self.db.refresh(deposit)
+
+        write_audit_log(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            actor=user,
+            action="create",
+            entity_type="billing_deposit",
+            entity_id=deposit.id,
+            summary=f"Advance deposit {deposit.deposit_number} (₹{deposit.original_amount:.2f}) received for {patient.name}",
+        )
+        self.db.commit()
+        return BillingDepositResponse.model_validate(deposit_to_dict(deposit, patient))
+
+
+class AllocateDepositAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(
+        self, deposit_id: UUID, payload: BillingDepositAllocate, user: dict[str, Any]
+    ) -> BillingDepositResponse:
+        alloc_list = [{"charge_id": item.charge_id, "amount": item.amount} for item in payload.allocations]
+        try:
+            allocated = draw_down_deposit_for_charges(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                deposit_id=deposit_id,
+                allocations_plan=alloc_list,
+                created_by_name=_actor(user),
+            )
+            deposit = self.repo.get_deposit_by_id(deposit_id)
+            if not deposit:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deposit not found")
+            refresh_invoice_paid_status(self.db, self.repo.hospital_id, deposit.patient_id)
+            self.db.commit()
+            self.db.refresh(deposit)
+        except ValueError as e:
+            self.db.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+        write_audit_log(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            actor=user,
+            action="allocate",
+            entity_type="billing_deposit",
+            entity_id=deposit_id,
+            summary=f"Allocated ₹{allocated:.2f} from deposit {deposit.deposit_number} to {len(payload.allocations)} charges",
+        )
+        self.db.commit()
+        return BillingDepositResponse.model_validate(deposit_to_dict(deposit))
+
+
+# ── Refund Actions ──────────────────────────────────────────────────────────
+
+class ListRefundsAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(
+        self,
+        *,
+        patient_id: UUID | None = None,
+        status: RefundStatus | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[BillingRefundResponse]:
+        refunds = self.repo.list_refunds(
+            patient_id=patient_id, status=status, from_date=from_date, to_date=to_date, limit=limit, offset=offset
+        )
+        return [BillingRefundResponse.model_validate(refund_to_dict(ref)) for ref in refunds]
+
+
+class CreateRefundAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(self, payload: BillingRefundCreate, user: dict[str, Any]) -> BillingRefundResponse:
+        patient = _get_patient_or_404(self.repo, payload.patient_id)
+        ref_date = payload.refund_date or date.today()
+        try:
+            refund = process_refund(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                patient_id=payload.patient_id,
+                amount=payload.amount,
+                reason=payload.reason,
+                refund_date=ref_date,
+                refund_method=payload.refund_method,
+                payment_id=payload.payment_id,
+                deposit_id=payload.deposit_id,
+                account_id=payload.account_id,
+                approved_by_name=_actor(user),
+                processed_by_name=_actor(user),
+            )
+            self.db.commit()
+            self.db.refresh(refund)
+        except ValueError as e:
+            self.db.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+        write_audit_log(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            actor=user,
+            action="refund",
+            entity_type="billing_refund",
+            entity_id=refund.id,
+            summary=f"Refund voucher {refund.refund_number} (₹{refund.amount:.2f}) issued for {patient.name}: {refund.reason[:40]}",
+        )
+        self.db.commit()
+        return BillingRefundResponse.model_validate(refund_to_dict(refund, patient))
+
+
+class PrintRefundAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(self, refund_id: UUID, auto_print: bool = True) -> str:
+        ref = self.repo.get_refund_by_id(refund_id)
+        if not ref:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Refund voucher not found")
+        hospital = self.db.query(Hospital).filter(Hospital.id == self.repo.hospital_id).first()
+        patient = self.repo.get_patient(ref.patient_id)
+        return refund_html(ref, hospital, patient, auto_print=auto_print)
 
 
 # ── Ledger & Dashboard Actions ──────────────────────────────────────────────

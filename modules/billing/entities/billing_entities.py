@@ -1,8 +1,18 @@
-"""Target architecture entities for Billing, Ledger, Invoices, Receipts, and Payments.
+"""Target architecture entities for Billing, Ledger, Invoices, Receipts, Payments,
+Financial Accounts, Allocations, Deposits, and Refunds.
 
 Conforms to UltrionTech-Backend-Template modules/billing/entities/ specification.
-Maps directly to billing_charges, billing_payments, billing_invoices,
-billing_invoice_lines, billing_receipts, and consultation_pricing on target Base.
+Maps directly to:
+- financial_accounts
+- billing_charges
+- billing_payments
+- billing_payment_allocations
+- billing_deposits
+- billing_refunds
+- billing_invoices
+- billing_invoice_lines
+- billing_receipts
+- consultation_pricing
 """
 
 from __future__ import annotations
@@ -34,6 +44,26 @@ from infrastructure.postgres.base import Base
 
 if TYPE_CHECKING:
     from modules.patients.entities.patient import Patient
+
+
+# ── Enumerations ─────────────────────────────────────────────────────────────
+
+class FinancialAccountType(str, enum.Enum):
+    """Episode boundary or grouping for patient financial accounts."""
+
+    opd = "opd"
+    ipd = "ipd"
+    emergency = "emergency"
+    daycare = "daycare"
+    general = "general"
+
+
+class FinancialAccountStatus(str, enum.Enum):
+    """Lifecycle settlement status of a financial account."""
+
+    open = "open"
+    cleared = "cleared"
+    closed = "closed"
 
 
 class BillingSourceType(str, enum.Enum):
@@ -85,12 +115,36 @@ class BillingReceiptStatus(str, enum.Enum):
     cancelled = "cancelled"
 
 
-class BillingCharge(Base):
-    """Unified patient charge / billable transaction (ledger debit)."""
+class DepositStatus(str, enum.Enum):
+    """Lifecycle state of an advance deposit."""
 
-    __tablename__ = "billing_charges"
+    available = "available"
+    partially_allocated = "partially_allocated"
+    exhausted = "exhausted"
+    refunded = "refunded"
+
+
+class RefundStatus(str, enum.Enum):
+    """Status of a financial refund voucher."""
+
+    draft = "draft"
+    approved = "approved"
+    processed = "processed"
+    rejected = "rejected"
+
+
+# ── Financial Account (Episode Boundary) ─────────────────────────────────────
+
+class FinancialAccount(Base):
+    """
+    Financial container / episode account for an admission, visit, or emergency stay.
+    Prevents cross-encounter debt leakage and scopes financial clearance.
+    """
+
+    __tablename__ = "financial_accounts"
     __table_args__ = (
-        Index("ix_billing_charges_hospital_created", "hospital_id", "created_at"),
+        UniqueConstraint("hospital_id", "account_number", name="uq_financial_account_number"),
+        Index("ix_financial_accounts_patient_status", "hospital_id", "patient_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -102,6 +156,70 @@ class BillingCharge(Base):
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    account_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    account_type: Mapped[FinancialAccountType] = mapped_column(
+        Enum(FinancialAccountType, name="financial_account_type"),
+        nullable=False,
+        default=FinancialAccountType.general,
+        index=True,
+    )
+    status: Mapped[FinancialAccountStatus] = mapped_column(
+        Enum(FinancialAccountStatus, name="financial_account_status"),
+        nullable=False,
+        default=FinancialAccountStatus.open,
+        index=True,
+    )
+    # Pointers to source clinical episode if applicable
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
+    appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    charges: Mapped[list["BillingCharge"]] = relationship(
+        "BillingCharge", back_populates="account"
+    )
+    payments: Mapped[list["BillingPayment"]] = relationship(
+        "BillingPayment", back_populates="account"
+    )
+    deposits: Mapped[list["BillingDeposit"]] = relationship(
+        "BillingDeposit", back_populates="account"
+    )
+
+
+# ── Billing Charge ───────────────────────────────────────────────────────────
+
+class BillingCharge(Base):
+    """Unified patient charge / billable transaction (ledger debit)."""
+
+    __tablename__ = "billing_charges"
+    __table_args__ = (
+        Index("ix_billing_charges_hospital_created", "hospital_id", "created_at"),
+        Index("ix_billing_charges_account", "hospital_id", "account_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     source_type: Mapped[BillingSourceType] = mapped_column(
         Enum(BillingSourceType, name="billing_source_type"), nullable=False, index=True
     )
@@ -109,9 +227,15 @@ class BillingCharge(Base):
         UUID(as_uuid=True), nullable=True, index=True
     )
     description: Mapped[str] = mapped_column(String(512), nullable=False)
+    quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    unit_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     charge_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     discount_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     discount_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    discount_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tax_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    gst_rate: Mapped[float | None] = mapped_column(Float, nullable=True, default=0.0)
+    hsn_sac_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
     net_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     amount_paid: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     status: Mapped[BillingChargeStatus] = mapped_column(
@@ -130,7 +254,13 @@ class BillingCharge(Base):
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    account: Mapped["FinancialAccount | None"] = relationship("FinancialAccount", back_populates="charges")
+    allocations: Mapped[list["BillingPaymentAllocation"]] = relationship(
+        "BillingPaymentAllocation", back_populates="charge"
+    )
 
+
+# ── Billing Payment ──────────────────────────────────────────────────────────
 
 class BillingPayment(Base):
     """Patient payment collection (ledger credit)."""
@@ -138,6 +268,7 @@ class BillingPayment(Base):
     __tablename__ = "billing_payments"
     __table_args__ = (
         Index("ix_billing_payments_hospital_created", "hospital_id", "created_at"),
+        Index("ix_billing_payments_account", "hospital_id", "account_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -149,6 +280,9 @@ class BillingPayment(Base):
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     payment_date: Mapped[date] = mapped_column(Date, nullable=False)
     payment_method: Mapped[BillingPaymentMethod] = mapped_column(
@@ -156,6 +290,7 @@ class BillingPayment(Base):
         nullable=False,
         default=BillingPaymentMethod.cash,
     )
+    reference_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     received_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
@@ -163,7 +298,174 @@ class BillingPayment(Base):
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    account: Mapped["FinancialAccount | None"] = relationship("FinancialAccount", back_populates="payments")
+    allocations: Mapped[list["BillingPaymentAllocation"]] = relationship(
+        "BillingPaymentAllocation", back_populates="payment"
+    )
+    refunds: Mapped[list["BillingRefund"]] = relationship(
+        "BillingRefund", back_populates="payment"
+    )
 
+
+# ── Billing Payment Allocation (Selective Settlement) ───────────────────────
+
+class BillingPaymentAllocation(Base):
+    """
+    Explicit, auditable allocation of tender (from payment or deposit) to a charge.
+    Enables selective payment and partial item settlement.
+    """
+
+    __tablename__ = "billing_payment_allocations"
+    __table_args__ = (
+        Index("ix_allocations_charge", "charge_id"),
+        Index("ix_allocations_payment", "payment_id"),
+        Index("ix_allocations_deposit", "deposit_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_payments.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    deposit_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_deposits.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    charge_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_charges.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    allocated_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    payment: Mapped["BillingPayment | None"] = relationship("BillingPayment", back_populates="allocations")
+    deposit: Mapped["BillingDeposit | None"] = relationship("BillingDeposit", back_populates="allocations")
+    charge: Mapped["BillingCharge"] = relationship("BillingCharge", back_populates="allocations")
+
+
+# ── Billing Deposit (Advance / Unearned Revenue) ────────────────────────────
+
+class BillingDeposit(Base):
+    """
+    Patient advance deposit held as liability before service execution.
+    Tracks available balance, drawdown allocations, and refunds.
+    """
+
+    __tablename__ = "billing_deposits"
+    __table_args__ = (
+        UniqueConstraint("hospital_id", "deposit_number", name="uq_billing_deposit_number"),
+        Index("ix_billing_deposits_patient", "hospital_id", "patient_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    deposit_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    deposit_date: Mapped[date] = mapped_column(Date, nullable=False)
+    deposit_type: Mapped[str] = mapped_column(String(32), nullable=False, default="admission")  # admission, surgical, general
+    payment_method: Mapped[BillingPaymentMethod] = mapped_column(
+        Enum(BillingPaymentMethod, name="billing_payment_method", create_type=False),
+        nullable=False,
+        default=BillingPaymentMethod.cash,
+    )
+    original_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    available_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    status: Mapped[DepositStatus] = mapped_column(
+        Enum(DepositStatus, name="billing_deposit_status"),
+        nullable=False,
+        default=DepositStatus.available,
+        index=True,
+    )
+    reference_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    received_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    account: Mapped["FinancialAccount | None"] = relationship("FinancialAccount", back_populates="deposits")
+    allocations: Mapped[list["BillingPaymentAllocation"]] = relationship(
+        "BillingPaymentAllocation", back_populates="deposit"
+    )
+    refunds: Mapped[list["BillingRefund"]] = relationship(
+        "BillingRefund", back_populates="deposit"
+    )
+
+
+# ── Billing Refund (Formal Refund Voucher) ───────────────────────────────────
+
+class BillingRefund(Base):
+    """
+    Documented refund returned to patient from a payment or unused deposit.
+    Maintains link to original tender, prevents over-refunding, and generates voucher.
+    """
+
+    __tablename__ = "billing_refunds"
+    __table_args__ = (
+        UniqueConstraint("hospital_id", "refund_number", name="uq_billing_refund_number"),
+        Index("ix_billing_refunds_patient", "hospital_id", "patient_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_payments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    deposit_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_deposits.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    refund_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    refund_date: Mapped[date] = mapped_column(Date, nullable=False)
+    refund_method: Mapped[BillingPaymentMethod] = mapped_column(
+        Enum(BillingPaymentMethod, name="billing_payment_method", create_type=False),
+        nullable=False,
+        default=BillingPaymentMethod.cash,
+    )
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[RefundStatus] = mapped_column(
+        Enum(RefundStatus, name="billing_refund_status"),
+        nullable=False,
+        default=RefundStatus.processed,
+        index=True,
+    )
+    approved_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    processed_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    payment: Mapped["BillingPayment | None"] = relationship("BillingPayment", back_populates="refunds")
+    deposit: Mapped["BillingDeposit | None"] = relationship("BillingDeposit", back_populates="refunds")
+
+
+# ── Billing Invoice & Lines ──────────────────────────────────────────────────
 
 class BillingInvoice(Base):
     """Hospital-scoped patient invoice generated from ledger charges."""
@@ -183,11 +485,18 @@ class BillingInvoice(Base):
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     invoice_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     invoice_date: Mapped[date] = mapped_column(Date, nullable=False)
     subtotal: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     discount_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    taxable_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     tax_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    cgst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    sgst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    igst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     grand_total: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     status: Mapped[BillingInvoiceStatus] = mapped_column(
         Enum(BillingInvoiceStatus, name="billing_invoice_status"),
@@ -211,7 +520,7 @@ class BillingInvoice(Base):
 
 
 class BillingInvoiceLine(Base):
-    """Immutable snapshot of a charge on an invoice."""
+    """Immutable snapshot of a charge on an invoice with HSN and tax decomposition."""
 
     __tablename__ = "billing_invoice_lines"
 
@@ -232,6 +541,10 @@ class BillingInvoiceLine(Base):
     quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    hsn_sac_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    gst_rate: Mapped[float | None] = mapped_column(Float, nullable=True, default=0.0)
+    cgst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    sgst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -239,6 +552,8 @@ class BillingInvoiceLine(Base):
 
     invoice: Mapped[BillingInvoice] = relationship("BillingInvoice", back_populates="lines")
 
+
+# ── Billing Receipt ──────────────────────────────────────────────────────────
 
 class BillingReceipt(Base):
     """Payment receipt document (hospital-scoped numbering)."""
@@ -260,6 +575,9 @@ class BillingReceipt(Base):
     )
     payment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("billing_payments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    deposit_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_deposits.id", ondelete="SET NULL"), nullable=True, index=True
     )
     linked_invoice_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("billing_invoices.id", ondelete="SET NULL"), nullable=True, index=True
@@ -287,6 +605,8 @@ class BillingReceipt(Base):
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
 
+
+# ── Consultation Pricing ─────────────────────────────────────────────────────
 
 class ConsultationPricing(Base):
     """Wing + Department + Doctor + Appointment Type -> consultation fee."""

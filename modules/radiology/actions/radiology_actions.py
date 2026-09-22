@@ -18,6 +18,10 @@ from modules.billing.entities.billing_entities import BillingSourceType
 from modules.billing.services.billing_service import (
     cancel_charge_for_source,
     ensure_charge,
+    find_charge_by_source,
+)
+from modules.billing.services.service_financial_clearance import (
+    assert_service_financially_cleared,
 )
 from modules.radiology.contracts.radiology_contracts import (
     RadCatalogueSeedResult,
@@ -46,8 +50,10 @@ from modules.radiology.services.radiology_service import (
     sync_radiology_order_medical_record,
 )
 from modules.radiology.services.rad_prescription_service import (
+    apply_cancel_rad_prescription_request,
     assert_request_fulfillable,
     get_prescription_request,
+    is_rad_request_released,
     request_to_response_dict,
     sync_request_after_order_change,
 )
@@ -292,6 +298,18 @@ class CreateOrdersAction:
                     detail="Doctor-prescribed orders cannot add or change scans; fulfill the prescription as written",
                 )
             fulfill_items = assert_request_fulfillable(self.db, rad_request)
+            is_stat = bool(
+                (rad_request.clinical_notes and "STAT" in rad_request.clinical_notes.upper())
+                or (clinical_notes and "STAT" in clinical_notes.upper())
+            )
+            assert_service_financially_cleared(
+                self.db,
+                self.hospital_id,
+                BillingSourceType.radiology,
+                rad_request.id,
+                action_description="accession doctor-prescribed radiology request",
+                is_emergency_override=is_stat,
+            )
             appointment_id = rad_request.appointment_id or appointment_id
             doctor = rad_request.doctor or doctor
             if not clinical_notes:
@@ -311,6 +329,10 @@ class CreateOrdersAction:
         actor_name = _actor_name(self.user)
         actor_role = _actor_role(self.user)
         created_ids: list[UUID] = []
+
+        req_charge = None
+        if rad_request:
+            req_charge = find_charge_by_source(self.db, self.hospital_id, BillingSourceType.radiology, rad_request.id)
 
         order_nos = iter(self.repo.next_order_no_batch(len(lines)))
         for scan_id, scan_code, scan_name, category, price in lines:
@@ -337,17 +359,22 @@ class CreateOrdersAction:
             self.db.flush()
             created_ids.append(order.id)
 
-            # Target-native billing integration
-            ensure_charge(
-                self.db,
-                hospital_id=self.hospital_id,
-                patient_id=patient.id,
-                source_type=BillingSourceType.radiology,
-                source_id=order.id,
-                description=f"Radiology {order.order_no} — {scan_name}",
-                charge_amount=float(price or 0),
-                created_by_name=actor_name,
-            )
+            if req_charge and len(lines) == 1:
+                # Re-point single charge to this order so order.id owns the paid ledger charge
+                req_charge.source_id = order.id
+                req_charge.description = f"Radiology {order.order_no} — {scan_name}"
+            elif not rad_request:
+                # Target-native billing integration for direct orders
+                ensure_charge(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    patient_id=patient.id,
+                    source_type=BillingSourceType.radiology,
+                    source_id=order.id,
+                    description=f"Radiology {order.order_no} — {scan_name}",
+                    charge_amount=float(price or 0),
+                    created_by_name=actor_name,
+                )
 
             write_audit_log(
                 self.db,
@@ -375,6 +402,7 @@ class CreateOrdersAction:
 
 class ListRadPrescriptionRequestsAction:
     def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
         self.repo = RadiologyRepository(db, hospital_id)
 
     def execute(
@@ -382,11 +410,14 @@ class ListRadPrescriptionRequestsAction:
         status: RadPrescriptionRequestStatus | None = None,
         patient_id: UUID | None = None,
         doctor_id: UUID | None = None,
+        released_only: bool | None = None,
     ) -> list[RadPrescriptionRequestResponse]:
         reqs = self.repo.list_prescription_requests(
             status=status, patient_id=patient_id, doctor_id=doctor_id
         )
-        return [RadPrescriptionRequestResponse(**request_to_response_dict(r)) for r in reqs]
+        if released_only is True or (released_only is None and status == RadPrescriptionRequestStatus.pending and not patient_id):
+            reqs = [r for r in reqs if is_rad_request_released(self.db, r)]
+        return [RadPrescriptionRequestResponse(**request_to_response_dict(r, self.db)) for r in reqs]
 
 
 class GetRadPrescriptionRequestAction:
@@ -400,7 +431,7 @@ class GetRadPrescriptionRequestAction:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Prescription radiology request not found",
             )
-        return RadPrescriptionRequestResponse(**request_to_response_dict(req))
+        return RadPrescriptionRequestResponse(**request_to_response_dict(req, self.repo.db))
 
 
 class CancelRadPrescriptionRequestAction:
@@ -409,23 +440,24 @@ class CancelRadPrescriptionRequestAction:
         self.hospital_id = hospital_id
         self.repo = RadiologyRepository(db, hospital_id)
 
-    def execute(self, request_id: UUID, reason: str | None, user: dict) -> RadPrescriptionRequestResponse:
-        req = get_prescription_request(self.db, request_id, self.hospital_id)
-        if req.status == RadPrescriptionRequestStatus.completed:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Completed prescription requests cannot be cancelled",
-            )
-        req.status = RadPrescriptionRequestStatus.cancelled
-        req.cancel_reason = reason.strip() if reason else "Cancelled by staff"
-        for item in req.items or []:
-            if item.status == RadRequestItemStatus.pending:
-                item.status = RadRequestItemStatus.cancelled
-        self.db.commit()
-        if req.appointment_id:
-            sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
+    def execute(
+        self,
+        request_id: UUID,
+        reason: str | None,
+        user: dict,
+        *,
+        commit: bool = True,
+        sync_appointment: bool = True,
+    ) -> RadPrescriptionRequestResponse:
+        req = apply_cancel_rad_prescription_request(self.db, request_id, self.hospital_id, reason)
+        cancel_charge_for_source(self.db, self.hospital_id, BillingSourceType.radiology, request_id)
+        if commit:
             self.db.commit()
-        return RadPrescriptionRequestResponse(**request_to_response_dict(req))
+        if sync_appointment and req.appointment_id:
+            sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
+            if commit:
+                self.db.commit()
+        return RadPrescriptionRequestResponse(**request_to_response_dict(req, self.db))
 
 
 class MarkRadRequestItemUnavailableAction:
@@ -451,7 +483,7 @@ class MarkRadRequestItemUnavailableAction:
         if req.appointment_id:
             sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
             self.db.commit()
-        return RadPrescriptionRequestResponse(**request_to_response_dict(req))
+        return RadPrescriptionRequestResponse(**request_to_response_dict(req, self.db))
 
 
 class CancelOrderAction:
@@ -507,15 +539,17 @@ class ScheduleOrderAction:
         if order.status in {RadiologyOrderStatus.cancelled, RadiologyOrderStatus.completed}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot schedule this order")
 
-        # Enforce financial clearance
+        # Enforce financial clearance (with emergency STAT override)
         from modules.billing.entities.billing_entities import BillingSourceType
         from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+        is_stat = bool(order.clinical_notes and "STAT" in order.clinical_notes.upper())
         assert_service_financially_cleared(
             self.db,
             self.hospital_id,
             BillingSourceType.radiology,
             order.id,
             action_description="schedule scan",
+            is_emergency_override=is_stat,
         )
 
         order.scheduled_at = payload.scheduled_at
@@ -663,7 +697,7 @@ class UploadReportAction:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scan image is required")
 
         # FLAW-009: Diagnostic immutability & amendment tracking
-        is_prior_completed = order.status == RadiologyOrderStatus.completed or bool(order.findings or order.impression)
+        is_prior_completed = bool(order.findings or order.impression)
         if is_prior_completed:
             if not payload.amendment_reason or not payload.amendment_reason.strip():
                 raise HTTPException(

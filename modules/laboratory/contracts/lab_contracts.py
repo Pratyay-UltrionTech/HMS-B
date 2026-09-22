@@ -143,6 +143,9 @@ class LabPrescriptionRequestResponse(BaseModel):
     test_count: int = 0
     pending_test_count: int = 0
     appointment_label: str | None = None
+    is_financially_cleared: bool = False
+    payment_status: str = "pending"
+    outstanding_amount: float = 0.0
     items: list[LabPrescriptionRequestItemResponse] = []
 
     model_config = ConfigDict(from_attributes=True)

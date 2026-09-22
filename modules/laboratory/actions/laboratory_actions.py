@@ -22,6 +22,7 @@ from modules.billing.entities.billing_entities import BillingSourceType
 from modules.billing.services.billing_service import (
     cancel_charge_for_source,
     ensure_charge,
+    find_charge_by_source,
 )
 from modules.clinical_records.entities.clinical_record import Prescription
 from modules.doctors.entities.doctor import HospitalUser
@@ -70,13 +71,16 @@ from modules.laboratory.services.lab_panels_service import (
     resolve_lab_selection,
 )
 from modules.laboratory.services.lab_prescription_service import (
+    apply_cancel_lab_prescription_request,
     assert_request_fulfillable,
     get_prescription_request,
+    is_lab_request_released,
     request_to_response_dict,
     sync_request_after_order_change,
 )
 from modules.billing.services.service_financial_clearance import (
     assert_service_financially_cleared,
+    check_service_financial_clearance,
 )
 from modules.laboratory.services.lab_report_service import (
     generate_lab_report_html,
@@ -94,10 +98,35 @@ def _actor_role(user: dict) -> str:
     return str(user.get("staff_role_name") or user.get("role") or "")
 
 
-def _order_to_response(order: LabOrder) -> LabOrderResponse:
+def _order_to_response(order: LabOrder, db: Session | None = None) -> LabOrderResponse:
     items = order.items or []
     panel_names = sorted({i.panel_name for i in items if i.panel_name})
     source = getattr(order, "order_source", None) or LabOrderSource.self_requested
+
+    payment_status = "pending"
+    is_financially_cleared = False
+    outstanding_amount = 0.0
+
+    target_db = db or (order._sa_instance_state.session if hasattr(order, "_sa_instance_state") else None)
+    if target_db:
+        try:
+            fin = check_service_financial_clearance(
+                target_db,
+                order.hospital_id,
+                BillingSourceType.laboratory,
+                order.id,
+            )
+            payment_status = fin.status
+            is_stat = bool(
+                getattr(order, "is_emergency", False)
+                or (order.clinical_notes and "STAT" in order.clinical_notes.upper())
+                or (order.collection_remarks and "STAT" in order.collection_remarks.upper())
+            )
+            is_financially_cleared = fin.is_cleared or is_stat
+            outstanding_amount = fin.outstanding_amount
+        except Exception:
+            pass
+
     return LabOrderResponse(
         id=order.id,
         hospital_id=order.hospital_id,
@@ -126,6 +155,8 @@ def _order_to_response(order: LabOrder) -> LabOrderResponse:
         doctor_name=order.doctor.name if order.doctor else None,
         test_names=", ".join(i.test_name for i in items) if items else None,
         panel_names=", ".join(panel_names) if panel_names else None,
+        is_financially_cleared=is_financially_cleared,
+        outstanding_amount=outstanding_amount,
         items=[
             LabOrderItemResponse(
                 id=i.id,
@@ -183,12 +214,13 @@ class GetLabDashboardAction:
             {"id": str(p.id), "panel_code": p.panel_code, "panel_name": p.panel_name, "price": float(p.price or 0)}
             for p in panels[:5]
         ]
-        pending_reqs = self.repo.list_prescription_requests(
+        all_pending_reqs = self.repo.list_prescription_requests(
             status=LabPrescriptionRequestStatus.pending
-        )[:10]
+        )
+        released_reqs = [r for r in all_pending_reqs if is_lab_request_released(self.db, r)]
         pending_req_responses = [
-            LabPrescriptionRequestResponse(**request_to_response_dict(r))
-            for r in pending_reqs
+            LabPrescriptionRequestResponse(**request_to_response_dict(r, self.db))
+            for r in released_reqs[:10]
         ]
 
         return LabDashboardResponse(
@@ -202,7 +234,7 @@ class GetLabDashboardAction:
             tests_count=metrics["tests_count"],
             seeded_tests_estimate=len(STANDARD_LAB_TESTS),
             top_panels=top_panels,
-            pending_doctor_requests=metrics["pending_doctor_requests"],
+            pending_doctor_requests=len(released_reqs),
             doctor_prescribed_orders=metrics["doctor_prescribed_orders"],
             self_requested_orders=metrics["self_requested_orders"],
             pending_requests=pending_req_responses,
@@ -532,6 +564,7 @@ class DeleteLabPanelAction:
 
 class ListLabPrescriptionRequestsAction:
     def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
         self.repo = LaboratoryRepository(db, hospital_id)
 
     def execute(
@@ -539,11 +572,14 @@ class ListLabPrescriptionRequestsAction:
         status: LabPrescriptionRequestStatus | None = None,
         patient_id: UUID | None = None,
         doctor_id: UUID | None = None,
+        released_only: bool | None = None,
     ) -> list[LabPrescriptionRequestResponse]:
         reqs = self.repo.list_prescription_requests(
             status=status, patient_id=patient_id, doctor_id=doctor_id
         )
-        return [LabPrescriptionRequestResponse(**request_to_response_dict(r)) for r in reqs]
+        if released_only is True or (released_only is None and status == LabPrescriptionRequestStatus.pending and not patient_id):
+            reqs = [r for r in reqs if is_lab_request_released(self.db, r)]
+        return [LabPrescriptionRequestResponse(**request_to_response_dict(r, self.db)) for r in reqs]
 
 
 class GetLabPrescriptionRequestAction:
@@ -566,23 +602,24 @@ class CancelLabPrescriptionRequestAction:
         self.hospital_id = hospital_id
         self.repo = LaboratoryRepository(db, hospital_id)
 
-    def execute(self, request_id: UUID, reason: str | None, user: dict) -> LabPrescriptionRequestResponse:
-        req = get_prescription_request(self.db, request_id, self.hospital_id)
-        if req.status == LabPrescriptionRequestStatus.completed:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Completed prescription requests cannot be cancelled",
-            )
-        req.status = LabPrescriptionRequestStatus.cancelled
-        req.cancel_reason = reason.strip() if reason else "Cancelled by staff"
-        for item in req.items or []:
-            if item.status == LabRequestItemStatus.pending:
-                item.status = LabRequestItemStatus.cancelled
-        self.db.commit()
-        if req.appointment_id:
-            sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
+    def execute(
+        self,
+        request_id: UUID,
+        reason: str | None,
+        user: dict,
+        *,
+        commit: bool = True,
+        sync_appointment: bool = True,
+    ) -> LabPrescriptionRequestResponse:
+        req = apply_cancel_lab_prescription_request(self.db, request_id, self.hospital_id, reason)
+        cancel_charge_for_source(self.db, self.hospital_id, BillingSourceType.laboratory, request_id)
+        if commit:
             self.db.commit()
-        return LabPrescriptionRequestResponse(**request_to_response_dict(req))
+        if sync_appointment and req.appointment_id:
+            sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
+            if commit:
+                self.db.commit()
+        return LabPrescriptionRequestResponse(**request_to_response_dict(req, self.db))
 
 
 class MarkLabRequestItemUnavailableAction:
@@ -695,6 +732,18 @@ class CreateLabOrderAction:
                     detail="Doctor-prescribed orders cannot add or change tests; fulfill the prescription as written",
                 )
             fulfill_items = assert_request_fulfillable(self.db, rx_request)
+            is_stat = bool(
+                (rx_request.clinical_notes and "STAT" in rx_request.clinical_notes.upper())
+                or (clinical_notes and "STAT" in clinical_notes.upper())
+            )
+            assert_service_financially_cleared(
+                self.db,
+                self.hospital_id,
+                BillingSourceType.laboratory,
+                rx_request.id,
+                action_description="accession lab order from prescription",
+                is_emergency_override=is_stat,
+            )
             order_source = LabOrderSource.doctor_prescribed
             prescription_id = rx_request.prescription_id
             appointment_id = rx_request.appointment_id or appointment_id
@@ -778,20 +827,30 @@ class CreateLabOrderAction:
             rx_request.lab_order_id = order.id
             rx_request.status = LabPrescriptionRequestStatus.partially_processed
 
-        # Auto-create ledger billing charge
+        # Link or create ledger billing charge
         panel_labels = sorted({row[2] for row in item_rows if row[2]})
         lab_total = round(sum(float(row[6] or 0) for row in item_rows), 2)
         desc_bits = panel_labels or [row[4] for row in item_rows[:3]]
-        ensure_charge(
-            self.db,
-            hospital_id=self.hospital_id,
-            patient_id=patient.id,
-            source_type=BillingSourceType.laboratory,
-            source_id=order.id,
-            description=f"Lab {order.order_no} — {', '.join(desc_bits)}"[:512],
-            charge_amount=lab_total,
-            created_by_name=_actor_name(user),
-        )
+
+        req_charge = None
+        if rx_request:
+            req_charge = find_charge_by_source(self.db, self.hospital_id, BillingSourceType.laboratory, rx_request.id)
+            if req_charge:
+                # Re-point the existing charge to this fulfilled order so order.id owns the paid ledger charge
+                req_charge.source_id = order.id
+                req_charge.description = f"Lab {order.order_no} — {', '.join(desc_bits)}"[:512]
+
+        if not req_charge:
+            ensure_charge(
+                self.db,
+                hospital_id=self.hospital_id,
+                patient_id=patient.id,
+                source_type=BillingSourceType.laboratory,
+                source_id=order.id,
+                description=f"Lab {order.order_no} — {', '.join(desc_bits)}"[:512],
+                charge_amount=lab_total,
+                created_by_name=_actor_name(user),
+            )
 
         self.db.commit()
 
@@ -845,12 +904,20 @@ class CollectSampleAction:
                 detail="Cannot collect sample for this order",
             )
 
+        # Emergency STAT order bypasses financial clearance
+        is_stat = bool(
+            getattr(order, "is_emergency", False)
+            or (order.clinical_notes and "STAT" in order.clinical_notes.upper())
+            or (order.collection_remarks and "STAT" in order.collection_remarks.upper())
+        )
+
         assert_service_financially_cleared(
             self.db,
             self.hospital_id,
             BillingSourceType.laboratory,
             order.id,
             action_description="collect specimen",
+            is_emergency_override=is_stat,
         )
 
         order.collected_at = payload.collected_at or datetime.now(timezone.utc)

@@ -58,6 +58,29 @@ def get_prescription_request(
     return req
 
 
+def apply_cancel_rad_prescription_request(
+    db: Session,
+    request_id: UUID,
+    hospital_id: UUID,
+    reason: str | None,
+) -> RadPrescriptionRequest:
+    """Cancel a radiology prescription request in the current session without committing."""
+    req = get_prescription_request(db, request_id, hospital_id)
+    if req.status == RadPrescriptionRequestStatus.cancelled:
+        return req
+    if req.status == RadPrescriptionRequestStatus.completed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Completed prescription requests cannot be cancelled",
+        )
+    req.status = RadPrescriptionRequestStatus.cancelled
+    req.cancel_reason = reason.strip() if reason else "Cancelled by staff"
+    for item in req.items or []:
+        if item.status == RadRequestItemStatus.pending:
+            item.status = RadRequestItemStatus.cancelled
+    return req
+
+
 def request_scan_summary(req: RadPrescriptionRequest) -> str:
     return ", ".join(i.scan_code for i in (req.items or []))
 
@@ -175,8 +198,38 @@ def sync_request_after_order_change(db: Session, order: RadiologyOrder) -> None:
     req.status = RadPrescriptionRequestStatus.partially_processed
 
 
-def request_to_response_dict(req: RadPrescriptionRequest) -> dict[str, Any]:
+def is_rad_request_released(db: Session, req: RadPrescriptionRequest) -> bool:
+    """Check if a RadPrescriptionRequest is operationally released to the radiology queue."""
+    if req.status == RadPrescriptionRequestStatus.cancelled:
+        return False
+    is_stat = bool(req.clinical_notes and "STAT" in req.clinical_notes.upper())
+    if is_stat:
+        return True
+    from modules.billing.entities.billing_entities import BillingSourceType
+    from modules.billing.services.service_financial_clearance import check_service_financial_clearance
+    fin = check_service_financial_clearance(db, req.hospital_id, BillingSourceType.radiology, req.id)
+    return fin.is_cleared
+
+
+def request_to_response_dict(req: RadPrescriptionRequest, db: Session | None = None) -> dict[str, Any]:
     items = sorted(req.items or [], key=lambda i: (i.sort_order, str(i.id)))
+    payment_status = "pending"
+    is_financially_cleared = False
+    outstanding_amount = 0.0
+
+    target_db = db or (req._sa_instance_state.session if hasattr(req, "_sa_instance_state") else None)
+    if target_db:
+        try:
+            from modules.billing.entities.billing_entities import BillingSourceType
+            from modules.billing.services.service_financial_clearance import check_service_financial_clearance
+            fin = check_service_financial_clearance(target_db, req.hospital_id, BillingSourceType.radiology, req.id)
+            payment_status = fin.status
+            is_stat = bool(req.clinical_notes and "STAT" in req.clinical_notes.upper())
+            is_financially_cleared = fin.is_cleared or is_stat
+            outstanding_amount = fin.outstanding_amount
+        except Exception:
+            pass
+
     return {
         "id": req.id,
         "hospital_id": req.hospital_id,
@@ -199,6 +252,9 @@ def request_to_response_dict(req: RadPrescriptionRequest) -> dict[str, Any]:
             [i for i in items if i.status == RadRequestItemStatus.pending]
         ),
         "appointment_label": None,
+        "is_financially_cleared": is_financially_cleared,
+        "payment_status": payment_status,
+        "outstanding_amount": outstanding_amount,
         "items": [
             {
                 "id": i.id,

@@ -103,7 +103,7 @@ def rad_client(rad_db):
             "sub": str(user_id),
             "hospital_id": str(hospital_id),
             "name": "Dr. Rad Staff",
-            "role": "doctor",
+            "role": "hospital_admin",
             "staff_role_name": "Senior Radiologist",
         }
 

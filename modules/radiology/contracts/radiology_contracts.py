@@ -105,6 +105,9 @@ class RadPrescriptionRequestResponse(BaseModel):
     scan_count: int = 0
     pending_scan_count: int = 0
     appointment_label: str | None = None
+    is_financially_cleared: bool = False
+    payment_status: str = "pending"
+    outstanding_amount: float = 0.0
     items: list[RadPrescriptionRequestItemResponse] = []
 
     model_config = ConfigDict(from_attributes=True)

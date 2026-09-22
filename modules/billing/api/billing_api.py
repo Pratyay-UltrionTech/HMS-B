@@ -16,24 +16,33 @@ from sqlalchemy.orm import Session
 
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.billing.actions.billing_actions import (
+    AllocateDepositAction,
     CancelChargeAction,
     CancelInvoiceAction,
     CancelReceiptAction,
+    CloseFinancialAccountAction,
     CreateChargeAction,
+    CreateDepositAction,
+    CreateFinancialAccountAction,
     CreateInvoiceAction,
     CreatePaymentAction,
     CreateReceiptAction,
+    CreateRefundAction,
     GetBillingDashboardAction,
     GetInvoiceAction,
     GetPatientLedgerAction,
     GetPatientSummaryAction,
     GetReceiptAction,
     ListChargesAction,
+    ListDepositsAction,
+    ListFinancialAccountsAction,
     ListInvoicesAction,
     ListPaymentsAction,
     ListReceiptsAction,
+    ListRefundsAction,
     PrintInvoiceAction,
     PrintReceiptAction,
+    PrintRefundAction,
     UpdateChargeAction,
 )
 from modules.billing.contracts.billing_contracts import (
@@ -41,12 +50,19 @@ from modules.billing.contracts.billing_contracts import (
     BillingChargeResponse,
     BillingChargeUpdate,
     BillingDashboardResponse,
+    BillingDepositAllocate,
+    BillingDepositCreate,
+    BillingDepositResponse,
     BillingInvoiceCreate,
     BillingInvoiceResponse,
     BillingPaymentCreate,
     BillingPaymentResponse,
     BillingReceiptCreate,
     BillingReceiptResponse,
+    BillingRefundCreate,
+    BillingRefundResponse,
+    FinancialAccountCreate,
+    FinancialAccountResponse,
     PatientFinancialSummary,
     PatientLedgerResponse,
 )
@@ -55,6 +71,10 @@ from modules.billing.entities.billing_entities import (
     BillingInvoiceStatus,
     BillingPaymentMethod,
     BillingSourceType,
+    DepositStatus,
+    FinancialAccountStatus,
+    FinancialAccountType,
+    RefundStatus,
 )
 from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
 
@@ -344,3 +364,130 @@ def get_patient_financial_summary(
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PatientFinancialSummary:
     return GetPatientSummaryAction(db, hospital_id).execute(patient_id)
+
+
+# ── Financial Accounts ──────────────────────────────────────────────────────
+
+@router.get("/accounts", response_model=list[FinancialAccountResponse])
+def list_financial_accounts(
+    patient_id: UUID | None = Query(default=None),
+    status_filter: FinancialAccountStatus | None = Query(default=None, alias="status"),
+    account_type: FinancialAccountType | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> list[FinancialAccountResponse]:
+    return ListFinancialAccountsAction(db, hospital_id).execute(
+        patient_id=patient_id, status=status_filter, account_type=account_type, limit=limit, offset=offset
+    )
+
+
+@router.post("/accounts", response_model=FinancialAccountResponse, status_code=status.HTTP_201_CREATED)
+def create_financial_account(
+    payload: FinancialAccountCreate,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_permission("billing", "edit")),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> FinancialAccountResponse:
+    return CreateFinancialAccountAction(db, hospital_id).execute(payload, user)
+
+
+@router.post("/accounts/{account_id}/close", response_model=FinancialAccountResponse)
+def close_financial_account_route(
+    account_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_permission("billing", "edit")),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> FinancialAccountResponse:
+    return CloseFinancialAccountAction(db, hospital_id).execute(account_id, user)
+
+
+# ── Advance Deposits ────────────────────────────────────────────────────────
+
+@router.get("/deposits", response_model=list[BillingDepositResponse])
+def list_deposits(
+    patient_id: UUID | None = Query(default=None),
+    account_id: UUID | None = Query(default=None),
+    status_filter: DepositStatus | None = Query(default=None, alias="status"),
+    from_date: date | None = Query(default=None),
+    to_date: date | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> list[BillingDepositResponse]:
+    return ListDepositsAction(db, hospital_id).execute(
+        patient_id=patient_id,
+        account_id=account_id,
+        status=status_filter,
+        from_date=from_date,
+        to_date=to_date,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/deposits", response_model=BillingDepositResponse, status_code=status.HTTP_201_CREATED)
+def create_deposit(
+    payload: BillingDepositCreate,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_permission("billing", "create")),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> BillingDepositResponse:
+    return CreateDepositAction(db, hospital_id).execute(payload, user)
+
+
+@router.post("/deposits/{deposit_id}/allocate", response_model=BillingDepositResponse)
+def allocate_deposit(
+    deposit_id: UUID,
+    payload: BillingDepositAllocate,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_permission("billing", "create")),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> BillingDepositResponse:
+    return AllocateDepositAction(db, hospital_id).execute(deposit_id, payload, user)
+
+
+# ── Refunds ─────────────────────────────────────────────────────────────────
+
+@router.get("/refunds", response_model=list[BillingRefundResponse])
+def list_refunds(
+    patient_id: UUID | None = Query(default=None),
+    status_filter: RefundStatus | None = Query(default=None, alias="status"),
+    from_date: date | None = Query(default=None),
+    to_date: date | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> list[BillingRefundResponse]:
+    return ListRefundsAction(db, hospital_id).execute(
+        patient_id=patient_id, status=status_filter, from_date=from_date, to_date=to_date, limit=limit, offset=offset
+    )
+
+
+@router.post("/refunds", response_model=BillingRefundResponse, status_code=status.HTTP_201_CREATED)
+def create_refund(
+    payload: BillingRefundCreate,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_permission("billing", "refund")),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> BillingRefundResponse:
+    return CreateRefundAction(db, hospital_id).execute(payload, user)
+
+
+@router.get("/refunds/{refund_id}/print", response_class=StreamingResponse)
+def print_refund_voucher(
+    refund_id: UUID,
+    download: bool = Query(default=False),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> StreamingResponse:
+    html = PrintRefundAction(db, hospital_id).execute(refund_id, auto_print=not download)
+    return _html_response(html, f"refund_{refund_id}.html", download=download)
+

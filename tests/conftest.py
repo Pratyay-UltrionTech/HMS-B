@@ -126,11 +126,14 @@ def db_session() -> Generator[Session, None, None]:
 @pytest.fixture(scope="function")
 def app(db_session: Session) -> FastAPI:
     """
-    Constructs an isolated FastAPI application mounting the unmodified vitals router.
+    Constructs an isolated FastAPI application mounting test routers.
     No lifespan context is executed, guaranteeing zero background loops and zero Azure calls.
     """
-    test_app = FastAPI(title="HMS Vitals Baseline Test App")
-    test_app.include_router(vitals.router, prefix="/api")
+    from modules.admin.api.admin_api import router as admin_router
+
+    test_app = FastAPI(title="HMS Isolated Test App")
+    test_app.include_router(vitals, prefix="/api")
+    test_app.include_router(admin_router, prefix="/api")
 
     def _override_get_db():
         yield db_session

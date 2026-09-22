@@ -53,7 +53,6 @@ from modules.radiology.entities.radiology_entities import (
 )
 from modules.radiology.services.radiology_service import (
     generate_radiology_report_html,
-    generate_radiology_report_pdf,
     stream_radiology_file,
 )
 from modules.tenancy.entities.hospital import Hospital
@@ -137,12 +136,13 @@ def list_prescription_requests(
     status: RadPrescriptionRequestStatus | None = Query(default=None),
     patient_id: UUID | None = Query(default=None),
     doctor_id: UUID | None = Query(default=None),
+    released_only: bool | None = Query(default=None),
     db: Session = Depends(get_transitional_sync_session),
     _: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[RadPrescriptionRequestResponse]:
     return ListRadPrescriptionRequestsAction(db, hospital_id).execute(
-        status=status, patient_id=patient_id, doctor_id=doctor_id
+        status=status, patient_id=patient_id, doctor_id=doctor_id, released_only=released_only
     )
 
 
@@ -267,7 +267,7 @@ def complete_scan(
     return CompleteScanAction(db, hospital_id, user).execute(order_id)
 
 
-@router.post("/orders/{order_id}/report", response_model=RadOrderResponse, dependencies=[Depends(require_permission("radiology", "edit"))])
+@router.post("/orders/{order_id}/report", response_model=RadOrderResponse, dependencies=[Depends(require_permission("radiology", "release"))])
 def upload_report(
     order_id: UUID,
     payload: RadReportRequest,
@@ -312,43 +312,6 @@ def report_html(
         BytesIO(html.encode("utf-8")),
         media_type="text/html",
         headers={"Content-Disposition": f'inline; filename="{order.order_no}-radiology.html"'},
-    )
-
-
-@router.get("/orders/{order_id}/report/pdf")
-def report_pdf(
-    order_id: UUID,
-    db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
-    hospital_id: UUID = Depends(get_hospital_context),
-) -> StreamingResponse:
-    repo = RadiologyRepository(db, hospital_id)
-    order = repo.get_order(order_id)
-    if not order:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
-
-    from modules.billing.entities.billing_entities import BillingSourceType
-    from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-    assert_service_financially_cleared(
-        db,
-        hospital_id,
-        BillingSourceType.radiology,
-        order.id,
-        action_description="download radiology report PDF",
-    )
-
-    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
-    pdf = generate_radiology_report_pdf(
-        order,
-        hospital.name if hospital else None,
-        hospital.address if hospital else None,
-        hospital.phone if hospital else None,
-        hospital.email if hospital else None,
-    )
-    return StreamingResponse(
-        BytesIO(pdf),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{order.order_no}-radiology-report.pdf"'},
     )
 
 

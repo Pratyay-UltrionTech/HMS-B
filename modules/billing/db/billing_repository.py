@@ -15,14 +15,22 @@ from sqlalchemy.orm import Session, joinedload
 from modules.billing.entities.billing_entities import (
     BillingCharge,
     BillingChargeStatus,
+    BillingDeposit,
     BillingInvoice,
     BillingInvoiceLine,
     BillingInvoiceStatus,
     BillingPayment,
+    BillingPaymentAllocation,
     BillingPaymentMethod,
     BillingReceipt,
     BillingReceiptStatus,
+    BillingRefund,
     BillingSourceType,
+    DepositStatus,
+    FinancialAccount,
+    FinancialAccountStatus,
+    FinancialAccountType,
+    RefundStatus,
 )
 from modules.patients.entities.patient import Patient
 
@@ -204,4 +212,135 @@ class BillingRepository:
             .options(joinedload(BillingReceipt.patient))
             .filter(BillingReceipt.id == receipt_id, BillingReceipt.hospital_id == self.hospital_id)
             .first()
+        )
+
+    # ── Financial Accounts ──────────────────────────────────────────────────
+
+    def list_accounts(
+        self,
+        *,
+        patient_id: UUID | None = None,
+        status: FinancialAccountStatus | None = None,
+        account_type: FinancialAccountType | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[FinancialAccount]:
+        q = (
+            self.db.query(FinancialAccount)
+            .options(joinedload(FinancialAccount.patient))
+            .filter(FinancialAccount.hospital_id == self.hospital_id)
+        )
+        if patient_id:
+            q = q.filter(FinancialAccount.patient_id == patient_id)
+        if status:
+            q = q.filter(FinancialAccount.status == status)
+        if account_type:
+            q = q.filter(FinancialAccount.account_type == account_type)
+        return q.order_by(FinancialAccount.opened_at.desc()).limit(limit).offset(offset).all()
+
+    def get_account_by_id(self, account_id: UUID) -> FinancialAccount | None:
+        return (
+            self.db.query(FinancialAccount)
+            .options(joinedload(FinancialAccount.patient))
+            .filter(FinancialAccount.id == account_id, FinancialAccount.hospital_id == self.hospital_id)
+            .first()
+        )
+
+    # ── Deposits ────────────────────────────────────────────────────────────
+
+    def list_deposits(
+        self,
+        *,
+        patient_id: UUID | None = None,
+        account_id: UUID | None = None,
+        status: DepositStatus | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[BillingDeposit]:
+        q = (
+            self.db.query(BillingDeposit)
+            .options(joinedload(BillingDeposit.patient))
+            .filter(BillingDeposit.hospital_id == self.hospital_id)
+        )
+        if patient_id:
+            q = q.filter(BillingDeposit.patient_id == patient_id)
+        if account_id:
+            q = q.filter(BillingDeposit.account_id == account_id)
+        if status:
+            q = q.filter(BillingDeposit.status == status)
+        if from_date:
+            q = q.filter(BillingDeposit.deposit_date >= from_date)
+        if to_date:
+            q = q.filter(BillingDeposit.deposit_date <= to_date)
+        return q.order_by(BillingDeposit.created_at.desc()).limit(limit).offset(offset).all()
+
+    def get_deposit_by_id(self, deposit_id: UUID) -> BillingDeposit | None:
+        return (
+            self.db.query(BillingDeposit)
+            .options(joinedload(BillingDeposit.patient))
+            .filter(BillingDeposit.id == deposit_id, BillingDeposit.hospital_id == self.hospital_id)
+            .first()
+        )
+
+    # ── Refunds ─────────────────────────────────────────────────────────────
+
+    def list_refunds(
+        self,
+        *,
+        patient_id: UUID | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        status: RefundStatus | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[BillingRefund]:
+        q = (
+            self.db.query(BillingRefund)
+            .options(joinedload(BillingRefund.patient))
+            .filter(BillingRefund.hospital_id == self.hospital_id)
+        )
+        if patient_id:
+            q = q.filter(BillingRefund.patient_id == patient_id)
+        if status:
+            q = q.filter(BillingRefund.status == status)
+        if from_date:
+            q = q.filter(BillingRefund.refund_date >= from_date)
+        if to_date:
+            q = q.filter(BillingRefund.refund_date <= to_date)
+        return q.order_by(BillingRefund.created_at.desc()).limit(limit).offset(offset).all()
+
+    def get_refund_by_id(self, refund_id: UUID) -> BillingRefund | None:
+        return (
+            self.db.query(BillingRefund)
+            .options(joinedload(BillingRefund.patient))
+            .filter(BillingRefund.id == refund_id, BillingRefund.hospital_id == self.hospital_id)
+            .first()
+        )
+
+    # ── Allocations ─────────────────────────────────────────────────────────
+
+    def list_allocations_for_payment(self, payment_id: UUID) -> list[BillingPaymentAllocation]:
+        return (
+            self.db.query(BillingPaymentAllocation)
+            .options(joinedload(BillingPaymentAllocation.charge))
+            .filter(
+                BillingPaymentAllocation.hospital_id == self.hospital_id,
+                BillingPaymentAllocation.payment_id == payment_id,
+            )
+            .order_by(BillingPaymentAllocation.created_at.asc())
+            .all()
+        )
+
+    def list_allocations_for_deposit(self, deposit_id: UUID) -> list[BillingPaymentAllocation]:
+        return (
+            self.db.query(BillingPaymentAllocation)
+            .options(joinedload(BillingPaymentAllocation.charge))
+            .filter(
+                BillingPaymentAllocation.hospital_id == self.hospital_id,
+                BillingPaymentAllocation.deposit_id == deposit_id,
+            )
+            .order_by(BillingPaymentAllocation.created_at.asc())
+            .all()
         )
