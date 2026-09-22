@@ -426,6 +426,216 @@ class StartSurgeryAction:
         return surgery_to_response(self.repo.get_surgery(surgery_id))
 
 
+def sync_ot_icu_transfer(
+    db: Session,
+    hospital_id: UUID,
+    surgery: OtSurgery,
+    actor: dict[str, Any],
+    target_ward_id: UUID | None = None,
+    target_bed_id: UUID | None = None,
+    ventilator_mode: str | None = None,
+    peep: float | None = None,
+    fio2_percent: float | None = None,
+    icu_notes: str | None = None,
+) -> None:
+    """Synchronize post-operative patient transfer to ICU ward, bed, and ICU profile."""
+    shifted = (surgery.shifted_to or "").strip().lower()
+    if not ("icu" in shifted or "intensive" in shifted or "critical" in shifted):
+        return
+
+    import uuid
+    from sqlalchemy import func, or_
+    from modules.beds.entities.bed import Bed, Room, Ward, WardType
+    from modules.critical_care.entities.critical_care_entities import IcuPatientProfile
+    from modules.inpatient.entities.admission import Admission, AdmissionStatus, BedStaySegment
+    from modules.inpatient.services.inpatient_billing_service import next_ip_encounter_id
+
+    # 1. Resolve Bed
+    bed = None
+    if target_bed_id:
+        bed = (
+            db.query(Bed)
+            .filter(Bed.id == target_bed_id, Bed.hospital_id == hospital_id)
+            .first()
+        )
+
+    if not bed:
+        # Find an unoccupied bed in an ICU ward
+        bed = (
+            db.query(Bed)
+            .join(Bed.ward)
+            .filter(
+                Bed.hospital_id == hospital_id,
+                Bed.is_occupied == False,
+                or_(
+                    Ward.ward_type == WardType.icu,
+                    func.lower(Ward.name).like("%icu%"),
+                    func.lower(Ward.name).like("%intensive%"),
+                    func.lower(Ward.name).like("%critical%"),
+                ),
+            )
+            .first()
+        )
+
+    # If all ICU beds are occupied or none exist, find or create an ICU ward & bed
+    if not bed:
+        icu_ward = (
+            db.query(Ward)
+            .filter(
+                Ward.hospital_id == hospital_id,
+                or_(
+                    Ward.ward_type == WardType.icu,
+                    func.lower(Ward.name).like("%icu%"),
+                    func.lower(Ward.name).like("%intensive%"),
+                    func.lower(Ward.name).like("%critical%"),
+                ),
+            )
+            .first()
+        )
+        if not icu_ward:
+            icu_ward = Ward(
+                id=uuid.uuid4(),
+                hospital_id=hospital_id,
+                name="Main ICU",
+                ward_type=WardType.icu,
+            )
+            db.add(icu_ward)
+            db.flush()
+
+        room = db.query(Room).filter(Room.ward_id == icu_ward.id, Room.hospital_id == hospital_id).first()
+        if not room:
+            room = Room(
+                id=uuid.uuid4(),
+                hospital_id=hospital_id,
+                ward_id=icu_ward.id,
+                room_code="ICU-101",
+                name="Intensive Care Room 1",
+            )
+            db.add(room)
+            db.flush()
+
+        bed = db.query(Bed).filter(Bed.room_id == room.id, Bed.hospital_id == hospital_id).first()
+        if not bed:
+            bed = Bed(
+                id=uuid.uuid4(),
+                hospital_id=hospital_id,
+                ward_id=icu_ward.id,
+                room_id=room.id,
+                bed_code="ICU-01",
+                is_occupied=False,
+            )
+            db.add(bed)
+            db.flush()
+
+    # 2. Check for active admission
+    adm = (
+        db.query(Admission)
+        .filter(
+            Admission.patient_id == surgery.patient_id,
+            Admission.hospital_id == hospital_id,
+            Admission.status == AdmissionStatus.admitted,
+        )
+        .first()
+    )
+
+    now = datetime.now(timezone.utc)
+    if adm:
+        # Patient is already an active inpatient: transfer bed to ICU
+        if adm.bed and adm.bed.id != bed.id:
+            adm.bed.is_occupied = False
+        adm.ward_id = bed.ward_id
+        adm.room_id = bed.room_id
+        adm.bed_id = bed.id
+        bed.is_occupied = True
+        segment = BedStaySegment(
+            hospital_id=hospital_id,
+            admission_id=adm.id,
+            ward_id=bed.ward_id,
+            room_id=bed.room_id,
+            bed_id=bed.id,
+            rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
+            started_at=now,
+            ended_at=None,
+        )
+        db.add(segment)
+    else:
+        # Patient was an outpatient / emergency case: create new ICU admission
+        ip_id = next_ip_encounter_id(db, hospital_id)
+        adm = Admission(
+            hospital_id=hospital_id,
+            patient_id=surgery.patient_id,
+            ward_id=bed.ward_id,
+            room_id=bed.room_id,
+            bed_id=bed.id,
+            doctor_id=surgery.surgeon_id,
+            status=AdmissionStatus.admitted,
+            ip_id=ip_id,
+            notes=icu_notes or f"Transferred from OT post-surgery: {surgery.procedure_performed or surgery.surgery_type}",
+            admitted_at=now,
+        )
+        bed.is_occupied = True
+        db.add(adm)
+        db.flush()
+
+        segment = BedStaySegment(
+            hospital_id=hospital_id,
+            admission_id=adm.id,
+            ward_id=bed.ward_id,
+            room_id=bed.room_id,
+            bed_id=bed.id,
+            rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
+            started_at=now,
+            ended_at=None,
+        )
+        db.add(segment)
+
+    # 3. Create or update ICU Patient Profile
+    profile = (
+        db.query(IcuPatientProfile)
+        .filter(
+            IcuPatientProfile.admission_id == adm.id,
+            IcuPatientProfile.hospital_id == hospital_id,
+        )
+        .first()
+    )
+    v_mode = ventilator_mode or "Post-Op Recovery"
+    if not profile:
+        profile = IcuPatientProfile(
+            hospital_id=hospital_id,
+            admission_id=adm.id,
+            patient_id=surgery.patient_id,
+            ventilator_mode=v_mode,
+            peep=peep or 5.0,
+            fio2_percent=fio2_percent or 40.0,
+            invasive_line_days={"ett": 1, "arterial_line": 1, "foley": 1},
+            inotrope_support=False,
+            care_indicators={
+                "source": "OT Post-Op Handover",
+                "surgery_no": surgery.surgery_no,
+                "procedure": surgery.procedure_performed or surgery.surgery_type,
+                "acuity": "critical" if "vent" in v_mode.lower() else "high",
+            },
+        )
+        db.add(profile)
+    else:
+        if ventilator_mode:
+            profile.ventilator_mode = ventilator_mode
+        if peep is not None:
+            profile.peep = peep
+        if fio2_percent is not None:
+            profile.fio2_percent = fio2_percent
+
+    write_audit_log(
+        db,
+        hospital_id=hospital_id,
+        actor=actor,
+        action="transfer_icu",
+        entity_type="admission",
+        entity_id=adm.id,
+        summary=f"Transferred patient from OT ({surgery.surgery_no}) to ICU Bed {bed.bed_code}",
+    )
+
+
 class CompleteSurgeryAction:
     def __init__(self, db: Session, hospital_id: UUID, user: dict[str, Any]) -> None:
         self.db = db
@@ -453,15 +663,33 @@ class CompleteSurgeryAction:
 
         item.status = OtSurgeryStatus.completed
         item.completed_at = now
+        started = item.started_at
+        if started and started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+
         if payload:
             if payload.shifted_to:
                 item.shifted_to = payload.shifted_to.strip()
             if payload.actual_duration_minutes:
                 item.actual_duration_minutes = payload.actual_duration_minutes
-            elif item.started_at:
-                item.actual_duration_minutes = max(1, int((now - item.started_at).total_seconds() // 60))
-        elif item.started_at:
-            item.actual_duration_minutes = max(1, int((now - item.started_at).total_seconds() // 60))
+            elif started:
+                item.actual_duration_minutes = max(1, int((now - started).total_seconds() // 60))
+        elif started:
+            item.actual_duration_minutes = max(1, int((now - started).total_seconds() // 60))
+
+        if payload and payload.shifted_to:
+            sync_ot_icu_transfer(
+                self.db,
+                self.hospital_id,
+                item,
+                self.user,
+                target_ward_id=payload.target_ward_id,
+                target_bed_id=payload.target_bed_id,
+                ventilator_mode=payload.ventilator_mode,
+                peep=payload.peep,
+                fio2_percent=payload.fio2_percent,
+                icu_notes=payload.icu_notes,
+            )
 
         write_audit_log(
             self.db,
@@ -556,6 +784,13 @@ class SaveNotesAction:
             summary=f"Saved operation notes for {item.surgery_no}",
         )
         sync_ot_surgery_medical_record(self.db, item)
+        if payload.shifted_to:
+            sync_ot_icu_transfer(
+                self.db,
+                self.hospital_id,
+                item,
+                self.user,
+            )
         self.db.commit()
 
         return surgery_to_response(self.repo.get_surgery(surgery_id))

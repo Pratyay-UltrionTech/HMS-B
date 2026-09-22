@@ -53,22 +53,56 @@ class CriticalCareRepository:
         return f"{prefix}{seq + 1:05d}"
 
     def get_active_icu_admissions(self) -> list[Admission]:
-        """Fetch all currently admitted patients in wards of type 'icu'."""
+        """Fetch all currently admitted patients in wards of type 'icu' or with ICU profile."""
+        from sqlalchemy import or_
         return (
             self.db.query(Admission)
             .join(Admission.ward)
             .options(
                 joinedload(Admission.patient),
                 joinedload(Admission.ward),
+                joinedload(Admission.room),
                 joinedload(Admission.bed),
                 joinedload(Admission.doctor),
             )
             .filter(
                 Admission.hospital_id == self.hospital_id,
                 Admission.status == AdmissionStatus.admitted,
-                Ward.ward_type == WardType.icu,
+                or_(
+                    Ward.ward_type == WardType.icu,
+                    func.lower(Ward.name).like("%icu%"),
+                    func.lower(Ward.name).like("%intensive%"),
+                    func.lower(Ward.name).like("%critical%"),
+                    Admission.id.in_(
+                        self.db.query(IcuPatientProfile.admission_id).filter(
+                            IcuPatientProfile.hospital_id == self.hospital_id
+                        )
+                    ),
+                ),
             )
             .order_by(Admission.admitted_at.asc())
+            .all()
+        )
+
+    def list_available_icu_beds(self):
+        """List available (unoccupied) beds located in ICU wards."""
+        from sqlalchemy import or_
+        from modules.beds.entities.bed import Bed
+        return (
+            self.db.query(Bed)
+            .join(Bed.ward)
+            .options(joinedload(Bed.ward), joinedload(Bed.room))
+            .filter(
+                Bed.hospital_id == self.hospital_id,
+                Bed.is_occupied == False,
+                or_(
+                    Ward.ward_type == WardType.icu,
+                    func.lower(Ward.name).like("%icu%"),
+                    func.lower(Ward.name).like("%intensive%"),
+                    func.lower(Ward.name).like("%critical%"),
+                ),
+            )
+            .order_by(Bed.bed_code.asc())
             .all()
         )
 

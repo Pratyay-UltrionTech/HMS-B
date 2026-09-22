@@ -162,7 +162,7 @@ def ot_client(ot_db):
             "sub": str(surgeon_id),
             "hospital_id": str(hospital_id),
             "name": "Dr. Arjun Roy",
-            "role": "doctor",
+            "role": "hospital_admin",
             "staff_role_name": "Chief Surgeon",
         }
 

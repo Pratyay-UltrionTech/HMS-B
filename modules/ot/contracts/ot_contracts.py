@@ -55,6 +55,12 @@ class OtRescheduleRequest(BaseModel):
 class OtCompleteRequest(BaseModel):
     shifted_to: str | None = Field(default=None, max_length=64)
     actual_duration_minutes: int | None = Field(default=None, ge=1, le=1440)
+    target_ward_id: UUID | None = None
+    target_bed_id: UUID | None = None
+    ventilator_mode: str | None = None
+    peep: float | None = None
+    fio2_percent: float | None = None
+    icu_notes: str | None = None
 
 
 class OtNotesRequest(BaseModel):

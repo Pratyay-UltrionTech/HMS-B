@@ -30,6 +30,7 @@ class IcuBoardPatientResponse(BaseModel):
     patient_gender: str | None
     ward_name: str
     bed_code: str
+    room_code: str | None = None
     attending_doctor_name: str | None
     length_of_stay_days: int
     ventilator_mode: str | None
@@ -39,10 +40,62 @@ class IcuBoardPatientResponse(BaseModel):
     inotrope_support: bool
     inotrope_details: str | None
     gcs_score: int | None
+    sofa_score: int | None = None
+    care_indicators: dict | None = None
+    diagnosis: str | None = None
     latest_heart_rate: float | None
     latest_spo2: float | None
     latest_map: float | None
     latest_hourly_balance_ml: float | None
+
+
+class IcuAvailableBedResponse(BaseModel):
+    bed_id: UUID
+    bed_code: str
+    room_id: UUID
+    room_code: str
+    ward_id: UUID
+    ward_name: str
+    is_occupied: bool
+
+
+class IcuAdmitRequest(BaseModel):
+    patient_id: UUID
+    ward_id: UUID
+    bed_id: UUID
+    doctor_id: UUID | None = None
+    diagnosis: str | None = None
+    acuity: str | None = "high"
+    ventilator_mode: str | None = None
+    peep: float | None = None
+    fio2_percent: float | None = None
+    gcs_score: int | None = None
+    inotrope_support: bool = False
+    inotrope_details: str | None = None
+    invasive_lines: dict | None = None
+    notes: str | None = None
+
+
+class IcuTransferRequest(BaseModel):
+    admission_id: UUID
+    to_ward_id: UUID
+    to_bed_id: UUID
+    transfer_reason: str | None = None
+    acuity: str | None = "high"
+    ventilator_mode: str | None = None
+    peep: float | None = None
+    fio2_percent: float | None = None
+    gcs_score: int | None = None
+    inotrope_support: bool = False
+    inotrope_details: str | None = None
+    invasive_lines: dict | None = None
+
+
+class IcuStepDownRequest(BaseModel):
+    admission_id: UUID
+    to_ward_id: UUID
+    to_bed_id: UUID
+    step_down_notes: str | None = None
 
 
 class IcuProfileUpdate(BaseModel):

@@ -35,7 +35,10 @@ from modules.critical_care.actions.flowsheet_actions import (
     RecordIcuFlowsheetAction,
 )
 from modules.critical_care.actions.icu_board_actions import (
+    AdmitToIcuAction,
     GetIcuBoardAction,
+    StepDownIcuAction,
+    TransferToIcuAction,
     UpdateIcuProfileAction,
 )
 from modules.critical_care.contracts.critical_care_contracts import (
@@ -47,26 +50,89 @@ from modules.critical_care.contracts.critical_care_contracts import (
     DeteriorationAlertAcknowledgeRequest,
     DeteriorationAlertCalculateRequest,
     DeteriorationAlertResponse,
+    IcuAdmitRequest,
+    IcuAvailableBedResponse,
     IcuBoardPatientResponse,
     IcuFlowsheetCreate,
     IcuFlowsheetResponse,
     IcuProfileUpdate,
+    IcuStepDownRequest,
+    IcuTransferRequest,
 )
 from modules.critical_care.db.critical_care_repository import CriticalCareRepository
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_permission
 
 router = APIRouter(prefix="/critical-care", tags=["critical-care"])
 
 
-# --- Feature 6: ICU Patient Board ---
+# --- Feature 6: ICU Patient Board & Admission/Transfer ---
 @router.get("/icu-board", response_model=list[IcuBoardPatientResponse])
 def get_icu_board(
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("critical_care", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Retrieve live intensivist ICU patient dashboard."""
     return GetIcuBoardAction(db, hospital_id).execute()
+
+
+@router.get("/available-beds", response_model=list[IcuAvailableBedResponse])
+def list_available_icu_beds(
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict[str, Any] = Depends(require_permission("critical_care", "view")),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """List unoccupied beds in ICU wards for direct admission or transfer."""
+    beds = CriticalCareRepository(db, hospital_id).list_available_icu_beds()
+    return [
+        IcuAvailableBedResponse(
+            bed_id=b.id,
+            bed_code=b.bed_code,
+            room_id=b.room_id,
+            room_code=b.room.room_code if b.room else "",
+            ward_id=b.ward_id,
+            ward_name=b.ward.name if b.ward else "ICU",
+            is_occupied=b.is_occupied,
+        )
+        for b in beds
+    ]
+
+
+@router.post(
+    "/admit",
+    response_model=IcuBoardPatientResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def admit_to_icu(
+    payload: IcuAdmitRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Directly admit a registered patient into an ICU bed and initialize ICU profile."""
+    return AdmitToIcuAction(db, hospital_id).execute(payload, user)
+
+
+@router.post("/transfer", response_model=IcuBoardPatientResponse)
+def transfer_to_icu(
+    payload: IcuTransferRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Transfer an active inpatient (from Emergency, Ward, or OT) into an ICU bed."""
+    return TransferToIcuAction(db, hospital_id).execute(payload, user)
+
+
+@router.post("/step-down")
+def step_down_from_icu(
+    payload: IcuStepDownRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Step down a stabilized ICU patient to a general ward bed."""
+    return StepDownIcuAction(db, hospital_id).execute(payload, user)
 
 
 @router.put("/admissions/{admission_id}/icu-profile")
@@ -74,7 +140,7 @@ def update_icu_profile(
     admission_id: UUID,
     payload: IcuProfileUpdate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Update ventilator, invasive lines, and critical care profile for an ICU admission."""
@@ -92,7 +158,7 @@ def record_icu_flowsheet(
     admission_id: UUID,
     payload: IcuFlowsheetCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Record hourly vitals, ventilator parameters, ABG, and intake/output fluids."""
@@ -106,7 +172,7 @@ def record_icu_flowsheet(
 def list_icu_flowsheet(
     admission_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("critical_care", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Get chronological hourly flowsheet entries for an ICU admission."""
@@ -118,7 +184,7 @@ def list_icu_flowsheet(
 def calculate_deterioration_score(
     payload: DeteriorationAlertCalculateRequest,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Compute NEWS2 score from vital parameters and trigger clinical alerts when thresholds breached."""
@@ -128,7 +194,7 @@ def calculate_deterioration_score(
 @router.get("/alerts", response_model=list[DeteriorationAlertResponse])
 def list_deterioration_alerts(
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("critical_care", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """List active clinical deterioration alerts for bedside nursing and escalation."""
@@ -142,7 +208,7 @@ def acknowledge_deterioration_alert(
     alert_id: UUID,
     payload: DeteriorationAlertAcknowledgeRequest,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Acknowledge an active clinical deterioration alert."""
@@ -158,7 +224,7 @@ def acknowledge_deterioration_alert(
 def activate_code_blue(
     payload: CodeBlueIncidentCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Activate in-hospital resuscitation Code Blue incident."""
@@ -168,7 +234,7 @@ def activate_code_blue(
 @router.get("/code-blue", response_model=list[CodeBlueIncidentResponse])
 def list_code_blue_incidents(
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("critical_care", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """List all Code Blue resuscitation incidents."""
@@ -181,7 +247,7 @@ def list_code_blue_incidents(
 def get_code_blue_incident(
     incident_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("critical_care", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Get Code Blue incident with full event timeline."""
@@ -197,7 +263,7 @@ def get_code_blue_incident(
 def mark_code_blue_team_arrived(
     incident_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Timestamp arrival of the Code Blue resuscitation team."""
@@ -213,7 +279,7 @@ def log_code_blue_event(
     incident_id: UUID,
     payload: CodeBlueEventCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Log CPR cycle, defibrillator shock, or emergency drug in resuscitation timeline."""
@@ -225,7 +291,7 @@ def conclude_code_blue(
     incident_id: UUID,
     payload: CodeBlueConcludeRequest,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("critical_care", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Conclude resuscitation event and document final patient outcome (ROSC, ICU, deceased)."""

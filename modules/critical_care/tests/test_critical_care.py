@@ -17,7 +17,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Bed, Hospital, HospitalUser, Patient, Room, Ward, WardType
+from modules.beds.entities.bed import Bed, Room, Ward, WardType
+from modules.doctors.entities.doctor import HospitalUser
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.base import Base
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.critical_care.api.critical_care_api import router as critical_care_router
@@ -48,7 +51,7 @@ def staff_auth(hospital: Hospital) -> dict[str, str]:
     token = create_access_token({
         "sub": "nurse.icu@hospital.com",
         "name": "Nurse Intensivist",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital.id),
         "user_id": str(uuid4()),
     })
@@ -60,7 +63,7 @@ def staff_auth_b(hospital_b: Hospital) -> dict[str, str]:
     token = create_access_token({
         "sub": "nurse.icu2@hospitalb.com",
         "name": "Nurse B",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital_b.id),
         "user_id": str(uuid4()),
     })
