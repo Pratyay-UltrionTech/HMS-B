@@ -121,17 +121,26 @@ def _ambiguous_list(conn, limit: int = 50) -> None:
                            r["id"], r["patient_id"], r["form_id"], r["status"], r["created_at"], r["n_adm"])
 
 
+def _ensure_enum_value(engine) -> None:
+    """Add the 'requested' enum label on an AUTOCOMMIT connection.
+
+    Postgres forbids ALTER TYPE ... ADD VALUE inside a transaction block,
+    so this must NOT share the transactional connection used by _apply.
+    """
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        has = conn.execute(text(
+            "SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
+            "WHERE t.typname = 'admission_status' AND e.enumlabel = 'requested'"
+        )).first()
+        if not has:
+            conn.execute(text("ALTER TYPE admission_status ADD VALUE 'requested'"))
+            logger.info("added enum value admission_status.requested")
+        else:
+            logger.info("enum value already present")
+
+
 def _apply(conn) -> None:
-    # 1. enum value
-    has = conn.execute(text(
-        "SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
-        "WHERE t.typname = 'admission_status' AND e.enumlabel = 'requested'"
-    )).first()
-    if not has:
-        conn.execute(text("ALTER TYPE admission_status ADD VALUE 'requested'"))
-        logger.info("added enum value admission_status.requested")
-    else:
-        logger.info("enum value already present")
+    # 1. enum value handled separately (autocommit) — see _ensure_enum_value.
 
     # 2. nullable location
     for col in ("ward_id", "room_id", "bed_id"):
@@ -201,6 +210,7 @@ def main(dry_run: bool = True) -> None:
         if rep["duplicate_open_patients"]:
             logger.error("ABORT: resolve duplicate open episodes before rebuilding unique indexes")
             return
+        _ensure_enum_value(engine)
         _apply(conn)
         logger.info("apply complete; re-run dry-run to verify zeros")
 
