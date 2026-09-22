@@ -42,7 +42,7 @@ from modules.blood_bank.contracts.blood_bank_contracts import (
 )
 from modules.blood_bank.db.blood_bank_repository import BloodBankRepository
 from modules.blood_bank.entities.blood_bank_entities import BloodGroup, BloodUnitStatus
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_permission
 
 router = APIRouter(prefix="/blood-bank", tags=["Blood Bank"])
 
@@ -56,7 +56,7 @@ def register_donor(
     payload: BloodDonorCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodDonorResponse:
     return BloodBankActions(db, hospital_id, current_user).register_donor(payload)
 
@@ -66,7 +66,7 @@ def get_donors(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> list[BloodDonorResponse]:
     return BloodBankActions(db, hospital_id, current_user).get_donors(limit=limit)
 
@@ -76,7 +76,7 @@ def get_donor(
     donor_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> BloodDonorResponse:
     return BloodBankActions(db, hospital_id, current_user).get_donor(donor_id)
 
@@ -86,7 +86,7 @@ def record_donation(
     payload: BloodDonationCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodDonationResponse:
     return BloodBankActions(db, hospital_id, current_user).record_donation(payload)
 
@@ -100,7 +100,7 @@ def create_unit_manual(
     payload: BloodUnitCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodUnitResponse:
     return BloodBankActions(db, hospital_id, current_user).create_unit_manual(payload)
 
@@ -112,7 +112,7 @@ def get_units(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> list[BloodUnitResponse]:
     return BloodBankActions(db, hospital_id, current_user).get_units(
         blood_group=blood_group, status_filter=status_filter
@@ -124,7 +124,7 @@ def get_unit(
     unit_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> BloodUnitResponse:
     return BloodBankActions(db, hospital_id, current_user).get_unit(unit_id)
 
@@ -135,7 +135,7 @@ def clear_serology(
     payload: BloodUnitSerologyClear,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "validate")),
 ) -> BloodUnitResponse:
     return BloodBankActions(db, hospital_id, current_user).clear_serology(unit_id, payload)
 
@@ -150,7 +150,7 @@ def separate_components(
     payload: ComponentSeparationRequest,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> ComponentSeparationResponse:
     return BloodBankActions(db, hospital_id, current_user).separate_components(unit_id, payload)
 
@@ -164,7 +164,7 @@ def record_cross_match(
     payload: CrossMatchCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "validate")),
 ) -> CrossMatchResponse:
     return BloodBankActions(db, hospital_id, current_user).record_cross_match(payload)
 
@@ -174,7 +174,7 @@ def get_cross_matches(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> list[CrossMatchResponse]:
     records = BloodBankRepository(db, hospital_id).list_cross_matches(limit=limit)
     return [CrossMatchResponse.model_validate(r) for r in records]
@@ -185,7 +185,7 @@ def get_cross_matches_for_patient(
     patient_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> list[CrossMatchResponse]:
     records = BloodBankRepository(db, hospital_id).get_cross_matches_for_patient(patient_id)
     return [CrossMatchResponse.model_validate(r) for r in records]
@@ -200,7 +200,7 @@ def get_issues(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> list[BloodIssueResponse]:
     records = BloodBankRepository(db, hospital_id).list_issues(limit=limit)
     return [BloodIssueResponse.model_validate(r) for r in records]
@@ -211,7 +211,7 @@ def issue_blood_unit(
     payload: BloodIssueCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodIssueResponse:
     return BloodBankActions(db, hospital_id, current_user).issue_blood_unit(payload)
 
@@ -222,7 +222,7 @@ def return_blood_unit(
     payload: BloodReturnCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodReturnResponse:
     return BloodBankActions(db, hospital_id, current_user).return_blood_unit(issue_id, payload)
 
@@ -236,7 +236,7 @@ def start_transfusion(
     payload: TransfusionStart,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodTransfusionResponse:
     return BloodBankActions(db, hospital_id, current_user).start_transfusion(payload)
 
@@ -246,7 +246,7 @@ def get_transfusion(
     transfusion_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> BloodTransfusionResponse:
     transfusion = BloodBankRepository(db, hospital_id).get_transfusion_by_id(transfusion_id)
     if not transfusion:
@@ -260,7 +260,7 @@ def complete_transfusion(
     payload: TransfusionComplete,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodTransfusionResponse:
     return BloodBankActions(db, hospital_id, current_user).complete_transfusion(transfusion_id, payload)
 
@@ -271,7 +271,7 @@ def abort_transfusion(
     payload: TransfusionAbort,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodTransfusionResponse:
     return BloodBankActions(db, hospital_id, current_user).abort_transfusion(transfusion_id, payload)
 
@@ -282,7 +282,7 @@ def report_transfusion_reaction(
     payload: TransfusionReactionReport,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "edit")),
 ) -> BloodTransfusionResponse:
     return BloodBankActions(db, hospital_id, current_user).report_transfusion_reaction(transfusion_id, payload)
 
@@ -296,7 +296,7 @@ def get_unit_traceability(
     unit_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> UnitTraceabilityResponse:
     return BloodTraceabilityActions(db, hospital_id).get_unit_traceability(unit_id)
 
@@ -306,6 +306,6 @@ def get_donor_traceability(
     donor_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("blood_bank", "view")),
 ) -> DonorTraceabilityResponse:
     return BloodTraceabilityActions(db, hospital_id).get_donor_traceability(donor_id)

@@ -43,7 +43,7 @@ from modules.insurance.contracts.insurance_contracts import (
     TPAPerformanceReportResponse,
 )
 from modules.insurance.db.insurance_repository import InsuranceRepository
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_permission
 
 router = APIRouter(prefix="/insurance", tags=["Insurance & TPA"])
 
@@ -57,7 +57,7 @@ def create_patient_policy(
     payload: PatientPolicyCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> PatientPolicyResponse:
     return InsuranceActions(db, hospital_id, current_user).create_patient_policy(payload)
 
@@ -67,7 +67,7 @@ def get_patient_policies(
     patient_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "view")),
 ) -> list[PatientPolicyResponse]:
     return InsuranceActions(db, hospital_id, current_user).get_patient_policies(patient_id)
 
@@ -77,7 +77,7 @@ def link_admission_policy(
     payload: AdmissionPolicyLinkCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> AdmissionPolicyResponse:
     return InsuranceActions(db, hospital_id, current_user).link_admission_policy(payload)
 
@@ -87,7 +87,7 @@ def get_admission_policies(
     admission_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "view")),
 ) -> list[AdmissionPolicyResponse]:
     return InsuranceActions(db, hospital_id, current_user).get_admission_policies(admission_id)
 
@@ -101,7 +101,7 @@ def verify_eligibility(
     payload: EligibilityCheckCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> EligibilityCheckResponse:
     return InsuranceActions(db, hospital_id, current_user).verify_eligibility(payload)
 
@@ -115,7 +115,7 @@ def create_pre_auth_request(
     payload: PreAuthRequestCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> PreAuthRequestResponse:
     return InsuranceActions(db, hospital_id, current_user).create_pre_auth_request(payload)
 
@@ -125,7 +125,7 @@ def get_pre_auth_requests(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "view")),
 ) -> list[PreAuthRequestResponse]:
     records = InsuranceRepository(db, hospital_id).list_pre_auths_for_hospital(limit=limit)
     return [PreAuthRequestResponse.model_validate(r) for r in records]
@@ -136,7 +136,7 @@ def get_pre_auth_request(
     pre_auth_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "view")),
 ) -> PreAuthRequestResponse:
     return InsuranceActions(db, hospital_id, current_user).get_pre_auth_request(pre_auth_id)
 
@@ -147,7 +147,7 @@ def update_pre_auth_decision(
     payload: PreAuthDecisionUpdate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> PreAuthRequestResponse:
     return InsuranceActions(db, hospital_id, current_user).update_pre_auth_decision(pre_auth_id, payload)
 
@@ -158,7 +158,7 @@ def raise_pre_auth_query(
     payload: PreAuthQueryCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> PreAuthQueryResponse:
     return InsuranceActions(db, hospital_id, current_user).raise_pre_auth_query(pre_auth_id, payload)
 
@@ -169,7 +169,7 @@ def respond_pre_auth_query(
     payload: PreAuthQueryRespond,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> PreAuthQueryResponse:
     return InsuranceActions(db, hospital_id, current_user).respond_pre_auth_query(query_id, payload)
 
@@ -183,7 +183,7 @@ def create_claim_dossier(
     payload: ClaimDossierCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> ClaimDossierResponse:
     return InsuranceActions(db, hospital_id, current_user).create_claim_dossier(payload)
 
@@ -193,7 +193,7 @@ def get_claims(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "view")),
 ) -> list[ClaimDossierResponse]:
     return InsuranceActions(db, hospital_id, current_user).get_claims(limit=limit)
 
@@ -203,7 +203,7 @@ def get_claim(
     claim_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "view")),
 ) -> ClaimDossierResponse:
     return InsuranceActions(db, hospital_id, current_user).get_claim(claim_id)
 
@@ -214,7 +214,7 @@ def verify_claim_checklist(
     payload: ClaimDossierVerify,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> ClaimDossierResponse:
     return InsuranceActions(db, hospital_id, current_user).verify_claim_checklist(claim_id, payload)
 
@@ -229,7 +229,7 @@ def submit_claim(
     payload: ClaimSubmissionCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> ClaimSubmissionDetailResponse:
     return InsuranceActions(db, hospital_id, current_user).submit_claim(claim_id, payload)
 
@@ -240,7 +240,7 @@ def acknowledge_submission(
     payload: ClaimSubmissionAcknowledge,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> ClaimSubmissionDetailResponse:
     return InsuranceActions(db, hospital_id, current_user).acknowledge_submission(submission_id, payload)
 
@@ -251,7 +251,7 @@ def raise_submission_query(
     payload: ClaimSubmissionQuery,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> ClaimSubmissionDetailResponse:
     return InsuranceActions(db, hospital_id, current_user).raise_submission_query(submission_id, payload)
 
@@ -262,7 +262,7 @@ def respond_submission_query(
     payload: ClaimSubmissionResponse,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> ClaimSubmissionDetailResponse:
     return InsuranceActions(db, hospital_id, current_user).respond_submission_query(submission_id, payload)
 
@@ -273,7 +273,7 @@ def record_submission_decision(
     payload: ClaimSubmissionDecision,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "approve")),
 ) -> ClaimSubmissionDetailResponse:
     return InsuranceActions(db, hospital_id, current_user).record_submission_decision(submission_id, payload)
 
@@ -288,7 +288,7 @@ def dispute_claim_rejection(
     payload: ClaimDisputeCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> ClaimDisputeResponse:
     return InsuranceActions(db, hospital_id, current_user).dispute_claim_rejection(claim_id, payload)
 
@@ -299,7 +299,7 @@ def resubmit_disputed_claim(
     payload: ClaimDisputeResubmit,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "edit")),
 ) -> ClaimDisputeResponse:
     return InsuranceActions(db, hospital_id, current_user).resubmit_disputed_claim(dispute_id, payload)
 
@@ -310,7 +310,7 @@ def list_cashless_settlements(
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "view")),
 ) -> list[CashlessSettlementResponse]:
     records = InsuranceRepository(db, hospital_id).list_settlements_for_hospital(limit=limit)
     return [CashlessSettlementResponse.model_validate(r) for r in records]
@@ -321,7 +321,7 @@ def settle_cashless_claim(
     payload: CashlessSettlementCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "approve")),
 ) -> CashlessSettlementResponse:
     return InsuranceActions(db, hospital_id, current_user).settle_cashless_claim(payload)
 
@@ -334,6 +334,6 @@ def settle_cashless_claim(
 def get_tpa_performance_report(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    current_user: dict[str, Any] = Depends(require_hospital_user),
+    current_user: dict[str, Any] = Depends(require_permission("insurance", "view")),
 ) -> TPAPerformanceReportResponse:
     return InsuranceActions(db, hospital_id, current_user).get_tpa_performance_report()

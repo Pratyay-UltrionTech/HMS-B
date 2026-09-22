@@ -33,6 +33,15 @@ BASIC_MODULE_KEYS = [
     "mis",
     "billing",
     "pharmacy",
+    "emergency",
+    "critical_care",
+    "ambulance",
+    "blood_bank",
+    "cssd",
+    "inventory",
+    "procurement",
+    "clinical_decision",
+    "insurance",
 ]
 
 BASIC_MODULE_LABELS = {
@@ -53,6 +62,15 @@ BASIC_MODULE_LABELS = {
     "mis": "MIS Reports",
     "billing": "Billing",
     "pharmacy": "Pharmacy",
+    "emergency": "Emergency Department",
+    "critical_care": "Critical Care / ICU",
+    "ambulance": "Ambulance Services",
+    "blood_bank": "Blood Bank",
+    "cssd": "CSSD (Sterilization)",
+    "inventory": "Hospital Inventory",
+    "procurement": "Procurement & Purchase",
+    "clinical_decision": "Clinical Decision Support",
+    "insurance": "Insurance & TPA",
 }
 
 
@@ -82,6 +100,15 @@ class RolePermissionInput(BaseModel):
     module_key: str
     can_view: bool = False
     can_edit: bool = False
+    can_create: bool = False
+    can_delete: bool = False
+    can_approve: bool = False
+    can_validate: bool = False
+    can_release: bool = False
+    can_dispense: bool = False
+    can_refund: bool = False
+    can_cancel: bool = False
+    can_administer: bool = False
 
 
 class RolePermissionResponse(BaseModel):
@@ -89,6 +116,15 @@ class RolePermissionResponse(BaseModel):
     module_key: str
     can_view: bool
     can_edit: bool
+    can_create: bool = False
+    can_delete: bool = False
+    can_approve: bool = False
+    can_validate: bool = False
+    can_release: bool = False
+    can_dispense: bool = False
+    can_refund: bool = False
+    can_cancel: bool = False
+    can_administer: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -128,6 +164,34 @@ class ModuleInfo(BaseModel):
     label: str
 
 
+# ── Hospital user assignment sub-models ────────────────────────────────────────
+class UserRoleAssignmentResponse(BaseModel):
+    role_id: UUID
+    role_name: str
+    is_primary: bool = False
+    assigned_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class UserDepartmentAssignmentResponse(BaseModel):
+    department_id: UUID
+    department_name: str
+    is_primary: bool = False
+    can_supervise: bool = False
+
+    model_config = {"from_attributes": True}
+
+
+class UserLocationAssignmentResponse(BaseModel):
+    ward_id: UUID | None = None
+    ward_name: str | None = None
+    wing_id: UUID | None = None
+    wing_name: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
 # ── Hospital users ─────────────────────────────────────────────────────────────
 class HospitalUserCreate(BaseModel):
     role_id: UUID
@@ -135,7 +199,10 @@ class HospitalUserCreate(BaseModel):
     phone: PhoneNumber
     email: EmailStr
     password: str = Field(min_length=4, max_length=128)
-    department_id: UUID | None = None  # used to validate shift belongs to department
+    role_ids: list[UUID] | None = None
+    department_id: UUID | None = None
+    department_ids: list[UUID] | None = None
+    ward_ids: list[UUID] | None = None
     shift_id: UUID | None = None
     specialization: str | None = Field(default=None, max_length=255)
     medical_registration_number: str | None = Field(default=None, max_length=64)
@@ -153,7 +220,10 @@ class HospitalUserUpdate(BaseModel):
     phone: PhoneNumber | None = None
     email: EmailStr | None = None
     password: str | None = Field(default=None, min_length=4, max_length=128)
-    department_id: UUID | None = None  # used to validate shift belongs to department
+    role_ids: list[UUID] | None = None
+    department_id: UUID | None = None
+    department_ids: list[UUID] | None = None
+    ward_ids: list[UUID] | None = None
     shift_id: UUID | None = None
     specialization: str | None = Field(default=None, max_length=255)
     medical_registration_number: str | None = Field(default=None, max_length=64)
@@ -188,6 +258,14 @@ class HospitalUserResponse(BaseModel):
     shift_department_name: str | None = None
     shift_start_time: str | None = None
     shift_end_time: str | None = None
+    department_id: UUID | None = None
+    department_name: str | None = None
+    roles: list[UserRoleAssignmentResponse] = Field(default_factory=list)
+    departments: list[UserDepartmentAssignmentResponse] = Field(default_factory=list)
+    locations: list[UserLocationAssignmentResponse] = Field(default_factory=list)
+    effective_permissions: list[dict] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}
 
     model_config = {"from_attributes": True}
 
@@ -307,4 +385,18 @@ class HospitalFacilitySettingsUpdate(BaseModel):
     sms_gateway_active: bool | None = None
     whatsapp_gateway_active: bool | None = None
     dlt_sender_id: str | None = None
+
+
+class AuthSimulateRequest(BaseModel):
+    user_id: str
+    action: str
+    department_id: str | None = None
+    ward_id: str | None = None
+    resource_hospital_id: str | None = None
+    resource_creator_id: str | None = None
+
+
+class AuthSimulateResponse(BaseModel):
+    decision: str
+    details: dict[str, Any]
 

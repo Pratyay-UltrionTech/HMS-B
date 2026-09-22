@@ -40,17 +40,25 @@ from modules.admin.contracts.admin_contracts import (
     ShiftRosterSnapshot,
     HospitalFacilitySettings,
     HospitalFacilitySettingsUpdate,
+    UserRoleAssignmentResponse,
+    UserDepartmentAssignmentResponse,
+    UserLocationAssignmentResponse,
 )
 from modules.doctors.entities.doctor import (
     Holiday,
     HospitalUser,
+    HospitalUserDepartment,
+    HospitalUserLocation,
+    HospitalUserRole,
+    Practitioner,
     RoleCustomField,
     RolePermission,
     ShiftType,
     StaffDailyShift,
     StaffRole,
 )
-from modules.masters.entities.organization_entities import Department
+from modules.beds.entities.bed import Ward
+from modules.masters.entities.organization_entities import Department, Wing
 from modules.tenancy.entities.hospital import Hospital
 from shared.audit import write_audit_log
 from shared.audit.entities.audit_log import AuditLog
@@ -203,6 +211,15 @@ class AdminActions:
                     module_key=key,
                     can_view=can_view,
                     can_edit=can_edit,
+                    can_create=bool(getattr(perm, "can_create", False)),
+                    can_delete=bool(getattr(perm, "can_delete", False)),
+                    can_approve=bool(getattr(perm, "can_approve", False)),
+                    can_validate=bool(getattr(perm, "can_validate", False)),
+                    can_release=bool(getattr(perm, "can_release", False)),
+                    can_dispense=bool(getattr(perm, "can_dispense", False)),
+                    can_refund=bool(getattr(perm, "can_refund", False)),
+                    can_cancel=bool(getattr(perm, "can_cancel", False)),
+                    can_administer=bool(getattr(perm, "can_administer", False)),
                 )
             )
 
@@ -270,6 +287,15 @@ class AdminActions:
                         module_key=key,
                         can_view=can_view,
                         can_edit=can_edit,
+                        can_create=bool(getattr(perm, "can_create", False)),
+                        can_delete=bool(getattr(perm, "can_delete", False)),
+                        can_approve=bool(getattr(perm, "can_approve", False)),
+                        can_validate=bool(getattr(perm, "can_validate", False)),
+                        can_release=bool(getattr(perm, "can_release", False)),
+                        can_dispense=bool(getattr(perm, "can_dispense", False)),
+                        can_refund=bool(getattr(perm, "can_refund", False)),
+                        can_cancel=bool(getattr(perm, "can_cancel", False)),
+                        can_administer=bool(getattr(perm, "can_administer", False)),
                     )
                 )
 
@@ -341,12 +367,111 @@ class AdminActions:
         self, user: HospitalUser, dept_by_id: dict[UUID, Department] | None = None
     ) -> HospitalUserResponse:
         shift = user.shift
-        dept = None
+        shift_dept = None
         if shift and shift.department_id:
             if dept_by_id is not None:
-                dept = dept_by_id.get(shift.department_id)
+                shift_dept = dept_by_id.get(shift.department_id)
             else:
-                dept = self.db.query(Department).filter(Department.id == shift.department_id).first()
+                shift_dept = self.db.query(Department).filter(Department.id == shift.department_id).first()
+
+        primary_dept = None
+        if user.department_id:
+            if dept_by_id is not None:
+                primary_dept = dept_by_id.get(user.department_id)
+            else:
+                primary_dept = self.db.query(Department).filter(Department.id == user.department_id).first()
+
+        # Assigned roles
+        role_assignments: list[UserRoleAssignmentResponse] = []
+        if getattr(user, "assigned_roles", None):
+            for ar in user.assigned_roles:
+                role_name = ar.role.name if ar.role else (user.role.name if user.role and user.role.id == ar.role_id else "Staff")
+                role_assignments.append(
+                    UserRoleAssignmentResponse(
+                        role_id=ar.role_id,
+                        role_name=role_name,
+                        is_primary=bool(ar.is_primary),
+                        assigned_at=ar.assigned_at,
+                    )
+                )
+        elif user.role_id and user.role:
+            role_assignments.append(
+                UserRoleAssignmentResponse(
+                    role_id=user.role_id,
+                    role_name=user.role.name,
+                    is_primary=True,
+                    assigned_at=user.created_at,
+                )
+            )
+
+        # Assigned departments
+        dept_assignments: list[UserDepartmentAssignmentResponse] = []
+        if getattr(user, "assigned_departments", None):
+            for ad in user.assigned_departments:
+                d_obj = dept_by_id.get(ad.department_id) if dept_by_id else self.db.query(Department).filter(Department.id == ad.department_id).first()
+                dept_assignments.append(
+                    UserDepartmentAssignmentResponse(
+                        department_id=ad.department_id,
+                        department_name=d_obj.name if d_obj else "Department",
+                        is_primary=bool(ad.is_primary),
+                        can_supervise=bool(ad.can_supervise),
+                    )
+                )
+        elif user.department_id:
+            dept_assignments.append(
+                UserDepartmentAssignmentResponse(
+                    department_id=user.department_id,
+                    department_name=primary_dept.name if primary_dept else "Department",
+                    is_primary=True,
+                    can_supervise=False,
+                )
+            )
+
+        # Assigned locations
+        loc_assignments: list[UserLocationAssignmentResponse] = []
+        if getattr(user, "assigned_locations", None):
+            for al in user.assigned_locations:
+                loc_assignments.append(
+                    UserLocationAssignmentResponse(
+                        ward_id=al.ward_id,
+                        wing_id=al.wing_id,
+                    )
+                )
+
+        # Effective permissions: union of permissions across all assigned roles
+        perms_map: dict[str, dict[str, Any]] = {}
+        candidate_roles = []
+        if getattr(user, "assigned_roles", None):
+            candidate_roles = [ar.role for ar in user.assigned_roles if ar.role]
+        if not candidate_roles and user.role:
+            candidate_roles = [user.role]
+
+        for r in candidate_roles:
+            for p in getattr(r, "permissions", []):
+                m = perms_map.setdefault(
+                    p.module_key,
+                    {
+                        "module_key": p.module_key,
+                        "can_view": False,
+                        "can_edit": False,
+                        "can_create": False,
+                        "can_delete": False,
+                        "can_approve": False,
+                        "can_validate": False,
+                        "can_release": False,
+                        "can_dispense": False,
+                        "can_refund": False,
+                        "can_cancel": False,
+                        "can_administer": False,
+                    },
+                )
+                for act in [
+                    "can_view", "can_edit", "can_create", "can_delete", "can_approve",
+                    "can_validate", "can_release", "can_dispense", "can_refund", "can_cancel", "can_administer"
+                ]:
+                    if getattr(p, act, False):
+                        m[act] = True
+
         return HospitalUserResponse(
             id=user.id,
             hospital_id=user.hospital_id,
@@ -367,20 +492,37 @@ class AdminActions:
             role_name=user.role.name if user.role else None,
             shift_name=shift.name if shift else None,
             shift_department_id=shift.department_id if shift else None,
-            shift_department_name=dept.name if dept else None,
+            shift_department_name=shift_dept.name if shift_dept else None,
             shift_start_time=fmt_shift_time(shift.start_time) if shift else None,
             shift_end_time=fmt_shift_time(shift.end_time) if shift else None,
+            department_id=user.department_id,
+            department_name=primary_dept.name if primary_dept else None,
+            roles=role_assignments,
+            departments=dept_assignments,
+            locations=loc_assignments,
+            effective_permissions=list(perms_map.values()),
         )
 
     def list_users(self) -> list[HospitalUserResponse]:
         users = (
             self.db.query(HospitalUser)
-            .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift))
+            .options(
+                joinedload(HospitalUser.role).joinedload(StaffRole.permissions),
+                joinedload(HospitalUser.shift),
+                joinedload(HospitalUser.assigned_roles).joinedload(HospitalUserRole.role).joinedload(StaffRole.permissions),
+                joinedload(HospitalUser.assigned_departments),
+                joinedload(HospitalUser.assigned_locations),
+            )
             .filter(HospitalUser.hospital_id == self.hospital_id)
             .order_by(HospitalUser.name)
             .all()
         )
         dept_ids = {u.shift.department_id for u in users if u.shift and u.shift.department_id}
+        dept_ids.update({u.department_id for u in users if u.department_id})
+        for u in users:
+            if getattr(u, "assigned_departments", None):
+                dept_ids.update({ad.department_id for ad in u.assigned_departments})
+        dept_ids.discard(None)
         dept_by_id: dict[UUID, Department] = {}
         if dept_ids:
             for d in self.db.query(Department).filter(Department.id.in_(dept_ids)).all():
@@ -412,6 +554,7 @@ class AdminActions:
         user = HospitalUser(
             hospital_id=self.hospital_id,
             role_id=payload.role_id,
+            department_id=payload.department_id,
             shift_id=shift_id,
             name=payload.name.strip(),
             phone=payload.phone.strip(),
@@ -428,6 +571,58 @@ class AdminActions:
         )
         self.db.add(user)
         self.db.flush()
+
+        # Multi-role bindings
+        all_role_ids = set(payload.role_ids or [])
+        all_role_ids.add(payload.role_id)
+        for rid in all_role_ids:
+            self.db.add(
+                HospitalUserRole(
+                    hospital_id=self.hospital_id,
+                    user_id=user.id,
+                    role_id=rid,
+                    is_primary=(rid == payload.role_id),
+                )
+            )
+
+        # Department bindings
+        all_dept_ids = set(payload.department_ids or [])
+        if payload.department_id:
+            all_dept_ids.add(payload.department_id)
+        for did in all_dept_ids:
+            self.db.add(
+                HospitalUserDepartment(
+                    hospital_id=self.hospital_id,
+                    user_id=user.id,
+                    department_id=did,
+                    is_primary=(did == payload.department_id),
+                )
+            )
+
+        # Location / ward bindings
+        for wid in (payload.ward_ids or []):
+            self.db.add(
+                HospitalUserLocation(
+                    hospital_id=self.hospital_id,
+                    user_id=user.id,
+                    ward_id=wid,
+                )
+            )
+
+        # Practitioner binding
+        if payload.specialization or payload.medical_registration_number:
+            self.db.add(
+                Practitioner(
+                    hospital_id=self.hospital_id,
+                    user_id=user.id,
+                    designation=payload.specialization or "Physician",
+                    medical_registration_number=clean_optional_str(payload.medical_registration_number),
+                    qualification=clean_optional_str(payload.qualification),
+                    years_of_experience=payload.years_of_experience,
+                    is_active=payload.is_active,
+                )
+            )
+
         self._audit(
             "create",
             "user",
@@ -438,7 +633,13 @@ class AdminActions:
         self.db.commit()
         user = (
             self.db.query(HospitalUser)
-            .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift))
+            .options(
+                joinedload(HospitalUser.role).joinedload(StaffRole.permissions),
+                joinedload(HospitalUser.shift),
+                joinedload(HospitalUser.assigned_roles).joinedload(HospitalUserRole.role).joinedload(StaffRole.permissions),
+                joinedload(HospitalUser.assigned_departments),
+                joinedload(HospitalUser.assigned_locations),
+            )
             .filter(HospitalUser.id == user.id)
             .first()
         )
@@ -447,19 +648,23 @@ class AdminActions:
     def update_user(self, user_id: UUID, payload: HospitalUserUpdate) -> HospitalUserResponse:
         user = (
             self.db.query(HospitalUser)
-            .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift))
+            .options(
+                joinedload(HospitalUser.role).joinedload(StaffRole.permissions),
+                joinedload(HospitalUser.shift),
+                joinedload(HospitalUser.assigned_roles).joinedload(HospitalUserRole.role).joinedload(StaffRole.permissions),
+                joinedload(HospitalUser.assigned_departments),
+                joinedload(HospitalUser.assigned_locations),
+            )
             .filter(HospitalUser.id == user_id, HospitalUser.hospital_id == self.hospital_id)
             .first()
         )
         if not user:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-        # FLAW-024: snapshot pre-change role/active so we can detect session-relevant
-        # changes and bump token_version accordingly.
         original_role_id = user.role_id
         original_is_active = user.is_active
 
-        data = payload.model_dump(exclude_unset=True, exclude={"password", "department_id"})
+        data = payload.model_dump(exclude_unset=True, exclude={"password", "role_ids", "department_ids", "ward_ids"})
         raw = payload.model_dump(exclude_unset=True)
         if "role_id" in data and data["role_id"]:
             self._get_role(data["role_id"])
@@ -502,10 +707,81 @@ class AdminActions:
         if payload.password:
             user.password_hash = hash_password(payload.password)
 
-        # FLAW-024: bump the session version whenever the user's role or active
-        # status changes so any already-issued JWT is rejected by GET /auth/me.
-        auth_relevant_change = ("role_id" in data and data["role_id"] != original_role_id) or (
-            "is_active" in data and data["is_active"] != original_is_active
+        # Multi-role updates
+        if payload.role_ids is not None or payload.role_id is not None:
+            primary_role_id = payload.role_id or user.role_id
+            all_rids = set(payload.role_ids or [])
+            all_rids.add(primary_role_id)
+            self.db.query(HospitalUserRole).filter(HospitalUserRole.user_id == user.id).delete()
+            for rid in all_rids:
+                self.db.add(
+                    HospitalUserRole(
+                        hospital_id=self.hospital_id,
+                        user_id=user.id,
+                        role_id=rid,
+                        is_primary=(rid == primary_role_id),
+                    )
+                )
+
+        # Department updates
+        if payload.department_ids is not None or payload.department_id is not None:
+            primary_dept_id = payload.department_id or user.department_id
+            all_dids = set(payload.department_ids or [])
+            if primary_dept_id:
+                all_dids.add(primary_dept_id)
+                user.department_id = primary_dept_id
+            self.db.query(HospitalUserDepartment).filter(HospitalUserDepartment.user_id == user.id).delete()
+            for did in all_dids:
+                self.db.add(
+                    HospitalUserDepartment(
+                        hospital_id=self.hospital_id,
+                        user_id=user.id,
+                        department_id=did,
+                        is_primary=(did == primary_dept_id),
+                    )
+                )
+
+        # Location updates
+        if payload.ward_ids is not None:
+            self.db.query(HospitalUserLocation).filter(HospitalUserLocation.user_id == user.id).delete()
+            for wid in payload.ward_ids:
+                self.db.add(
+                    HospitalUserLocation(
+                        hospital_id=self.hospital_id,
+                        user_id=user.id,
+                        ward_id=wid,
+                    )
+                )
+
+        # Practitioner updates
+        if payload.specialization or payload.medical_registration_number:
+            practitioner = self.db.query(Practitioner).filter(Practitioner.user_id == user.id).first()
+            if not practitioner:
+                practitioner = Practitioner(
+                    hospital_id=self.hospital_id,
+                    user_id=user.id,
+                    designation=payload.specialization or user.specialization or "Physician",
+                    medical_registration_number=clean_optional_str(payload.medical_registration_number) or user.medical_registration_number,
+                    qualification=clean_optional_str(payload.qualification) or user.qualification,
+                    years_of_experience=payload.years_of_experience or user.years_of_experience,
+                    is_active=user.is_active,
+                )
+                self.db.add(practitioner)
+            else:
+                if payload.specialization:
+                    practitioner.designation = payload.specialization
+                if payload.medical_registration_number:
+                    practitioner.medical_registration_number = clean_optional_str(payload.medical_registration_number)
+                if payload.qualification:
+                    practitioner.qualification = clean_optional_str(payload.qualification)
+                if payload.years_of_experience is not None:
+                    practitioner.years_of_experience = payload.years_of_experience
+                practitioner.is_active = user.is_active
+
+        auth_relevant_change = (
+            ("role_id" in data and data["role_id"] != original_role_id)
+            or ("is_active" in data and data["is_active"] != original_is_active)
+            or payload.role_ids is not None
         )
         if auth_relevant_change:
             user.token_version = (user.token_version or 1) + 1
@@ -520,7 +796,13 @@ class AdminActions:
         self.db.commit()
         user = (
             self.db.query(HospitalUser)
-            .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift))
+            .options(
+                joinedload(HospitalUser.role).joinedload(StaffRole.permissions),
+                joinedload(HospitalUser.shift),
+                joinedload(HospitalUser.assigned_roles).joinedload(HospitalUserRole.role).joinedload(StaffRole.permissions),
+                joinedload(HospitalUser.assigned_departments),
+                joinedload(HospitalUser.assigned_locations),
+            )
             .filter(HospitalUser.id == user_id)
             .first()
         )

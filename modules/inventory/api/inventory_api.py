@@ -30,7 +30,7 @@ from modules.inventory.contracts.inventory_contracts import (
     InventoryTransferResponse,
     ReceiveStockRequest,
 )
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_permission
 
 router = APIRouter(prefix="/inventory", tags=["inventory"])
 
@@ -41,7 +41,7 @@ router = APIRouter(prefix="/inventory", tags=["inventory"])
 def list_items(
     active_only: bool | None = Query(None),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[ConsumableItemResponse]:
     return InventoryActions(db, hospital_id, user).list_items(active_only=active_only)
@@ -51,7 +51,7 @@ def list_items(
 def create_item(
     payload: ConsumableItemCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> ConsumableItemResponse:
     return InventoryActions(db, hospital_id, user).create_item(payload)
@@ -61,7 +61,7 @@ def create_item(
 def get_item(
     item_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> ConsumableItemResponse:
     return InventoryActions(db, hospital_id, user).get_item(item_id)
@@ -72,7 +72,7 @@ def update_item(
     item_id: UUID,
     payload: ConsumableItemUpdate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> ConsumableItemResponse:
     return InventoryActions(db, hospital_id, user).update_item(item_id, payload)
@@ -84,7 +84,7 @@ def update_item(
 def list_batches(
     item_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[ConsumableBatchResponse]:
     return InventoryActions(db, hospital_id, user).list_batches(item_id)
@@ -96,7 +96,7 @@ def list_batches(
 def list_transactions(
     item_id: UUID | None = Query(None),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[InventoryStockTransactionResponse]:
     return InventoryActions(db, hospital_id, user).list_transactions(item_id=item_id)
@@ -107,7 +107,7 @@ def list_transactions(
 @router.get("/central-stock", response_model=list[CentralInventoryStockResponse])
 def list_central_stock(
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[CentralInventoryStockResponse]:
     return InventoryActions(db, hospital_id, user).list_central_stock()
@@ -117,7 +117,7 @@ def list_central_stock(
 def receive_stock(
     payload: ReceiveStockRequest,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> CentralInventoryStockResponse:
     return InventoryActions(db, hospital_id, user).receive_stock(payload)
@@ -129,7 +129,7 @@ def receive_stock(
 def list_departmental_stock(
     department: str | None = Query(None),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[DepartmentalStockResponse]:
     return InventoryActions(db, hospital_id, user).list_departmental_stock(department=department)
@@ -139,7 +139,7 @@ def list_departmental_stock(
 def consume_departmental_stock(
     payload: ConsumeDepartmentalStockRequest,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> DepartmentalStockResponse:
     return InventoryActions(db, hospital_id, user).consume_departmental_stock(payload)
@@ -151,7 +151,7 @@ def consume_departmental_stock(
 def list_transfers(
     status_filter: str | None = Query(None, alias="status"),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[InventoryTransferResponse]:
     return InventoryActions(db, hospital_id, user).list_transfers(status_filter=status_filter)
@@ -161,7 +161,7 @@ def list_transfers(
 def get_transfer(
     transfer_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InventoryTransferResponse:
     return InventoryActions(db, hospital_id, user).get_transfer(transfer_id)
@@ -171,7 +171,7 @@ def get_transfer(
 def request_transfer(
     payload: InventoryTransferCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InventoryTransferResponse:
     return InventoryActions(db, hospital_id, user).request_transfer(payload)
@@ -182,7 +182,7 @@ def approve_transfer(
     transfer_id: UUID,
     payload: InventoryTransferApprove,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "approve")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InventoryTransferResponse:
     return InventoryActions(db, hospital_id, user).approve_transfer(transfer_id, payload)
@@ -192,7 +192,7 @@ def approve_transfer(
 def dispatch_transfer(
     transfer_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InventoryTransferResponse:
     return InventoryActions(db, hospital_id, user).dispatch_transfer(transfer_id)
@@ -202,7 +202,7 @@ def dispatch_transfer(
 def complete_transfer(
     transfer_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InventoryTransferResponse:
     return InventoryActions(db, hospital_id, user).complete_transfer(transfer_id)
@@ -213,7 +213,7 @@ def reject_transfer(
     transfer_id: UUID,
     payload: InventoryTransferReject,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("inventory", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InventoryTransferResponse:
     return InventoryActions(db, hospital_id, user).reject_transfer(transfer_id, payload)

@@ -32,7 +32,7 @@ from modules.cssd.contracts.cssd_contracts import (
     SterilizationQCCreate,
     SterilizationQCResponse,
 )
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_permission
 
 router = APIRouter(prefix="/cssd", tags=["cssd"])
 
@@ -43,7 +43,7 @@ router = APIRouter(prefix="/cssd", tags=["cssd"])
 def list_instrument_sets(
     active_only: bool | None = Query(None),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[InstrumentSetResponse]:
     return CssdActions(db, hospital_id, user).list_instrument_sets(active_only=active_only)
@@ -53,7 +53,7 @@ def list_instrument_sets(
 def create_instrument_set(
     payload: InstrumentSetCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InstrumentSetResponse:
     return CssdActions(db, hospital_id, user).create_instrument_set(payload)
@@ -64,7 +64,7 @@ def update_instrument_set(
     set_id: UUID,
     payload: InstrumentSetUpdate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InstrumentSetResponse:
     return CssdActions(db, hospital_id, user).update_instrument_set(set_id, payload)
@@ -76,7 +76,7 @@ def update_instrument_set(
 def list_batches(
     status_filter: str | None = Query(None, alias="status"),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[SterilizationBatchResponse]:
     return CssdActions(db, hospital_id, user).list_batches(status_filter=status_filter)
@@ -86,7 +86,7 @@ def list_batches(
 def get_batch(
     batch_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> SterilizationBatchResponse:
     return CssdActions(db, hospital_id, user).get_batch(batch_id)
@@ -96,7 +96,7 @@ def get_batch(
 def create_batch(
     payload: SterilizationBatchCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> SterilizationBatchResponse:
     return CssdActions(db, hospital_id, user).create_batch(payload)
@@ -107,7 +107,7 @@ def complete_batch(
     batch_id: UUID,
     payload: SterilizationBatchComplete,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> SterilizationBatchResponse:
     return CssdActions(db, hospital_id, user).complete_batch(batch_id, payload)
@@ -118,7 +118,7 @@ def fail_batch(
     batch_id: UUID,
     payload: SterilizationBatchFail,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> SterilizationBatchResponse:
     return CssdActions(db, hospital_id, user).fail_batch(batch_id, payload)
@@ -131,7 +131,7 @@ def record_qc(
     batch_id: UUID,
     payload: SterilizationQCCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> SterilizationQCResponse:
     return CssdActions(db, hospital_id, user).record_qc(batch_id, payload)
@@ -141,7 +141,7 @@ def record_qc(
 def get_qc(
     batch_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> SterilizationQCResponse:
     return CssdActions(db, hospital_id, user).get_qc(batch_id)
@@ -153,7 +153,7 @@ def get_qc(
 def list_issues(
     status_filter: str | None = Query(None, alias="status"),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[InstrumentSetIssueResponse]:
     return CssdActions(db, hospital_id, user).list_issues(status_filter=status_filter)
@@ -163,7 +163,7 @@ def list_issues(
 def issue_set(
     payload: InstrumentSetIssueCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InstrumentSetIssueResponse:
     return CssdActions(db, hospital_id, user).issue_set(payload)
@@ -174,7 +174,7 @@ def return_set(
     issue_id: UUID,
     payload: InstrumentSetReturn,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> InstrumentSetIssueResponse:
     return CssdActions(db, hospital_id, user).return_set(issue_id, payload)
@@ -186,7 +186,7 @@ def return_set(
 def list_discrepancies(
     status_filter: str | None = Query(None, alias="status"),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[DiscrepancyReportResponse]:
     return CssdActions(db, hospital_id, user).list_discrepancies(status_filter=status_filter)
@@ -196,7 +196,7 @@ def list_discrepancies(
 def report_discrepancy(
     payload: DiscrepancyReportCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> DiscrepancyReportResponse:
     return CssdActions(db, hospital_id, user).report_discrepancy(payload)
@@ -207,7 +207,7 @@ def transition_discrepancy(
     report_id: UUID,
     payload: DiscrepancyReportTransition,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("cssd", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> DiscrepancyReportResponse:
     return CssdActions(db, hospital_id, user).transition_discrepancy(report_id, payload)

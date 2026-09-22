@@ -50,6 +50,8 @@ from modules.emergency.db.emergency_repository import EmergencyRepository
 from modules.emergency.permissions.emergency_permissions import (
     get_emergency_hospital_context,
     require_emergency_access,
+    require_emergency_administer,
+    require_emergency_edit,
 )
 
 router = APIRouter(prefix="/emergency", tags=["emergency"])
@@ -64,7 +66,7 @@ router = APIRouter(prefix="/emergency", tags=["emergency"])
 def register_emergency_encounter(
     payload: EmergencyEncounterCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_emergency_access),
+    user: dict[str, Any] = Depends(require_emergency_edit),
     hospital_id: UUID = Depends(get_emergency_hospital_context),
 ):
     """Register an emergency patient arrival and generate encounter with ER sequence ID."""
@@ -118,7 +120,7 @@ def perform_emergency_triage(
     encounter_id: UUID,
     payload: EmergencyTriageCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_emergency_access),
+    user: dict[str, Any] = Depends(require_emergency_edit),
     hospital_id: UUID = Depends(get_emergency_hospital_context),
 ):
     """Perform clinical triage evaluation (acuity 1-5, AVPU, vitals, red flags)."""
@@ -147,7 +149,7 @@ def escalate_emergency_encounter(
     encounter_id: UUID,
     payload: EmergencyEscalateRequest,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_emergency_access),
+    user: dict[str, Any] = Depends(require_emergency_edit),
     hospital_id: UUID = Depends(get_emergency_hospital_context),
 ):
     """Escalate a deteriorating patient in the emergency queue."""
@@ -166,7 +168,7 @@ def create_emergency_order(
     encounter_id: UUID,
     payload: EmergencyOrderCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_emergency_access),
+    user: dict[str, Any] = Depends(require_emergency_edit),
     hospital_id: UUID = Depends(get_emergency_hospital_context),
 ):
     """Record rapid emergency treatment, STAT medication, or verbal orders."""
@@ -195,7 +197,7 @@ def execute_emergency_order(
     order_id: UUID,
     payload: EmergencyOrderExecute,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_emergency_access),
+    user: dict[str, Any] = Depends(require_emergency_administer),
     hospital_id: UUID = Depends(get_emergency_hospital_context),
 ):
     """Log nurse execution of emergency treatment or verbal orders."""
@@ -212,7 +214,7 @@ def record_emergency_disposition(
     encounter_id: UUID,
     payload: EmergencyDispositionCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_emergency_access),
+    user: dict[str, Any] = Depends(require_emergency_edit),
     hospital_id: UUID = Depends(get_emergency_hospital_context),
 ):
     """Record final emergency outcome (admission, observation, discharge, referral, LAMA)."""

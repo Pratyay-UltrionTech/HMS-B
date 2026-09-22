@@ -13,9 +13,13 @@ from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
-from modules.billing.entities.billing_entities import BillingSourceType
+from modules.billing.entities.billing_entities import (
+    BillingPaymentMethod,
+    BillingSourceType,
+)
 from modules.billing.services.billing_service import (
     cancel_charge_for_source,
+    create_payment,
     ensure_charge,
 )
 from modules.pharmacy.contracts.pharmacy_contracts import (
@@ -986,6 +990,27 @@ class PharmacyActions:
                 created_by_name=actor,
             )
             sale.billing_charge_id = charge.id
+
+            # If payment was collected at pharmacy POS counter, mirror to central billing as paid
+            if paid > 0:
+                method_val = payload.payment_method.value if getattr(payload, "payment_method", None) else "cash"
+                try:
+                    pay_method = BillingPaymentMethod(method_val)
+                except ValueError:
+                    pay_method = BillingPaymentMethod.cash
+
+                create_payment(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    patient_id=payload.patient_id,
+                    amount=paid,
+                    payment_date=date.today(),
+                    payment_method=pay_method,
+                    notes=f"Pharmacy Counter POS Collection: {invoice_number}",
+                    received_by_name=actor,
+                    allocate=True,
+                    allocations_plan=[{"charge_id": charge.id, "amount": min(paid, float(charge.net_amount))}],
+                )
 
         # Transition prescription status (FLAW-004). When dispensing against a pharmacy
         # Rx request, the request-level recompute above already mirrored the clinical

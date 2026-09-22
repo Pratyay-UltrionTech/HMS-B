@@ -232,3 +232,57 @@ def update_facility_settings(
 ) -> HospitalFacilitySettings:
     return AdminActions(db, hospital_id, actor).update_facility_settings(payload)
 
+
+# ── Authorization Simulation & Diagnostics (Admin Only) ──────────────────────
+from modules.admin.contracts.admin_contracts import AuthSimulateRequest, AuthSimulateResponse
+from shared.auth.service import authorization
+
+
+@router.post("/authorization/simulate", response_model=AuthSimulateResponse)
+def simulate_authorization(
+    payload: AuthSimulateRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    _: dict[str, Any] = Depends(require_hospital_admin),
+) -> AuthSimulateResponse:
+    from modules.doctors.entities.doctor import HospitalUser
+    user_row = db.query(HospitalUser).filter(
+        HospitalUser.id == UUID(payload.user_id),
+        HospitalUser.hospital_id == hospital_id,
+    ).first()
+    if not user_row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    simulated_user = {
+        "user_id": str(user_row.id),
+        "email": user_row.email,
+        "name": user_row.name,
+        "role": "hospital_staff",
+        "hospital_uuid": str(hospital_id),
+    }
+
+    class MockResource:
+        pass
+
+    mock_resource = None
+    if payload.department_id or payload.ward_id or payload.resource_hospital_id or payload.resource_creator_id:
+        mock_resource = MockResource()
+        mock_resource.hospital_id = payload.resource_hospital_id or str(hospital_id)
+        if payload.department_id:
+            mock_resource.department_id = payload.department_id
+        if payload.ward_id:
+            mock_resource.ward_id = payload.ward_id
+        if payload.resource_creator_id:
+            mock_resource.created_by_user_id = payload.resource_creator_id
+
+    result = authorization.simulate(
+        user=simulated_user,
+        action_spec=payload.action,
+        resource=mock_resource,
+        db=db,
+    )
+    return AuthSimulateResponse(
+        decision=result["decision"],
+        details=result["details"],
+    )
+

@@ -301,7 +301,7 @@ def get_sale(
 
 
 @router.post("/sales", response_model=SaleResponse, status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_permission("pharmacy", "edit"))])
+    dependencies=[Depends(require_permission("pharmacy", "dispense"))])
 def create_sale(
     payload: SaleCreate,
     db: Session = Depends(get_transitional_sync_session),

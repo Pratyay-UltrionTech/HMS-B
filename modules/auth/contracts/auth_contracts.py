@@ -24,6 +24,12 @@ class LoginResponse(BaseModel):
     name: str | None = None
     plan: PlanType | None = None
     staff_role_name: str | None = None
+    roles: list[str] | None = None
+    primary_role: str | None = None
+    department_id: str | None = None
+    department_name: str | None = None
+    department_ids: list[str] | None = None
+    ward_ids: list[str] | None = None
     permissions: list[dict] | None = None
     user_id: str | None = None
     token_version: int = 1
@@ -38,6 +44,12 @@ class MeResponse(BaseModel):
     hospital_id: str | None = None
     hospital_uuid: str | None = None
     staff_role_name: str | None = None
+    roles: list[str] | None = None
+    primary_role: str | None = None
+    department_id: str | None = None
+    department_name: str | None = None
+    department_ids: list[str] | None = None
+    ward_ids: list[str] | None = None
     user_id: str | None = None
     is_active: bool = True
     token_version: int = 1

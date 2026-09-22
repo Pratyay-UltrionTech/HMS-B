@@ -35,7 +35,7 @@ from modules.ambulance.contracts.ambulance_contracts import (
     AmbulanceVehicleUpdate,
 )
 from modules.ambulance.db.ambulance_repository import AmbulanceRepository
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_permission
 
 router = APIRouter(prefix="/ambulance", tags=["ambulance"])
 
@@ -49,7 +49,7 @@ router = APIRouter(prefix="/ambulance", tags=["ambulance"])
 def create_ambulance_vehicle(
     payload: AmbulanceVehicleCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("ambulance", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Register an ambulance vehicle in the hospital fleet."""
@@ -60,7 +60,7 @@ def create_ambulance_vehicle(
 def list_ambulance_vehicles(
     available_only: bool = Query(default=False),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("ambulance", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """List ambulance vehicles in hospital fleet."""
@@ -74,7 +74,7 @@ def update_ambulance_vehicle(
     vehicle_id: UUID,
     payload: AmbulanceVehicleUpdate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("ambulance", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Update status, equipment, or active crew of an ambulance vehicle."""
@@ -90,7 +90,7 @@ def update_ambulance_vehicle(
 def create_ambulance_dispatch(
     payload: AmbulanceDispatchCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("ambulance", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Assign available ambulance to emergency request and initiate dispatch."""
@@ -101,7 +101,7 @@ def create_ambulance_dispatch(
 def list_ambulance_dispatches(
     active_only: bool = Query(default=False),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("ambulance", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """List ambulance dispatches and active trips."""
@@ -114,7 +114,7 @@ def list_ambulance_dispatches(
 def get_ambulance_dispatch(
     dispatch_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("ambulance", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Get single dispatch trip details."""
@@ -131,7 +131,7 @@ def update_ambulance_dispatch_status(
     dispatch_id: UUID,
     payload: AmbulanceDispatchUpdateStatus,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("ambulance", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     """Update dispatch status (at_scene, transporting, completed, cancelled)."""

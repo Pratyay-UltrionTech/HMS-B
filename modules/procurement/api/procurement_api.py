@@ -30,7 +30,7 @@ from modules.procurement.contracts.procurement_contracts import (
     PurchaseOrderResponse,
     SupplierPerformanceResponse,
 )
-from shared.auth import get_hospital_context, require_hospital_user
+from shared.auth import get_hospital_context, require_permission
 
 router = APIRouter(prefix="/procurement", tags=["procurement"])
 
@@ -41,7 +41,7 @@ router = APIRouter(prefix="/procurement", tags=["procurement"])
 def list_requisitions(
     status_filter: str | None = Query(None, alias="status"),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[MaterialRequisitionResponse]:
     return ProcurementActions(db, hospital_id, user).list_requisitions(status_filter=status_filter)
@@ -51,7 +51,7 @@ def list_requisitions(
 def create_requisition(
     payload: MaterialRequisitionCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> MaterialRequisitionResponse:
     return ProcurementActions(db, hospital_id, user).create_requisition(payload)
@@ -62,7 +62,7 @@ def approve_requisition(
     requisition_id: UUID,
     payload: MaterialRequisitionAction | None = None,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "approve")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> MaterialRequisitionResponse:
     return ProcurementActions(db, hospital_id, user).approve_requisition(requisition_id, payload)
@@ -73,7 +73,7 @@ def reject_requisition(
     requisition_id: UUID,
     payload: MaterialRequisitionAction | None = None,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "approve")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> MaterialRequisitionResponse:
     return ProcurementActions(db, hospital_id, user).reject_requisition(requisition_id, payload)
@@ -83,7 +83,7 @@ def reject_requisition(
 def fulfill_requisition(
     requisition_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> MaterialRequisitionResponse:
     return ProcurementActions(db, hospital_id, user).fulfill_requisition(requisition_id)
@@ -95,7 +95,7 @@ def fulfill_requisition(
 def list_thresholds(
     applies_to: str | None = Query(None),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[ApprovalThresholdResponse]:
     return ProcurementActions(db, hospital_id, user).list_thresholds(applies_to=applies_to)
@@ -105,7 +105,7 @@ def list_thresholds(
 def create_threshold(
     payload: ApprovalThresholdCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "approve")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> ApprovalThresholdResponse:
     return ProcurementActions(db, hospital_id, user).create_threshold(payload)
@@ -116,7 +116,7 @@ def list_approval_history(
     entity_type: str,
     entity_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[ApprovalActionResponse]:
     return ProcurementActions(db, hospital_id, user).list_approval_history(entity_type, entity_id)
@@ -128,7 +128,7 @@ def list_approval_history(
 def list_pos(
     status_filter: str | None = Query(None, alias="status"),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[PurchaseOrderResponse]:
     return ProcurementActions(db, hospital_id, user).list_pos(status_filter=status_filter)
@@ -138,7 +138,7 @@ def list_pos(
 def create_po(
     payload: PurchaseOrderCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PurchaseOrderResponse:
     return ProcurementActions(db, hospital_id, user).create_po(payload)
@@ -148,7 +148,7 @@ def create_po(
 def get_po(
     po_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PurchaseOrderResponse:
     return ProcurementActions(db, hospital_id, user).get_po(po_id)
@@ -158,7 +158,7 @@ def get_po(
 def submit_po(
     po_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PurchaseOrderResponse:
     return ProcurementActions(db, hospital_id, user).submit_po_for_approval(po_id)
@@ -169,7 +169,7 @@ def approve_po(
     po_id: UUID,
     payload: ApprovalDecisionRequest | None = None,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "approve")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PurchaseOrderResponse:
     return ProcurementActions(db, hospital_id, user).approve_po(po_id, payload)
@@ -179,7 +179,7 @@ def approve_po(
 def cancel_po(
     po_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PurchaseOrderResponse:
     return ProcurementActions(db, hospital_id, user).cancel_po(po_id)
@@ -189,7 +189,7 @@ def cancel_po(
 def mark_po_sent(
     po_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PurchaseOrderResponse:
     return ProcurementActions(db, hospital_id, user).mark_po_sent(po_id)
@@ -201,7 +201,7 @@ def mark_po_sent(
 def record_grn(
     payload: GrnCreate,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "edit")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> GrnResponse:
     return ProcurementActions(db, hospital_id, user).record_grn(payload)
@@ -211,7 +211,7 @@ def record_grn(
 def list_grns_for_po(
     po_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[GrnResponse]:
     return ProcurementActions(db, hospital_id, user).list_grns_for_po(po_id)
@@ -223,7 +223,7 @@ def list_grns_for_po(
 def get_supplier_performance(
     supplier_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> SupplierPerformanceResponse:
     return ProcurementActions(db, hospital_id, user).get_supplier_performance(supplier_id)
@@ -234,7 +234,7 @@ def get_supplier_performance(
 @router.get("/analytics", response_model=ProcurementAnalyticsResponse)
 def get_analytics(
     db: Session = Depends(get_transitional_sync_session),
-    user: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_permission("procurement", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> ProcurementAnalyticsResponse:
     return ProcurementActions(db, hospital_id, user).get_analytics()

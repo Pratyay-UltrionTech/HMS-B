@@ -50,6 +50,9 @@ class Hospital(Base):
     facility_settings: Mapped[dict | None] = mapped_column(
         JSONB().with_variant(JSON, "sqlite"), nullable=True
     )
+    gstin: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    pan: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    state_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
