@@ -31,7 +31,7 @@ from modules.clinical_decision.contracts.clinical_decision_contracts import (
     MedicationReconciliationResponse,
     UpdateReconciliationItemsRequest,
 )
-from shared.auth.dependencies import get_hospital_context, require_hospital_user
+from shared.auth.dependencies import get_hospital_context, require_permission
 
 router = APIRouter(prefix="/clinical", tags=["Clinical Decision Support"])
 
@@ -49,7 +49,7 @@ def create_medication_reconciliation(
     payload: MedicationReconciliationCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "edit")),
 ) -> MedicationReconciliationResponse:
     return ClinicalDecisionActions(db, hospital_id, actor).create_reconciliation(payload)
 
@@ -62,7 +62,7 @@ def get_medication_reconciliation(
     rec_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "view")),
 ) -> MedicationReconciliationResponse:
     return ClinicalDecisionActions(db, hospital_id, actor).get_reconciliation(rec_id)
 
@@ -75,7 +75,7 @@ def list_reconciliations_for_admission(
     admission_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "view")),
 ) -> list[MedicationReconciliationResponse]:
     return ClinicalDecisionActions(db, hospital_id, actor).list_reconciliations_for_admission(admission_id)
 
@@ -88,7 +88,7 @@ def list_reconciliations_for_patient(
     patient_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "view")),
 ) -> list[MedicationReconciliationResponse]:
     return ClinicalDecisionActions(db, hospital_id, actor).list_reconciliations_for_patient(patient_id)
 
@@ -102,7 +102,7 @@ def update_reconciliation_items(
     payload: UpdateReconciliationItemsRequest,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "edit")),
 ) -> MedicationReconciliationResponse:
     return ClinicalDecisionActions(db, hospital_id, actor).update_reconciliation_items(rec_id, payload)
 
@@ -120,7 +120,7 @@ def create_clinical_rule(
     payload: ClinicalRuleCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "edit")),
 ) -> ClinicalRuleResponse:
     return ClinicalDecisionActions(db, hospital_id, actor).create_rule(payload)
 
@@ -132,7 +132,7 @@ def create_clinical_rule(
 def list_clinical_rules(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "view")),
 ) -> list[ClinicalRuleResponse]:
     return ClinicalDecisionActions(db, hospital_id, actor).list_rules()
 
@@ -146,7 +146,7 @@ def evaluate_patient_clinical_alerts(
     payload: EvaluateAlertsRequest | None = None,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "edit")),
 ) -> list[ClinicalAlertResponse]:
     return ClinicalDecisionActions(db, hospital_id, actor).evaluate_patient_alerts(patient_id, payload)
 
@@ -159,7 +159,7 @@ def list_patient_clinical_alerts(
     patient_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "view")),
 ) -> list[ClinicalAlertResponse]:
     return ClinicalDecisionActions(db, hospital_id, actor).evaluate_patient_alerts(patient_id, None)
 
@@ -173,13 +173,8 @@ def list_clinical_alerts(
     status: str | None = Query(default=None),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "view")),
 ) -> list[ClinicalAlertResponse]:
-    """Hospital-scoped alert feed used by the Clinical Decision workspace.
-
-    Frontend calls GET /api/clinical/alerts[?patient_id=&status=].
-    Previously missing, which surfaced as 404 spam in the console.
-    """
     return ClinicalDecisionActions(db, hospital_id, actor).list_alerts(patient_id, status)
 
 
@@ -190,7 +185,6 @@ def _acknowledge(
     hospital_id: UUID,
     actor: dict[str, Any],
 ) -> ClinicalAlertResponse:
-    # Frontend sends PATCH with {"notes": "..."} and no status; accept empty body too.
     req = payload or AcknowledgeAlertRequest()
     return ClinicalDecisionActions(db, hospital_id, actor).acknowledge_alert(alert_id, req)
 
@@ -204,7 +198,7 @@ def acknowledge_clinical_alert(
     payload: AcknowledgeAlertRequest | None = None,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "edit")),
 ) -> ClinicalAlertResponse:
     return _acknowledge(alert_id, payload, db, hospital_id, actor)
 
@@ -218,9 +212,8 @@ def acknowledge_clinical_alert_patch(
     payload: AcknowledgeAlertRequest | None = None,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "edit")),
 ) -> ClinicalAlertResponse:
-    """PATCH alias — frontend uses PATCH with { notes }."""
     return _acknowledge(alert_id, payload, db, hospital_id, actor)
 
 
@@ -237,7 +230,7 @@ def create_clinical_order_set(
     payload: ClinicalOrderSetCreate,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "edit")),
 ) -> ClinicalOrderSetResponse:
     return ClinicalDecisionActions(db, hospital_id, actor).create_order_set(payload)
 
@@ -250,7 +243,7 @@ def list_clinical_order_sets(
     category: str | None = Query(default=None),
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "view")),
 ) -> list[ClinicalOrderSetResponse]:
     return ClinicalDecisionActions(db, hospital_id, actor).list_order_sets(category)
 
@@ -263,7 +256,7 @@ def get_clinical_order_set(
     set_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "view")),
 ) -> ClinicalOrderSetResponse:
     return ClinicalDecisionActions(db, hospital_id, actor).get_order_set(set_id)
 
@@ -277,6 +270,6 @@ def apply_clinical_order_set(
     payload: ApplyOrderSetRequest,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    actor: dict[str, Any] = Depends(require_hospital_user),
+    actor: dict[str, Any] = Depends(require_permission("clinical_decision", "edit")),
 ) -> ApplyOrderSetResult:
     return ClinicalDecisionActions(db, hospital_id, actor).apply_order_set(set_id, payload)

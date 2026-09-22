@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from modules.appointments.entities.appointment import Appointment
 from modules.appointments.entities.enums import AppointmentStatus
-from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.doctors.entities.doctor import HospitalUser, RolePermission, StaffRole
 from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.session import get_transitional_sync_session
@@ -53,6 +53,16 @@ def client(clinical_app: FastAPI) -> TestClient:
 def doctor_with_role(db_session: Session, hospital: Hospital) -> HospitalUser:
     role = StaffRole(id=uuid4(), hospital_id=hospital.id, name="Doctor")
     db_session.add(role)
+    db_session.flush()
+    db_session.add(
+        RolePermission(
+            hospital_id=hospital.id,
+            role_id=role.id,
+            module_key="doctors",
+            can_view=True,
+            can_edit=True,
+        )
+    )
     db_session.commit()
 
     doc = HospitalUser(
@@ -80,6 +90,7 @@ def auth_headers(hospital: Hospital, doctor_with_role: HospitalUser) -> dict[str
         "hospital_uuid": str(hospital.id),
         "user_id": str(doctor_with_role.id),
         "doctor_id": str(doctor_with_role.id),
+        "staff_role_id": str(doctor_with_role.role_id),
     })
     return {"Authorization": f"Bearer {token}"}
 
@@ -470,6 +481,7 @@ def test_cross_doctor_patient_diagnostic_records_and_history(
         "hospital_uuid": str(hospital.id),
         "user_id": str(doctor_with_role.id),
         "doctor_id": str(doctor_with_role.id),
+        "staff_role_id": str(doctor_with_role.role_id),
     })
     headers_a = {"Authorization": f"Bearer {token_a}"}
 
@@ -480,6 +492,7 @@ def test_cross_doctor_patient_diagnostic_records_and_history(
         "hospital_uuid": str(hospital.id),
         "user_id": str(doc_b.id),
         "doctor_id": str(doc_b.id),
+        "staff_role_id": str(doc_b.role_id),
     })
     headers_b = {"Authorization": f"Bearer {token_b}"}
 
@@ -605,4 +618,41 @@ def test_prescription_pdf_includes_radiology_and_lab_investigations(
     assert "Complete Blood Count" in html
     assert "Radiology / Imaging Prescribed" in html
     assert "Laboratory Tests Prescribed" in html
+
+
+def test_issued_prescription_cancel_appears_in_history(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    doctor_with_role: HospitalUser,
+    test_patient: Patient,
+):
+    """Cancelled prescriptions remain listable; cancel metadata is returned."""
+    doc_id = str(doctor_with_role.id)
+    create_res = client.post(
+        f"/api/doctors/{doc_id}/prescriptions",
+        json={
+            "patient_id": str(test_patient.id),
+            "symptoms": "Cough",
+            "diagnosis": "URI",
+            "medicines": "Cetirizine",
+            "dosage": "1 OD",
+            "status": "issued",
+        },
+        headers=auth_headers,
+    )
+    assert create_res.status_code == 201, create_res.text
+    rx_id = create_res.json()["id"]
+    cancel_res = client.post(
+        f"/api/doctors/{doc_id}/prescriptions/{rx_id}/cancel",
+        json={"reason": "Duplicate prescription"},
+        headers=auth_headers,
+    )
+    assert cancel_res.status_code == 200, cancel_res.text
+    assert cancel_res.json()["status"] == "cancelled"
+    assert cancel_res.json()["cancel_reason"] == "Duplicate prescription"
+    list_res = client.get(
+        f"/api/doctors/{doc_id}/prescriptions?patient_id={test_patient.id}",
+        headers=auth_headers,
+    )
+    assert any(r["id"] == rx_id and r["status"] == "cancelled" for r in list_res.json())
 

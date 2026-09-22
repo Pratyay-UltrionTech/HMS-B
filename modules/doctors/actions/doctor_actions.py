@@ -269,8 +269,19 @@ class GetDoctorPatientHistoryAction:
             or self.db.query(MedicalRecord.id)
             .filter(MedicalRecord.doctor_id == doctor_id, MedicalRecord.patient_id == patient_id)
             .first()
+            or self.db.query(Admission.id)
+            .filter(Admission.doctor_id == doctor_id, Admission.patient_id == patient_id)
+            .first()
         )
-        if not linked and actor.get("role") != "hospital_admin":
+        # Any doctor in the hospital or hospital admin can view patient history for clinical consultation
+        actor_role = str(actor.get("role") or "").lower()
+        actor_staff_role = str(actor.get("staff_role_name") or actor.get("staff_role") or "").lower()
+        is_admin_or_doctor = (
+            actor_role in ("hospital_admin", "doctor")
+            or "doctor" in actor_staff_role
+            or actor.get("is_doctor") is True
+        )
+        if not linked and not is_admin_or_doctor:
             raise HTTPException(status_code=404, detail="Patient not found for this doctor")
 
         appointments = (

@@ -115,6 +115,16 @@ class RolePermission(Base):
     module_key: Mapped[str] = mapped_column(String(64), nullable=False)
     can_view: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     can_edit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Granular action permissions
+    can_create: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_delete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_approve: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_validate: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_release: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_dispense: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_refund: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_cancel: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_administer: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     role: Mapped["StaffRole"] = relationship("StaffRole", back_populates="permissions")
 
@@ -163,6 +173,9 @@ class HospitalUser(Base):
     role_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("staff_roles.id", ondelete="RESTRICT"), nullable=False, index=True
     )
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     shift_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("shift_types.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -192,6 +205,156 @@ class HospitalUser(Base):
 
     role: Mapped[StaffRole | None] = relationship("StaffRole", foreign_keys=[role_id])
     shift: Mapped[ShiftType | None] = relationship("ShiftType", foreign_keys=[shift_id])
+
+    assigned_roles: Mapped[list["HospitalUserRole"]] = relationship(
+        "HospitalUserRole",
+        primaryjoin="HospitalUser.id == HospitalUserRole.user_id",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    assigned_departments: Mapped[list["HospitalUserDepartment"]] = relationship(
+        "HospitalUserDepartment",
+        primaryjoin="HospitalUser.id == HospitalUserDepartment.user_id",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    assigned_locations: Mapped[list["HospitalUserLocation"]] = relationship(
+        "HospitalUserLocation",
+        primaryjoin="HospitalUser.id == HospitalUserLocation.user_id",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    practitioner: Mapped["Practitioner | None"] = relationship(
+        "Practitioner",
+        primaryjoin="HospitalUser.id == Practitioner.user_id",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class HospitalUserRole(Base):
+    """Many-to-many assignment mapping hospital users to one or more staff roles."""
+
+    __tablename__ = "hospital_user_roles"
+    __table_args__ = (
+        UniqueConstraint("user_id", "role_id", name="uq_user_role"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("staff_roles.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    assigned_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    role: Mapped[StaffRole] = relationship("StaffRole")
+    user: Mapped[HospitalUser] = relationship("HospitalUser", back_populates="assigned_roles", foreign_keys=[user_id])
+
+
+class HospitalUserDepartment(Base):
+    """User-to-Department organizational assignment supporting primary and secondary departments."""
+
+    __tablename__ = "hospital_user_departments"
+    __table_args__ = (
+        UniqueConstraint("user_id", "department_id", name="uq_user_dept"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    can_supervise: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user: Mapped[HospitalUser] = relationship("HospitalUser", back_populates="assigned_departments", foreign_keys=[user_id])
+
+
+class HospitalUserLocation(Base):
+    """User-to-Ward/Location operational assignment for nursing and ward-level scoping."""
+
+    __tablename__ = "hospital_user_locations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "ward_id", name="uq_user_ward"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ward_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wards.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    wing_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wings.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user: Mapped[HospitalUser] = relationship("HospitalUser", back_populates="assigned_locations", foreign_keys=[user_id])
+
+
+class Practitioner(Base):
+    """Clinical practitioner professional registration and credential record."""
+
+    __tablename__ = "practitioners"
+    __table_args__ = (
+        UniqueConstraint("hospital_id", "user_id", name="uq_practitioner_user"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    designation: Mapped[str] = mapped_column(String(128), nullable=False)
+    medical_registration_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    qualification: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    years_of_experience: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    digital_signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user: Mapped[HospitalUser] = relationship("HospitalUser", back_populates="practitioner", foreign_keys=[user_id])
 
 
 class DoctorLeave(Base):

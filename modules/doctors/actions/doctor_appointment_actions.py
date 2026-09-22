@@ -154,6 +154,8 @@ class ListDoctorAppointmentsAction:
         on_date: date | None = None,
         status_filter: AppointmentStatus | None = None,
         visit_type: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
     ) -> list[DoctorAppointmentResponse]:
         q = (
             self.db.query(Appointment)
@@ -162,11 +164,15 @@ class ListDoctorAppointmentsAction:
         )
         if on_date:
             q = q.filter(Appointment.appointment_date == on_date)
+        if date_from:
+            q = q.filter(Appointment.appointment_date >= date_from)
+        if date_to:
+            q = q.filter(Appointment.appointment_date <= date_to)
         if status_filter:
             q = q.filter(Appointment.status == status_filter)
         if visit_type:
             q = q.filter(Appointment.visit_type == visit_type)
-        rows = q.order_by(Appointment.appointment_time.asc()).all()
+        rows = q.order_by(Appointment.appointment_date.asc(), Appointment.appointment_time.asc()).all()
         return [to_doctor_appointment_response(a) for a in rows]
 
 

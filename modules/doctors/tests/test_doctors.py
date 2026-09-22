@@ -23,7 +23,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.doctors.entities.doctor import HospitalUser, RolePermission, StaffRole
 from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.session import get_transitional_sync_session
@@ -61,6 +61,16 @@ def doctor_role(db_session: Session, hospital: Hospital) -> StaffRole:
         description="Medical Doctor Role",
     )
     db_session.add(role)
+    db_session.flush()
+    db_session.add(
+        RolePermission(
+            hospital_id=hospital.id,
+            role_id=role.id,
+            module_key="doctors",
+            can_view=True,
+            can_edit=True,
+        )
+    )
     db_session.commit()
     return role
 
@@ -96,6 +106,7 @@ def doctor_auth_headers(hospital: Hospital, doctor_user: HospitalUser) -> dict[s
         "hospital_uuid": str(hospital.id),
         "user_id": str(doctor_user.id),
         "doctor_id": str(doctor_user.id),
+        "staff_role_id": str(doctor_user.role_id),
     })
     return {"Authorization": f"Bearer {token}"}
 
@@ -339,6 +350,72 @@ def test_get_doctor_patient_history(
     assert appt_resp["admission_ward"] == "General Ward"
     assert appt_resp["admission_bed"] == "B-101"
     assert appt_resp["admission_status"] == "admitted"
+
+
+def test_doctor_patient_history_allows_admission_only_link(
+    client: TestClient,
+    doctor_auth_headers: dict[str, str],
+    doctor_user: HospitalUser,
+    db_session: Session,
+    hospital: Hospital,
+):
+    """Regression: a patient linked to the doctor ONLY via an Admission (no
+    appointment/prescription/record) must still open in the current-patient view.
+
+    Previously GetDoctorPatientHistoryAction only considered Appointment,
+    Prescription and MedicalRecord links, so an admitted patient with none of
+    those returned 404 and the frontend rendered an empty patient screen.
+    """
+    from modules.beds.entities.bed import Bed, Room, Ward, WardType
+    from modules.inpatient.entities.admission import Admission, AdmissionStatus
+
+    patient = Patient(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        uhid="PADMONLY",
+        name="Admitted Only Patient",
+        gender="Female",
+        mobile="9998887701",
+    )
+    db_session.add(patient)
+    db_session.flush()
+
+    ward = Ward(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        name="IPD Ward",
+        ward_type=WardType.general,
+    )
+    db_session.add(ward)
+    db_session.flush()
+    room = Room(id=uuid4(), hospital_id=hospital.id, ward_id=ward.id, room_code="R-200")
+    db_session.add(room)
+    db_session.flush()
+    bed = Bed(id=uuid4(), hospital_id=hospital.id, ward_id=ward.id, room_id=room.id, bed_code="B-200")
+    db_session.add(bed)
+    db_session.flush()
+
+    adm = Admission(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        patient_id=patient.id,
+        doctor_id=doctor_user.id,
+        ward_id=ward.id,
+        room_id=room.id,
+        bed_id=bed.id,
+        ip_id="IPADMONLY",
+        status=AdmissionStatus.admitted,
+    )
+    db_session.add(adm)
+    db_session.commit()
+
+    res = client.get(
+        f"/api/doctors/{doctor_user.id}/patients/{patient.id}",
+        headers=doctor_auth_headers,
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["patient"]["id"] == str(patient.id)
 
 
 def test_direct_backend_completion_diagnostic_blockers_enforced(

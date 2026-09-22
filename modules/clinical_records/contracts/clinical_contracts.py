@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from modules.appointments.entities.enums import AppointmentStatus
 
@@ -49,6 +49,18 @@ class PrescriptionUpdate(BaseModel):
     override_reason: str | None = None
 
 
+class PrescriptionCancelRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_must_be_non_empty(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("reason is required")
+        return stripped
+
+
 class PrescriptionResponse(BaseModel):
     id: UUID
     hospital_id: UUID
@@ -64,6 +76,9 @@ class PrescriptionResponse(BaseModel):
     signature_data: str | None = None
     has_signature: bool = False
     status: str = "issued"
+    cancelled_at: datetime | None = None
+    cancelled_by: str | None = None
+    cancel_reason: str | None = None
     created_at: datetime
     patient_name: str | None = None
     patient_mobile: str | None = None

@@ -25,9 +25,14 @@ from modules.clinical_records.actions.clinical_actions import (
     StreamPrescriptionPdfAction,
     UpdatePrescriptionAction,
 )
+from modules.clinical_records.actions.prescription_lifecycle_actions import (
+    CancelPrescriptionAction,
+    DeletePrescriptionAction,
+)
 from modules.clinical_records.contracts.clinical_contracts import (
     MedicalRecordCreate,
     MedicalRecordResponse,
+    PrescriptionCancelRequest,
     PrescriptionCreate,
     PrescriptionResponse,
     PrescriptionUpdate,
@@ -85,7 +90,7 @@ router = APIRouter(prefix="/doctors", tags=["doctors"])
 def list_doctors(
     specialization: str | None = Query(default=None),
     db: Session = Depends(get_transitional_sync_session),
-    user: dict = Depends(require_hospital_user),
+    user: dict = Depends(require_permission("doctors", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ):
     return ListDoctorsAction(db).execute(hospital_id, specialization)
@@ -183,6 +188,8 @@ def create_doctor_appointment(
 def list_doctor_appointments(
     doctor_id: UUID,
     on_date: date | None = Query(default=None, alias="date"),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
     status_filter: AppointmentStatus | None = Query(default=None, alias="status"),
     visit_type: str | None = Query(default=None),
     db: Session = Depends(get_transitional_sync_session),
@@ -191,7 +198,7 @@ def list_doctor_appointments(
 ):
     resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
     return ListDoctorAppointmentsAction(db).execute(
-        hospital_id, resolved, on_date, status_filter, visit_type
+        hospital_id, resolved, on_date, status_filter, visit_type, date_from=date_from, date_to=date_to
     )
 
 
@@ -361,6 +368,42 @@ def update_prescription(
     resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
     return UpdatePrescriptionAction(db).execute(
         hospital_id, resolved, prescription_id, payload, user
+    )
+
+
+@router.post(
+    "/{doctor_id}/prescriptions/{prescription_id}/cancel",
+    response_model=PrescriptionResponse,
+    dependencies=[Depends(require_permission("doctors", "edit"))],
+)
+def cancel_prescription(
+    doctor_id: UUID,
+    prescription_id: UUID,
+    payload: PrescriptionCancelRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
+    return CancelPrescriptionAction(db).execute(
+        hospital_id, resolved, prescription_id, payload, user
+    )
+
+
+@router.delete(
+    "/{doctor_id}/prescriptions/{prescription_id}",
+    dependencies=[Depends(require_permission("doctors", "edit"))],
+)
+def delete_prescription(
+    doctor_id: UUID,
+    prescription_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
+    return DeletePrescriptionAction(db).execute(
+        hospital_id, resolved, prescription_id, user
     )
 
 
