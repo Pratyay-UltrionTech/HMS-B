@@ -58,7 +58,7 @@ jobs:
           tar -czf antenv.tar.gz -C antenv .
           rm -rf antenv
           echo "Archive top entries (must be bin/ lib/ etc, not antenv/):"
-          tar -tzf antenv.tar.gz | head -n 20
+          tar -tzf antenv.tar.gz | sed -n '1,20p'
           ls -lh antenv.tar.gz
           mkdir -p /tmp/antenv-check
           tar -xzf antenv.tar.gz -C /tmp/antenv-check
