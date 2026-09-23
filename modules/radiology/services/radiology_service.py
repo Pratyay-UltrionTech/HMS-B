@@ -119,6 +119,106 @@ def order_to_response(order: RadiologyOrder, db: Session | None = None) -> RadOr
     )
 
 
+def _build_order_response(order: RadiologyOrder, fin_state: Any) -> RadOrderResponse:
+    """
+    Build a RadOrderResponse from an already-fetched ServiceFinancialState.
+
+    Used by orders_to_responses() to avoid a per-order billing DB query.
+    All field mapping is identical to order_to_response() — only the billing
+    lookup source changes (pre-fetched dict vs. per-order DB call).
+    """
+    return RadOrderResponse(
+        id=order.id,
+        hospital_id=order.hospital_id,
+        order_no=order.order_no,
+        patient_id=order.patient_id,
+        doctor_id=order.doctor_id,
+        appointment_id=order.appointment_id,
+        admission_id=getattr(order, "admission_id", None),
+        prescription_id=order.prescription_id,
+        prescription_request_id=order.prescription_request_id,
+        scan_id=order.scan_id,
+        scan_code=order.scan_code,
+        scan_name=order.scan_name,
+        category=order.category,
+        price=order.price,
+        ordered_by_name=order.ordered_by_name,
+        ordered_by_role=order.ordered_by_role,
+        status=order.status,
+        clinical_notes=order.clinical_notes,
+        scheduled_at=order.scheduled_at,
+        machine=order.machine,
+        technician_name=order.technician_name,
+        started_at=order.started_at,
+        completed_at=order.completed_at,
+        findings=order.findings,
+        impression=order.impression,
+        remarks=order.remarks,
+        report_file_name=order.report_file_name,
+        has_report_file=bool(getattr(order, "has_report_file", None) if getattr(order, "has_report_file", None) is not None else order.report_file_name),
+        image_file_name=order.image_file_name,
+        has_image_file=bool(getattr(order, "has_image_file", None) if getattr(order, "has_image_file", None) is not None else order.image_file_name),
+        report_uploaded_by=order.report_uploaded_by,
+        report_date=order.report_date,
+        is_amended=bool(getattr(order, "is_amended", False)),
+        amendment_reason=getattr(order, "amendment_reason", None),
+        ordered_at=order.ordered_at,
+        patient_name=order.patient.name if order.patient else None,
+        patient_uhid=order.patient.uhid if order.patient else None,
+        patient_mobile=order.patient.mobile if order.patient else None,
+        doctor_name=order.doctor.name if order.doctor else None,
+        payment_status=fin_state.status,
+        is_financially_cleared=fin_state.is_cleared,
+        net_amount=fin_state.net_amount,
+        amount_paid=fin_state.amount_paid,
+        outstanding_amount=fin_state.outstanding_amount,
+    )
+
+
+def orders_to_responses(orders: list[RadiologyOrder], db: Session) -> list[RadOrderResponse]:
+    """
+    Batch-convert a list of RadiologyOrder entities to RadOrderResponse objects.
+
+    Replaces the per-order loop that calls order_to_response() (which invokes
+    check_service_financial_clearance() once per order).  Instead, all billing
+    clearance states for the entire list are fetched in 1-3 queries total using
+    bulk_check_service_financial_clearance(), regardless of list length.
+
+    Semantics preserved:
+    - latest applicable charge (ORDER BY created_at DESC)
+    - cancelled, partially_paid, pending, paid, unbilled states
+    - cross-link fallback (RadiologyOrder ↔ RadPrescriptionRequest)
+    - is_financially_cleared, payment_status, net_amount, amount_paid, outstanding_amount
+
+    The existing order_to_response() is unchanged and continues to be used by
+    all single-order operations (GET order, cancel, schedule, start, complete,
+    upload report).
+    """
+    if not orders:
+        return []
+
+    try:
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.service_financial_clearance import (
+            bulk_check_service_financial_clearance,
+        )
+
+        order_ids = [o.id for o in orders]
+        hospital_id = orders[0].hospital_id  # all orders share the same hospital in list queries
+
+        fin_states = bulk_check_service_financial_clearance(
+            db,
+            hospital_id,
+            BillingSourceType.radiology,
+            order_ids,
+        )
+    except Exception:
+        # Graceful degradation: fall back to the per-order path if bulk lookup fails
+        return [order_to_response(o, db) for o in orders]
+
+    return [_build_order_response(o, fin_states[o.id]) for o in orders]
+
+
 def sync_radiology_order_medical_record(db: Session, order: RadiologyOrder) -> None:
     """Sync completed radiology report into MedicalRecord clinical history."""
     if order.status != RadiologyOrderStatus.completed or not order.doctor_id:
@@ -154,6 +254,7 @@ def sync_radiology_order_medical_record(db: Session, order: RadiologyOrder) -> N
         existing.title = f"Radiology — {order.scan_name} ({order.order_no})"
         existing.notes = notes
         existing.appointment_id = order.appointment_id
+        existing.admission_id = order.admission_id
         existing.file_name = order.report_file_name
         existing.file_data = order.report_file_data
         return
@@ -164,6 +265,7 @@ def sync_radiology_order_medical_record(db: Session, order: RadiologyOrder) -> N
             doctor_id=order.doctor_id,
             patient_id=order.patient_id,
             appointment_id=order.appointment_id,
+            admission_id=order.admission_id,
             radiology_order_id=order.id,
             report_type=report_type,
             title=f"Radiology — {order.scan_name} ({order.order_no})",

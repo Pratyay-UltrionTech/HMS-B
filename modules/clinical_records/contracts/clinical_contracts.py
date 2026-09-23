@@ -17,6 +17,7 @@ from modules.appointments.entities.enums import AppointmentStatus
 class PrescriptionCreate(BaseModel):
     patient_id: UUID
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     symptoms: str = Field(default="")
     diagnosis: str = Field(default="")
     medicines: str = Field(default="")
@@ -34,6 +35,7 @@ class PrescriptionCreate(BaseModel):
 
 class PrescriptionUpdate(BaseModel):
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     symptoms: str | None = None
     diagnosis: str | None = None
     medicines: str | None = None
@@ -67,6 +69,7 @@ class PrescriptionResponse(BaseModel):
     doctor_id: UUID
     patient_id: UUID
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     symptoms: str
     diagnosis: str
     medicines: str
@@ -94,6 +97,7 @@ class PrescriptionResponse(BaseModel):
 class MedicalRecordCreate(BaseModel):
     patient_id: UUID
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     report_type: str = Field(min_length=1, max_length=64)
     provenance: str = Field(default="external", max_length=32)
     title: str = Field(min_length=1, max_length=255)
@@ -108,6 +112,7 @@ class MedicalRecordResponse(BaseModel):
     doctor_id: UUID
     patient_id: UUID
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     lab_order_id: UUID | None = None
     radiology_order_id: UUID | None = None
     report_type: str

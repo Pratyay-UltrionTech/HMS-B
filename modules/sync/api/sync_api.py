@@ -114,6 +114,9 @@ async def sync_events_stream(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            # Prevent GZipMiddleware from buffering/compressing the stream —
+            # gzip + SSE causes hung connections and 500s through the Vite proxy.
+            "Content-Encoding": "identity",
         },
     )
 

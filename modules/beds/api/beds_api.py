@@ -34,6 +34,7 @@ from modules.doctors.entities.doctor import HospitalUser
 from modules.inpatient.actions.admission_actions import (
     AdmitPatientAction,
     AllocateBedAction,
+    CancelAdmissionAction,
     DischargePatientAction,
     ListDischargeRequestsAction,
     RequestDischargeAction,
@@ -181,6 +182,25 @@ def list_admission_requests(
     return [to_admission_detail(a) for a in rows]
 
 
+@router.get("/admissions/open", response_model=AdmissionDetail | None)
+def get_open_admission(
+    patient_id: UUID = Query(...),
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Return the patient's single open-episode admission (requested/admitted/
+    discharge_requested) or ``null`` with HTTP 200 when there is none.
+
+    Cross-doctor visibility helper: any role can see whether an episode
+    created by another doctor already blocks a new admission.
+    """
+    rows = AdmissionsRepository(db).list_open_admissions(hospital_id, patient_id=patient_id)
+    if not rows:
+        return None
+    return to_admission_detail(rows[0])
+
+
 @router.post("/admissions/{admission_id}/accept", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])
 def accept_admission(
     admission_id: UUID,
@@ -204,6 +224,18 @@ def accept_admission(
         doctor_id=payload.doctor_id,
         notes=payload.notes,
     )
+
+
+@router.post("/admissions/{admission_id}/cancel", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])
+def cancel_admission(
+    admission_id: UUID,
+    reason: str | None = Query(default=None),
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Cancel a requested or admitted admission, releasing bed and segments cleanly."""
+    return CancelAdmissionAction(db).execute(hospital_id, admission_id, reason, user)
 
 
 @router.post("/admit", response_model=AdmissionDetail, status_code=status.HTTP_201_CREATED,

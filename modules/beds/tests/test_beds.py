@@ -19,8 +19,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
-
-from app.models import Hospital, HospitalUser, Room, StaffRole, Ward, WardType
+from modules.tenancy.entities.hospital import Hospital
+from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.beds.entities.bed import Ward, Room, WardType
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.beds.api.beds_api import (
     registration_inpatient_router,

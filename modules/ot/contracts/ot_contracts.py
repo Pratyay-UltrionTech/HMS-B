@@ -14,6 +14,7 @@ from modules.ot.entities.ot_entities import OtPriority, OtSurgeryStatus
 
 class OtSurgeryCreate(BaseModel):
     patient_id: UUID
+    admission_id: UUID | None = None
     surgeon_id: UUID | None = None
     assistant_surgeon: str | None = None
     surgery_type: str = Field(min_length=1, max_length=255)
@@ -85,6 +86,7 @@ class OtSurgeryResponse(BaseModel):
     hospital_id: UUID
     surgery_no: str
     patient_id: UUID
+    admission_id: UUID | None = None
     surgeon_id: UUID | None
     assistant_surgeon: str | None
     surgery_type: str

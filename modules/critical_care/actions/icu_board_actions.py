@@ -193,6 +193,11 @@ class AdmitToIcuAction:
         from modules.inpatient.entities.admission import Admission, AdmissionStatus, BedStaySegment
         from modules.inpatient.services.inpatient_billing_service import next_ip_encounter_id
 
+        from modules.inpatient.utils.admission_conflicts import (
+            admission_conflict as _icu_conflict,
+            bed_conflict as _icu_bed_conflict,
+        )
+
         patient = (
             self.db.query(Patient)
             .filter(Patient.id == payload.patient_id, Patient.hospital_id == self.hospital_id)
@@ -201,26 +206,20 @@ class AdmitToIcuAction:
         if not patient:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
 
-        active = (
-            self.db.query(Admission)
-            .filter(
-                Admission.patient_id == payload.patient_id,
-                Admission.hospital_id == self.hospital_id,
-                # Invariant 1: requested/admitted/discharge_requested all block.
-                Admission.status.in_(
-                    [
-                        AdmissionStatus.requested,
-                        AdmissionStatus.admitted,
-                        AdmissionStatus.discharge_requested,
-                    ]
-                ),
-            )
-            .first()
+        # Locked open-episode check (Invariant 1: requested/admitted/
+        # discharge_requested all block a second episode).
+        from modules.inpatient.db.admissions_repository import AdmissionsRepository as _AdmRepo
+
+        active = _AdmRepo(self.db).get_open_admission(
+            self.hospital_id, payload.patient_id, for_update=True
         )
         if active:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Patient is already admitted. Please use the Transfer to ICU action instead.",
+            raise _icu_conflict(
+                "Patient is already admitted. Please use the Transfer to ICU action instead.",
+                admission_id=active.id,
+                admission_status=active.status,
+                bed_id=active.bed_id,
+                doctor_id=active.doctor_id,
             )
 
         bed = (
@@ -232,7 +231,7 @@ class AdmitToIcuAction:
         if not bed:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bed not found")
         if bed.is_occupied:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Selected bed is already occupied")
+            raise _icu_bed_conflict("Selected bed is already occupied", bed_id=bed.id)
 
         now = datetime.now(timezone.utc)
         ip_id = next_ip_encounter_id(self.db, self.hospital_id)
@@ -293,7 +292,35 @@ class AdmitToIcuAction:
             entity_id=admission.id,
             summary=f"Direct ICU Admission for {patient.name} to Bed {bed.bed_code}",
         )
-        self.db.commit()
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="bed",
+            entity_id=bed.id,
+            summary=f"Bed {bed.bed_code} occupied by ICU admission {admission.id}",
+        )
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="patient",
+            entity_id=patient.id,
+            summary="Patient admitted to ICU",
+        )
+        from sqlalchemy.exc import IntegrityError as _AdmitIntegrityError
+
+        try:
+            self.db.commit()
+        except _AdmitIntegrityError as exc:
+            self.db.rollback()
+            raise _icu_conflict(
+                "Patient already admitted or bed just taken",
+                bed_id=bed.id,
+                doctor_id=payload.doctor_id,
+            ) from exc
         return GetIcuBoardAction(self.db, self.hospital_id).execute_for_admission(admission.id)
 
 
@@ -306,9 +333,15 @@ class TransferToIcuAction:
         self.repo = CriticalCareRepository(db, hospital_id)
 
     def execute(self, payload: IcuTransferRequest, actor: dict[str, Any]) -> IcuBoardPatientResponse:
+        from sqlalchemy.exc import IntegrityError as _IntegrityError
+
         from modules.beds.entities.bed import Bed
         from modules.inpatient.entities.admission import Admission, AdmissionStatus, BedStaySegment
+        from modules.inpatient.utils.admission_conflicts import (
+            bed_conflict as _icu_bed_conflict,
+        )
 
+        # Lock admission + new bed + open segment; old bed locked below.
         adm = (
             self.db.query(Admission)
             .filter(
@@ -319,6 +352,7 @@ class TransferToIcuAction:
                     [AdmissionStatus.admitted, AdmissionStatus.discharge_requested]
                 ),
             )
+            .with_for_update()
             .first()
         )
         if not adm:
@@ -333,11 +367,19 @@ class TransferToIcuAction:
         if not bed:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target ICU bed not found")
         if bed.is_occupied and bed.id != adm.bed_id:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Target bed is already occupied")
+            raise _icu_bed_conflict(
+                "Target bed is already occupied",
+                bed_id=bed.id,
+                admission_id=adm.id,
+                admission_status=adm.status,
+            )
 
-        old_bed = adm.bed
-        if old_bed and old_bed.id != bed.id:
-            old_bed.is_occupied = False
+        if adm.bed_id and adm.bed_id != bed.id:
+            old_bed = (
+                self.db.query(Bed).filter(Bed.id == adm.bed_id).with_for_update().first()
+            )
+            if old_bed:
+                old_bed.is_occupied = False
 
         adm.ward_id = bed.ward_id
         adm.room_id = bed.room_id
@@ -353,6 +395,7 @@ class TransferToIcuAction:
                 BedStaySegment.admission_id == adm.id,
                 BedStaySegment.ended_at.is_(None),
             )
+            .with_for_update()
             .order_by(BedStaySegment.started_at.desc())
             .first()
         )
@@ -418,7 +461,34 @@ class TransferToIcuAction:
             entity_id=adm.id,
             summary=f"Transferred patient to ICU Bed {bed.bed_code}",
         )
-        self.db.commit()
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="bed",
+            entity_id=bed.id,
+            summary=f"Bed {bed.bed_code} received ICU transfer of admission {adm.id}",
+        )
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="patient",
+            entity_id=adm.patient_id,
+            summary="Patient transferred to ICU",
+        )
+        try:
+            self.db.commit()
+        except _IntegrityError as exc:
+            self.db.rollback()
+            raise _icu_bed_conflict(
+                "ICU transfer collided concurrently; please retry",
+                bed_id=bed.id,
+                admission_id=adm.id,
+                admission_status=adm.status,
+            ) from exc
         return GetIcuBoardAction(self.db, self.hospital_id).execute_for_admission(adm.id)
 
 
@@ -431,8 +501,13 @@ class StepDownIcuAction:
         self.repo = CriticalCareRepository(db, hospital_id)
 
     def execute(self, payload: IcuStepDownRequest, actor: dict[str, Any]) -> dict[str, Any]:
+        from sqlalchemy.exc import IntegrityError as _IntegrityError
+
         from modules.beds.entities.bed import Bed
         from modules.inpatient.entities.admission import Admission, AdmissionStatus, BedStaySegment
+        from modules.inpatient.utils.admission_conflicts import (
+            bed_conflict as _icu_bed_conflict,
+        )
 
         adm = (
             self.db.query(Admission)
@@ -443,6 +518,7 @@ class StepDownIcuAction:
                     [AdmissionStatus.admitted, AdmissionStatus.discharge_requested]
                 ),
             )
+            .with_for_update()
             .first()
         )
         if not adm:
@@ -457,11 +533,19 @@ class StepDownIcuAction:
         if not bed:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target ward bed not found")
         if bed.is_occupied and bed.id != adm.bed_id:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Target bed is already occupied")
+            raise _icu_bed_conflict(
+                "Target bed is already occupied",
+                bed_id=bed.id,
+                admission_id=adm.id,
+                admission_status=adm.status,
+            )
 
-        old_bed = adm.bed
-        if old_bed:
-            old_bed.is_occupied = False
+        if adm.bed_id and adm.bed_id != bed.id:
+            old_bed = (
+                self.db.query(Bed).filter(Bed.id == adm.bed_id).with_for_update().first()
+            )
+            if old_bed:
+                old_bed.is_occupied = False
 
         adm.ward_id = bed.ward_id
         adm.room_id = bed.room_id
@@ -476,6 +560,7 @@ class StepDownIcuAction:
                 BedStaySegment.admission_id == adm.id,
                 BedStaySegment.ended_at.is_(None),
             )
+            .with_for_update()
             .order_by(BedStaySegment.started_at.desc())
             .first()
         )
@@ -511,5 +596,32 @@ class StepDownIcuAction:
             entity_id=adm.id,
             summary=f"Stepped down patient from ICU to Bed {bed.bed_code}",
         )
-        self.db.commit()
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="bed",
+            entity_id=bed.id,
+            summary=f"Bed {bed.bed_code} received step-down of admission {adm.id}",
+        )
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="patient",
+            entity_id=adm.patient_id,
+            summary="Patient stepped down from ICU",
+        )
+        try:
+            self.db.commit()
+        except _IntegrityError as exc:
+            self.db.rollback()
+            raise _icu_bed_conflict(
+                "ICU step-down collided concurrently; please retry",
+                bed_id=bed.id,
+                admission_id=adm.id,
+                admission_status=adm.status,
+            ) from exc
         return {"status": "ok", "message": f"Patient stepped down to {bed.bed_code}"}

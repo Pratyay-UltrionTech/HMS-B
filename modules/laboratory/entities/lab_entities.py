@@ -40,6 +40,7 @@ from infrastructure.postgres.base import Base
 # class as the earlier `OtRoom` -> `Wing` fix in modules/ot/entities.
 from modules.clinical_records.entities.clinical_record import Prescription
 from modules.doctors.entities.doctor import HospitalUser
+from modules.inpatient.entities.admission import Admission
 from modules.patients.entities.patient import Patient
 
 
@@ -201,6 +202,9 @@ class LabOrder(Base):
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     prescription_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("prescriptions.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -238,6 +242,7 @@ class LabOrder(Base):
     amendment_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    admission: Mapped["Admission | None"] = relationship("Admission", foreign_keys=[admission_id])
     doctor: Mapped["HospitalUser | None"] = relationship("HospitalUser", foreign_keys=[doctor_id])
     prescription: Mapped["Prescription | None"] = relationship("Prescription", foreign_keys=[prescription_id])
     prescription_request: Mapped["LabPrescriptionRequest | None"] = relationship(
@@ -320,6 +325,9 @@ class LabPrescriptionRequest(Base):
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     status: Mapped[LabPrescriptionRequestStatus] = mapped_column(
         Enum(LabPrescriptionRequestStatus, name="lab_prescription_request_status"),
         nullable=False,
@@ -344,6 +352,7 @@ class LabPrescriptionRequest(Base):
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    admission: Mapped["Admission | None"] = relationship("Admission", foreign_keys=[admission_id])
     doctor: Mapped["HospitalUser"] = relationship("HospitalUser", foreign_keys=[doctor_id])
     prescription: Mapped["Prescription"] = relationship("Prescription", foreign_keys=[prescription_id])
     items: Mapped[list[LabPrescriptionRequestItem]] = relationship(

@@ -305,6 +305,7 @@ class SaleCreate(BaseModel):
     customer_name: str = Field(min_length=1, max_length=255)
     customer_phone: str = Field(min_length=7, max_length=32)
     patient_id: UUID | None = None
+    admission_id: UUID | None = None
     prescription_id: UUID | None = None
     pharmacy_rx_request_id: UUID | None = None
     doctor_name: str | None = None
@@ -344,6 +345,7 @@ class SaleResponse(BaseModel):
     customer_name: str
     customer_phone: str
     patient_id: UUID | None
+    admission_id: UUID | None = None
     prescription_id: UUID | None
     doctor_name: str | None
     sale_date: date
@@ -429,6 +431,7 @@ class RxRequestItemCreate(BaseModel):
 class RxRequestCreate(BaseModel):
     prescription_id: UUID | None = None
     patient_id: UUID | None = None
+    admission_id: UUID | None = None
     doctor_id: UUID | None = None
     patient_name: str = ""
     patient_phone: str = ""
@@ -454,6 +457,7 @@ class RxRequestResponse(BaseModel):
     hospital_id: UUID
     prescription_id: UUID | None
     patient_id: UUID | None
+    admission_id: UUID | None = None
     doctor_id: UUID | None
     patient_name: str
     patient_phone: str

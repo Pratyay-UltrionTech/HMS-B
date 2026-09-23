@@ -88,10 +88,12 @@ def pharm_client(pharm_db):
 
     current_user = {
         "id": str(uuid4()),
+        "user_id": str(uuid4()),
         "sub": "pharm_admin@example.com",
         "email": "pharm_admin@example.com",
-        "role": "admin",
+        "role": "hospital_admin",
         "name": "Pharmacist Admin",
+        "hospital_uuid": str(hospital_id),
         "hospital_id": str(hospital_id),
     }
 

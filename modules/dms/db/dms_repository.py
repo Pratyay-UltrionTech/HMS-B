@@ -89,13 +89,51 @@ class DmsRepository:
             .filter(
                 Admission.hospital_id == self.hospital_id,
                 Admission.patient_id.in_(patient_ids),
-                # Canonical active-inpatient census (spec §14).
-                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+                # Open-episode set (Invariant 1): requested/admitted/
+                # discharge_requested all count as IPD for care_status.
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
             )
             .distinct()
             .all()
         )
         return {r[0] for r in rows}
+
+    def bulk_open_admission_states(
+        self, patient_ids: list[UUID]
+    ) -> dict[UUID, str]:
+        """Map patient_id → open-episode state label (requested/admitted/
+        discharge_requested) for DMS care-status derivation."""
+        if not patient_ids:
+            return {}
+        rows = (
+            self.db.query(Admission.patient_id, Admission.status)
+            .filter(
+                Admission.hospital_id == self.hospital_id,
+                Admission.patient_id.in_(patient_ids),
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
+            )
+            .all()
+        )
+        out: dict[UUID, str] = {}
+        for pid, st in rows:
+            label = st.value if hasattr(st, "value") else str(st)
+            # Keep the most advanced state when duplicates predate backfill.
+            rank = {"requested": 0, "admitted": 1, "discharge_requested": 2}
+            if pid not in out or rank.get(label, 0) > rank.get(out[pid], 0):
+                out[pid] = label
+        return out
 
     def bulk_last_visit_dates(self, patient_ids: list[UUID]) -> dict[UUID, date]:
         if not patient_ids:

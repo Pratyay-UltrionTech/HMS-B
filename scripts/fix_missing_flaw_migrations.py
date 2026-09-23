@@ -40,8 +40,9 @@ logger = logging.getLogger("hms.scripts.fix_missing_flaw_migrations")
 # partial index predicate: status NOT IN ('cancelled', 'no_show')).
 NON_ACTIVE_APPOINTMENT_STATUSES = ("cancelled", "no_show")
 
-# Statuses considered "active" for admissions (matches uq_admissions_active_*).
-ACTIVE_ADMISSION_STATUSES = ("admitted", "discharge_requested")
+# Open-episode statuses for admissions (matches uq_admissions_active_*,
+# Invariant 1: requested/admitted/discharge_requested).
+ACTIVE_ADMISSION_STATUSES = ("requested", "admitted", "discharge_requested")
 
 
 # ---------------------------------------------------------------------------

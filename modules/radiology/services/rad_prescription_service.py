@@ -237,6 +237,7 @@ def request_to_response_dict(req: RadPrescriptionRequest, db: Session | None = N
         "patient_id": req.patient_id,
         "doctor_id": req.doctor_id,
         "appointment_id": req.appointment_id,
+        "admission_id": getattr(req, "admission_id", None),
         "status": req.status,
         "prescribed_scan_ids": [str(sid) for sid in (req.prescribed_scan_ids or [])],
         "clinical_notes": req.clinical_notes,

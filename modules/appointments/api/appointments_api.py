@@ -244,7 +244,33 @@ def check_in(
     return CheckInAction(db, hospital_id, repo).execute(appointment_id, user)
 
 
-@router.post("/{appointment_id}/complete", response_model=AppointmentListItem, dependencies=[Depends(require_permission("appointment", "edit"))])
+def check_appointment_complete_access(
+    appointment_id: UUID,
+    db: Session = Depends(get_db),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> None:
+    role = user.get("role")
+    if role in {"super_admin", "hospital_admin"}:
+        return
+
+    from shared.auth.service import authorization
+    if authorization.is_authorized(user, ("appointment", "edit"), db=db):
+        return
+    if authorization.is_authorized(user, ("doctors", "edit"), db=db):
+        return
+
+    user_id = user.get("user_id")
+    if user_id:
+        repo = AppointmentsRepository(db, hospital_id)
+        appt = repo.get_by_id(appointment_id)
+        if appt and appt.doctor_id and str(appt.doctor_id) == str(user_id):
+            return
+
+    authorization.require(user, ("appointment", "edit"), db=db)
+
+
+@router.post("/{appointment_id}/complete", response_model=AppointmentListItem, dependencies=[Depends(check_appointment_complete_access)])
 def complete_appointment(
     appointment_id: UUID,
     force: bool = False,

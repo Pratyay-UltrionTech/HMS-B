@@ -149,6 +149,66 @@ def test_mis_patient_reports(mis_client, mis_db):
     assert any(m["metric"] == "Total Patients" and m["count"] >= 1 for m in data["metrics"])
 
 
+def test_mis_patient_reports_ipd_series_from_admission_status(mis_client, mis_db):
+    """IPD series derives from Admission.status (requested / active /
+    discharged separately) with no Patient.status proxy."""
+    from datetime import timezone as _tz
+
+    def _patient(uhid, mobile):
+        p = Patient(
+            id=uuid4(),
+            hospital_id=mis_client.hospital_id,
+            uhid=uhid,
+            first_name="IPD",
+            last_name="Case",
+            name="IPD Case",
+            gender="male",
+            mobile=mobile,
+            # Deliberately stale proxy: an admitted-flagged patient with NO
+            # admission row must not inflate the IPD series.
+            status=PatientStatus.admitted,
+        )
+        mis_db.add(p)
+        mis_db.flush()
+        return p
+
+    p_req = _patient("P0901", "9000000901")
+    p_adm = _patient("P0902", "9000000902")
+    p_dis = _patient("P0903", "9000000903")
+    now = datetime.now(_tz.utc)
+    mis_db.add_all(
+        [
+            Admission(
+                hospital_id=mis_client.hospital_id,
+                patient_id=p_req.id,
+                status=AdmissionStatus.requested,
+                admitted_at=now,
+            ),
+            Admission(
+                hospital_id=mis_client.hospital_id,
+                patient_id=p_adm.id,
+                status=AdmissionStatus.admitted,
+                admitted_at=now,
+            ),
+            Admission(
+                hospital_id=mis_client.hospital_id,
+                patient_id=p_dis.id,
+                status=AdmissionStatus.discharged,
+                admitted_at=now,
+                discharged_at=now,
+            ),
+        ]
+    )
+    mis_db.commit()
+
+    res = mis_client.get("/mis/patients")
+    assert res.status_code == 200
+    by_metric = {m["metric"]: m["count"] for m in res.json()["metrics"]}
+    assert by_metric["IPD Requests (Pending)"] == 1
+    assert by_metric["IPD Admissions (Active)"] == 1
+    assert "Admitted Patients (IPD)" not in by_metric
+
+
 def test_mis_appointment_reports(mis_client, mis_db):
     patient = Patient(
         id=uuid4(),

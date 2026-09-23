@@ -346,6 +346,11 @@ def auth_headers(hospital: Hospital) -> dict[str, str]:
         "name": "Nurse Joy",
         "role": "hospital_staff",
         "hospital_uuid": str(hospital.id),
+        "permissions": {
+            "appointment": {"can_view": True, "can_edit": True, "can_create": True, "can_cancel": True},
+            "registration": {"can_view": True, "can_edit": True},
+            "doctors": {"can_view": True, "can_edit": True},
+        },
     })
     return {"Authorization": f"Bearer {token}"}
 
@@ -358,6 +363,11 @@ def auth_headers_b(hospital_b: Hospital) -> dict[str, str]:
         "name": "Nurse Clara",
         "role": "hospital_staff",
         "hospital_uuid": str(hospital_b.id),
+        "permissions": {
+            "appointment": {"can_view": True, "can_edit": True, "can_create": True, "can_cancel": True},
+            "registration": {"can_view": True, "can_edit": True},
+            "doctors": {"can_view": True, "can_edit": True},
+        },
     })
     return {"Authorization": f"Bearer {token}"}
 

@@ -23,6 +23,7 @@ from modules.billing.services.billing_service import (
 from modules.billing.services.service_financial_clearance import (
     assert_service_financially_cleared,
 )
+from modules.inpatient.entities.admission import Admission
 from modules.radiology.contracts.radiology_contracts import (
     RadCatalogueSeedResult,
     RadDashboardResponse,
@@ -47,6 +48,7 @@ from modules.radiology.entities.radiology_entities import (
 from modules.radiology.services.radiology_service import (
     STANDARD_RADIOLOGY_SCANS,
     order_to_response,
+    orders_to_responses,
     sync_radiology_order_medical_record,
 )
 from modules.radiology.services.rad_prescription_service import (
@@ -247,7 +249,8 @@ class ListOrdersAction:
             search=search,
             scheduled_only=scheduled_only,
         )
-        return [order_to_response(o, self.repo.db) for o in orders]
+        # Use batch billing clearance (1-3 queries total) instead of N per-order queries.
+        return orders_to_responses(orders, self.repo.db)
 
 
 class GetOrderAction:
@@ -326,6 +329,24 @@ class CreateOrdersAction:
             for scan in scans:
                 lines.append((scan.id, scan.scan_code, scan.scan_name, scan.category, scan.price))
 
+        admission_id = payload.admission_id
+        if rad_request and rad_request.admission_id:
+            admission_id = rad_request.admission_id
+
+        if admission_id:
+            admission = (
+                self.db.query(Admission)
+                .filter(Admission.id == admission_id, Admission.hospital_id == self.hospital_id)
+                .first()
+            )
+            if not admission:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found")
+            if admission.patient_id != patient.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Admission does not belong to the selected patient",
+                )
+
         actor_name = _actor_name(self.user)
         actor_role = _actor_role(self.user)
         created_ids: list[UUID] = []
@@ -343,6 +364,7 @@ class CreateOrdersAction:
                 patient_id=patient.id,
                 doctor_id=doctor.id if doctor else None,
                 appointment_id=appointment_id,
+                admission_id=admission_id,
                 prescription_id=rad_request.prescription_id if rad_request else None,
                 prescription_request_id=rad_request.id if rad_request else None,
                 scan_id=scan_id,
@@ -364,6 +386,20 @@ class CreateOrdersAction:
                 req_charge.source_id = order.id
                 req_charge.description = f"Radiology {order.order_no} — {scan_name}"
             elif not rad_request:
+                rad_account_id = None
+                if admission_id:
+                    from modules.billing.entities.billing_entities import FinancialAccountType
+                    from modules.billing.services.billing_service import get_or_create_financial_account
+                    rad_acc = get_or_create_financial_account(
+                        self.db,
+                        hospital_id=self.hospital_id,
+                        patient_id=patient.id,
+                        account_type=FinancialAccountType.ipd,
+                        admission_id=admission_id,
+                        created_by_name=actor_name,
+                    )
+                    rad_account_id = rad_acc.id
+
                 # Target-native billing integration for direct orders
                 ensure_charge(
                     self.db,
@@ -373,6 +409,7 @@ class CreateOrdersAction:
                     source_id=order.id,
                     description=f"Radiology {order.order_no} — {scan_name}",
                     charge_amount=float(price or 0),
+                    account_id=rad_account_id,
                     created_by_name=actor_name,
                 )
 
@@ -415,9 +452,109 @@ class ListRadPrescriptionRequestsAction:
         reqs = self.repo.list_prescription_requests(
             status=status, patient_id=patient_id, doctor_id=doctor_id
         )
-        if released_only is True or (released_only is None and status == RadPrescriptionRequestStatus.pending and not patient_id):
-            reqs = [r for r in reqs if is_rad_request_released(self.db, r)]
-        return [RadPrescriptionRequestResponse(**request_to_response_dict(r, self.db)) for r in reqs]
+
+        apply_release_filter = released_only is True or (
+            released_only is None
+            and status == RadPrescriptionRequestStatus.pending
+            and not patient_id
+        )
+
+        if not apply_release_filter:
+            # No release filter — simple batch path: bulk-fetch billing states and build responses.
+            return [RadPrescriptionRequestResponse(**request_to_response_dict(r, self.db)) for r in reqs]
+
+        # Release filter is active.  Bulk-fetch clearance for all request IDs so that
+        # is_rad_request_released() does not issue one DB query per request.
+        # STAT requests are always released without a billing query.
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.service_financial_clearance import (
+            bulk_check_service_financial_clearance,
+        )
+
+        stat_reqs: list = []
+        non_stat_reqs: list = []
+        for r in reqs:
+            is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
+            if is_stat:
+                stat_reqs.append(r)  # always released; skip billing lookup
+            else:
+                non_stat_reqs.append(r)
+
+        # Single bulk query for all non-STAT requests
+        fin_states: dict = {}
+        if non_stat_reqs:
+            if non_stat_reqs[0].hospital_id:
+                fin_states = bulk_check_service_financial_clearance(
+                    self.db,
+                    non_stat_reqs[0].hospital_id,
+                    BillingSourceType.radiology,
+                    [r.id for r in non_stat_reqs],
+                )
+
+        # Filter non-STAT requests: only keep those whose charge is cleared
+        released_non_stat = [
+            r for r in non_stat_reqs
+            if fin_states.get(r.id) and fin_states[r.id].is_cleared
+        ]
+
+        released = stat_reqs + released_non_stat
+
+        # Build responses — request_to_response_dict will call check_service_financial_clearance
+        # per request for the payment fields, but we pass the pre-fetched fin_states dict
+        # via a local wrapper to avoid re-querying.
+        from modules.radiology.services.rad_prescription_service import request_to_response_dict as _base_rtrd
+
+        def _build_response(r) -> dict:
+            is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
+            if is_stat:
+                # For STAT, use normal single-request path (charge may or may not exist)
+                return _base_rtrd(r, self.db)
+            # Inject pre-fetched fin_state to avoid a second billing query per request
+            fin = fin_states.get(r.id)
+            if fin is None:
+                return _base_rtrd(r, self.db)
+            items = sorted(r.items or [], key=lambda i: (i.sort_order, str(i.id)))
+            return {
+                "id": r.id,
+                "hospital_id": r.hospital_id,
+                "prescription_id": r.prescription_id,
+                "patient_id": r.patient_id,
+                "doctor_id": r.doctor_id,
+                "appointment_id": r.appointment_id,
+                "status": r.status,
+                "prescribed_scan_ids": [str(sid) for sid in (r.prescribed_scan_ids or [])],
+                "clinical_notes": r.clinical_notes,
+                "cancel_reason": r.cancel_reason,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+                "patient_name": r.patient.name if r.patient else None,
+                "patient_uhid": r.patient.uhid if r.patient else None,
+                "doctor_name": r.doctor.name if r.doctor else None,
+                "scan_names": ", ".join(i.scan_code for i in (r.items or [])) or None,
+                "scan_count": len(items),
+                "pending_scan_count": len(
+                    [i for i in items if i.status == RadRequestItemStatus.pending]
+                ),
+                "appointment_label": None,
+                "is_financially_cleared": fin.is_cleared,
+                "payment_status": fin.status,
+                "outstanding_amount": fin.outstanding_amount,
+                "items": [
+                    {
+                        "id": i.id,
+                        "scan_id": i.scan_id,
+                        "scan_code": i.scan_code,
+                        "scan_name": i.scan_name,
+                        "category": i.category,
+                        "price": i.price,
+                        "sort_order": i.sort_order,
+                        "status": i.status,
+                    }
+                    for i in items
+                ],
+            }
+
+        return [RadPrescriptionRequestResponse(**_build_response(r)) for r in released]
 
 
 class GetRadPrescriptionRequestAction:

@@ -19,12 +19,11 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import Hospital
 from infrastructure.postgres.base import Base
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.patients.entities.patient import Patient as TargetPatient
 from modules.pharmacy.api.drug_interaction_api import router as interaction_router
-from modules.tenancy.entities.hospital import Hospital as TargetHospital
+from modules.tenancy.entities.hospital import Hospital
 from modules.pharmacy.entities.drug_interaction_entities import (
     DrugInteractionRule,
     InteractionSeverity,

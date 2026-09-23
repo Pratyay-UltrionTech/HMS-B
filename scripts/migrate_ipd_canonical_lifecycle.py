@@ -62,7 +62,7 @@ def _report(conn) -> dict:
     out["pending_appts_no_open_admission"] = q(
         "SELECT COUNT(*) FROM appointments ap WHERE ap.status = 'ipd_transfer_requested' "
         "AND NOT EXISTS (SELECT 1 FROM admissions a WHERE a.patient_id = ap.patient_id "
-        f"AND a.status IN {OPEN})"
+        f"AND a.status::text IN {OPEN})"
     )
     out["admissions_by_status"] = [
         dict(r) for r in conn.execute(
@@ -71,22 +71,22 @@ def _report(conn) -> dict:
     ]
     out["duplicate_open_patients"] = q(
         "SELECT COUNT(*) FROM (SELECT patient_id FROM admissions "
-        f"WHERE status IN {OPEN} GROUP BY hospital_id, patient_id HAVING COUNT(*) > 1) d"
+        f"WHERE status::text IN {OPEN} GROUP BY hospital_id, patient_id HAVING COUNT(*) > 1) d"
     )
     out["beds_occupied_no_admission"] = q(
         "SELECT COUNT(*) FROM beds b WHERE b.is_occupied IS TRUE AND NOT EXISTS "
-        f"(SELECT 1 FROM admissions a WHERE a.bed_id = b.id AND a.status IN {OPEN})"
+        f"(SELECT 1 FROM admissions a WHERE a.bed_id = b.id AND a.status::text IN {OPEN})"
     )
     out["admissions_bed_flag_off"] = q(
         "SELECT COUNT(*) FROM admissions a JOIN beds b ON b.id = a.bed_id "
-        f"WHERE a.status IN {OPEN} AND (b.is_occupied IS NOT TRUE)"
+        f"WHERE a.status::text IN {OPEN} AND (b.is_occupied IS NOT TRUE)"
     )
     out["multi_open_segments"] = q(
         "SELECT COUNT(*) FROM (SELECT admission_id FROM bed_stay_segments "
         "WHERE ended_at IS NULL GROUP BY hospital_id, admission_id HAVING COUNT(*) > 1) d"
     )
     out["discharged_null_date"] = q(
-        "SELECT COUNT(*) FROM admissions WHERE status = 'discharged' AND discharged_at IS NULL"
+        "SELECT COUNT(*) FROM admissions WHERE status::text = 'discharged' AND discharged_at IS NULL"
     )
     return out
 
@@ -168,20 +168,34 @@ def _apply(conn) -> None:
     ))
     logger.info("partial unique indexes rebuilt")
 
-    # 6. FK with orphan guard (NOT VALID + VALIDATE, same convention as add_missing_foreign_keys.py)
-    orphans = conn.execute(text(
-        "SELECT COUNT(*) FROM admissions t WHERE t.source_appointment_id IS NOT NULL "
-        "AND NOT EXISTS (SELECT 1 FROM appointments r WHERE r.id = t.source_appointment_id)"
-    )).scalar_one()
-    if orphans:
-        logger.warning("SKIP FK admissions.source_appointment_id: %d orphaned row(s); fix data then re-run", orphans)
+    # 6. FK with orphan guard (NOT VALID + VALIDATE, same convention as add_missing_foreign_keys.py).
+    # Idempotent: skip ADD when the constraint already exists.
+    fk = conn.execute(text(
+        "SELECT convalidated FROM pg_constraint "
+        "WHERE conname = 'fk_admissions_source_appointment_id'"
+    )).first()
+    if fk is not None:
+        logger.info(
+            "SKIP FK admissions.source_appointment_id: already exists (validated=%s)",
+            fk[0],
+        )
+        if not fk[0]:
+            conn.execute(text("ALTER TABLE admissions VALIDATE CONSTRAINT fk_admissions_source_appointment_id"))
+            logger.info("validated FK admissions.source_appointment_id")
     else:
-        conn.execute(text(
-            'ALTER TABLE admissions ADD CONSTRAINT fk_admissions_source_appointment_id '
-            'FOREIGN KEY (source_appointment_id) REFERENCES appointments (id) ON DELETE SET NULL NOT VALID'
-        ))
-        conn.execute(text("ALTER TABLE admissions VALIDATE CONSTRAINT fk_admissions_source_appointment_id"))
-        logger.info("added FK admissions.source_appointment_id")
+        orphans = conn.execute(text(
+            "SELECT COUNT(*) FROM admissions t WHERE t.source_appointment_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM appointments r WHERE r.id = t.source_appointment_id)"
+        )).scalar_one()
+        if orphans:
+            logger.warning("SKIP FK admissions.source_appointment_id: %d orphaned row(s); fix data then re-run", orphans)
+        else:
+            conn.execute(text(
+                'ALTER TABLE admissions ADD CONSTRAINT fk_admissions_source_appointment_id '
+                'FOREIGN KEY (source_appointment_id) REFERENCES appointments (id) ON DELETE SET NULL NOT VALID'
+            ))
+            conn.execute(text("ALTER TABLE admissions VALIDATE CONSTRAINT fk_admissions_source_appointment_id"))
+            logger.info("added FK admissions.source_appointment_id")
 
     # 7. deterministic orphan linking: exact-one-admission only
     linked = conn.execute(text(
@@ -199,18 +213,27 @@ def main(dry_run: bool = True) -> None:
     if engine.dialect.name != "postgresql":
         logger.warning("non-postgresql dialect (%s): report-only mode", engine.dialect.name)
         dry_run = True
-    with engine.connect() as conn:
-        rep = _report(conn)
-        conn.commit()
-        _print_report(rep)
-        _ambiguous_list(conn)
-        if dry_run:
+    if dry_run:
+        # Dry-run is strictly read-only: no DDL/UPDATE, no _ensure_enum_value.
+        with engine.connect() as conn:
+            rep = _report(conn)
+            conn.rollback()
+            _print_report(rep)
+            _ambiguous_list(conn)
+            conn.rollback()
             logger.info("dry-run only; re-run with --apply to migrate")
             return
+    # --apply path: ensure the enum label exists BEFORE any status::text report,
+    # so _report() runs on pre- and post-migration DBs.
+    _ensure_enum_value(engine)
+    with engine.connect() as conn:
+        rep = _report(conn)
+        _print_report(rep)
+        _ambiguous_list(conn)
         if rep["duplicate_open_patients"]:
             logger.error("ABORT: resolve duplicate open episodes before rebuilding unique indexes")
+            conn.rollback()
             return
-        _ensure_enum_value(engine)
         _apply(conn)
         logger.info("apply complete; re-run dry-run to verify zeros")
 

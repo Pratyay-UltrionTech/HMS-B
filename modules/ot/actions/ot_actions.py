@@ -9,7 +9,13 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError as _OTIntegrityError
 from sqlalchemy.orm import Session
+
+from modules.inpatient.utils.admission_conflicts import (
+    admission_conflict as _ot_conflict,
+    bed_conflict as _ot_bed_conflict,
+)
 
 from modules.billing.entities.billing_entities import BillingSourceType
 from modules.billing.services.billing_service import (
@@ -221,10 +227,27 @@ class CreateSurgeryAction:
         actor_name = _actor_name(self.user)
         actor_role = _actor_role(self.user)
 
+        admission_id = payload.admission_id
+        if admission_id:
+            from modules.inpatient.entities.admission import Admission
+            admission = (
+                self.db.query(Admission)
+                .filter(
+                    Admission.id == admission_id,
+                    Admission.hospital_id == self.hospital_id,
+                )
+                .first()
+            )
+            if not admission:
+                raise HTTPException(status_code=404, detail="Admission not found")
+            if admission.patient_id != payload.patient_id:
+                raise HTTPException(status_code=400, detail="Admission does not belong to the selected patient")
+
         item = OtSurgery(
             hospital_id=self.hospital_id,
             surgery_no=surgery_no,
             patient_id=payload.patient_id,
+            admission_id=admission_id,
             surgeon_id=payload.surgeon_id,
             assistant_surgeon=payload.assistant_surgeon.strip() if payload.assistant_surgeon else None,
             surgery_type=payload.surgery_type.strip(),
@@ -246,6 +269,20 @@ class CreateSurgeryAction:
         self.db.flush()
 
         # Target-native billing integration
+        account_id = None
+        if admission_id:
+            from modules.billing.entities.billing_entities import FinancialAccountType
+            from modules.billing.services.billing_service import get_or_create_financial_account
+            acc = get_or_create_financial_account(
+                self.db,
+                hospital_id=self.hospital_id,
+                patient_id=patient.id,
+                account_type=FinancialAccountType.ipd,
+                admission_id=admission_id,
+                created_by_name=actor_name,
+            )
+            account_id = acc.id
+
         ensure_charge(
             self.db,
             hospital_id=self.hospital_id,
@@ -254,6 +291,7 @@ class CreateSurgeryAction:
             source_id=item.id,
             description=f"OT Charge — {item.surgery_no} · {room_label(ot_room)}"[:512],
             charge_amount=float(item.ot_charge_amount or 0),
+            account_id=account_id,
             created_by_name=actor_name,
         )
 
@@ -444,18 +482,21 @@ def sync_ot_icu_transfer(
         return
 
     import uuid
+    from fastapi import HTTPException as _HTTPException
     from sqlalchemy import func, or_
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
     from modules.beds.entities.bed import Bed, Room, Ward, WardType
     from modules.critical_care.entities.critical_care_entities import IcuPatientProfile
     from modules.inpatient.entities.admission import Admission, AdmissionStatus, BedStaySegment
     from modules.inpatient.services.inpatient_billing_service import next_ip_encounter_id
 
-    # 1. Resolve Bed
+    # 1. Resolve Bed (locked: post-op transfer mutates occupancy)
     bed = None
     if target_bed_id:
         bed = (
             db.query(Bed)
             .filter(Bed.id == target_bed_id, Bed.hospital_id == hospital_id)
+            .with_for_update()
             .first()
         )
 
@@ -527,69 +568,181 @@ def sync_ot_icu_transfer(
             db.add(bed)
             db.flush()
 
-    # 2. Check for active admission (canonical census: admitted + discharge_requested)
+    # 2. Open-episode guard (requested/admitted/discharge_requested), locked.
+    # requested → accept with the ICU bed; admitted/discharge_requested →
+    # bed transfer; no open episode → create a fresh ICU admission.
     adm = (
         db.query(Admission)
         .filter(
             Admission.patient_id == surgery.patient_id,
             Admission.hospital_id == hospital_id,
-            Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+            Admission.status.in_(
+                [
+                    AdmissionStatus.requested,
+                    AdmissionStatus.admitted,
+                    AdmissionStatus.discharge_requested,
+                ]
+            ),
         )
+        .with_for_update()
         .first()
     )
 
+    if bed.is_occupied and (adm is None or adm.bed_id != bed.id):
+        raise _ot_bed_conflict(
+            "Target ICU bed is already occupied",
+            bed_id=bed.id,
+            admission_id=adm.id if adm else None,
+            admission_status=adm.status if adm else None,
+        )
+
     now = datetime.now(timezone.utc)
-    if adm:
-        # Patient is already an active inpatient: transfer bed to ICU
-        if adm.bed and adm.bed.id != bed.id:
-            adm.bed.is_occupied = False
-        adm.ward_id = bed.ward_id
-        adm.room_id = bed.room_id
-        adm.bed_id = bed.id
-        bed.is_occupied = True
-        segment = BedStaySegment(
-            hospital_id=hospital_id,
-            admission_id=adm.id,
-            ward_id=bed.ward_id,
-            room_id=bed.room_id,
-            bed_id=bed.id,
-            rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
-            started_at=now,
-            ended_at=None,
-        )
-        db.add(segment)
-    else:
-        # Patient was an outpatient / emergency case: create new ICU admission
-        # via the canonical repository (snapshot + occupancy + appointment
-        # reconcile, spec §18) instead of an inline constructor.
-        from modules.inpatient.db.admissions_repository import AdmissionsRepository as _AdmRepo
-        from modules.patients.entities.patient import Patient as _Patient
+    try:
+        if adm is not None and adm.status != AdmissionStatus.requested:
+            # Patient is already an active inpatient: transfer bed to ICU.
+            # Lock the outgoing bed, close the outgoing segment (Invariant 7),
+            # then open the ICU segment.
+            if adm.bed_id and adm.bed_id != bed.id:
+                _old_bed = (
+                    db.query(Bed).filter(Bed.id == adm.bed_id).with_for_update().first()
+                )
+                if _old_bed:
+                    _old_bed.is_occupied = False
+            adm.ward_id = bed.ward_id
+            adm.room_id = bed.room_id
+            adm.bed_id = bed.id
+            bed.is_occupied = True
+            _open_seg = (
+                db.query(BedStaySegment)
+                .filter(
+                    BedStaySegment.hospital_id == hospital_id,
+                    BedStaySegment.admission_id == adm.id,
+                    BedStaySegment.ended_at.is_(None),
+                )
+                .with_for_update()
+                .order_by(BedStaySegment.started_at.desc())
+                .first()
+            )
+            if _open_seg:
+                _open_seg.ended_at = now
+            segment = BedStaySegment(
+                hospital_id=hospital_id,
+                admission_id=adm.id,
+                ward_id=bed.ward_id,
+                room_id=bed.room_id,
+                bed_id=bed.id,
+                rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
+                started_at=now,
+                ended_at=None,
+            )
+            db.add(segment)
+        elif adm is not None:
+            # Canonical request exists: accept it with the ICU bed instead of
+            # creating a duplicate episode.
+            adm.status = AdmissionStatus.admitted
+            adm.admitted_at = now
+            adm.ward_id = bed.ward_id
+            adm.room_id = bed.room_id
+            adm.bed_id = bed.id
+            if not adm.ip_id:
+                adm.ip_id = next_ip_encounter_id(db, hospital_id)
+            if surgery.surgeon_id and not adm.doctor_id:
+                adm.doctor_id = surgery.surgeon_id
+            bed.is_occupied = True
+            from modules.patients.entities.patient import Patient as _Pat
+            from modules.patients.entities.patient import PatientStatus as _PatStatus
 
-        ip_id = next_ip_encounter_id(db, hospital_id)
-        _patient = db.query(_Patient).filter(_Patient.id == surgery.patient_id).first()
-        adm = _AdmRepo(db).create_admission(
-            hospital_id=hospital_id,
-            patient=_patient,
-            bed=bed,
-            ward_id=bed.ward_id,
-            room_id=bed.room_id,
-            doctor_id=surgery.surgeon_id,
-            ip_id=ip_id,
-            notes=icu_notes or f"Transferred from OT post-surgery: {surgery.procedure_performed or surgery.surgery_type}",
-            admitted_at=now,
-        )
+            _pat = (
+                db.query(_Pat)
+                .filter(
+                    _Pat.id == surgery.patient_id,
+                    _Pat.hospital_id == hospital_id,
+                )
+                .first()
+            )
+            if _pat is not None:
+                _pat.status = _PatStatus.admitted
+            from modules.appointments.entities.appointment import (
+                Appointment as _Appt,
+            )
+            from modules.appointments.entities.appointment import (
+                AppointmentStatus as _ApptStatus,
+            )
 
-        segment = BedStaySegment(
-            hospital_id=hospital_id,
-            admission_id=adm.id,
-            ward_id=bed.ward_id,
-            room_id=bed.room_id,
-            bed_id=bed.id,
-            rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
-            started_at=now,
-            ended_at=None,
-        )
-        db.add(segment)
+            for _p in (
+                db.query(_Appt)
+                .filter(
+                    _Appt.hospital_id == hospital_id,
+                    _Appt.patient_id == surgery.patient_id,
+                    _Appt.status == _ApptStatus.ipd_transfer_requested,
+                )
+                .all()
+            ):
+                _p.status = _ApptStatus.transferred_to_inpatient
+                _p.admission_id = adm.id
+            segment = BedStaySegment(
+                hospital_id=hospital_id,
+                admission_id=adm.id,
+                ward_id=bed.ward_id,
+                room_id=bed.room_id,
+                bed_id=bed.id,
+                rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
+                started_at=now,
+                ended_at=None,
+            )
+            db.add(segment)
+        else:
+            # Patient was an outpatient / emergency case: create new ICU admission
+            # via the canonical repository (snapshot + occupancy + appointment
+            # reconcile, spec §18) instead of an inline constructor.
+            from modules.inpatient.db.admissions_repository import AdmissionsRepository as _AdmRepo
+            from modules.patients.entities.patient import Patient as _Patient
+
+            ip_id = next_ip_encounter_id(db, hospital_id)
+            _patient = (
+                db.query(_Patient)
+                .filter(
+                    _Patient.id == surgery.patient_id,
+                    _Patient.hospital_id == hospital_id,
+                )
+                .first()
+            )
+            if _patient is None:
+                raise _HTTPException(
+                    status_code=404, detail="Patient not found"
+                )
+            adm = _AdmRepo(db).create_admission(
+                hospital_id=hospital_id,
+                patient=_patient,
+                bed=bed,
+                ward_id=bed.ward_id,
+                room_id=bed.room_id,
+                doctor_id=surgery.surgeon_id,
+                ip_id=ip_id,
+                notes=icu_notes or f"Transferred from OT post-surgery: {surgery.procedure_performed or surgery.surgery_type}",
+                admitted_at=now,
+            )
+
+            segment = BedStaySegment(
+                hospital_id=hospital_id,
+                admission_id=adm.id,
+                ward_id=bed.ward_id,
+                room_id=bed.room_id,
+                bed_id=bed.id,
+                rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
+                started_at=now,
+                ended_at=None,
+            )
+            db.add(segment)
+        db.flush()
+    except _IntegrityError as exc:
+        db.rollback()
+        raise _ot_conflict(
+            "OT post-op transfer collided concurrently; please retry",
+            admission_id=adm.id if adm else None,
+            admission_status=adm.status if adm else None,
+            bed_id=bed.id if bed else None,
+        ) from exc
 
     # 3. Create or update ICU Patient Profile
     profile = (
@@ -636,6 +789,34 @@ def sync_ot_icu_transfer(
         entity_id=adm.id,
         summary=f"Transferred patient from OT ({surgery.surgery_no}) to ICU Bed {bed.bed_code}",
     )
+    write_audit_log(
+        db,
+        hospital_id=hospital_id,
+        actor=actor,
+        action="update",
+        entity_type="bed",
+        entity_id=bed.id,
+        summary=f"Bed {bed.bed_code} received OT post-op transfer of admission {adm.id}",
+    )
+    write_audit_log(
+        db,
+        hospital_id=hospital_id,
+        actor=actor,
+        action="update",
+        entity_type="patient",
+        entity_id=surgery.patient_id,
+        summary="Patient transferred from OT to ICU",
+    )
+    if adm.source_appointment_id:
+        write_audit_log(
+            db,
+            hospital_id=hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="appointment",
+            entity_id=adm.source_appointment_id,
+            summary="Appointment linkage carried with OT post-op transfer",
+        )
 
 
 class CompleteSurgeryAction:
@@ -702,7 +883,13 @@ class CompleteSurgeryAction:
             entity_id=item.id,
             summary=f"Completed surgery {item.surgery_no}",
         )
-        self.db.commit()
+        try:
+            self.db.commit()
+        except _IntegrityError as exc:
+            self.db.rollback()
+            raise _ot_conflict(
+                "Surgery completion collided concurrently; please retry",
+            ) from exc
         return surgery_to_response(self.repo.get_surgery(surgery_id))
 
 
@@ -793,6 +980,12 @@ class SaveNotesAction:
                 item,
                 self.user,
             )
-        self.db.commit()
+        try:
+            self.db.commit()
+        except _OTIntegrityError as exc:
+            self.db.rollback()
+            raise _ot_conflict(
+                "Surgery notes save collided concurrently; please retry",
+            ) from exc
 
         return surgery_to_response(self.repo.get_surgery(surgery_id))

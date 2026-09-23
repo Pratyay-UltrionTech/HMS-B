@@ -92,10 +92,22 @@ class BedsRepository:
         )
         if ward_id:
             q = q.filter(Bed.ward_id == ward_id)
+        # Status pre-filter on the flag; the overlay below re-derives the
+        # final status, so "available" additionally drops held beds and
+        # "occupied" additionally keeps held beds whose flag lagged.
         if status_filter == "available":
             q = q.filter(Bed.is_occupied.is_(False))
+            held = self._open_admission_bed_ids(hospital_id)
+            if held:
+                q = q.filter(~Bed.id.in_(held))
         elif status_filter == "occupied":
-            q = q.filter(Bed.is_occupied.is_(True))
+            held = self._open_admission_bed_ids(hospital_id)
+            if held:
+                from sqlalchemy import or_ as _or
+
+                q = q.filter(_or(Bed.is_occupied.is_(True), Bed.id.in_(held)))
+            else:
+                q = q.filter(Bed.is_occupied.is_(True))
 
         beds = q.order_by(Bed.ward_id.asc(), Bed.room_id.asc(), Bed.bed_code.asc()).all()
 
@@ -104,11 +116,19 @@ class BedsRepository:
             .options(joinedload(Admission.patient), joinedload(Admission.doctor))
             .filter(
                 Admission.hospital_id == hospital_id,
-                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+                # Open-episode overlay (Invariant 1): a bed held by any open
+                # episode counts as occupied even if the flag lagged.
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
             )
             .all()
         )
-        by_bed = {a.bed_id: a for a in active}
+        by_bed = {a.bed_id: a for a in active if a.bed_id is not None}
 
         rows = []
         for b in beds:
@@ -133,8 +153,31 @@ class BedsRepository:
             )
         return rows
 
+    def _open_admission_bed_ids(self, hospital_id: UUID) -> set[UUID]:
+        """Bed ids held by any open-episode admission (overlay source)."""
+        rows = (
+            self.db.query(Admission.bed_id)
+            .filter(
+                Admission.hospital_id == hospital_id,
+                Admission.bed_id.is_not(None),
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
+            )
+            .all()
+        )
+        return {r[0] for r in rows if r[0] is not None}
+
     def get_occupancy_report(self, hospital_id: UUID) -> dict[str, Any]:
-        """Calculate hospital-wide and per-ward bed occupancy statistics."""
+        """Calculate hospital-wide and per-ward bed occupancy statistics.
+
+        Occupied = flag OR held-by-open-admission (same-query overlay so a
+        lagging flag can never report a held bed as available).
+        """
         self.sync_all_beds(hospital_id)
         self.db.commit()
 
@@ -144,16 +187,20 @@ class BedsRepository:
             .scalar()
             or 0
         )
-        occupied = (
-            self.db.query(func.count(Bed.id))
-            .filter(
-                Bed.hospital_id == hospital_id,
-                Bed.is_active.is_(True),
-                Bed.is_occupied.is_(True),
+        flag_occupied_ids = {
+            r[0]
+            for r in (
+                self.db.query(Bed.id)
+                .filter(
+                    Bed.hospital_id == hospital_id,
+                    Bed.is_active.is_(True),
+                    Bed.is_occupied.is_(True),
+                )
+                .all()
             )
-            .scalar()
-            or 0
-        )
+        }
+        occupied_ids = flag_occupied_ids | self._open_admission_bed_ids(hospital_id)
+        occupied = len(occupied_ids)
         available = int(total) - int(occupied)
         pct = round((occupied / total) * 100, 1) if total else 0.0
 
@@ -175,19 +222,21 @@ class BedsRepository:
                 .group_by(Bed.ward_id)
                 .all()
             )
-            occ_rows = (
-                self.db.query(Bed.ward_id, func.count(Bed.id))
+            # Per-ward occupied with the same flag-OR-overlay definition.
+            bed_wards = (
+                self.db.query(Bed.id, Bed.ward_id)
                 .filter(
                     Bed.hospital_id == hospital_id,
                     Bed.ward_id.in_(ward_ids),
                     Bed.is_active.is_(True),
-                    Bed.is_occupied.is_(True),
                 )
-                .group_by(Bed.ward_id)
                 .all()
             )
             totals_map = {wid: int(cnt) for wid, cnt in total_rows}
-            occ_map = {wid: int(cnt) for wid, cnt in occ_rows}
+            occ_map: dict[UUID, int] = {}
+            for bid, wid in bed_wards:
+                if bid in occupied_ids:
+                    occ_map[wid] = occ_map.get(wid, 0) + 1
             for w in wards:
                 wt = totals_map.get(w.id, 0)
                 wo = occ_map.get(w.id, 0)
@@ -252,7 +301,11 @@ class BedsRepository:
         if room_id:
             q = q.filter(Bed.room_id == room_id)
         if available_only:
+            # Exclude flag-occupied AND open-admission-held beds.
             q = q.filter(Bed.is_occupied.is_(False))
+            held = self._open_admission_bed_ids(hospital_id)
+            if held:
+                q = q.filter(~Bed.id.in_(held))
         return q.order_by(Bed.bed_code.asc()).all()
 
     def get_bed_by_id(self, hospital_id: UUID, bed_id: UUID) -> Bed | None:

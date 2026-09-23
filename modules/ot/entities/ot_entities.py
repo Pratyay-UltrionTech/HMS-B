@@ -39,6 +39,7 @@ from infrastructure.postgres.base import Base
 # not always guaranteed, causing
 # `InvalidRequestError: ... expression 'Wing' failed to locate a name`.
 from modules.doctors.entities.doctor import HospitalUser
+from modules.inpatient.entities.admission import Admission
 from modules.masters.entities.organization_entities import Department, Wing
 from modules.patients.entities.patient import Patient
 
@@ -119,6 +120,9 @@ class OtSurgery(Base):
     patient_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     surgeon_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -187,6 +191,7 @@ class OtSurgery(Base):
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    admission: Mapped["Admission | None"] = relationship("Admission", foreign_keys=[admission_id])
     surgeon: Mapped["HospitalUser | None"] = relationship("HospitalUser", foreign_keys=[surgeon_id])
     department: Mapped["Department | None"] = relationship("Department", foreign_keys=[department_id])
     ot_room_ref: Mapped["OtRoom | None"] = relationship("OtRoom", foreign_keys=[ot_room_id])

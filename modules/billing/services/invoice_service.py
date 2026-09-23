@@ -47,46 +47,54 @@ def _esc(s: str | None) -> str:
     return (s or "—").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def next_invoice_number(db: Session, hospital_id: UUID, year: int | None = None) -> str:
-    """Generate sequential invoice number scoped to hospital and year."""
-    y = year or date.today().year
-    prefix = f"INV-{y}-"
-    rows = (
-        db.query(BillingInvoice.invoice_number)
+def _max_existing_seq(db: Session, column, hospital_id: UUID, prefix: str) -> int:
+    """Return the highest numeric suffix already stored for ``prefix``.
+
+    Used once per number generation to self-heal atomic counters that were
+    introduced after rows numbered with the legacy read-MAX-then-+1 scheme
+    already existed (e.g. RCPT-2026-00001 predating the counter row).
+    """
+    max_seq = 0
+    for (num,) in (
+        db.query(column)
         .filter(
-            BillingInvoice.hospital_id == hospital_id,
-            BillingInvoice.invoice_number.like(f"{prefix}%"),
+            BillingInvoice.hospital_id == hospital_id
+            if column is BillingInvoice.invoice_number
+            else BillingReceipt.hospital_id == hospital_id,
+            column.like(f"{prefix}%"),
         )
         .all()
-    )
-    max_seq = 0
-    for (num,) in rows:
+    ):
         try:
             max_seq = max(max_seq, int(str(num).split("-")[-1]))
         except (ValueError, IndexError):
             continue
-    return f"{prefix}{max_seq + 1:05d}"
+    return max_seq
+
+
+def next_invoice_number(db: Session, hospital_id: UUID, year: int | None = None) -> str:
+    """Generate sequential invoice number scoped to hospital and year atomically."""
+    from shared.database.sequences import (
+        ensure_counter_at_least as _ensure,
+        next_invoice_number as _atomic_next_inv,
+    )
+    y = year or date.today().year
+    _ensure(db, hospital_id, f"invoice_{y}", _max_existing_seq(
+        db, BillingInvoice.invoice_number, hospital_id, f"INV-{y}-"))
+    return _atomic_next_inv(db, hospital_id, year)
 
 
 def next_receipt_number(db: Session, hospital_id: UUID, year: int | None = None) -> str:
-    """Generate sequential payment receipt number scoped to hospital and year."""
-    y = year or date.today().year
-    prefix = f"RCPT-{y}-"
-    rows = (
-        db.query(BillingReceipt.receipt_number)
-        .filter(
-            BillingReceipt.hospital_id == hospital_id,
-            BillingReceipt.receipt_number.like(f"{prefix}%"),
-        )
-        .all()
+    """Generate sequential payment receipt number scoped to hospital and year atomically."""
+    from shared.database.sequences import (
+        ensure_counter_at_least as _ensure,
+        next_receipt_number as _atomic_next_rcpt,
     )
-    max_seq = 0
-    for (num,) in rows:
-        try:
-            max_seq = max(max_seq, int(str(num).split("-")[-1]))
-        except (ValueError, IndexError):
-            continue
-    return f"{prefix}{max_seq + 1:05d}"
+    y = year or date.today().year
+    _ensure(db, hospital_id, f"receipt_{y}", _max_existing_seq(
+        db, BillingReceipt.receipt_number, hospital_id, f"RCPT-{y}-"))
+    return _atomic_next_rcpt(db, hospital_id, year)
+
 
 
 def charges_already_invoiced(

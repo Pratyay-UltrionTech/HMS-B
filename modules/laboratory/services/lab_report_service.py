@@ -191,6 +191,7 @@ def sync_lab_order_medical_record(db: Session, order: LabOrder) -> None:
         existing.title = title_bits
         existing.notes = notes
         existing.appointment_id = order.appointment_id
+        existing.admission_id = order.admission_id
         return
 
     db.add(
@@ -199,6 +200,7 @@ def sync_lab_order_medical_record(db: Session, order: LabOrder) -> None:
             doctor_id=order.doctor_id,
             patient_id=order.patient_id,
             appointment_id=order.appointment_id,
+            admission_id=order.admission_id,
             lab_order_id=order.id,
             report_type="Blood Report",
             title=title_bits,

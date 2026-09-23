@@ -278,10 +278,15 @@ def test_admit_ipd_action_rejects_already_occupied_bed(standalone_db: Session):
     action = AdmitIpdAction(db, hospital_id, repo)
     payload = AdmitIpdRequest(ward_id=ward.id, room_id=room.id, bed_id=bed.id)
 
-    with pytest.raises(AppointmentConflictError) as exc_info:
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
         action.execute(appt.id, payload, {"name": "Nurse"})
 
-    assert "already occupied" in str(exc_info.value)
+    assert exc_info.value.status_code == 409
+    assert isinstance(exc_info.value.detail, dict)
+    assert exc_info.value.detail.get("code") == "BED_OCCUPIED"
+    assert "already occupied" in exc_info.value.detail.get("message", "")
 
 
 def test_hydrate_appointment_items_ledger_clearance(standalone_db: Session):

@@ -25,14 +25,14 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import (
+from modules.appointments.entities.appointment import (
     Appointment as LegacyAppointment,
-    AppointmentStatus as LegacyAppointmentStatus,
-    AppointmentType,
-    Hospital,
-    HospitalUser,
-    Patient as LegacyPatient,
 )
+from modules.appointments.entities.appointment_type import AppointmentType
+from modules.appointments.entities.enums import AppointmentStatus as LegacyAppointmentStatus
+from modules.doctors.entities.doctor import HospitalUser
+from modules.patients.entities.patient import Patient as LegacyPatient
+from modules.tenancy.entities.hospital import Hospital
 
 
 def _future_slot() -> tuple[date, str]:

@@ -46,6 +46,7 @@ from infrastructure.postgres.base import Base
 if TYPE_CHECKING:
     from modules.clinical_records.entities.clinical_record import Prescription
     from modules.doctors.entities.doctor import HospitalUser
+    from modules.inpatient.entities.admission import Admission
     from modules.patients.entities.patient import Patient
 
 
@@ -422,6 +423,9 @@ class PharmacySale(Base):
     prescription_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("prescriptions.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     pharmacy_rx_request_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("pharmacy_rx_requests.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -446,6 +450,7 @@ class PharmacySale(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     patient: Mapped["Patient | None"] = relationship()
+    admission: Mapped["Admission | None"] = relationship("Admission", foreign_keys=[admission_id])
     items: Mapped[list["PharmacySaleItem"]] = relationship(
         back_populates="sale", cascade="all, delete-orphan"
     )
@@ -522,6 +527,9 @@ class PharmacyRxRequest(Base):
     patient_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("patients.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     doctor_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -540,6 +548,7 @@ class PharmacyRxRequest(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
+    admission: Mapped["Admission | None"] = relationship("Admission", foreign_keys=[admission_id])
     items: Mapped[list["PharmacyRxRequestItem"]] = relationship(
         back_populates="request", cascade="all, delete-orphan"
     )

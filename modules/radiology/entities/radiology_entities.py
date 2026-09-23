@@ -40,6 +40,7 @@ from infrastructure.postgres.base import Base
 # relationship() targets are resolved from SQLAlchemy's mapper registry at
 # first mapper configuration (same pattern as laboratory entities).
 from modules.clinical_records.entities.clinical_record import Prescription
+from modules.inpatient.entities.admission import Admission
 
 if TYPE_CHECKING:
     from modules.doctors.entities.doctor import HospitalUser
@@ -125,6 +126,9 @@ class RadiologyOrder(Base):
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     scan_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("radiology_scan_catalog.id", ondelete="SET NULL"), nullable=True
     )
@@ -179,6 +183,7 @@ class RadiologyOrder(Base):
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    admission: Mapped["Admission | None"] = relationship("Admission", foreign_keys=[admission_id])
     doctor: Mapped["HospitalUser | None"] = relationship("HospitalUser", foreign_keys=[doctor_id])
     scan: Mapped["RadiologyScanCatalog | None"] = relationship("RadiologyScanCatalog", foreign_keys=[scan_id])
 
@@ -206,6 +211,9 @@ class RadPrescriptionRequest(Base):
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     status: Mapped[RadPrescriptionRequestStatus] = mapped_column(
         Enum(RadPrescriptionRequestStatus, name="rad_prescription_request_status"),
         nullable=False,
@@ -224,6 +232,7 @@ class RadPrescriptionRequest(Base):
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+    admission: Mapped["Admission | None"] = relationship("Admission", foreign_keys=[admission_id])
     doctor: Mapped["HospitalUser"] = relationship("HospitalUser", foreign_keys=[doctor_id])
     prescription: Mapped["Prescription"] = relationship("Prescription", foreign_keys=[prescription_id])
     items: Mapped[list[RadPrescriptionRequestItem]] = relationship(

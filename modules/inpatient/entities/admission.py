@@ -46,6 +46,7 @@ class AdmissionStatus(str, enum.Enum):
     admitted = "admitted"
     discharge_requested = "discharge_requested"
     discharged = "discharged"
+    cancelled = "cancelled"
 
 
 # Statuses in which the patient counts as having an open inpatient episode

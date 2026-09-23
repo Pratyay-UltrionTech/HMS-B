@@ -263,8 +263,15 @@ class OtRepository:
             .filter(
                 Admission.hospital_id == self.hospital_id,
                 Admission.patient_id == patient_id,
-                # Canonical active-inpatient census (spec §14).
-                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+                # Open-episode set: a requested admission already blocks a
+                # second episode, so OT booking sees it as IPD (Invariant 1).
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
             )
             .first()
             is not None

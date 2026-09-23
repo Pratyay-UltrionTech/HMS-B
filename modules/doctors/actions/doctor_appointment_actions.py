@@ -301,54 +301,52 @@ class TransferAppointmentToInpatientAction:
                 detail=f"Cannot transfer a {appt.status.value} visit to inpatient",
             )
 
-        # Pre-check: an already-active episode blocks a new request (Invariant 1).
-        # Only a REQUESTED episode may be reused (idempotent convergence).
-        from modules.inpatient.entities.admission import Admission as _Admission
-        from modules.inpatient.entities.admission import AdmissionStatus as _AdmStatus
+        from sqlalchemy.exc import IntegrityError as _IntegrityError
 
-        open_episode = (
-            self.db.query(_Admission)
-            .filter(
-                _Admission.hospital_id == hospital_id,
-                _Admission.patient_id == appt.patient_id,
-                _Admission.status.in_(
-                    [
-                        _AdmStatus.requested,
-                        _AdmStatus.admitted,
-                        _AdmStatus.discharge_requested,
-                    ]
-                ),
-            )
-            .first()
+        from modules.inpatient.actions.admission_lifecycle_actions import (
+            EnsureAdmissionRequestAction,
         )
-        if open_episode and open_episode.status != _AdmStatus.requested:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Patient already has an {open_episode.status.value} admission",
-            )
+        from modules.inpatient.entities.admission import AdmissionStatus as _AdmStatus
+        from modules.inpatient.utils.admission_conflicts import (
+            admission_conflict as _transfer_conflict,
+        )
 
         appt.status = AppointmentStatus.ipd_transfer_requested
         if payload.notes:
             appt.notes = payload.notes.strip()
         self.db.flush()
 
-        # Spec §5: converge on the canonical request lifecycle. The canonical
-        # request state is Admission(status=requested); the appointment flag
-        # above is a derived compatibility mirror synchronized here in the
-        # same transaction. Idempotent: a request created by IPD-form
-        # finalization is reused, never duplicated.
-        from modules.inpatient.actions.admission_lifecycle_actions import (
-            EnsureAdmissionRequestAction,
-        )
-
-        EnsureAdmissionRequestAction(self.db).execute(
-            hospital_id=hospital_id,
-            patient_id=appt.patient_id,
-            actor=actor,
-            doctor_id=doctor_id,
-            notes=payload.notes,
-            source_appointment_id=appt.id,
-        )
+        # Spec §5: converge on the canonical request lifecycle in a SINGLE
+        # commit — Ensure stages without committing (commit=False) and the
+        # transfer audit below commits atomically with it. Only a REQUESTED
+        # episode may be reused; admitted/discharge_requested → 409.
+        try:
+            admission, _ = EnsureAdmissionRequestAction(self.db).execute(
+                hospital_id=hospital_id,
+                patient_id=appt.patient_id,
+                actor=actor,
+                doctor_id=doctor_id,
+                notes=payload.notes,
+                source_appointment_id=appt.id,
+                commit=False,
+            )
+            self.db.flush()
+        except _IntegrityError as exc:
+            self.db.rollback()
+            raise _transfer_conflict(
+                "Admission request collided concurrently; please retry",
+                admission_status=_AdmStatus.requested,
+                doctor_id=doctor_id,
+            ) from exc
+        if admission.status != _AdmStatus.requested:
+            self.db.rollback()
+            raise _transfer_conflict(
+                f"Patient already has an {admission.status.value} admission",
+                admission_id=admission.id,
+                admission_status=admission.status,
+                bed_id=admission.bed_id,
+                doctor_id=admission.doctor_id,
+            )
 
         write_audit_log(
             self.db,

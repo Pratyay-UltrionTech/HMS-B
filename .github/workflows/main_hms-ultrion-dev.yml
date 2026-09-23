@@ -33,15 +33,27 @@ jobs:
       # App Service extracts antenv.tar.gz into /antenv and sets
       # PYTHONPATH=/antenv/lib/pythonX.Y/site-packages. The archive root must be
       # bin/, lib/, … — NOT a nested antenv/ folder (that causes ModuleNotFoundError).
+      # Always rebuild from requirements.txt — never reuse a prior antenv archive.
       - name: Create virtual environment and package antenv.tar.gz
         run: |
+          set -euo pipefail
+          rm -rf antenv /tmp/antenv-check
+          rm -f antenv.tar.gz
+          chmod +x startup.sh
+
           python -m venv antenv
           source antenv/bin/activate
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -c "import fastapi, sqlalchemy; print('fastapi', fastapi.__version__); print('sqlalchemy', sqlalchemy.__version__)"
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+          python -c "import typing_extensions as te, importlib.metadata as m; assert getattr(te, 'sentinel', None) is not None, 'typing_extensions.sentinel missing'; print('typing_extensions', m.version('typing_extensions'), te.__file__); print('sentinel', te.sentinel)"
+          python -c "import fastapi, starlette, anyio, importlib.metadata as m; print('fastapi', fastapi.__version__); print('starlette', starlette.__version__); print('anyio', m.version('anyio'))"
+          python -c "import fastapi, sqlalchemy; print('sqlalchemy', sqlalchemy.__version__)"
+
           PY_XY=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
           deactivate
+
           # Pack venv contents at archive root (Oryx extracts into /antenv)
           tar -czf antenv.tar.gz -C antenv .
           rm -rf antenv
@@ -51,6 +63,7 @@ jobs:
           mkdir -p /tmp/antenv-check
           tar -xzf antenv.tar.gz -C /tmp/antenv-check
           test -d "/tmp/antenv-check/lib/python${PY_XY}/site-packages/fastapi"
+          test -f "/tmp/antenv-check/lib/python${PY_XY}/site-packages/typing_extensions.py"
           echo "antenv.tar.gz layout OK for python${PY_XY}"
 
       - name: Upload artifact for deployment jobs
@@ -93,6 +106,7 @@ jobs:
 
       # Disabling remote build avoids long Oryx runs that collide with SCM restarts.
       # Also pin the App Service runtime to Python 3.12 to match the built antenv.
+      # startup.sh strips /agents/python from PYTHONPATH so antenv typing_extensions wins.
       - name: Align App Service runtime and disable remote Oryx if needed
         id: appsettings
         run: |
@@ -105,6 +119,7 @@ jobs:
           echo "RESOURCE_GROUP=$RG" >> "$GITHUB_ENV"
 
           NEED_UPDATE=false
+          TARGET_STARTUP="startup.sh"
 
           CURRENT_FX=$(az webapp config show \
             --name "${{ env.APP_NAME }}" \
@@ -117,6 +132,20 @@ jobs:
               --name "${{ env.APP_NAME }}" \
               --resource-group "$RG" \
               --linux-fx-version "$TARGET_FX" \
+              --output none
+            NEED_UPDATE=true
+          fi
+
+          CURRENT_STARTUP=$(az webapp config show \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "$RG" \
+            --query "appCommandLine" -o tsv)
+          if [ "${CURRENT_STARTUP}" != "${TARGET_STARTUP}" ]; then
+            echo "Updating startup command from '${CURRENT_STARTUP}' to '${TARGET_STARTUP}'..."
+            az webapp config set \
+              --name "${{ env.APP_NAME }}" \
+              --resource-group "$RG" \
+              --startup-file "${TARGET_STARTUP}" \
               --output none
             NEED_UPDATE=true
           fi

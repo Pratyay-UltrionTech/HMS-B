@@ -14,6 +14,7 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from modules.billing.contracts.billing_contracts import (
@@ -102,6 +103,192 @@ def _get_patient_or_404(repo: BillingRepository, patient_id: UUID) -> Patient:
     if not patient:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found")
     return patient
+
+
+def _apply_global_settlement_discount(
+    db: Session, hospital_id: UUID, patient_id: UUID, payload: BillingPaymentCreate
+) -> None:
+    """Fold a top-level settlement discount into ``payload.allocations``.
+
+    A global concession accepted on the contract must never be silently
+    dropped. Distribution is proportional to each target's amount due:
+
+    - Explicit allocations: only items without their own discount receive a
+      share (per-item entries always win over the global value).
+    - No allocations (FIFO tender): a plan is built across all open,
+      non-invoiced charges in FIFO order, with tender covering the
+      discounted remainder. ``payload.amount`` must equal that remainder.
+
+    Invoiced targets are rejected (same convention as UpdateChargeAction:
+    invoiced charges need an adjustment/credit note, not a silent edit).
+    Raises ValueError (mapped to 400) on any inconsistency.
+    """
+    from modules.billing.services.invoice_service import charges_already_invoiced
+
+    disc_amt = round(float(payload.discount_amount or 0), 2)
+    disc_pct = float(payload.discount_percent or 0)
+    if disc_amt <= 0 and disc_pct <= 0:
+        return
+    reason = (payload.discount_reason or "").strip()
+
+    if payload.allocations:
+        target_ids = [a.charge_id for a in payload.allocations]
+        charges = (
+            db.query(BillingCharge)
+            .filter(
+                BillingCharge.id.in_(target_ids),
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.patient_id == patient_id,
+                BillingCharge.status.in_(
+                    [BillingChargeStatus.pending, BillingChargeStatus.partially_paid]
+                ),
+            )
+            .order_by(BillingCharge.created_at.asc())
+            .all()
+        )
+        by_id = {c.id: c for c in charges}
+        # Only items without an explicit discount receive a global share.
+        receivable = [
+            (a, by_id[a.charge_id])
+            for a in payload.allocations
+            if a.charge_id in by_id
+            and (a.discount_amount or 0) <= 0
+            and (a.discount_percent or 0) <= 0
+        ]
+        if not receivable:
+            return
+        invoiced = charges_already_invoiced(
+            db, hospital_id, [c.id for _, c in receivable]
+        )
+        if invoiced:
+            raise ValueError(
+                "Discount cannot be applied at settlement: one or more selected "
+                "charges are on an active invoice. Issue an adjustment or credit note."
+            )
+        dues = {
+            c.id: round(float(c.net_amount) - float(c.amount_paid or 0), 2)
+            for _, c in receivable
+        }
+        _split_discount(receivable, dues, disc_amt, disc_pct, reason)
+    else:
+        charges = (
+            db.query(BillingCharge)
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.patient_id == patient_id,
+                BillingCharge.status.in_(
+                    [BillingChargeStatus.pending, BillingChargeStatus.partially_paid]
+                ),
+            )
+            .order_by(BillingCharge.created_at.asc())
+            .all()
+        )
+        invoiced = set(
+            charges_already_invoiced(db, hospital_id, [c.id for c in charges])
+        )
+        discountable = [c for c in charges if c.id not in invoiced]
+        if not discountable:
+            raise ValueError(
+                "Discount cannot be applied at settlement: all open charges are "
+                "on an active invoice. Issue an adjustment or credit note."
+            )
+        dues = {
+            c.id: round(float(c.net_amount) - float(c.amount_paid or 0), 2)
+            for c in discountable
+        }
+        dues = {cid: d for cid, d in dues.items() if d > 0}
+        if not dues:
+            raise ValueError("There is no outstanding balance to discount.")
+        from modules.billing.contracts.billing_contracts import ChargeAllocationItem
+
+        plan = [
+            ChargeAllocationItem(charge_id=c.id, amount=dues[c.id])
+            for c in discountable
+            if c.id in dues
+        ]
+        receivable = [
+            (a, next(c for c in discountable if c.id == a.charge_id)) for a in plan
+        ]
+        shares = _split_discount(receivable, dues, disc_amt, disc_pct, reason)
+        expected_tender = round(
+            sum(dues[c.id] - shares[c.id] for _, c in receivable), 2
+        )
+        if abs(float(payload.amount) - expected_tender) > 0.01:
+            raise ValueError(
+                f"Payment amount ₹{float(payload.amount):.2f} must equal the discounted "
+                f"total ₹{expected_tender:.2f} when a global discount is applied "
+                "without explicit allocations."
+            )
+        payload.allocations = plan
+
+
+def _split_discount(
+    receivable, dues: dict, disc_amt: float, disc_pct: float, reason: str
+) -> dict:
+    """Assign proportional amount shares (plus pass-through percent) in place.
+
+    Returns {charge_id: share} so callers can reconcile tender without
+    stashing private attributes on the pydantic plan items.
+    """
+    from uuid import UUID as _UUID
+
+    total_due = round(sum(dues.values()), 2)
+    if total_due <= 0:
+        raise ValueError("There is no outstanding balance to discount.")
+    total = min(disc_amt, total_due)
+    shares: dict[_UUID, float] = {}
+    assigned = 0.0
+    for idx, (item, charge) in enumerate(receivable):
+        due = dues[charge.id]
+        if idx == len(receivable) - 1:
+            share = round(total - assigned, 2)
+        else:
+            share = round(total * due / total_due, 2) if total_due else 0.0
+            assigned = round(assigned + share, 2)
+        share = max(0.0, min(share, due))
+        item.discount_amount = share if share > 0 or disc_amt > 0 else None
+        if disc_pct > 0:
+            item.discount_percent = disc_pct
+        if reason:
+            item.discount_reason = reason
+        shares[charge.id] = share
+    return shares
+
+
+def _resync_billing_counters(db: Session, hospital_id: UUID) -> None:
+    """Resync all billing document counters past legacy MAX+1 rows.
+
+    Called before a single retry after a receipt/invoice numbering
+    UniqueViolation. The per-call resync in the number generators normally
+    prevents this; this is the backstop for a counter that fell behind
+    between generation and flush under concurrency.
+    """
+    from shared.database.sequences import ensure_counter_at_least
+
+    specs = [
+        (BillingInvoice, BillingInvoice.invoice_number, "invoice", "INV"),
+        (BillingReceipt, BillingReceipt.receipt_number, "receipt", "RCPT"),
+        (BillingDeposit, BillingDeposit.deposit_number, "deposit", "DEP"),
+        (BillingRefund, BillingRefund.refund_number, "refund", "REF"),
+    ]
+    for entity, column, counter_base, prefix in specs:
+        years: set[int] = set()
+        max_by_year: dict[int, int] = {}
+        for (num,) in db.query(column).filter(
+            entity.hospital_id == hospital_id,
+        ).all():
+            try:
+                parts = str(num).split("-")
+                y, seq = int(parts[1]), int(parts[-1])
+            except (ValueError, IndexError):
+                continue
+            if not str(num).startswith(f"{prefix}-"):
+                continue
+            years.add(y)
+            max_by_year[y] = max(max_by_year.get(y, 0), seq)
+        for y in years:
+            ensure_counter_at_least(db, hospital_id, f"{counter_base}_{y}", max_by_year[y])
+    db.flush()
 
 
 def _payment_response_dto(
@@ -225,11 +412,20 @@ class CreateChargeAction:
             charge_amount=payload.charge_amount,
             discount_amount=payload.discount_amount,
             discount_percent=payload.discount_percent,
+            discount_reason=payload.discount_reason,
+            quantity=payload.quantity,
+            unit_price=payload.unit_price,
+            tax_amount=payload.tax_amount,
+            gst_rate=payload.gst_rate,
+            hsn_sac_code=payload.hsn_sac_code,
             notes=payload.notes,
             created_by_name=_actor(user),
         )
         self.db.commit()
         self.db.refresh(row)
+        audit_summary = f"Charge ₹{row.net_amount:.2f} created for {patient.name} ({row.description[:40]})"
+        if row.discount_amount > 0:
+            audit_summary += f" [Discount: ₹{row.discount_amount:.2f}, Reason: {row.discount_reason}]"
         write_audit_log(
             self.db,
             hospital_id=self.repo.hospital_id,
@@ -237,7 +433,7 @@ class CreateChargeAction:
             action="create",
             entity_type="billing_charge",
             entity_id=row.id,
-            summary=f"Charge ₹{row.net_amount:.2f} created for {patient.name} ({row.description[:40]})",
+            summary=audit_summary,
         )
         self.db.commit()
         return BillingChargeResponse.model_validate(charge_to_dict(row, patient))
@@ -255,16 +451,33 @@ class UpdateChargeAction:
         if charge.status == BillingChargeStatus.cancelled:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot edit a cancelled charge")
 
+        # Check if already on a non-cancelled invoice
+        from modules.billing.services.invoice_service import charges_already_invoiced
+        if charges_already_invoiced(self.db, self.repo.hospital_id, [charge.id]):
+            # If attempting to alter financial numbers on an invoiced charge, reject
+            if (
+                payload.discount_amount is not None
+                or payload.discount_percent is not None
+                or payload.tax_amount is not None
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot modify financial amounts or discounts on an invoiced charge. Issue an adjustment or credit note.",
+                )
+
         if payload.description is not None:
             charge.description = payload.description.strip()[:512]
         if payload.notes is not None:
             charge.notes = payload.notes
 
-        disc_amt = payload.discount_amount if payload.discount_amount is not None else float(charge.discount_amount or 0)
+        old_disc = float(charge.discount_amount or 0)
+        disc_amt = payload.discount_amount if payload.discount_amount is not None else old_disc
         disc_pct = payload.discount_percent if payload.discount_percent is not None else charge.discount_percent
         disc, net = compute_net(float(charge.charge_amount or 0), disc_amt, disc_pct)
         charge.discount_amount = disc
         charge.discount_percent = disc_pct
+        if payload.discount_reason is not None:
+            charge.discount_reason = payload.discount_reason.strip() or None
         charge.net_amount = net
 
         if payload.status is not None:
@@ -281,6 +494,9 @@ class UpdateChargeAction:
 
         self.db.commit()
         self.db.refresh(charge)
+        audit_summary = f"Updated charge {charge.id} (Net: ₹{charge.net_amount:.2f})"
+        if disc > 0 and disc != old_disc:
+            audit_summary += f" [Discount updated: ₹{disc:.2f}, Reason: {charge.discount_reason}]"
         write_audit_log(
             self.db,
             hospital_id=self.repo.hospital_id,
@@ -288,10 +504,11 @@ class UpdateChargeAction:
             action="update",
             entity_type="billing_charge",
             entity_id=charge.id,
-            summary=f"Updated charge {charge.id}",
+            summary=audit_summary,
         )
         self.db.commit()
         return BillingChargeResponse.model_validate(charge_to_dict(charge))
+
 
 
 class CancelChargeAction:
@@ -375,37 +592,97 @@ class CreatePaymentAction:
     def execute(self, payload: BillingPaymentCreate, user: dict[str, Any]) -> BillingPaymentResponse:
         patient = _get_patient_or_404(self.repo, payload.patient_id)
         pdate = payload.payment_date or date.today()
-        
+
+        # Fold a top-level settlement concession into per-charge allocations
+        # (or build the plan for FIFO tenders). Never silently drop it.
+        try:
+            _apply_global_settlement_discount(
+                self.db, self.repo.hospital_id, payload.patient_id, payload
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
         # Convert Pydantic allocation models if provided
         allocations_plan = None
         if payload.allocations:
             allocations_plan = [
-                {"charge_id": item.charge_id, "amount": item.amount}
+                {
+                    "charge_id": item.charge_id,
+                    "amount": item.amount,
+                    "discount_amount": item.discount_amount,
+                    "discount_percent": item.discount_percent,
+                    "discount_reason": item.discount_reason or payload.discount_reason,
+                }
                 for item in payload.allocations
             ]
 
-        pay = create_payment(
-            self.db,
-            hospital_id=self.repo.hospital_id,
-            patient_id=payload.patient_id,
-            amount=payload.amount,
-            payment_date=pdate,
-            payment_method=payload.payment_method,
-            account_id=payload.account_id,
-            reference_number=payload.reference_number,
-            notes=payload.notes,
-            received_by_name=_actor(user),
-            allocate=True,
-            allocations_plan=allocations_plan,
-        )
-        receipt = issue_receipt_for_payment(
-            self.db,
-            pay,
-            linked_invoice_id=payload.linked_invoice_id,
-            reference_number=payload.reference_number,
-        )
-        refresh_invoice_paid_status(self.db, self.repo.hospital_id, payload.patient_id)
-        self.db.commit()
+        try:
+            pay = create_payment(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                patient_id=payload.patient_id,
+                amount=payload.amount,
+                payment_date=pdate,
+                payment_method=payload.payment_method,
+                account_id=payload.account_id,
+                reference_number=payload.reference_number,
+                notes=payload.notes,
+                received_by_name=_actor(user),
+                allocate=True,
+                allocations_plan=allocations_plan,
+            )
+        except ValueError as e:
+            # Settlement-guard rejection (e.g. discount on an invoiced charge).
+            self.db.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        try:
+            receipt = issue_receipt_for_payment(
+                self.db,
+                pay,
+                linked_invoice_id=payload.linked_invoice_id,
+                reference_number=payload.reference_number,
+            )
+            refresh_invoice_paid_status(self.db, self.repo.hospital_id, payload.patient_id)
+            self.db.commit()
+        except IntegrityError as e:
+            # Receipt/invoice numbering collision (stale sequence counter behind
+            # legacy MAX+1 rows, or concurrent writers). Roll back the whole
+            # payment attempt so a client retry cannot mint a duplicate payment,
+            # resync the counters past existing rows, and retry exactly once.
+            self.db.rollback()
+            if "uq_billing_receipt_number" not in str(e.orig or e) and \
+               "uq_billing_invoice_number" not in str(e.orig or e):
+                raise
+            _resync_billing_counters(self.db, self.repo.hospital_id)
+            pay = create_payment(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                patient_id=payload.patient_id,
+                amount=payload.amount,
+                payment_date=pdate,
+                payment_method=payload.payment_method,
+                account_id=payload.account_id,
+                reference_number=payload.reference_number,
+                notes=payload.notes,
+                received_by_name=_actor(user),
+                allocate=True,
+                allocations_plan=allocations_plan,
+            )
+            try:
+                receipt = issue_receipt_for_payment(
+                    self.db,
+                    pay,
+                    linked_invoice_id=payload.linked_invoice_id,
+                    reference_number=payload.reference_number,
+                )
+                refresh_invoice_paid_status(self.db, self.repo.hospital_id, payload.patient_id)
+                self.db.commit()
+            except IntegrityError:
+                self.db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Receipt numbering conflict — please retry recording the payment",
+                )
         self.db.refresh(pay)
         self.db.refresh(receipt)
         write_audit_log(
@@ -496,7 +773,36 @@ class CreateInvoiceAction:
                 notes=payload.notes,
                 created_by_name=_actor(user),
             )
-            self.db.commit()
+            try:
+                self.db.commit()
+            except IntegrityError as e:
+                # Invoice numbering collision (stale counter) — resync + retry once.
+                self.db.rollback()
+                if "uq_billing_invoice_number" not in str(e.orig or e):
+                    raise
+                _resync_billing_counters(self.db, self.repo.hospital_id)
+                inv = create_invoice_from_charges(
+                    self.db,
+                    hospital_id=self.repo.hospital_id,
+                    patient_id=payload.patient_id,
+                    charge_ids=payload.charge_ids,
+                    account_id=payload.account_id,
+                    invoice_date=payload.invoice_date,
+                    tax_amount=payload.tax_amount,
+                    cgst_amount=payload.cgst_amount,
+                    sgst_amount=payload.sgst_amount,
+                    igst_amount=payload.igst_amount,
+                    notes=payload.notes,
+                    created_by_name=_actor(user),
+                )
+                try:
+                    self.db.commit()
+                except IntegrityError:
+                    self.db.rollback()
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Invoice numbering conflict — please retry generating the invoice",
+                    )
             self.db.refresh(inv)
         except ValueError as e:
             self.db.rollback()

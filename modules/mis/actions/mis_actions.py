@@ -116,9 +116,15 @@ class MisActions:
             new_in_range_q = new_in_range_q.filter(Patient.id == patient_id)
         new_in_range_sq = new_in_range_q.scalar_subquery()
 
-        admitted_sq = (
-            self.db.query(func.count(Patient.id))
-            .filter(Patient.hospital_id == self.hospital_id, Patient.status == PatientStatus.admitted)
+        # IPD series derived purely from Admission.status — no Patient.status
+        # proxy: requested (pending) vs admitted+discharge_requested (active)
+        # vs discharged (reported separately below).
+        requested_sq = (
+            self.db.query(func.count(Admission.id))
+            .filter(
+                Admission.hospital_id == self.hospital_id,
+                Admission.status == AdmissionStatus.requested,
+            )
             .scalar_subquery()
         )
 
@@ -177,7 +183,7 @@ class MisActions:
             total,
             new_today,
             new_in_range,
-            admitted,
+            requested,
             opd,
             ipd,
             discharged_today,
@@ -186,7 +192,7 @@ class MisActions:
             total_sq,
             new_today_sq,
             new_in_range_sq,
-            admitted_sq,
+            requested_sq,
             opd_sq,
             ipd_sq,
             discharged_today_sq,
@@ -195,7 +201,7 @@ class MisActions:
         total = total or 0
         new_today = new_today or 0
         new_in_range = new_in_range or 0
-        admitted = admitted or 0
+        requested = requested or 0
         opd = opd or 0
         ipd = ipd or 0
         discharged_today = discharged_today or 0
@@ -206,7 +212,7 @@ class MisActions:
             MetricRow(metric="New Patients (Range)", count=int(new_in_range)),
             MetricRow(metric="Total Patients", count=int(total)),
             MetricRow(metric="OPD Patients", count=int(opd)),
-            MetricRow(metric="Admitted Patients (IPD)", count=int(admitted if not ipd else max(int(admitted), int(ipd)))),
+            MetricRow(metric="IPD Requests (Pending)", count=int(requested)),
             MetricRow(metric="IPD Admissions (Active)", count=int(ipd)),
             MetricRow(metric="Discharged Today", count=int(discharged_today)),
             MetricRow(metric="Discharged (Range)", count=int(discharged_range)),
@@ -320,8 +326,32 @@ class MisActions:
             bq = bq.filter(Bed.is_occupied.is_(True))
 
         beds = bq.options(joinedload(Bed.ward)).all()
+        # Occupied = flag OR held-by-open-admission (same-query overlay).
+        held_ids = {
+            r[0]
+            for r in (
+                self.db.query(Admission.bed_id)
+                .filter(
+                    Admission.hospital_id == self.hospital_id,
+                    Admission.bed_id.is_not(None),
+                    Admission.status.in_(
+                        [
+                            AdmissionStatus.requested,
+                            AdmissionStatus.admitted,
+                            AdmissionStatus.discharge_requested,
+                        ]
+                    ),
+                )
+                .all()
+            )
+            if r[0] is not None
+        }
+
+        def _is_occupied(b: Bed) -> bool:
+            return bool(b.is_occupied or b.id in held_ids)
+
         total = len(beds)
-        occupied = sum(1 for b in beds if b.is_occupied)
+        occupied = sum(1 for b in beds if _is_occupied(b))
         available = total - occupied
         pct = round((occupied / total) * 100, 1) if total else 0.0
 
@@ -337,7 +367,7 @@ class MisActions:
                     occupancy_percent=0.0,
                 )
             ward_map[wid].total += 1
-            if b.is_occupied:
+            if _is_occupied(b):
                 ward_map[wid].occupied += 1
             else:
                 ward_map[wid].available += 1

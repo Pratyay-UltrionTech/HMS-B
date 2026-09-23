@@ -275,6 +275,13 @@ class RecordEmergencyDispositionAction:
             payload.transfer_facility,
         )
 
+        from sqlalchemy.exc import IntegrityError as _IntegrityError
+
+        from modules.inpatient.utils.admission_conflicts import (
+            admission_conflict as _er_conflict,
+            bed_conflict as _er_bed_conflict,
+        )
+
         decider_name = str(actor.get("name") or "Emergency Physician")
         decider_id_raw = actor.get("user_id")
         decider_id = UUID(str(decider_id_raw)) if decider_id_raw else None
@@ -287,10 +294,13 @@ class RecordEmergencyDispositionAction:
         ) and payload.destination_bed_id and payload.destination_ward_id:
             from modules.beds.entities.bed import Bed
             from modules.inpatient.db.admissions_repository import AdmissionsRepository
+            from modules.inpatient.entities.admission import AdmissionStatus as _AdmStatus
+            from modules.inpatient.entities.admission import BedStaySegment as _Seg
             from modules.inpatient.services.inpatient_billing_service import (
                 InpatientBillingService,
                 next_ip_encounter_id,
             )
+            from modules.patients.entities.patient import PatientStatus as _PatientStatus
 
             bed = (
                 self.db.query(Bed)
@@ -304,9 +314,9 @@ class RecordEmergencyDispositionAction:
                     detail="Destination bed not found",
                 )
             if bed.is_occupied:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Selected bed is occupied. Choose another bed.",
+                raise _er_bed_conflict(
+                    "Selected bed is occupied. Choose another bed.",
+                    bed_id=bed.id,
                 )
             if bed.ward_id != payload.destination_ward_id:
                 raise HTTPException(
@@ -316,8 +326,80 @@ class RecordEmergencyDispositionAction:
 
             admissions_repo = AdmissionsRepository(self.db)
             billing_svc = InpatientBillingService(self.db)
-            patient = encounter.patient or self.db.query(Patient).filter(Patient.id == encounter.patient_id).first()
-            if patient:
+            patient = (
+                self.db.query(Patient)
+                .filter(
+                    Patient.id == encounter.patient_id,
+                    Patient.hospital_id == self.hospital_id,
+                )
+                .first()
+            )
+            if not patient:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Patient not found"
+                )
+            # Open-episode guard: requested → accept with this bed;
+            # admitted/discharge_requested → structured 409.
+            open_ep = admissions_repo.get_open_admission(
+                self.hospital_id, patient.id, for_update=True
+            )
+            if open_ep is not None and open_ep.status != _AdmStatus.requested:
+                raise _er_conflict(
+                    f"Patient already has an {open_ep.status.value} admission episode",
+                    admission_id=open_ep.id,
+                    admission_status=open_ep.status,
+                    bed_id=open_ep.bed_id,
+                    doctor_id=open_ep.doctor_id,
+                )
+            now = datetime.now(timezone.utc)
+            if open_ep is not None:
+                open_ep.status = _AdmStatus.admitted
+                open_ep.admitted_at = now
+                open_ep.ward_id = payload.destination_ward_id
+                open_ep.room_id = bed.room_id
+                open_ep.bed_id = bed.id
+                if not open_ep.ip_id:
+                    open_ep.ip_id = next_ip_encounter_id(self.db, self.hospital_id)
+                if encounter.attending_doctor_id and not open_ep.doctor_id:
+                    open_ep.doctor_id = encounter.attending_doctor_id
+                open_ep.er_id = encounter.er_id
+                bed.is_occupied = True
+                patient.status = _PatientStatus.admitted
+                self.db.add(
+                    _Seg(
+                        hospital_id=self.hospital_id,
+                        admission_id=open_ep.id,
+                        ward_id=bed.ward_id,
+                        room_id=bed.room_id,
+                        bed_id=bed.id,
+                        rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0)
+                        if bed.ward
+                        else 0.0,
+                        started_at=now,
+                        ended_at=None,
+                    )
+                )
+                # Reconcile pending IPD transfer requests onto the episode.
+                from modules.appointments.entities.appointment import (
+                    Appointment as _Appt,
+                )
+                from modules.appointments.entities.appointment import (
+                    AppointmentStatus as _ApptStatus,
+                )
+
+                for _p in (
+                    self.db.query(_Appt)
+                    .filter(
+                        _Appt.hospital_id == self.hospital_id,
+                        _Appt.patient_id == patient.id,
+                        _Appt.status == _ApptStatus.ipd_transfer_requested,
+                    )
+                    .all()
+                ):
+                    _p.status = _ApptStatus.transferred_to_inpatient
+                    _p.admission_id = open_ep.id
+                admission = open_ep
+            else:
                 ip_id = next_ip_encounter_id(self.db, self.hospital_id)
                 admission = admissions_repo.create_admission(
                     hospital_id=self.hospital_id,
@@ -328,9 +410,24 @@ class RecordEmergencyDispositionAction:
                     doctor_id=encounter.attending_doctor_id,
                     ip_id=ip_id,
                     notes=f"Admitted via Emergency ({encounter.er_id}). {payload.disposition_notes or ''}".strip(),
-                    admitted_at=datetime.now(timezone.utc),
+                    admitted_at=now,
                 )
                 admission.er_id = encounter.er_id
+                self.db.add(
+                    _Seg(
+                        hospital_id=self.hospital_id,
+                        admission_id=admission.id,
+                        ward_id=bed.ward_id,
+                        room_id=bed.room_id,
+                        bed_id=bed.id,
+                        rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0)
+                        if bed.ward
+                        else 0.0,
+                        started_at=now,
+                        ended_at=None,
+                    )
+                )
+            if True:
                 created_admission_id = admission.id
                 from modules.beds.entities.bed import Ward
                 ward_obj = self.db.query(Ward).filter(Ward.id == payload.destination_ward_id).first()
@@ -342,6 +439,34 @@ class RecordEmergencyDispositionAction:
                     admission_fee=float(getattr(ward_obj, "admission_fee", 0.0) or 0.0),
                     created_by_name=decider_name,
                 )
+                write_audit_log(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    actor=actor,
+                    action="update",
+                    entity_type="bed",
+                    entity_id=str(bed.id),
+                    summary=f"Bed {bed.bed_code} occupied by emergency admission {admission.id}",
+                )
+                write_audit_log(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    actor=actor,
+                    action="update",
+                    entity_type="patient",
+                    entity_id=str(patient.id),
+                    summary="Patient admitted via emergency",
+                )
+                if admission.source_appointment_id:
+                    write_audit_log(
+                        self.db,
+                        hospital_id=self.hospital_id,
+                        actor=actor,
+                        action="update",
+                        entity_type="appointment",
+                        entity_id=str(admission.source_appointment_id),
+                        summary="Appointment linkage reconciled on emergency admit",
+                    )
 
         disposition = EmergencyDisposition(
             hospital_id=self.hospital_id,
@@ -385,6 +510,14 @@ class RecordEmergencyDispositionAction:
                 "admission_id": str(created_admission_id) if created_admission_id else None,
             },
         )
-        self.repo.commit()
+        try:
+            self.repo.commit()
+        except _IntegrityError as exc:
+            self.db.rollback()
+            raise _er_conflict(
+                "Admission was just created or bed just taken; please retry",
+                admission_id=created_admission_id,
+                bed_id=payload.destination_bed_id,
+            ) from exc
         self.repo.refresh(disposition)
         return EmergencyDispositionResponse.model_validate(disposition)

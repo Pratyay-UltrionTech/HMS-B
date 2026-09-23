@@ -844,6 +844,8 @@ class PharmacyActions:
 
         invoice_number = next_doc_number(self.db, self.hospital_id, PharmacySale, "invoice_number", "SAL")
 
+        sale_admission_id = payload.admission_id or (rx_request.admission_id if rx_request else None) or (rx_obj.admission_id if rx_obj else None)
+
         sale = PharmacySale(
             hospital_id=self.hospital_id,
             invoice_number=invoice_number,
@@ -852,6 +854,7 @@ class PharmacyActions:
             customer_name=payload.customer_name.strip(),
             customer_phone=payload.customer_phone.strip(),
             patient_id=payload.patient_id,
+            admission_id=sale_admission_id,
             prescription_id=payload.prescription_id,
             pharmacy_rx_request_id=payload.pharmacy_rx_request_id,
             doctor_name=payload.doctor_name.strip() if payload.doctor_name else None,
@@ -979,6 +982,20 @@ class PharmacyActions:
 
         # Integrate with target Billing domain if registered patient
         if payload.patient_id:
+            account_id = None
+            if sale_admission_id:
+                from modules.billing.entities.billing_entities import FinancialAccountType
+                from modules.billing.services.billing_service import get_or_create_financial_account
+                acc = get_or_create_financial_account(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    patient_id=payload.patient_id,
+                    account_type=FinancialAccountType.ipd,
+                    admission_id=sale_admission_id,
+                    created_by_name=actor,
+                )
+                account_id = acc.id
+
             charge = ensure_charge(
                 self.db,
                 hospital_id=self.hospital_id,
@@ -987,6 +1004,7 @@ class PharmacyActions:
                 source_id=sale.id,
                 description=f"Pharmacy {invoice_number} — {sale.customer_name}"[:512],
                 charge_amount=sale.net_amount,
+                account_id=account_id,
                 created_by_name=actor,
             )
             sale.billing_charge_id = charge.id
@@ -1006,6 +1024,7 @@ class PharmacyActions:
                     amount=paid,
                     payment_date=date.today(),
                     payment_method=pay_method,
+                    account_id=account_id,
                     notes=f"Pharmacy Counter POS Collection: {invoice_number}",
                     received_by_name=actor,
                     allocate=True,
@@ -1329,6 +1348,7 @@ class PharmacyActions:
             items_payload = self._parse_prescription_items(rx_obj)
 
         patient_id = payload.patient_id or (rx_obj.patient_id if rx_obj else None)
+        admission_id = payload.admission_id or (rx_obj.admission_id if rx_obj else None)
         doctor_id = payload.doctor_id or (rx_obj.doctor_id if rx_obj else None)
         patient_name = payload.patient_name or (rx_obj.patient.name if rx_obj and rx_obj.patient else "")
         patient_phone = payload.patient_phone or (rx_obj.patient.mobile if rx_obj and rx_obj.patient else "")
@@ -1338,6 +1358,7 @@ class PharmacyActions:
             hospital_id=self.hospital_id,
             prescription_id=payload.prescription_id,
             patient_id=patient_id,
+            admission_id=admission_id,
             doctor_id=doctor_id,
             patient_name=patient_name,
             patient_phone=patient_phone,

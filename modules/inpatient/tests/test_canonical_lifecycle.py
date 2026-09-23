@@ -328,17 +328,24 @@ def test_11_discharge(db_session: Session, hospital: Hospital):
     RequestDischargeAction(db_session).execute(
         hospital.id, DischargeRequestCreate(admission_id=detail.id), ACTOR
     )
-    # Settle the ledger (preserved billing gate): pay the outstanding balance.
-    from modules.billing.entities.billing_entities import BillingPayment
+    from modules.billing.entities.billing_entities import BillingPayment, FinancialAccount
     from modules.inpatient.services.inpatient_billing_service import InpatientBillingService
-
+    acc = (
+        db_session.query(FinancialAccount)
+        .filter(
+            FinancialAccount.hospital_id == hospital.id,
+            FinancialAccount.admission_id == detail.id,
+        )
+        .first()
+    )
     outstanding = float(
-        InpatientBillingService(db_session).get_ledger_totals(hospital.id, patient.id).get("outstanding") or 0
+        InpatientBillingService(db_session).get_ledger_totals(hospital.id, patient.id, admission_id=detail.id).get("outstanding") or 0
     )
     assert outstanding > 0  # gate is real: charges exist
     db_session.add(
         BillingPayment(
             id=uuid4(), hospital_id=hospital.id, patient_id=patient.id,
+            account_id=acc.id if acc else None,
             amount=outstanding, payment_date=date.today(),
         )
     )

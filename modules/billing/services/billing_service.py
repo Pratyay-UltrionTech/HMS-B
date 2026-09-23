@@ -469,7 +469,7 @@ def allocate_specific_charges(
     db: Session,
     hospital_id: UUID,
     patient_id: UUID,
-    allocations_plan: list[dict[str, Any]],  # list of {"charge_id": UUID, "amount": float}
+    allocations_plan: list[dict[str, Any]],  # list of {"charge_id": UUID, "amount": float, "discount_amount": float?, "discount_percent": float?, "discount_reason": str?}
     *,
     payment_id: UUID | None = None,
     deposit_id: UUID | None = None,
@@ -477,13 +477,13 @@ def allocate_specific_charges(
 ) -> float:
     """
     Selectively allocate money strictly to specific charges chosen by cashier.
-    Validates allocation against remaining balance and creates explicit allocation records.
+    Applies any per-item discount requested at settlement before recording allocations.
     """
     total_allocated = 0.0
     for item in allocations_plan:
         cid = item["charge_id"]
         alloc_amt = round(float(item["amount"]), 2)
-        if alloc_amt <= 0:
+        if alloc_amt <= 0 and not (item.get("discount_amount") or item.get("discount_percent")):
             continue
 
         charge = (
@@ -500,21 +500,57 @@ def allocate_specific_charges(
         if not charge:
             continue
 
+        # If discount is specified at payment settlement, apply and recalculate net.
+        # Convention mirrors UpdateChargeAction: effective discount is
+        # max(amount, percent-derived) capped at the charge (see compute_net).
+        disc_amt = item.get("discount_amount")
+        disc_pct = item.get("discount_percent")
+        disc_reason = item.get("discount_reason")
+        if disc_amt is not None or disc_pct is not None:
+            from modules.billing.services.invoice_service import (
+                charges_already_invoiced,
+            )
+            if charges_already_invoiced(db, hospital_id, [cid]):
+                raise ValueError(
+                    "Discount cannot be applied at settlement: charge "
+                    f"{charge.description} is on an active invoice. "
+                    "Issue an adjustment or credit note instead."
+                )
+            if disc_amt is not None:
+                charge.discount_amount = round(float(disc_amt), 2)
+            if disc_pct is not None:
+                charge.discount_percent = round(float(disc_pct), 2)
+            if disc_reason:
+                charge.discount_reason = disc_reason
+
+            # Recalculate net_amount (compute_net returns (disc, net) tuple)
+            disc, net = compute_net(
+                float(charge.charge_amount or 0),
+                float(charge.discount_amount or 0),
+                charge.discount_percent,
+                float(charge.tax_amount or 0),
+            )
+            charge.discount_amount = disc
+            charge.net_amount = net
+
         due = round(float(charge.net_amount) - float(charge.amount_paid or 0), 2)
         apply = min(due, alloc_amt)
-        charge.amount_paid = round(float(charge.amount_paid or 0) + apply, 2)
-        total_allocated = round(total_allocated + apply, 2)
+        if apply > 0:
+            charge.amount_paid = round(float(charge.amount_paid or 0) + apply, 2)
+            total_allocated = round(total_allocated + apply, 2)
+        
         _refresh_charge_status(charge)
 
-        allocation = BillingPaymentAllocation(
-            hospital_id=hospital_id,
-            payment_id=payment_id,
-            deposit_id=deposit_id,
-            charge_id=charge.id,
-            allocated_amount=apply,
-            created_by_name=created_by_name,
-        )
-        db.add(allocation)
+        if apply > 0:
+            allocation = BillingPaymentAllocation(
+                hospital_id=hospital_id,
+                payment_id=payment_id,
+                deposit_id=deposit_id,
+                charge_id=charge.id,
+                allocated_amount=apply,
+                created_by_name=created_by_name,
+            )
+            db.add(allocation)
 
     return total_allocated
 
@@ -577,25 +613,38 @@ def create_payment(
 
 # ── Advance / Deposit System ────────────────────────────────────────────────
 
-def next_deposit_number(db: Session, hospital_id: UUID, year: int | None = None) -> str:
-    """Generate sequential deposit voucher number: DEP-YYYY-NNNNN."""
-    y = year or date.today().year
-    prefix = f"DEP-{y}-"
-    rows = (
-        db.query(BillingDeposit.deposit_number)
+def _max_existing_seq_for(db: Session, column, hospital_id: UUID, prefix: str) -> int:
+    """Highest numeric suffix already stored for ``prefix`` (counter resync)."""
+    max_seq = 0
+    for (num,) in (
+        db.query(column)
         .filter(
-            BillingDeposit.hospital_id == hospital_id,
-            BillingDeposit.deposit_number.like(f"{prefix}%"),
+            column.like(f"{prefix}%"),
+        )
+        .filter(
+            BillingDeposit.hospital_id == hospital_id
+            if column is BillingDeposit.deposit_number
+            else BillingRefund.hospital_id == hospital_id,
         )
         .all()
-    )
-    max_seq = 0
-    for (num,) in rows:
+    ):
         try:
             max_seq = max(max_seq, int(str(num).split("-")[-1]))
         except (ValueError, IndexError):
             continue
-    return f"{prefix}{max_seq + 1:05d}"
+    return max_seq
+
+
+def next_deposit_number(db: Session, hospital_id: UUID, year: int | None = None) -> str:
+    """Generate sequential deposit voucher number: DEP-YYYY-NNNNN (atomic)."""
+    from shared.database.sequences import (
+        ensure_counter_at_least as _ensure,
+        next_deposit_number as _atomic_next_dep,
+    )
+    y = year or date.today().year
+    _ensure(db, hospital_id, f"deposit_{y}", _max_existing_seq_for(
+        db, BillingDeposit.deposit_number, hospital_id, f"DEP-{y}-"))
+    return _atomic_next_dep(db, hospital_id, year)
 
 
 def create_deposit(
@@ -692,24 +741,15 @@ def draw_down_deposit_for_charges(
 # ── Refund System ────────────────────────────────────────────────────────────
 
 def next_refund_number(db: Session, hospital_id: UUID, year: int | None = None) -> str:
-    """Generate sequential refund voucher number: REF-YYYY-NNNNN."""
-    y = year or date.today().year
-    prefix = f"REF-{y}-"
-    rows = (
-        db.query(BillingRefund.refund_number)
-        .filter(
-            BillingRefund.hospital_id == hospital_id,
-            BillingRefund.refund_number.like(f"{prefix}%"),
-        )
-        .all()
+    """Generate sequential refund voucher number: REF-YYYY-NNNNN (atomic)."""
+    from shared.database.sequences import (
+        ensure_counter_at_least as _ensure,
+        next_refund_number as _atomic_next_ref,
     )
-    max_seq = 0
-    for (num,) in rows:
-        try:
-            max_seq = max(max_seq, int(str(num).split("-")[-1]))
-        except (ValueError, IndexError):
-            continue
-    return f"{prefix}{max_seq + 1:05d}"
+    y = year or date.today().year
+    _ensure(db, hospital_id, f"refund_{y}", _max_existing_seq_for(
+        db, BillingRefund.refund_number, hospital_id, f"REF-{y}-"))
+    return _atomic_next_ref(db, hospital_id, year)
 
 
 def process_refund(

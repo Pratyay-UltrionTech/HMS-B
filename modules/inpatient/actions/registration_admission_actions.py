@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from shared.exceptions.base import ConflictError, NotFoundError, ValidationError
+from shared.exceptions.base import NotFoundError, ValidationError
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -56,24 +56,24 @@ class RegistrationAdmitAction:
         if not patient:
             raise NotFoundError("Patient not found")
 
-        active = (
-            self.db.query(Admission)
-            .filter(
-                Admission.patient_id == patient_id,
-                Admission.hospital_id == hospital_id,
-                # Invariant 1: requested/admitted/discharge_requested all block.
-                Admission.status.in_(
-                    [
-                        AdmissionStatus.requested,
-                        AdmissionStatus.admitted,
-                        AdmissionStatus.discharge_requested,
-                    ]
-                ),
-            )
-            .first()
+        from modules.inpatient.utils.admission_conflicts import (
+            admission_conflict as _reg_conflict,
+            bed_conflict as _reg_bed_conflict,
+        )
+
+        # Locked open-episode check (Invariant 1: requested/admitted/
+        # discharge_requested all block a second episode).
+        active = self.admissions_repo.get_open_admission(
+            hospital_id, patient_id, for_update=True
         )
         if active:
-            raise ConflictError("Patient is already admitted")
+            raise _reg_conflict(
+                f"Patient already has an {active.status.value} admission episode",
+                admission_id=active.id,
+                admission_status=active.status,
+                bed_id=active.bed_id,
+                doctor_id=active.doctor_id,
+            )
 
         from modules.beds.entities.bed import Bed
         bed = (
@@ -85,7 +85,7 @@ class RegistrationAdmitAction:
         if not bed:
             raise NotFoundError("Bed not found")
         if bed.is_occupied:
-            raise ConflictError("Bed is already occupied")
+            raise _reg_bed_conflict("Bed is already occupied", bed_id=bed.id)
         if bed.ward_id != payload.ward_id or bed.room_id != payload.room_id:
             raise ValidationError("Ward/Room does not match selected bed")
 
@@ -120,6 +120,19 @@ class RegistrationAdmitAction:
             created_by_name=actor_name,
         )
 
+        from modules.inpatient.entities.admission import BedStaySegment
+        initial_segment = BedStaySegment(
+            hospital_id=hospital_id,
+            admission_id=admission.id,
+            ward_id=bed.ward_id,
+            room_id=bed.room_id,
+            bed_id=bed.id,
+            rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0) if bed.ward else 0.0,
+            started_at=admission.admitted_at or datetime.now(timezone.utc),
+            ended_at=None,
+        )
+        self.db.add(initial_segment)
+
         write_audit_log(
             self.db,
             hospital_id=hospital_id,
@@ -129,11 +142,33 @@ class RegistrationAdmitAction:
             entity_id=str(admission.id),
             summary=f"Admitted {patient.uhid} {patient.name} ({admission.ip_id})",
         )
+        write_audit_log(
+            self.db,
+            hospital_id=hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="bed",
+            entity_id=str(bed.id),
+            summary=f"Bed {bed.bed_code} occupied by admission {admission.id}",
+        )
+        write_audit_log(
+            self.db,
+            hospital_id=hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="patient",
+            entity_id=str(patient.id),
+            summary="Patient admitted via registration",
+        )
         try:
             self.db.commit()
         except IntegrityError as exc:
             self.db.rollback()
-            raise ConflictError("Patient already admitted or bed just taken") from exc
+            raise _reg_conflict(
+                "Patient already admitted or bed just taken",
+                bed_id=payload.bed_id,
+                doctor_id=payload.doctor_id,
+            ) from exc
         refreshed = self.admissions_repo.get_admission_by_id(hospital_id, admission.id)
         adm = refreshed or admission
         return AdmissionSummary(
@@ -178,8 +213,12 @@ class RegistrationDischargeAction:
         )
         if not admission:
             raise NotFoundError("Admission not found")
-        if admission.status != AdmissionStatus.admitted:
-            raise ValidationError("Admission already discharged")
+        if admission.status == AdmissionStatus.discharged:
+            raise ValidationError("Admission is already discharged")
+        if admission.status == AdmissionStatus.requested:
+            raise ValidationError(
+                "Admission has not been accepted yet — accept it before discharge"
+            )
 
         now = datetime.now(timezone.utc)
         ward = admission.ward
@@ -195,7 +234,7 @@ class RegistrationDischargeAction:
             bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
             created_by_name=actor.get("name") or "System",
         )
-        fin = self.billing_svc.get_ledger_totals(hospital_id, admission.patient_id)
+        fin = self.billing_svc.get_ledger_totals(hospital_id, admission.patient_id, admission_id=admission.id)
         outstanding = float(fin.get("outstanding") or 0)
         if outstanding > 0.009:
             raise ValidationError(f"Cannot discharge — outstanding balance ₹{outstanding:,.2f}. Clear all dues before discharging.")
@@ -215,6 +254,23 @@ class RegistrationDischargeAction:
         if admission.patient:
             admission.patient.status = PatientStatus.active
 
+        # Close any open stay segment at discharge (Invariant 7); keep the
+        # billing ledger gate above unchanged.
+        from modules.inpatient.entities.admission import BedStaySegment as _Seg
+
+        _open_seg = (
+            self.db.query(_Seg)
+            .filter(
+                _Seg.hospital_id == hospital_id,
+                _Seg.admission_id == admission.id,
+                _Seg.ended_at.is_(None),
+            )
+            .with_for_update()
+            .first()
+        )
+        if _open_seg:
+            _open_seg.ended_at = now
+
         write_audit_log(
             self.db,
             hospital_id=hospital_id,
@@ -223,6 +279,25 @@ class RegistrationDischargeAction:
             entity_type="admission",
             entity_id=str(admission.id),
             summary=f"Discharged patient admission {admission_id}",
+        )
+        if admission.bed_id:
+            write_audit_log(
+                self.db,
+                hospital_id=hospital_id,
+                actor=actor,
+                action="update",
+                entity_type="bed",
+                entity_id=str(admission.bed_id),
+                summary=f"Bed freed by registration discharge of admission {admission.id}",
+            )
+        write_audit_log(
+            self.db,
+            hospital_id=hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="patient",
+            entity_id=str(admission.patient_id),
+            summary="Patient discharged via registration",
         )
         self.db.commit()
         return DischargeResponse(

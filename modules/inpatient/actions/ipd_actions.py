@@ -90,6 +90,25 @@ def _ensure_request_for_final(
         .all()
     )
     source_id = pending[0].id if len(pending) == 1 else None
+    if len(pending) > 1:
+        # Ambiguous source: leave the request unlinked (never guess across
+        # multiple candidates) but keep a forensic trace of the ambiguity.
+        from shared.audit.service import write_audit_log as _audit
+
+        _audit(
+            db,
+            hospital_id=hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="appointment",
+            entity_id=str(pending[0].id),
+            summary=(
+                f"IPD finalize left admission source unlinked: "
+                f"{len(pending)} pending transfer requests for patient "
+                f"{patient.uhid} {patient.name}"
+            ),
+            details={"candidate_appointment_ids": [str(p.id) for p in pending]},
+        )
     admission, _ = EnsureAdmissionRequestAction(db).execute(
         hospital_id=hospital_id,
         patient_id=patient.id,

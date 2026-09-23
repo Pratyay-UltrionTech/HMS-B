@@ -58,6 +58,7 @@ class RadOrderCreate(BaseModel):
     patient_id: UUID
     doctor_id: UUID | None = None
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     prescription_request_id: UUID | None = None
     scan_ids: list[UUID] = Field(default_factory=list)
     clinical_notes: str | None = None
@@ -92,6 +93,7 @@ class RadPrescriptionRequestResponse(BaseModel):
     patient_id: UUID
     doctor_id: UUID
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     status: RadPrescriptionRequestStatus
     prescribed_scan_ids: list[UUID] = []
     clinical_notes: str | None = None
@@ -142,6 +144,7 @@ class RadOrderResponse(BaseModel):
     patient_id: UUID
     doctor_id: UUID | None
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     prescription_id: UUID | None = None
     prescription_request_id: UUID | None = None
     scan_id: UUID | None

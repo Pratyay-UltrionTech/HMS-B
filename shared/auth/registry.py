@@ -63,6 +63,15 @@ MODULE_REGISTRY: dict[str, ModuleDefinition] = {
 }
 
 
+MODULE_ALIASES: dict[str, str] = {
+    "appointments": "appointment",
+    "patients": "registration",
+    "patient": "registration",
+    "ipd": "all_ipd",
+    "clinical": "doctors",
+}
+
+
 def parse_action(action_spec: str | tuple[str, str]) -> tuple[str, str, str]:
     """
     Parse action specification into (module_key, action_name, db_flag).
@@ -84,6 +93,7 @@ def parse_action(action_spec: str | tuple[str, str]) -> tuple[str, str, str]:
         module_key = action_spec.strip().lower()
         action_name = "view"
 
+    module_key = MODULE_ALIASES.get(module_key, module_key)
     db_flag = ACTION_FLAG_MAP.get(action_name, f"can_{action_name}")
     return module_key, action_name, db_flag
 

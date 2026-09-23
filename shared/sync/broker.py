@@ -18,31 +18,52 @@ from uuid import UUID, uuid4
 logger = logging.getLogger("hms.sync")
 
 
+def _enqueue(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
+    """Put an event onto a subscriber queue, evicting the oldest if saturated."""
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        try:
+            _ = queue.get_nowait()
+            queue.put_nowait(event)
+        except Exception:
+            pass
+
+
 class SyncBroker:
     """Manages active SSE subscriber queues and event delivery per hospital."""
 
     def __init__(self, max_history_per_hospital: int = 200) -> None:
         self._max_history = max_history_per_hospital
-        self._subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
+        # Each subscriber is (queue, loop) so publish() can safely wake the
+        # correct event loop from sync worker threads.
+        self._subscribers: dict[str, set[tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop]]] = {}
         self._history: dict[str, deque[dict[str, Any]]] = {}
         self._lock = threading.Lock()
 
     def subscribe(self, hospital_id: str | UUID) -> asyncio.Queue[dict[str, Any]]:
         hid = str(hospital_id)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
         with self._lock:
             if hid not in self._subscribers:
                 self._subscribers[hid] = set()
-            self._subscribers[hid].add(queue)
+            self._subscribers[hid].add((queue, loop))
         return queue
 
     def unsubscribe(self, hospital_id: str | UUID, queue: asyncio.Queue[dict[str, Any]]) -> None:
         hid = str(hospital_id)
         with self._lock:
-            if hid in self._subscribers:
-                self._subscribers[hid].discard(queue)
-                if not self._subscribers[hid]:
-                    del self._subscribers[hid]
+            if hid not in self._subscribers:
+                return
+            to_remove = [entry for entry in self._subscribers[hid] if entry[0] is queue]
+            for entry in to_remove:
+                self._subscribers[hid].discard(entry)
+            if not self._subscribers[hid]:
+                del self._subscribers[hid]
 
     def publish(
         self,
@@ -61,6 +82,8 @@ class SyncBroker:
             "entity_id": str(entity_id) if entity_id else None,
             "timestamp": int(time.time() * 1000),
         }
+        if details:
+            event["details"] = details
 
         with self._lock:
             # Store in ring buffer for catchup
@@ -69,18 +92,16 @@ class SyncBroker:
             self._history[hid].append(event)
 
             # Distribute to subscriber queues
-            queues = list(self._subscribers.get(hid, set()))
+            subscribers = list(self._subscribers.get(hid, set()))
 
-        for q in queues:
+        for queue, loop in subscribers:
             try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                # Evict oldest event if client queue is saturated to prevent memory leak
-                try:
-                    _ = q.get_nowait()
-                    q.put_nowait(event)
-                except Exception:
-                    pass
+                if loop.is_running():
+                    loop.call_soon_threadsafe(_enqueue, queue, event)
+                else:
+                    _enqueue(queue, event)
+            except Exception:
+                logger.debug("sync publish dropped for closed subscriber", exc_info=True)
 
         return event
 

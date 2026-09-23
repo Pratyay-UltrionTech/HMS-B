@@ -63,6 +63,81 @@ def next_sequence_value(db: Session, hospital_id: uuid.UUID, counter_name: str) 
     return db.execute(stmt).scalar_one()
 
 
+def ensure_counter_at_least(
+    db: Session, hospital_id: uuid.UUID, counter_name: str, minimum: int
+) -> int:
+    """Bump a counter forward so its next value exceeds ``minimum``.
+
+    Self-healing for counters introduced after rows already existed with
+    the old read-MAX-then-+1 numbering (e.g. RCPT-2026-00001 created before
+    the atomic counter existed). Returns the counter's current value after
+    the bump. Safe to call repeatedly; never moves the counter backwards.
+    """
+    current = (
+        db.query(SequenceCounter.current_val)
+        .filter(
+            SequenceCounter.hospital_id == hospital_id,
+            SequenceCounter.counter_name == counter_name,
+        )
+        .scalar()
+    )
+    if current is None:
+        db.add(
+            SequenceCounter(
+                hospital_id=hospital_id,
+                counter_name=counter_name,
+                current_val=minimum,
+            )
+        )
+        db.flush()
+        return minimum
+    if current < minimum:
+        db.query(SequenceCounter).filter(
+            SequenceCounter.hospital_id == hospital_id,
+            SequenceCounter.counter_name == counter_name,
+        ).update({"current_val": minimum}, synchronize_session=False)
+        db.flush()
+        return minimum
+    return current
+
+
 def next_uhid(db: Session, hospital_id: uuid.UUID) -> str:
     """Generate the next unique UHID (P0001 format) atomically for a hospital."""
     return f"P{next_sequence_value(db, hospital_id, 'uhid'):04d}"
+
+
+def next_invoice_number(db: Session, hospital_id: uuid.UUID, year: int | None = None) -> str:
+    """Generate sequential invoice number (INV-YYYY-NNNNN format) atomically for a hospital."""
+    from datetime import date
+    y = year or date.today().year
+    counter_name = f"invoice_{y}"
+    seq = next_sequence_value(db, hospital_id, counter_name)
+    return f"INV-{y}-{seq:05d}"
+
+
+def next_receipt_number(db: Session, hospital_id: uuid.UUID, year: int | None = None) -> str:
+    """Generate sequential payment receipt number (RCPT-YYYY-NNNNN format) atomically for a hospital."""
+    from datetime import date
+    y = year or date.today().year
+    counter_name = f"receipt_{y}"
+    seq = next_sequence_value(db, hospital_id, counter_name)
+    return f"RCPT-{y}-{seq:05d}"
+
+
+def next_deposit_number(db: Session, hospital_id: uuid.UUID, year: int | None = None) -> str:
+    """Generate sequential deposit voucher number (DEP-YYYY-NNNNN format) atomically for a hospital."""
+    from datetime import date
+    y = year or date.today().year
+    counter_name = f"deposit_{y}"
+    seq = next_sequence_value(db, hospital_id, counter_name)
+    return f"DEP-{y}-{seq:05d}"
+
+
+def next_refund_number(db: Session, hospital_id: uuid.UUID, year: int | None = None) -> str:
+    """Generate sequential refund voucher number (REF-YYYY-NNNNN format) atomically for a hospital."""
+    from datetime import date
+    y = year or date.today().year
+    counter_name = f"refund_{y}"
+    seq = next_sequence_value(db, hospital_id, counter_name)
+    return f"REF-{y}-{seq:05d}"
+

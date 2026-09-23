@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from modules.laboratory.entities.lab_entities import (
     LabItemStatus,
@@ -127,6 +127,7 @@ class LabPrescriptionRequestResponse(BaseModel):
     patient_id: UUID
     doctor_id: UUID
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     status: LabPrescriptionRequestStatus
     prescribed_test_ids: list[UUID] = []
     prescribed_panel_ids: list[UUID] = []
@@ -160,6 +161,7 @@ class LabOrderCreate(BaseModel):
     patient_id: UUID
     doctor_id: UUID | None = None
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     prescription_request_id: UUID | None = None
     test_ids: list[UUID] = Field(default_factory=list)
     panel_ids: list[UUID] = Field(default_factory=list)
@@ -199,6 +201,11 @@ class LabResultResponse(BaseModel):
     sort_order: int
     is_panic: bool = False
 
+    @field_validator("is_panic", mode="before")
+    @classmethod
+    def coerce_panic(cls, v: bool | None) -> bool:
+        return bool(v) if v is not None else False
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -209,6 +216,7 @@ class LabOrderResponse(BaseModel):
     patient_id: UUID
     doctor_id: UUID | None
     appointment_id: UUID | None = None
+    admission_id: UUID | None = None
     prescription_id: UUID | None = None
     prescription_request_id: UUID | None = None
     order_source: LabOrderSource = LabOrderSource.self_requested
@@ -224,6 +232,11 @@ class LabOrderResponse(BaseModel):
     completed_at: datetime | None
     is_amended: bool = False
     amendment_reason: str | None = None
+
+    @field_validator("is_amended", mode="before")
+    @classmethod
+    def coerce_amended(cls, v: bool | None) -> bool:
+        return bool(v) if v is not None else False
     patient_name: str | None = None
     patient_uhid: str | None = None
     patient_mobile: str | None = None
@@ -261,6 +274,11 @@ class LabResultInput(BaseModel):
     remarks: str | None = None
     sort_order: int = 0
     is_panic: bool = False
+
+    @field_validator("is_panic", mode="before")
+    @classmethod
+    def coerce_panic(cls, v: bool | None) -> bool:
+        return bool(v) if v is not None else False
 
 
 class LabReportSaveRequest(BaseModel):

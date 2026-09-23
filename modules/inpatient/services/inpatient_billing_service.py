@@ -135,16 +135,53 @@ class InpatientBillingService:
             created_by_name=created_by_name,
         )
 
-    def get_ledger_totals(self, hospital_id: UUID, patient_id: UUID) -> dict[str, Any]:
-        """Compute patient financial totals: charges, payments, outstanding balance."""
+    def get_ledger_totals(
+        self,
+        hospital_id: UUID,
+        patient_id: UUID,
+        admission_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """Compute patient financial totals: charges, payments, outstanding balance.
+        When admission_id is provided, scopes to the admission's IPD FinancialAccount.
+        """
+        from modules.billing.entities.billing_entities import FinancialAccount
         from modules.billing.services.billing_service import patient_ledger_totals
-        return patient_ledger_totals(self.db, hospital_id, patient_id)
+
+        account_id = None
+        if admission_id:
+            acc = (
+                self.db.query(FinancialAccount)
+                .filter(
+                    FinancialAccount.hospital_id == hospital_id,
+                    FinancialAccount.admission_id == admission_id,
+                )
+                .first()
+            )
+            if acc:
+                account_id = acc.id
+
+        return patient_ledger_totals(
+            self.db, hospital_id, patient_id, account_id=account_id
+        )
 
     def get_ledger_totals_bulk(
-        self, hospital_id: UUID, patient_ids: list[UUID]
+        self,
+        hospital_id: UUID,
+        patient_ids: list[UUID],
+        admission_ids: list[UUID] | None = None,
     ) -> dict[UUID, dict[str, Any]]:
-        """Compute financial totals for many patients in two bulk queries."""
+        """Compute financial totals for many patients in bulk queries."""
+        from modules.billing.entities.billing_entities import FinancialAccount
         from modules.billing.services.billing_service import (
+            patient_ledger_totals,
             patient_ledger_totals_bulk,
         )
+
+        if admission_ids:
+            # Per-admission scoping for discharge queue
+            res: dict[UUID, dict[str, Any]] = {}
+            for pid, aid in zip(patient_ids, admission_ids):
+                res[pid] = self.get_ledger_totals(hospital_id, pid, admission_id=aid)
+            return res
+
         return patient_ledger_totals_bulk(self.db, hospital_id, patient_ids)

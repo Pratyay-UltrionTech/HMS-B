@@ -315,9 +315,9 @@ def test_fifo_payment_allocation(db_session: Session, hospital: Hospital, patien
 # ── API Integration Tests ───────────────────────────────────────────────────
 
 def test_api_charges_crud(billing_client: TestClient, admin_headers: dict, patient: Patient):
-    """Test creating, listing, updating, and cancelling a billing charge."""
-    # 1. Create charge
-    res = billing_client.post(
+    """Test creating, listing, updating, and cancelling a billing charge with discount reason validation."""
+    # 0. Test missing discount reason rejection
+    bad_res = billing_client.post(
         "/api/billing/charges",
         headers=admin_headers,
         json={
@@ -328,9 +328,26 @@ def test_api_charges_crud(billing_client: TestClient, admin_headers: dict, patie
             "discount_amount": 100.0,
         },
     )
+    assert bad_res.status_code == 422
+    assert "Discount reason is mandatory" in bad_res.text
+
+    # 1. Create charge with valid discount reason
+    res = billing_client.post(
+        "/api/billing/charges",
+        headers=admin_headers,
+        json={
+            "patient_id": str(patient.id),
+            "source_type": "consultation",
+            "description": "General OPD Consultation",
+            "charge_amount": 600.0,
+            "discount_amount": 100.0,
+            "discount_reason": "Senior Citizen Concession",
+        },
+    )
     assert res.status_code == 201, res.text
     data = res.json()
     assert data["net_amount"] == 500.0
+    assert data["discount_reason"] == "Senior Citizen Concession"
     assert data["status"] == "pending"
     charge_id = data["id"]
 
@@ -342,14 +359,15 @@ def test_api_charges_crud(billing_client: TestClient, admin_headers: dict, patie
     assert list_res.status_code == 200
     assert len(list_res.json()) >= 1
 
-    # 3. Update charge
+    # 3. Update charge with discount reason
     upd_res = billing_client.put(
         f"/api/billing/charges/{charge_id}",
         headers=admin_headers,
-        json={"discount_amount": 200.0},
+        json={"discount_amount": 200.0, "discount_reason": "Special Management Approval"},
     )
     assert upd_res.status_code == 200
     assert upd_res.json()["net_amount"] == 400.0
+    assert upd_res.json()["discount_reason"] == "Special Management Approval"
 
     # 4. Cancel charge
     cancel_res = billing_client.post(
@@ -358,6 +376,7 @@ def test_api_charges_crud(billing_client: TestClient, admin_headers: dict, patie
     )
     assert cancel_res.status_code == 200
     assert cancel_res.json()["status"] == "cancelled"
+
 
 
 def test_api_payment_and_invoice_workflow(
@@ -684,3 +703,200 @@ def test_emergency_clearance_override(
     )
     assert cleared_state.is_cleared is True
     assert "override" in cleared_state.reason.lower()
+
+
+def test_receipt_number_self_heals_behind_legacy_rows(
+    db_session: Session, hospital: Hospital, patient: Patient
+):
+    """Regression: atomic receipt counter behind legacy MAX+1 rows must not 500.
+
+    Reproduces POST /api/billing/payments → UniqueViolation on
+    uq_billing_receipt_number for RCPT-<year>-00001: a legacy receipt row
+    exists while the sequence counter starts at 1. The generator must resync
+    past existing rows instead of re-issuing the same number.
+    """
+    from datetime import date
+    from modules.billing.entities.billing_entities import (
+        BillingPayment as _Pay,
+        BillingReceipt as _Rcpt,
+    )
+    from modules.billing.services.invoice_service import issue_receipt
+
+    y = date.today().year
+    legacy = _Rcpt(
+        hospital_id=hospital.id,
+        patient_id=patient.id,
+        payment_id=uuid4(),
+        receipt_number=f"RCPT-{y}-00001",
+        payment_date=date.today(),
+        payment_method=BillingPaymentMethod.cash,
+        amount=100.0,
+        status="issued",
+        collected_by_name="Legacy",
+    )
+    db_session.add(legacy)
+    db_session.commit()
+    # No sequence_counters row exists yet — counter would start at 1.
+
+    r1 = issue_receipt(
+        db_session,
+        hospital_id=hospital.id,
+        patient_id=patient.id,
+        amount=200.0,
+        payment_date=date.today(),
+        payment_method=BillingPaymentMethod.cash,
+        collected_by_name="Test",
+    )
+    db_session.commit()
+    assert r1.receipt_number == f"RCPT-{y}-00002"
+
+    r2 = issue_receipt(
+        db_session,
+        hospital_id=hospital.id,
+        patient_id=patient.id,
+        amount=300.0,
+        payment_date=date.today(),
+        payment_method=BillingPaymentMethod.cash,
+        collected_by_name="Test",
+    )
+    db_session.commit()
+    assert r2.receipt_number == f"RCPT-{y}-00003"
+
+
+def test_two_payments_get_distinct_receipts(
+    billing_client: TestClient, admin_headers: dict, patient: Patient
+):
+    """Two consecutive POST /payments must yield distinct receipt numbers."""
+    numbers = set()
+    for _ in range(2):
+        res = billing_client.post(
+            "/api/billing/payments",
+            headers=admin_headers,
+            json={
+                "patient_id": str(patient.id),
+                "amount": 5000.0,
+                "payment_method": "cash",
+            },
+        )
+        assert res.status_code == 201, res.text
+        numbers.add(res.json()["receipt_number"])
+    assert len(numbers) == 2
+
+
+# ── Settlement-discount regression tests ──────────────────────────────────
+
+def _make_charge(db_session, hospital, patient, amount: float, desc: str = "Consult"):
+    ch = ensure_charge(
+        db_session,
+        hospital_id=hospital.id,
+        patient_id=patient.id,
+        source_type=BillingSourceType.consultation,
+        source_id=uuid4(),
+        description=desc,
+        charge_amount=amount,
+    )
+    db_session.commit()
+    return ch
+
+
+def test_settlement_item_discount_updates_charge_net(
+    billing_client: TestClient, admin_headers: dict,
+    db_session: Session, hospital: Hospital, patient: Patient,
+):
+    """Per-item discount entered at Record Payment must update the charge net.
+
+    Regression: allocate_specific_charges assigned compute_net()'s (disc, net)
+    tuple straight into the Float column → flush blew up → 500.
+    """
+    ch = _make_charge(db_session, hospital, patient, 1000.0)
+    res = billing_client.post(
+        "/api/billing/payments",
+        headers=admin_headers,
+        json={
+            "patient_id": str(patient.id),
+            "amount": 800.0,
+            "payment_method": "cash",
+            "allocations": [
+                {
+                    "charge_id": str(ch.id),
+                    "amount": 800.0,
+                    "discount_amount": 200.0,
+                    "discount_reason": "Staff concession",
+                }
+            ],
+        },
+    )
+    assert res.status_code == 201, res.text
+    db_session.refresh(ch)
+    assert ch.discount_amount == 200.0
+    assert ch.discount_reason == "Staff concession"
+    assert ch.net_amount == 800.0
+    assert ch.amount_paid == 800.0
+    assert ch.status == "paid"
+
+
+def test_settlement_global_discount_distributes_across_charges(
+    billing_client: TestClient, admin_headers: dict,
+    db_session: Session, hospital: Hospital, patient: Patient,
+):
+    """Top-level discount on POST /payments must not be silently dropped.
+
+    A ₹200 global concession on two ₹1000 charges distributes ₹100 each.
+    """
+    c1 = _make_charge(db_session, hospital, patient, 1000.0, "Consult A")
+    c2 = _make_charge(db_session, hospital, patient, 1000.0, "Consult B")
+    res = billing_client.post(
+        "/api/billing/payments",
+        headers=admin_headers,
+        json={
+            "patient_id": str(patient.id),
+            "amount": 1800.0,
+            "payment_method": "cash",
+            "discount_amount": 200.0,
+            "discount_reason": "Management concession",
+        },
+    )
+    assert res.status_code == 201, res.text
+    db_session.refresh(c1)
+    db_session.refresh(c2)
+    assert c1.net_amount == 900.0
+    assert c2.net_amount == 900.0
+    assert c1.discount_reason == "Management concession"
+    assert c2.discount_reason == "Management concession"
+    assert c1.status == "paid"
+    assert c2.status == "paid"
+
+
+def test_settlement_discount_only_line_without_tender(
+    billing_client: TestClient, admin_headers: dict,
+    db_session: Session, hospital: Hospital, patient: Patient,
+):
+    """A fully-waived line (₹0 tender + discount) must be accepted.
+
+    Regression: ChargeAllocationItem.amount gt=0 rejected discount-only lines
+    with 422, making 100% concessions at settlement impossible.
+    """
+    c1 = _make_charge(db_session, hospital, patient, 500.0, "Consult A")
+    c2 = _make_charge(db_session, hospital, patient, 1000.0, "Consult B")
+    res = billing_client.post(
+        "/api/billing/payments",
+        headers=admin_headers,
+        json={
+            "patient_id": str(patient.id),
+            "amount": 500.0,
+            "payment_method": "cash",
+            "allocations": [
+                {"charge_id": str(c1.id), "amount": 500.0},
+                {
+                    "charge_id": str(c2.id),
+                    "amount": 0,
+                    "discount_amount": 1000.0,
+                    "discount_reason": "Charity waiver",
+                },
+            ],
+        },
+    )
+    assert res.status_code == 201, res.text
+    db_session.refresh(c2)
+    assert c2.net_amount == 0.0
+    assert c2.status == "paid"

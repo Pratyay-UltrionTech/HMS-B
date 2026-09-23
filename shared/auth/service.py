@@ -25,7 +25,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 
-from shared.auth.registry import ACTION_FLAG_MAP, MODULE_REGISTRY, parse_action
+from shared.auth.registry import ACTION_FLAG_MAP, MODULE_ALIASES, MODULE_REGISTRY, parse_action
 
 
 # Standardized diagnostic denial & grant codes
@@ -95,17 +95,23 @@ class AuthorizationService:
         """Load granular permissions for a role from the database."""
         from modules.doctors.entities.doctor import RolePermission
 
+        try:
+            role_uuid = UUID(str(role_id))
+            h_uuid = UUID(str(hospital_uuid))
+        except (ValueError, TypeError):
+            return {}
+
         rows = (
             db.query(RolePermission)
             .filter(
-                RolePermission.hospital_id == UUID(hospital_uuid),
-                RolePermission.role_id == UUID(role_id),
+                RolePermission.hospital_id == h_uuid,
+                RolePermission.role_id == role_uuid,
             )
             .all()
         )
         perms: dict[str, dict[str, bool]] = {}
         for r in rows:
-            perms[r.module_key] = {
+            entry = {
                 "can_view": bool(r.can_view),
                 "can_edit": bool(r.can_edit),
                 "can_create": bool(getattr(r, "can_create", False)),
@@ -118,6 +124,15 @@ class AuthorizationService:
                 "can_cancel": bool(getattr(r, "can_cancel", False)),
                 "can_administer": bool(getattr(r, "can_administer", False)),
             }
+            perms[r.module_key] = entry
+            canon_key = MODULE_ALIASES.get(r.module_key)
+            if canon_key:
+                if canon_key not in perms:
+                    perms[canon_key] = dict(entry)
+                else:
+                    for k, v in entry.items():
+                        if v:
+                            perms[canon_key][k] = True
         return perms
 
     def get_role_permissions(self, db: Any, hospital_uuid: str, role_id: str) -> dict[str, dict[str, bool]]:
@@ -277,8 +292,23 @@ class AuthorizationService:
 
         # 5. Permission Union Aggregation
         has_permission = False
-        if db is not None:
+
+        # First check explicit token permissions claims (if present)
+        user_perms = user.get("permissions") or {}
+        if user_perms:
+            mod_perms = user_perms.get(module_key) or {}
+            if not mod_perms and MODULE_ALIASES.get(module_key):
+                mod_perms = user_perms.get(MODULE_ALIASES[module_key]) or {}
+            if mod_perms.get(action_flag, False):
+                has_permission = True
+            elif action_name == "create" and mod_perms.get("can_edit", False):
+                has_permission = True
+
+        # Next check active database roles
+        if not has_permission and db is not None:
             for r_id in active_role_ids:
+                if r_id == "claims_permissions":
+                    continue
                 perms = self.get_role_permissions(db, hospital_uuid_str, r_id)
                 mod_perms = perms.get(module_key)
                 if not mod_perms:
@@ -290,14 +320,6 @@ class AuthorizationService:
                 if action_name == "create" and mod_perms.get("can_edit", False):
                     has_permission = True
                     break
-        else:
-            # Check permissions claims if token carries union
-            user_perms = user.get("permissions") or {}
-            mod_perms = user_perms.get(module_key) or {}
-            if mod_perms.get(action_flag, False):
-                has_permission = True
-            elif action_name == "create" and mod_perms.get("can_edit", False):
-                has_permission = True
 
         if not has_permission:
             return AuthDecision(
@@ -433,6 +455,9 @@ class AuthorizationService:
         """Return boolean indicating whether the user is authorized."""
         decision = self.evaluate(user, action_spec, resource=resource, db=db)
         return decision.allowed
+
+    is_authorized = can
+    has_permission = can
 
     def require(
         self,

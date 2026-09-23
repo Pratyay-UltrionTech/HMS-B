@@ -30,6 +30,7 @@ from infrastructure.postgres.base import Base
 
 if TYPE_CHECKING:
     from modules.doctors.entities.doctor import HospitalUser
+    from modules.inpatient.entities.admission import Admission
     from modules.patients.entities.patient import Patient
 
 
@@ -64,6 +65,9 @@ class Prescription(Base):
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     symptoms: Mapped[str] = mapped_column(Text, nullable=False)
     diagnosis: Mapped[str] = mapped_column(Text, nullable=False)
     medicines: Mapped[str] = mapped_column(Text, nullable=False)
@@ -80,6 +84,7 @@ class Prescription(Base):
     )
 
     patient: Mapped[Patient | None] = relationship("Patient", foreign_keys=[patient_id])
+    admission: Mapped[Admission | None] = relationship("Admission", foreign_keys=[admission_id])
     doctor: Mapped[HospitalUser | None] = relationship("HospitalUser", foreign_keys=[doctor_id])
 
 
@@ -103,6 +108,9 @@ class MedicalRecord(Base):
     appointment_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     lab_order_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
     )
@@ -120,6 +128,7 @@ class MedicalRecord(Base):
     )
 
     patient: Mapped[Patient | None] = relationship("Patient", foreign_keys=[patient_id])
+    admission: Mapped[Admission | None] = relationship("Admission", foreign_keys=[admission_id])
     doctor: Mapped[HospitalUser | None] = relationship("HospitalUser", foreign_keys=[doctor_id])
 
 

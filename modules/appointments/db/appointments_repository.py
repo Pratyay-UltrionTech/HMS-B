@@ -221,7 +221,8 @@ class AppointmentsRepository(BaseRepository[Appointment]):
 
     def list_ipd_requests(self) -> list[Appointment]:
         """List appointments requesting IPD bed transfer.
-        Excludes appointments for patients who already have an active inpatient admission.
+        Excludes appointments for patients who already have an open inpatient
+        episode (requested/admitted/discharge_requested — Invariant 1).
         """
         from modules.inpatient.entities.admission import Admission, AdmissionStatus
 
@@ -229,7 +230,13 @@ class AppointmentsRepository(BaseRepository[Appointment]):
             self.db.query(Admission.patient_id)
             .filter(
                 Admission.hospital_id == self.hospital_id,
-                Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested]),
+                Admission.status.in_(
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
+                ),
             )
         )
 

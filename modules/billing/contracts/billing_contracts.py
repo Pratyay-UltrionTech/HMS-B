@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from modules.billing.entities.billing_entities import (
     BillingChargeStatus,
@@ -75,6 +75,17 @@ class BillingChargeCreate(BaseModel):
     hsn_sac_code: str | None = None
     notes: str | None = None
 
+    @model_validator(mode="after")
+    def validate_discount_reason(self) -> "BillingChargeCreate":
+        has_discount = (self.discount_amount and self.discount_amount > 0) or (
+            self.discount_percent is not None and self.discount_percent > 0
+        )
+        if has_discount:
+            if not self.discount_reason or not self.discount_reason.strip():
+                raise ValueError("Discount reason is mandatory when applying a discount")
+            self.discount_reason = self.discount_reason.strip()
+        return self
+
 
 class BillingChargeUpdate(BaseModel):
     description: str | None = Field(default=None, min_length=1, max_length=512)
@@ -86,6 +97,18 @@ class BillingChargeUpdate(BaseModel):
     tax_amount: float | None = Field(default=None, ge=0)
     notes: str | None = None
     status: BillingChargeStatus | None = None
+
+    @model_validator(mode="after")
+    def validate_discount_reason(self) -> "BillingChargeUpdate":
+        has_discount = (self.discount_amount is not None and self.discount_amount > 0) or (
+            self.discount_percent is not None and self.discount_percent > 0
+        )
+        if has_discount:
+            if not self.discount_reason or not self.discount_reason.strip():
+                raise ValueError("Discount reason is mandatory when applying a discount")
+            self.discount_reason = self.discount_reason.strip()
+        return self
+
 
 
 class BillingChargeResponse(BaseModel):
@@ -123,7 +146,22 @@ class BillingChargeResponse(BaseModel):
 
 class ChargeAllocationItem(BaseModel):
     charge_id: UUID
-    amount: float = Field(gt=0)
+    # Zero tender is allowed only when the line carries a discount
+    # (discount-only / fully-waived line at settlement).
+    amount: float = Field(ge=0)
+    # Optional inline discount applied at payment settlement
+    discount_amount: float | None = Field(default=None, ge=0)
+    discount_percent: float | None = Field(default=None, ge=0, le=100)
+    discount_reason: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def validate_allocation_line(self) -> "ChargeAllocationItem":
+        has_discount = (self.discount_amount or 0) > 0 or (self.discount_percent or 0) > 0
+        if (self.amount or 0) <= 0 and not has_discount:
+            raise ValueError("allocation amount must be greater than 0 unless a discount is applied")
+        if has_discount and not (self.discount_reason and self.discount_reason.strip()):
+            raise ValueError("discount_reason is mandatory whenever a discount is applied")
+        return self
 
 
 class BillingPaymentAllocationResponse(BaseModel):
@@ -152,6 +190,18 @@ class BillingPaymentCreate(BaseModel):
     linked_invoice_id: UUID | None = None
     # Selective payment allocations (if specified, funds allocate strictly to these charges)
     allocations: list[ChargeAllocationItem] | None = None
+    # Overall discount applied at payment settlement
+    discount_amount: float | None = Field(default=None, ge=0)
+    discount_percent: float | None = Field(default=None, ge=0, le=100)
+    discount_reason: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def validate_payment_discount(self) -> "BillingPaymentCreate":
+        disc_amt = self.discount_amount or 0.0
+        disc_pct = self.discount_percent or 0.0
+        if (disc_amt > 0 or disc_pct > 0) and not (self.discount_reason and self.discount_reason.strip()):
+            raise ValueError("discount_reason is mandatory whenever a discount is applied at payment")
+        return self
 
 
 class BillingPaymentResponse(BaseModel):

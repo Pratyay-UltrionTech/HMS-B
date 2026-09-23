@@ -84,6 +84,7 @@ def to_prescription_response(
         patient_mobile=p.patient.mobile if p.patient else None,
         doctor_name=p.doctor.name if p.doctor else None,
         appointment_status=appt_status,
+        admission_id=p.admission_id,
         test_ids=test_ids,
         panel_ids=panel_ids,
         scan_ids=scan_ids,
@@ -97,6 +98,7 @@ def to_record_response(r: MedicalRecord) -> MedicalRecordResponse:
         doctor_id=r.doctor_id,
         patient_id=r.patient_id,
         appointment_id=r.appointment_id,
+        admission_id=r.admission_id,
         lab_order_id=r.lab_order_id,
         radiology_order_id=r.radiology_order_id,
         report_type=r.report_type,
@@ -144,6 +146,21 @@ class CreatePrescriptionAction:
             if appt:
                 appt_status = appt.status
                 mark_in_progress(appt)
+
+        if payload.admission_id:
+            from modules.inpatient.entities.admission import Admission
+            admission = (
+                self.db.query(Admission)
+                .filter(
+                    Admission.id == payload.admission_id,
+                    Admission.hospital_id == hospital_id,
+                )
+                .first()
+            )
+            if not admission:
+                raise HTTPException(status_code=404, detail="Admission not found")
+            if admission.patient_id != payload.patient_id:
+                raise HTTPException(status_code=400, detail="Admission does not belong to the selected patient")
 
         status = payload.status or "issued"
         if status != "draft":
@@ -210,6 +227,7 @@ class CreatePrescriptionAction:
             doctor_id=doctor_id,
             patient_id=payload.patient_id,
             appointment_id=payload.appointment_id,
+            admission_id=payload.admission_id,
             symptoms=payload.symptoms.strip(),
             diagnosis=payload.diagnosis.strip(),
             medicines=payload.medicines.strip(),
@@ -235,6 +253,7 @@ class CreatePrescriptionAction:
                     patient_id=payload.patient_id,
                     appointment_id=payload.appointment_id,
                     prescription_id=rx.id,
+                    admission_id=payload.admission_id,
                     test_ids=payload.test_ids,
                     panel_ids=payload.panel_ids,
                     scan_ids=payload.scan_ids,
@@ -486,12 +505,28 @@ class CreateMedicalRecordAction:
         if file_data and len(file_data) > 2_500_000:
             raise HTTPException(status_code=400, detail="File too large (max ~1.5MB)")
 
+        if payload.admission_id:
+            from modules.inpatient.entities.admission import Admission
+            admission = (
+                self.db.query(Admission)
+                .filter(
+                    Admission.id == payload.admission_id,
+                    Admission.hospital_id == hospital_id,
+                )
+                .first()
+            )
+            if not admission:
+                raise HTTPException(status_code=404, detail="Admission not found")
+            if admission.patient_id != payload.patient_id:
+                raise HTTPException(status_code=400, detail="Admission does not belong to the selected patient")
+
         provenance_val = getattr(payload, "provenance", None) or "external"
         record = MedicalRecord(
             hospital_id=hospital_id,
             doctor_id=doctor_id,
             patient_id=payload.patient_id,
             appointment_id=payload.appointment_id,
+            admission_id=payload.admission_id,
             report_type=payload.report_type.strip(),
             provenance=provenance_val.strip()[:32],
             title=payload.title.strip(),

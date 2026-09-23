@@ -230,6 +230,7 @@ def request_to_response_dict(req: LabPrescriptionRequest, db: Session | None = N
         "patient_id": req.patient_id,
         "doctor_id": req.doctor_id,
         "appointment_id": req.appointment_id,
+        "admission_id": getattr(req, "admission_id", None),
         "status": req.status,
         "prescribed_test_ids": [
             UUID(x) if not isinstance(x, UUID) else x
@@ -283,6 +284,7 @@ def create_investigation_requests_for_prescription(
     patient_id: UUID,
     appointment_id: UUID | None,
     prescription_id: UUID,
+    admission_id: UUID | None = None,
     test_ids: list[UUID] | None = None,
     panel_ids: list[UUID] | None = None,
     scan_ids: list[UUID] | None = None,
@@ -308,6 +310,7 @@ def create_investigation_requests_for_prescription(
                 patient_id=patient_id,
                 doctor_id=doctor_id,
                 appointment_id=appointment_id,
+                admission_id=admission_id,
                 status=LabPrescriptionRequestStatus.pending,
                 prescribed_test_ids=[str(tid) for tid in (test_ids or [])],
                 prescribed_panel_ids=[str(pid) for pid in (panel_ids or [])],
@@ -337,6 +340,20 @@ def create_investigation_requests_for_prescription(
             # Auto-create BillingCharge so billing receives investigation immediately
             lab_total = round(sum(float(r.test.price or 0.0) for r in tests_resolved), 2)
             desc_names = [r.test.test_name for r in tests_resolved]
+            inv_account_id = None
+            if admission_id:
+                from modules.billing.entities.billing_entities import FinancialAccountType
+                from modules.billing.services.billing_service import get_or_create_financial_account
+                inv_acc = get_or_create_financial_account(
+                    db,
+                    hospital_id=hospital_id,
+                    patient_id=patient_id,
+                    account_type=FinancialAccountType.ipd,
+                    admission_id=admission_id,
+                    created_by_name="Prescription Order",
+                )
+                inv_account_id = inv_acc.id
+
             ensure_charge(
                 db,
                 hospital_id=hospital_id,
@@ -345,6 +362,7 @@ def create_investigation_requests_for_prescription(
                 source_id=lab_req.id,
                 description=f"Lab Investigation — {', '.join(desc_names)}"[:512],
                 charge_amount=lab_total,
+                account_id=inv_account_id,
                 created_by_name="Prescription Order",
             )
 
@@ -368,6 +386,7 @@ def create_investigation_requests_for_prescription(
                 patient_id=patient_id,
                 doctor_id=doctor_id,
                 appointment_id=appointment_id,
+                admission_id=admission_id,
                 status=RadPrescriptionRequestStatus.pending,
                 prescribed_scan_ids=[str(sid) for sid in (scan_ids or [])],
                 clinical_notes=clinical_notes,
@@ -393,6 +412,20 @@ def create_investigation_requests_for_prescription(
             # Auto-create BillingCharge for radiology
             rad_total = round(sum(float(s.price or 0.0) for s in scans_resolved), 2)
             scan_names = [s.scan_name for s in scans_resolved]
+            rad_inv_account_id = None
+            if admission_id:
+                from modules.billing.entities.billing_entities import FinancialAccountType
+                from modules.billing.services.billing_service import get_or_create_financial_account
+                rad_inv_acc = get_or_create_financial_account(
+                    db,
+                    hospital_id=hospital_id,
+                    patient_id=patient_id,
+                    account_type=FinancialAccountType.ipd,
+                    admission_id=admission_id,
+                    created_by_name="Prescription Order",
+                )
+                rad_inv_account_id = rad_inv_acc.id
+
             ensure_charge(
                 db,
                 hospital_id=hospital_id,
@@ -401,6 +434,7 @@ def create_investigation_requests_for_prescription(
                 source_id=rad_req.id,
                 description=f"Radiology Investigation — {', '.join(scan_names)}"[:512],
                 charge_amount=rad_total,
+                account_id=rad_inv_account_id,
                 created_by_name="Prescription Order",
             )
 

@@ -174,7 +174,8 @@ class UpdatePatientAction:
         """FLAW-010 demographic amendment propagation.
 
         When the canonical Patient identity (name / gender / age) changes, the
-        immutable snapshots of ACTIVE (non-discharged) admissions are refreshed
+        immutable snapshots of open-episode (requested/admitted/
+        discharge_requested) admissions are refreshed
         so wristbands / worklists reflect the corrected identity, and a dedicated
         ``amend_demographics`` audit entry records the before/after values so
         nursing can reprint labels. Discharged / historical admissions keep the
@@ -199,8 +200,14 @@ class UpdatePatientAction:
             .filter(
                 Admission.patient_id == patient.id,
                 Admission.hospital_id == self.repo.hospital_id,
+                # Open episodes (requested included): snapshots exist from
+                # request creation, so corrections propagate to them too.
                 Admission.status.in_(
-                    [AdmissionStatus.admitted, AdmissionStatus.discharge_requested]
+                    [
+                        AdmissionStatus.requested,
+                        AdmissionStatus.admitted,
+                        AdmissionStatus.discharge_requested,
+                    ]
                 ),
             )
             .all()

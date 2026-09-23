@@ -50,7 +50,8 @@ PATIENT_FK_TABLES = [
     ("ipd_form_submissions", "patient_id"),
 ]
 
-ACTIVE_STATUSES = ("admitted", "discharge_requested")
+# Open-episode set (Invariant 1): requested/admitted/discharge_requested.
+ACTIVE_STATUSES = ("requested", "admitted", "discharge_requested")
 
 _UHID_NUM_RE = re.compile(r"^P(\d+)$")
 
@@ -127,22 +128,32 @@ def _sanitize_duplicate_active_admissions(conn: Connection, inspector, dry_run: 
         logger.info("SKIP admissions sanitization: table does not exist")
         return
     active_sql = ", ".join(f"'{s}'" for s in ACTIVE_STATUSES)
+    # NOTE: NULL bed_ids are never grouped together — bedless episodes
+    # (requested / awaiting-bed) legitimately share "no bed", so the bed
+    # partition only ranks rows that actually hold a bed.
     dup_sql = text(
         f"""
-        WITH ranked AS (
+        WITH bed_ranked AS (
             SELECT id,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY hospital_id, bed_id
-                       ORDER BY admitted_at ASC, id ASC
-                   ) AS rn_bed,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY hospital_id, patient_id
-                       ORDER BY admitted_at ASC, id ASC
-                   ) AS rn_patient
+                    ROW_NUMBER() OVER (
+                        PARTITION BY hospital_id, bed_id
+                        ORDER BY admitted_at ASC, id ASC
+                    ) AS rn_bed
+            FROM admissions
+            WHERE status IN ({active_sql}) AND bed_id IS NOT NULL
+        ),
+        patient_ranked AS (
+            SELECT id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY hospital_id, patient_id
+                        ORDER BY admitted_at ASC, id ASC
+                    ) AS rn_patient
             FROM admissions
             WHERE status IN ({active_sql})
         )
-        SELECT id FROM ranked WHERE rn_bed > 1 OR rn_patient > 1
+        SELECT id FROM bed_ranked WHERE rn_bed > 1
+        UNION
+        SELECT id FROM patient_ranked WHERE rn_patient > 1
         """
     )
     dup_ids = conn.execute(dup_sql).scalars().all()
@@ -156,6 +167,8 @@ def _sanitize_duplicate_active_admissions(conn: Connection, inspector, dry_run: 
     conn.execute(
         text(
             "UPDATE admissions SET status = 'discharged', "
+            # discharged ⇔ discharged_at invariant (spec §23).
+            "discharged_at = COALESCE(discharged_at, NOW()), "
             "discharge_notes = COALESCE(discharge_notes || '; ', '') || "
             "'[FLAW-027] Auto-sanitized duplicate active admission' "
             "WHERE id = ANY(:ids)"

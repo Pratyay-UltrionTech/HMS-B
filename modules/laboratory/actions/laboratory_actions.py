@@ -80,6 +80,7 @@ from modules.laboratory.services.lab_prescription_service import (
 )
 from modules.billing.services.service_financial_clearance import (
     assert_service_financially_cleared,
+    bulk_check_service_financial_clearance,
     check_service_financial_clearance,
 )
 from modules.laboratory.services.lab_report_service import (
@@ -98,34 +99,19 @@ def _actor_role(user: dict) -> str:
     return str(user.get("staff_role_name") or user.get("role") or "")
 
 
-def _order_to_response(order: LabOrder, db: Session | None = None) -> LabOrderResponse:
+def _build_order_response(order: LabOrder, fin: Any) -> LabOrderResponse:
     items = order.items or []
     panel_names = sorted({i.panel_name for i in items if i.panel_name})
     source = getattr(order, "order_source", None) or LabOrderSource.self_requested
 
-    payment_status = "pending"
-    is_financially_cleared = False
-    outstanding_amount = 0.0
-
-    target_db = db or (order._sa_instance_state.session if hasattr(order, "_sa_instance_state") else None)
-    if target_db:
-        try:
-            fin = check_service_financial_clearance(
-                target_db,
-                order.hospital_id,
-                BillingSourceType.laboratory,
-                order.id,
-            )
-            payment_status = fin.status
-            is_stat = bool(
-                getattr(order, "is_emergency", False)
-                or (order.clinical_notes and "STAT" in order.clinical_notes.upper())
-                or (order.collection_remarks and "STAT" in order.collection_remarks.upper())
-            )
-            is_financially_cleared = fin.is_cleared or is_stat
-            outstanding_amount = fin.outstanding_amount
-        except Exception:
-            pass
+    payment_status = fin.status if fin else "pending"
+    is_stat = bool(
+        getattr(order, "is_emergency", False)
+        or (order.clinical_notes and "STAT" in order.clinical_notes.upper())
+        or (order.collection_remarks and "STAT" in order.collection_remarks.upper())
+    )
+    is_financially_cleared = (fin.is_cleared if fin else False) or is_stat
+    outstanding_amount = fin.outstanding_amount if fin else 0.0
 
     return LabOrderResponse(
         id=order.id,
@@ -134,6 +120,7 @@ def _order_to_response(order: LabOrder, db: Session | None = None) -> LabOrderRe
         patient_id=order.patient_id,
         doctor_id=order.doctor_id,
         appointment_id=order.appointment_id,
+        admission_id=getattr(order, "admission_id", None),
         prescription_id=getattr(order, "prescription_id", None),
         prescription_request_id=getattr(order, "prescription_request_id", None),
         order_source=source,
@@ -147,7 +134,7 @@ def _order_to_response(order: LabOrder, db: Session | None = None) -> LabOrderRe
         collection_remarks=order.collection_remarks,
         ordered_at=order.ordered_at,
         completed_at=order.completed_at,
-        is_amended=getattr(order, "is_amended", False),
+        is_amended=bool(getattr(order, "is_amended", False) or False),
         amendment_reason=getattr(order, "amendment_reason", None),
         patient_name=order.patient.name if order.patient else None,
         patient_uhid=order.patient.uhid if order.patient else None,
@@ -181,11 +168,55 @@ def _order_to_response(order: LabOrder, db: Session | None = None) -> LabOrderRe
                 reference_range=r.reference_range,
                 remarks=r.remarks,
                 sort_order=r.sort_order,
-                is_panic=getattr(r, "is_panic", False),
+                is_panic=bool(getattr(r, "is_panic", False) or False),
             )
             for r in (order.results or [])
         ],
     )
+
+
+def _order_to_response(order: LabOrder, db: Session | None = None) -> LabOrderResponse:
+    target_db = db or (order._sa_instance_state.session if hasattr(order, "_sa_instance_state") else None)
+    fin = None
+    if target_db:
+        try:
+            fin = check_service_financial_clearance(
+                target_db,
+                order.hospital_id,
+                BillingSourceType.laboratory,
+                order.id,
+            )
+        except Exception:
+            pass
+
+    return _build_order_response(order, fin)
+
+
+def orders_to_responses(orders: list[LabOrder], db: Session) -> list[LabOrderResponse]:
+    """
+    Batch-convert a list of LabOrder entities to LabOrderResponse objects.
+
+    Replaces the per-order loop calling _order_to_response() (which issues N+1/2N+1
+    queries). All billing clearance states for the entire list are fetched in 1-3
+    queries total using bulk_check_service_financial_clearance(), regardless of list length.
+    """
+    if not orders:
+        return []
+
+    fin_map = {}
+    try:
+        hosp_id = orders[0].hospital_id
+        order_ids = [o.id for o in orders]
+        fin_map = bulk_check_service_financial_clearance(
+            db,
+            hosp_id,
+            BillingSourceType.laboratory,
+            order_ids,
+        )
+    except Exception:
+        pass
+
+    return [_build_order_response(o, fin_map.get(o.id)) for o in orders]
 
 
 def _sync_order_status_from_items(order: LabOrder) -> None:
@@ -217,9 +248,49 @@ class GetLabDashboardAction:
         all_pending_reqs = self.repo.list_prescription_requests(
             status=LabPrescriptionRequestStatus.pending
         )
-        released_reqs = [r for r in all_pending_reqs if is_lab_request_released(self.db, r)]
+
+        stat_reqs: list = []
+        non_stat_reqs: list = []
+        for r in all_pending_reqs:
+            if r.status == LabPrescriptionRequestStatus.cancelled:
+                continue
+            is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
+            if is_stat:
+                stat_reqs.append(r)
+            else:
+                non_stat_reqs.append(r)
+
+        fin_states: dict = {}
+        if non_stat_reqs:
+            try:
+                fin_states = bulk_check_service_financial_clearance(
+                    self.db,
+                    self.hospital_id,
+                    BillingSourceType.laboratory,
+                    [r.id for r in non_stat_reqs],
+                )
+            except Exception:
+                pass
+
+        released_non_stat = [
+            r for r in non_stat_reqs
+            if fin_states.get(r.id) and fin_states[r.id].is_cleared
+        ]
+        released_reqs = stat_reqs + released_non_stat
+
+        def _build_req_dict(r) -> dict:
+            fin = fin_states.get(r.id)
+            if fin is not None:
+                is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
+                res = request_to_response_dict(r)
+                res["payment_status"] = fin.status
+                res["is_financially_cleared"] = fin.is_cleared or is_stat
+                res["outstanding_amount"] = fin.outstanding_amount
+                return res
+            return request_to_response_dict(r, self.db)
+
         pending_req_responses = [
-            LabPrescriptionRequestResponse(**request_to_response_dict(r, self.db))
+            LabPrescriptionRequestResponse(**_build_req_dict(r))
             for r in released_reqs[:10]
         ]
 
@@ -565,6 +636,7 @@ class DeleteLabPanelAction:
 class ListLabPrescriptionRequestsAction:
     def __init__(self, db: Session, hospital_id: UUID) -> None:
         self.db = db
+        self.hospital_id = hospital_id
         self.repo = LaboratoryRepository(db, hospital_id)
 
     def execute(
@@ -577,9 +649,57 @@ class ListLabPrescriptionRequestsAction:
         reqs = self.repo.list_prescription_requests(
             status=status, patient_id=patient_id, doctor_id=doctor_id
         )
-        if released_only is True or (released_only is None and status == LabPrescriptionRequestStatus.pending and not patient_id):
-            reqs = [r for r in reqs if is_lab_request_released(self.db, r)]
-        return [LabPrescriptionRequestResponse(**request_to_response_dict(r, self.db)) for r in reqs]
+
+        apply_release_filter = released_only is True or (
+            released_only is None
+            and status == LabPrescriptionRequestStatus.pending
+            and not patient_id
+        )
+
+        stat_reqs: list = []
+        non_stat_reqs: list = []
+        for r in reqs:
+            if r.status == LabPrescriptionRequestStatus.cancelled:
+                continue
+            is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
+            if is_stat:
+                stat_reqs.append(r)
+            else:
+                non_stat_reqs.append(r)
+
+        fin_states: dict = {}
+        if non_stat_reqs:
+            try:
+                fin_states = bulk_check_service_financial_clearance(
+                    self.db,
+                    self.hospital_id,
+                    BillingSourceType.laboratory,
+                    [r.id for r in non_stat_reqs],
+                )
+            except Exception:
+                pass
+
+        if apply_release_filter:
+            released_non_stat = [
+                r for r in non_stat_reqs
+                if fin_states.get(r.id) and fin_states[r.id].is_cleared
+            ]
+            final_reqs = stat_reqs + released_non_stat
+        else:
+            final_reqs = reqs
+
+        def _build_req_dict(r) -> dict:
+            fin = fin_states.get(r.id)
+            if fin is not None:
+                is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
+                res = request_to_response_dict(r)
+                res["payment_status"] = fin.status
+                res["is_financially_cleared"] = fin.is_cleared or is_stat
+                res["outstanding_amount"] = fin.outstanding_amount
+                return res
+            return request_to_response_dict(r, self.db)
+
+        return [LabPrescriptionRequestResponse(**_build_req_dict(r)) for r in final_reqs]
 
 
 class GetLabPrescriptionRequestAction:
@@ -593,7 +713,7 @@ class GetLabPrescriptionRequestAction:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Prescription lab request not found",
             )
-        return LabPrescriptionRequestResponse(**request_to_response_dict(req))
+        return LabPrescriptionRequestResponse(**request_to_response_dict(req, self.repo.db))
 
 
 class CancelLabPrescriptionRequestAction:
@@ -645,7 +765,7 @@ class MarkLabRequestItemUnavailableAction:
         if req.appointment_id:
             sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
             self.db.commit()
-        return LabPrescriptionRequestResponse(**request_to_response_dict(req))
+        return LabPrescriptionRequestResponse(**request_to_response_dict(req, self.db))
 
 
 class ListLabOrdersAction:
@@ -673,7 +793,7 @@ class ListLabOrdersAction:
             limit=limit,
             offset=offset,
         )
-        return [_order_to_response(o) for o in orders]
+        return orders_to_responses(orders, self.repo.db)
 
 
 class GetLabOrderAction:
@@ -786,12 +906,31 @@ class CreateLabOrderAction:
                     )
                 )
 
+        admission_id = payload.admission_id
+        if rx_request and rx_request.admission_id:
+            admission_id = rx_request.admission_id
+
+        if admission_id:
+            admission = (
+                self.db.query(Admission)
+                .filter(Admission.id == admission_id, Admission.hospital_id == self.hospital_id)
+                .first()
+            )
+            if not admission:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found")
+            if admission.patient_id != patient.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Admission does not belong to the selected patient",
+                )
+
         order = LabOrder(
             hospital_id=self.hospital_id,
             order_no=self.repo.next_order_no(),
             patient_id=patient.id,
             doctor_id=doctor.id if doctor else None,
             appointment_id=appointment_id,
+            admission_id=admission_id,
             prescription_id=prescription_id,
             prescription_request_id=rx_request.id if rx_request else None,
             order_source=order_source,
@@ -841,6 +980,20 @@ class CreateLabOrderAction:
                 req_charge.description = f"Lab {order.order_no} — {', '.join(desc_bits)}"[:512]
 
         if not req_charge:
+            lab_account_id = None
+            if admission_id:
+                from modules.billing.entities.billing_entities import FinancialAccountType
+                from modules.billing.services.billing_service import get_or_create_financial_account
+                lab_acc = get_or_create_financial_account(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    patient_id=patient.id,
+                    account_type=FinancialAccountType.ipd,
+                    admission_id=admission_id,
+                    created_by_name=_actor_name(user),
+                )
+                lab_account_id = lab_acc.id
+
             ensure_charge(
                 self.db,
                 hospital_id=self.hospital_id,
@@ -849,6 +1002,7 @@ class CreateLabOrderAction:
                 source_id=order.id,
                 description=f"Lab {order.order_no} — {', '.join(desc_bits)}"[:512],
                 charge_amount=lab_total,
+                account_id=lab_account_id,
                 created_by_name=_actor_name(user),
             )
 

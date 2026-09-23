@@ -168,7 +168,30 @@ class AdmissionsRepository:
         admitted_at: datetime | None = None,
         source_appointment_id: UUID | None = None,
     ) -> Admission:
-        """Create new admission and set bed and patient occupancy state."""
+        """Create new admission and set bed and patient occupancy state.
+
+        Global backstop (Invariant 1): the Patient row is locked FOR UPDATE
+        and any pre-existing open episode (requested/admitted/
+        discharge_requested) raises ConflictError, protecting all
+        current/future callers against check-then-act races. The DB partial
+        unique index remains the final arbiter under true concurrency.
+        """
+        from shared.exceptions.base import ConflictError as _ConflictError
+
+        self.db.query(Patient).filter(
+            Patient.id == patient.id, Patient.hospital_id == hospital_id
+        ).with_for_update().first()
+        _open = (
+            self.db.query(Admission.id)
+            .filter(
+                Admission.hospital_id == hospital_id,
+                Admission.patient_id == patient.id,
+                Admission.status.in_(OPEN_STATUSES),
+            )
+            .first()
+        )
+        if _open:
+            raise _ConflictError("Patient already has an open admission episode")
         admission = Admission(
             hospital_id=hospital_id,
             patient_id=patient.id,
@@ -248,6 +271,31 @@ class AdmissionsRepository:
         if for_update:
             q = q.with_for_update()
         return q.first()
+
+    def list_open_admissions(
+        self,
+        hospital_id: UUID,
+        patient_id: UUID | None = None,
+    ) -> list[Admission]:
+        """List all open-episode admissions (requested/admitted/
+        discharge_requested), optionally scoped to one patient."""
+        q = (
+            self.db.query(Admission)
+            .options(
+                joinedload(Admission.patient),
+                joinedload(Admission.ward),
+                joinedload(Admission.room),
+                joinedload(Admission.bed),
+                joinedload(Admission.doctor),
+            )
+            .filter(
+                Admission.hospital_id == hospital_id,
+                Admission.status.in_(OPEN_STATUSES),
+            )
+        )
+        if patient_id:
+            q = q.filter(Admission.patient_id == patient_id)
+        return q.order_by(Admission.admitted_at.asc()).all()
 
     def list_admission_requests(self, hospital_id: UUID) -> list[Admission]:
         """Canonical admission-request queue (spec §7): requested only."""

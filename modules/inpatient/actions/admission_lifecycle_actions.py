@@ -28,7 +28,6 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -95,7 +94,18 @@ class EnsureAdmissionRequestAction:
         doctor_id: UUID | None = None,
         notes: str | None = None,
         source_appointment_id: UUID | None = None,
+        commit: bool = True,
     ) -> tuple[Admission, bool]:
+        """Ensure a canonical admission request exists (idempotent).
+
+        ``commit=False`` stages everything without committing so a caller
+        (Transfer to Inpatient) can commit once together with its own audit
+        row — single-commit semantics preserved either way.
+        """
+        from modules.inpatient.utils.admission_conflicts import (
+            admission_conflict as _ensure_conflict,
+        )
+
         patient = (
             self.db.query(Patient)
             .filter(Patient.id == patient_id, Patient.hospital_id == hospital_id)
@@ -110,6 +120,8 @@ class EnsureAdmissionRequestAction:
         if existing:
             if source_appointment_id and not existing.source_appointment_id:
                 existing.source_appointment_id = source_appointment_id
+            # Loser path also reconciles the appointment mirror so the
+            # compatibility state can never diverge from the winner (§6).
             _link_appointment_compat(
                 self.db,
                 hospital_id,
@@ -126,7 +138,8 @@ class EnsureAdmissionRequestAction:
                 entity_id=str(existing.id),
                 summary="Admission request already exists — linked (idempotent)",
             )
-            self.db.commit()
+            if commit:
+                self.db.commit()
             refreshed = self.repo.get_admission_by_id(hospital_id, existing.id)
             return refreshed or existing, False
 
@@ -149,6 +162,9 @@ class EnsureAdmissionRequestAction:
             entity_id=str(admission.id),
             summary=f"Admission requested for {patient.uhid} {patient.name}",
         )
+        if not commit:
+            self.db.flush()
+            return admission, True
         try:
             self.db.commit()
         except IntegrityError:
@@ -157,10 +173,19 @@ class EnsureAdmissionRequestAction:
             self.db.rollback()
             winner = self.repo.get_open_admission(hospital_id, patient_id)
             if winner:
+                _link_appointment_compat(
+                    self.db,
+                    hospital_id,
+                    source_appointment_id or winner.source_appointment_id,
+                    winner.id,
+                    admitted=winner.status != AdmissionStatus.requested,
+                )
+                self.db.commit()
                 return winner, False
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="An admission request already exists for this patient",
+            raise _ensure_conflict(
+                "An admission request already exists for this patient",
+                admission_status=AdmissionStatus.requested,
+                doctor_id=doctor_id,
             )
         refreshed = self.repo.get_admission_by_id(hospital_id, admission.id)
         return refreshed or admission, True
@@ -197,7 +222,12 @@ class AcceptAdmissionAction:
             next_ip_encounter_id,
         )
         from modules.patients.entities.patient import PatientStatus
-        from shared.exceptions.base import ConflictError, NotFoundError, ValidationError
+        from shared.exceptions.base import NotFoundError, ValidationError
+
+        from modules.inpatient.utils.admission_conflicts import (
+            admission_conflict as _accept_conflict,
+            bed_conflict as _accept_bed_conflict,
+        )
 
         if admission_id:
             # Locked load by id (joinedload omitted under FOR UPDATE).
@@ -213,7 +243,9 @@ class AcceptAdmissionAction:
                 .first()
             )
         elif patient_id:
-            admission = self.repo.get_requested_admission(
+            # Accept-by-patient: look at the whole open episode first so a
+            # bedded follow-up gets a structured 409 instead of a 404.
+            admission = self.repo.get_open_admission(
                 hospital_id, patient_id, for_update=True
             )
         else:
@@ -221,8 +253,13 @@ class AcceptAdmissionAction:
         if not admission:
             raise NotFoundError("Admission request not found")
         if admission.status != AdmissionStatus.requested:
-            raise ConflictError(
-                f"Admission is already {admission.status.value}; only requested admissions can be accepted"
+            raise _accept_conflict(
+                f"Admission is already {admission.status.value}; only requested admissions can be accepted",
+                admission_id=admission.id,
+                admission_status=admission.status,
+                bed_id=admission.bed_id,
+                doctor_id=admission.doctor_id,
+                code="WRONG_STATE",
             )
 
         with_bed = bed_id is not None
@@ -242,9 +279,11 @@ class AcceptAdmissionAction:
             if not bed:
                 raise NotFoundError("Bed not found")
             if bed.is_occupied:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Selected bed is already occupied or was just taken",
+                raise _accept_bed_conflict(
+                    "Selected bed is already occupied or was just taken",
+                    bed_id=bed.id,
+                    admission_id=admission.id,
+                    admission_status=admission.status,
                 )
             if bed.ward_id != ward_id or bed.room_id != room_id:
                 raise ValidationError("Ward/Room does not match selected bed")
@@ -345,13 +384,44 @@ class AcceptAdmissionAction:
                 + (f"to bed {bed.bed_code}" if bed else "as awaiting bed")
             ),
         )
+        if bed is not None:
+            write_audit_log(
+                self.db,
+                hospital_id=hospital_id,
+                actor=actor,
+                action="update",
+                entity_type="bed",
+                entity_id=str(bed.id),
+                summary=f"Bed {bed.bed_code} occupied by admission {admission.id}",
+            )
+        write_audit_log(
+            self.db,
+            hospital_id=hospital_id,
+            actor=actor,
+            action="update",
+            entity_type="patient",
+            entity_id=str(admission.patient_id),
+            summary="Patient admitted",
+        )
+        if admission.source_appointment_id:
+            write_audit_log(
+                self.db,
+                hospital_id=hospital_id,
+                actor=actor,
+                action="update",
+                entity_type="appointment",
+                entity_id=str(admission.source_appointment_id),
+                summary="Appointment transferred to inpatient on accept",
+            )
         try:
             self.db.commit()
         except IntegrityError as exc:
             self.db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Admission state changed concurrently; please retry",
+            raise _accept_bed_conflict(
+                "Admission state changed concurrently; please retry",
+                bed_id=bed_id,
+                admission_id=admission.id,
+                admission_status=admission.status,
             ) from exc
         refreshed = self.repo.get_admission_by_id(hospital_id, admission.id)
         detail = to_admission_detail(refreshed or admission)
