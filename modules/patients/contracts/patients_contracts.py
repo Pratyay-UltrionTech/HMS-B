@@ -62,6 +62,8 @@ class PatientRegister(BaseModel):
             phone=self.emergency_contact,
             required=True,
         )
+        if self.mobile and self.emergency_contact and str(self.mobile).strip() == str(self.emergency_contact).strip():
+            raise ValueError("Emergency contact number cannot be the same as patient mobile number")
         if not self.has_insurance:
             object.__setattr__(self, "insurance_provider", None)
         else:

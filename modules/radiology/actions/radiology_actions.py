@@ -25,6 +25,7 @@ from modules.billing.services.service_financial_clearance import (
 )
 from modules.inpatient.entities.admission import Admission
 from modules.radiology.contracts.radiology_contracts import (
+    RadAttachmentResponse,
     RadCatalogueSeedResult,
     RadDashboardResponse,
     RadOrderCreate,
@@ -39,6 +40,7 @@ from modules.radiology.contracts.radiology_contracts import (
 )
 from modules.radiology.db.radiology_repository import RadiologyRepository
 from modules.radiology.entities.radiology_entities import (
+    RadiologyAttachment,
     RadiologyOrder,
     RadiologyOrderStatus,
     RadiologyScanCatalog,
@@ -421,6 +423,7 @@ class CreateOrdersAction:
                 entity_type="radiology_order",
                 entity_id=order.id,
                 summary=f"Radiology order {order.order_no} for {patient.name}: {scan_name}",
+                details={"order_id": str(order.id), "order_no": order.order_no, "patient_id": str(order.patient_id)},
             )
 
         if rad_request:
@@ -651,6 +654,7 @@ class CancelOrderAction:
             entity_type="radiology_order",
             entity_id=order.id,
             summary=f"Cancelled radiology order {order.order_no}",
+            details={"order_id": str(order.id), "order_no": order.order_no, "status": "cancelled", "patient_id": str(order.patient_id)},
         )
         sync_request_after_order_change(self.db, order)
         self.db.commit()
@@ -702,6 +706,7 @@ class ScheduleOrderAction:
             entity_type="radiology_order",
             entity_id=order.id,
             summary=f"Scheduled {order.order_no} on {order.machine} at {payload.scheduled_at.isoformat()}",
+            details={"order_id": str(order.id), "status": "scheduled", "patient_id": str(order.patient_id)},
         )
         self.db.commit()
         return order_to_response(self.repo.get_order(order_id), self.repo.db)
@@ -724,15 +729,17 @@ class StartScanAction:
                 detail="Order must be scheduled (or ordered) to start",
             )
 
-        # Enforce financial clearance
+        # Enforce financial clearance (with emergency STAT override)
         from modules.billing.entities.billing_entities import BillingSourceType
         from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+        is_stat = bool(order.clinical_notes and "STAT" in order.clinical_notes.upper())
         assert_service_financially_cleared(
             self.db,
             self.hospital_id,
             BillingSourceType.radiology,
             order.id,
             action_description="start scan acquisition",
+            is_emergency_override=is_stat,
         )
 
         order.status = RadiologyOrderStatus.in_progress
@@ -746,6 +753,7 @@ class StartScanAction:
             entity_type="radiology_order",
             entity_id=order.id,
             summary=f"Started scan for {order.order_no}",
+            details={"order_id": str(order.id), "status": "in_progress", "patient_id": str(order.patient_id)},
         )
         self.db.commit()
         return order_to_response(self.repo.get_order(order_id), self.repo.db)
@@ -790,6 +798,7 @@ class CompleteScanAction:
             entity_type="radiology_order",
             entity_id=order.id,
             summary=f"Completed scan for {order.order_no} (report may still be pending)",
+            details={"order_id": str(order.id), "status": "completed", "patient_id": str(order.patient_id)},
         )
         sync_request_after_order_change(self.db, order)
         self.db.commit()
@@ -815,23 +824,27 @@ class UploadReportAction:
         if order.status == RadiologyOrderStatus.cancelled:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is cancelled")
 
-        # Enforce financial clearance before uploading/signing report
+        # Enforce financial clearance before uploading/signing report (with emergency STAT override)
         from modules.billing.entities.billing_entities import BillingSourceType
         from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+        is_stat = bool(order.clinical_notes and "STAT" in order.clinical_notes.upper())
         assert_service_financially_cleared(
             self.db,
             self.hospital_id,
             BillingSourceType.radiology,
             order.id,
             action_description="finalize and sign off radiology report",
+            is_emergency_override=is_stat,
         )
 
         if payload.report_file_data and len(payload.report_file_data) > 2_500_000:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Report file too large (max ~1.5MB)")
         if payload.image_file_data and len(payload.image_file_data) > 2_500_000:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image file too large (max ~1.5MB)")
-        if not payload.image_file_data and not order.image_file_data:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scan image is required")
+        # Scan can be satisfied by payload image, legacy image_file_data, OR uploaded attachments
+        has_attachments = bool(order.attachments and len(order.attachments) > 0)
+        if not payload.image_file_data and not order.image_file_data and not has_attachments:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scan image or attachment is required")
 
         # FLAW-009: Diagnostic immutability & amendment tracking
         is_prior_completed = bool(order.findings or order.impression)
@@ -869,6 +882,17 @@ class UploadReportAction:
             entity_type="radiology_report",
             entity_id=order.id,
             summary=f"Uploaded radiology report for {order.order_no}",
+            details={"order_id": str(order.id), "status": order.status.value, "patient_id": str(order.patient_id)},
+        )
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=self.user,
+            action="complete",
+            entity_type="radiology_order",
+            entity_id=order.id,
+            summary=f"Radiology order {order.order_no} finalized with report",
+            details={"order_id": str(order.id), "status": "completed", "patient_id": str(order.patient_id)},
         )
         self.db.commit()
 
@@ -879,6 +903,113 @@ class UploadReportAction:
         self.db.commit()
 
         return order_to_response(self.repo.get_order(order_id))
+
+
+class AddAttachmentAction:
+    def __init__(self, db: Session, hospital_id: UUID, user: dict[str, Any]) -> None:
+        self.db = db
+        self.hospital_id = hospital_id
+        self.user = user
+        self.repo = RadiologyRepository(db, hospital_id)
+
+    def execute(
+        self,
+        order_id: UUID,
+        file_name: str,
+        mime_type: str,
+        file_size: int,
+        storage_path: str,
+        attachment_type: str = "scan_plate",
+    ) -> RadAttachmentResponse:
+        order = self.repo.get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
+        if order.status == RadiologyOrderStatus.cancelled:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is cancelled")
+
+        att = RadiologyAttachment(
+            hospital_id=self.hospital_id,
+            order_id=order.id,
+            file_name=file_name,
+            mime_type=mime_type,
+            file_size=file_size,
+            storage_path=storage_path,
+            attachment_type=attachment_type,
+            uploaded_by=_actor_name(self.user),
+        )
+        self.db.add(att)
+
+        # Transition order to in_progress or update technician if scheduled/ordered
+        if order.status == RadiologyOrderStatus.ordered:
+            order.status = RadiologyOrderStatus.in_progress
+            order.started_at = order.started_at or datetime.now(timezone.utc)
+            if not order.technician_name:
+                order.technician_name = _actor_name(self.user)
+
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=self.user,
+            action="upload_attachment",
+            entity_type="radiology_scan",
+            entity_id=att.id,
+            summary=f"Uploaded attachment {file_name} for order {order.order_no}",
+            details={"order_id": str(order.id), "attachment_id": str(att.id)},
+        )
+        if order.status == RadiologyOrderStatus.in_progress:
+            write_audit_log(
+                self.db,
+                hospital_id=self.hospital_id,
+                actor=self.user,
+                action="status_change",
+                entity_type="radiology_order",
+                entity_id=order.id,
+                summary=f"Radiology order {order.order_no} status changed to in_progress",
+                details={"order_id": str(order.id), "status": "in_progress"},
+            )
+
+        self.db.commit()
+        self.db.refresh(att)
+        return RadAttachmentResponse.model_validate(att)
+
+
+class DeleteAttachmentAction:
+    def __init__(self, db: Session, hospital_id: UUID, user: dict[str, Any]) -> None:
+        self.db = db
+        self.hospital_id = hospital_id
+        self.user = user
+        self.repo = RadiologyRepository(db, hospital_id)
+
+    def execute(self, order_id: UUID, attachment_id: UUID) -> None:
+        order = self.repo.get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
+        if order.status == RadiologyOrderStatus.completed:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete attachments after report has been finalized and released.",
+            )
+
+        att = self.repo.get_attachment(attachment_id)
+        if not att or att.order_id != order_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found on order")
+
+        # Delete physical file from disk storage if exists
+        from shared.storage.local_storage import delete_attachment_file
+        delete_attachment_file(att.storage_path)
+
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=self.user,
+            action="delete_attachment",
+            entity_type="radiology_scan",
+            entity_id=attachment_id,
+            summary=f"Deleted attachment {att.file_name} from order {order.order_no}",
+            details={"order_id": str(order.id), "attachment_id": str(attachment_id)},
+        )
+        self.db.delete(att)
+        self.db.commit()
 
 
 class GetDashboardAction:

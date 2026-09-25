@@ -185,6 +185,8 @@ def print_patient_label(
             appointment_time=appt.appointment_time,
             doctor_name=doctor_name,
             department_name=department_name,
+            consultation_fee=getattr(appt, "consultation_fee", None),
+            visit_type=getattr(appt, "visit_type", None),
         )
 
     html = render_patient_label_html(

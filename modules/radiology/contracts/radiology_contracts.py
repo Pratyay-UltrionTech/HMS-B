@@ -137,6 +137,38 @@ class RadReportRequest(BaseModel):
     amendment_reason: str | None = None
 
 
+class RadAttachmentResponse(BaseModel):
+    id: UUID
+    hospital_id: UUID
+    order_id: UUID
+    file_name: str
+    mime_type: str
+    file_size: int
+    storage_path: str
+    attachment_type: str
+    uploaded_by: str
+    uploaded_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RadAttachmentUploadRequest(BaseModel):
+    file_name: str = Field(min_length=1, max_length=255)
+    file_data: str | None = Field(default=None, min_length=1)  # base64 encoded binary data
+    file_data_base64: str | None = Field(default=None, min_length=1)  # legacy frontend alias
+    mime_type: str = Field(default="application/octet-stream", max_length=128)
+    attachment_type: str = Field(default="scan_plate", max_length=64)
+
+    @model_validator(mode="after")
+    def coalesce_file_data(self):
+        data = (self.file_data or "").strip() or (self.file_data_base64 or "").strip()
+        if not data:
+            raise ValueError("file_data (or legacy file_data_base64) is required")
+        self.file_data = data
+        return self
+
+
+
 class RadOrderResponse(BaseModel):
     id: UUID
     hospital_id: UUID
@@ -168,6 +200,7 @@ class RadOrderResponse(BaseModel):
     has_report_file: bool = False
     image_file_name: str | None
     has_image_file: bool = False
+    attachments: list[RadAttachmentResponse] = []
     report_uploaded_by: str | None
     report_date: date | None
     is_amended: bool = False

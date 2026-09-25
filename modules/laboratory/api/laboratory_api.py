@@ -25,6 +25,7 @@ from modules.laboratory.actions.laboratory_actions import (
     CancelLabOrderAction,
     CancelLabPrescriptionRequestAction,
     CollectSampleAction,
+    CollectSpecimenAction,
     CreateLabOrderAction,
     CreateLabPanelAction,
     CreateLabTestAction,
@@ -40,6 +41,7 @@ from modules.laboratory.actions.laboratory_actions import (
     ListLabPrescriptionRequestsAction,
     ListLabTestsAction,
     MarkLabRequestItemUnavailableAction,
+    ReprintSpecimenLabelAction,
     SaveLabResultsAction,
     SeedStandardCatalogueAction,
     UpdateItemStatusAction,
@@ -58,11 +60,14 @@ from modules.laboratory.contracts.lab_contracts import (
     LabPrescriptionRequestResponse,
     LabReportSaveRequest,
     LabRequestCancelBody,
+    LabSpecimenResponse,
     LabTestCreate,
     LabTestResponse,
     LabTestUpdate,
     SampleCollectRequest,
+    SpecimenCollectRequest,
 )
+from modules.laboratory.services.specimen_label_service import render_specimen_label_html
 from modules.laboratory.entities.lab_entities import (
     LabOrderSource,
     LabOrderStatus,
@@ -379,3 +384,74 @@ def report_html(
         media_type="text/html",
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
+
+
+# ── 25-27. Specimen Collection & Label Printing ──────────────────────────────
+@router.post(
+    "/orders/{order_id}/specimens/{specimen_id}/collect",
+    response_model=LabOrderResponse,
+    dependencies=[Depends(require_permission("laboratory", "edit"))],
+)
+def collect_specimen(
+    order_id: UUID,
+    specimen_id: UUID,
+    payload: SpecimenCollectRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> LabOrderResponse:
+    return CollectSpecimenAction(db, hospital_id).execute(order_id, specimen_id, payload, user)
+
+
+@router.get("/specimens/{specimen_id}/label")
+def get_specimen_label(
+    specimen_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> Response:
+    repo = LaboratoryRepository(db, hospital_id)
+    specimen = repo.get_specimen(specimen_id)
+    if not specimen:
+        raise HTTPException(status_code=404, detail="Specimen not found")
+
+    order = specimen.order
+    patient = order.patient if order else None
+    test_names = [i.test_code or i.test_name for i in (specimen.items or [])]
+
+    label_html = render_specimen_label_html(
+        specimen_no=specimen.specimen_no,
+        order_no=order.order_no if order else "",
+        sample_type=str(specimen.sample_type.value if hasattr(specimen.sample_type, "value") else specimen.sample_type),
+        container_type=specimen.container_type,
+        patient_name=patient.name if patient else "UNKNOWN",
+        patient_uhid=patient.uhid if patient else "NO-UHID",
+        patient_age=getattr(patient, "age", None),
+        patient_gender=getattr(patient, "gender", None),
+        test_names=test_names,
+        collected_at=specimen.collected_at,
+    )
+    return Response(
+        content=label_html,
+        media_type="text/html",
+        headers={
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+    )
+
+
+@router.post(
+    "/specimens/{specimen_id}/reprint",
+    response_model=LabSpecimenResponse,
+    dependencies=[Depends(require_permission("laboratory", "edit"))],
+)
+def reprint_specimen_label(
+    specimen_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> LabSpecimenResponse:
+    specimen = ReprintSpecimenLabelAction(db, hospital_id).execute(specimen_id, user)
+    return LabSpecimenResponse.model_validate(specimen)
+

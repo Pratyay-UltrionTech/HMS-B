@@ -61,6 +61,13 @@ class LabOrderStatus(str, enum.Enum):
     cancelled = "cancelled"
 
 
+class LabSpecimenStatus(str, enum.Enum):
+    pending = "pending"
+    collected = "collected"
+    rejected = "rejected"
+    recollected = "recollected"
+
+
 class LabOrderSource(str, enum.Enum):
     doctor_prescribed = "doctor_prescribed"
     self_requested = "self_requested"
@@ -262,6 +269,63 @@ class LabOrder(Base):
         cascade="all, delete-orphan",
         order_by="LabResult.sort_order",
     )
+    specimens: Mapped[list[LabSpecimen]] = relationship(
+        "LabSpecimen",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        order_by="LabSpecimen.created_at",
+    )
+
+
+class LabSpecimen(Base):
+    """Physical laboratory specimen container (tube, cup, swab) linked to a lab order."""
+
+    __tablename__ = "lab_specimens"
+    __table_args__ = (
+        UniqueConstraint("hospital_id", "specimen_no", name="uq_lab_specimen_no"),
+        Index("ix_lab_specimens_hospital_order", "hospital_id", "order_id"),
+        Index("ix_lab_specimens_hospital_status", "hospital_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_orders.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    specimen_no: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    sample_type: Mapped[LabSampleType] = mapped_column(
+        Enum(LabSampleType, name="lab_sample_type", create_type=False),
+        nullable=False,
+        default=LabSampleType.blood,
+    )
+    container_type: Mapped[str] = mapped_column(String(64), nullable=False, default="EDTA Whole Blood")
+    status: Mapped[LabSpecimenStatus] = mapped_column(
+        Enum(LabSpecimenStatus, name="lab_specimen_status"),
+        nullable=False,
+        default=LabSpecimenStatus.pending,
+        index=True,
+    )
+    collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    collected_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    collection_remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
+    barcode_value: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reprint_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_reprinted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_reprinted_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    order: Mapped[LabOrder] = relationship("LabOrder", back_populates="specimens")
+    items: Mapped[list[LabOrderItem]] = relationship("LabOrderItem", back_populates="specimen")
 
 
 class LabOrderItem(Base):
@@ -277,6 +341,9 @@ class LabOrderItem(Base):
     )
     order_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("lab_orders.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    specimen_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("lab_specimens.id", ondelete="SET NULL"), nullable=True, index=True
     )
     test_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("lab_test_catalog.id", ondelete="SET NULL"), nullable=True
@@ -300,6 +367,7 @@ class LabOrderItem(Base):
 
     order: Mapped[LabOrder] = relationship("LabOrder", back_populates="items")
     panel: Mapped[LabTestPanel | None] = relationship("LabTestPanel")
+    specimen: Mapped[LabSpecimen | None] = relationship("LabSpecimen", back_populates="items")
 
 
 class LabPrescriptionRequest(Base):

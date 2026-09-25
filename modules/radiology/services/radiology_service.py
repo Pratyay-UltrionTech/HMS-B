@@ -15,7 +15,10 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from modules.clinical_records.entities.clinical_record import MedicalRecord
-from modules.radiology.contracts.radiology_contracts import RadOrderResponse
+from modules.radiology.contracts.radiology_contracts import (
+    RadAttachmentResponse,
+    RadOrderResponse,
+)
 from modules.radiology.entities.radiology_entities import (
     RadiologyOrder,
     RadiologyOrderStatus,
@@ -102,6 +105,21 @@ def order_to_response(order: RadiologyOrder, db: Session | None = None) -> RadOr
         has_report_file=bool(getattr(order, "has_report_file", None) if getattr(order, "has_report_file", None) is not None else order.report_file_name),
         image_file_name=order.image_file_name,
         has_image_file=bool(getattr(order, "has_image_file", None) if getattr(order, "has_image_file", None) is not None else order.image_file_name),
+        attachments=[
+            RadAttachmentResponse(
+                id=att.id,
+                hospital_id=att.hospital_id,
+                order_id=att.order_id,
+                file_name=att.file_name,
+                mime_type=att.mime_type,
+                file_size=att.file_size,
+                storage_path=att.storage_path,
+                attachment_type=att.attachment_type,
+                uploaded_by=att.uploaded_by,
+                uploaded_at=att.uploaded_at,
+            )
+            for att in (getattr(order, "attachments", None) or [])
+        ],
         report_uploaded_by=order.report_uploaded_by,
         report_date=order.report_date,
         is_amended=bool(getattr(order, "is_amended", False)),
@@ -158,6 +176,21 @@ def _build_order_response(order: RadiologyOrder, fin_state: Any) -> RadOrderResp
         has_report_file=bool(getattr(order, "has_report_file", None) if getattr(order, "has_report_file", None) is not None else order.report_file_name),
         image_file_name=order.image_file_name,
         has_image_file=bool(getattr(order, "has_image_file", None) if getattr(order, "has_image_file", None) is not None else order.image_file_name),
+        attachments=[
+            RadAttachmentResponse(
+                id=att.id,
+                hospital_id=att.hospital_id,
+                order_id=att.order_id,
+                file_name=att.file_name,
+                mime_type=att.mime_type,
+                file_size=att.file_size,
+                storage_path=att.storage_path,
+                attachment_type=att.attachment_type,
+                uploaded_by=att.uploaded_by,
+                uploaded_at=att.uploaded_at,
+            )
+            for att in (getattr(order, "attachments", None) or [])
+        ],
         report_uploaded_by=order.report_uploaded_by,
         report_date=order.report_date,
         is_amended=bool(getattr(order, "is_amended", False)),

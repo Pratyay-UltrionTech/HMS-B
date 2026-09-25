@@ -9,11 +9,12 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import case, func, or_
-from sqlalchemy.orm import Session, defer, joinedload
+from sqlalchemy.orm import Session, defer, joinedload, selectinload
 
 from modules.doctors.entities.doctor import HospitalUser
 from modules.patients.entities.patient import Patient
 from modules.radiology.entities.radiology_entities import (
+    RadiologyAttachment,
     RadiologyOrder,
     RadiologyOrderStatus,
     RadiologyScanCatalog,
@@ -114,6 +115,7 @@ class RadiologyRepository:
                 joinedload(RadiologyOrder.patient),
                 joinedload(RadiologyOrder.doctor),
                 joinedload(RadiologyOrder.scan),
+                selectinload(RadiologyOrder.attachments),
                 defer(RadiologyOrder.report_file_data),
                 defer(RadiologyOrder.image_file_data),
             )
@@ -122,6 +124,27 @@ class RadiologyRepository:
                 RadiologyOrder.hospital_id == self.hospital_id,
             )
             .first()
+        )
+
+    def get_attachment(self, attachment_id: UUID) -> RadiologyAttachment | None:
+        return (
+            self.db.query(RadiologyAttachment)
+            .filter(
+                RadiologyAttachment.id == attachment_id,
+                RadiologyAttachment.hospital_id == self.hospital_id,
+            )
+            .first()
+        )
+
+    def list_attachments_for_order(self, order_id: UUID) -> list[RadiologyAttachment]:
+        return (
+            self.db.query(RadiologyAttachment)
+            .filter(
+                RadiologyAttachment.order_id == order_id,
+                RadiologyAttachment.hospital_id == self.hospital_id,
+            )
+            .order_by(RadiologyAttachment.uploaded_at.asc())
+            .all()
         )
 
     def list_orders(
@@ -137,6 +160,7 @@ class RadiologyRepository:
             .options(
                 joinedload(RadiologyOrder.patient),
                 joinedload(RadiologyOrder.doctor),
+                selectinload(RadiologyOrder.attachments),
                 defer(RadiologyOrder.report_file_data),
                 defer(RadiologyOrder.image_file_data),
             )

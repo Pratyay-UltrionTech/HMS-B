@@ -1,13 +1,13 @@
-"""Patient Identification Label generation service.
+"""Patient Identification Label and Appointment Slip generation service.
 
-Generates standard identification sticker and wristband HTML representations
-with barcode / visual identifier, adhering to strict PHI allowlist:
-- Hospital Identity (Name, contact)
+Generates standard identification sticker (50x25mm), wristband (250x25mm),
+and appointment token slip (80mm) HTML representations with barcode / visual identifier,
+adhering to strict PHI allowlist and thermal-printer contrast guidelines:
+- Pure monochrome black-on-white (#000000 on #ffffff) for maximum thermal clarity (203/300 DPI)
 - Patient Name
 - UHID / MRN
 - Age / Gender
 - Blood Group (if known)
-- Registration Date & Time (generic label) or appointment context when encounter_id supplied
 - Machine-readable barcode (Code128 SVG / minimal opaque payload)
 
 EXCLUDES:
@@ -16,7 +16,7 @@ EXCLUDES:
 - Medication / lab values
 - Full allergen lists (only emergency flags if any)
 - National ID in clear text
-- Financial or insurance details
+- Financial or insurance details on pure identification stickers
 """
 
 from __future__ import annotations
@@ -26,17 +26,20 @@ from datetime import date, datetime, time
 
 from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
+from shared.barcodes.code128 import generate_code128_svg
 
 
 @dataclass(frozen=True)
 class LabelAppointmentContext:
-    """Resolved appointment fields for appointment-aware patient labels."""
+    """Resolved appointment fields for appointment-aware labels and slips."""
 
     op_id: str
     appointment_date: date
     appointment_time: time
     doctor_name: str | None = None
     department_name: str | None = None
+    consultation_fee: float | None = None
+    visit_type: str | None = None
 
 
 def _esc(s: str | None) -> str:
@@ -62,92 +65,15 @@ def normalize_gender_short(gender: str | None) -> str:
 def resolve_facility_branding(hospital: Hospital | None) -> tuple[str, str]:
     """Return (compact header code, display name) from facility settings or hospital record."""
     if not hospital:
-        return "Hospital", "Hospital"
+        return "HOSPITAL", "Hospital"
     stored = hospital.facility_settings or {}
     display = stored.get(
         "display_name",
         hospital.name.split(" & ")[0] if " & " in hospital.name else hospital.name,
     )
     code = stored.get("institutional_code") or hospital.hospital_id
-    header = str(code or display).strip() or "Hospital"
+    header = str(code or display).strip().upper() or "HOSPITAL"
     return header, str(display).strip() or header
-
-
-def generate_code128_svg(code: str, height: int = 40, quiet_modules: int = 10) -> str:
-    """Generate a clean, self-contained SVG representation of a Code128-B barcode."""
-    patterns = {
-        ' ': '11011001100', '!': '11001101100', '"': '11001100110', '#': '10010011000',
-        '$': '10010001100', '%': '10001001100', '&': '10011001000', "'": '10011000100',
-        '(': '10001100100', ')': '11001001000', '*': '11001000100', '+': '11000100100',
-        ',': '10110011100', '-': '10011011100', '.': '10011001110', '/': '10111001100',
-        '0': '10011101100', '1': '10011100110', '2': '11001110010', '3': '11001011100',
-        '4': '11001001110', '5': '11011100100', '6': '11001110100', '7': '11101101110',
-        '8': '11101001100', '9': '11100101100', ':': '11100100110', ';': '11101100100',
-        '<': '11100110100', '=': '11100110010', '>': '11011011000', '?': '11011000110',
-        '@': '11000110110', 'A': '10100011000', 'B': '10001011000', 'C': '10001000110',
-        'D': '10110001000', 'E': '10001101000', 'F': '10001100010', 'G': '11010001000',
-        'H': '11000101000', 'I': '11000100010', 'J': '10110111000', 'K': '10110001110',
-        'L': '10001101110', 'M': '10111011000', 'N': '10111000110', 'O': '10001110110',
-        'P': '11101110110', 'Q': '11010001110', 'R': '11000101110', 'S': '11011101000',
-        'T': '11011100010', 'U': '11011101110', 'V': '11101011000', 'W': '11101000110',
-        'X': '11100010110', 'Y': '11101101000', 'Z': '11101100010', '[': '11100011010',
-        '\\': '11101111010', ']': '11001000010', '^': '11110001010', '_': '10100110000',
-        'a': '10100001100', 'b': '10010110000', 'c': '10010000110', 'd': '10000101100',
-        'e': '10000100110', 'f': '10110010000', 'g': '10110000100', 'h': '10011010000',
-        'i': '10011000010', 'j': '10000110100', 'k': '10000110010', 'l': '11000010010',
-        'm': '11001010000', 'n': '11110111010', 'o': '11000010100', 'p': '10001111010',
-        'q': '10100111100', 'r': '10010111100', 's': '10010011110', 't': '10111100100',
-        'u': '10011110100', 'v': '10011110010', 'w': '11110100100', 'x': '11110010100',
-        'y': '11110010010', 'z': '11011011110',
-    }
-    val_map = {
-        ' ': 0, '!': 1, '"': 2, '#': 3, '$': 4, '%': 5, '&': 6, "'": 7,
-        '(': 8, ')': 9, '*': 10, '+': 11, ',': 12, '-': 13, '.': 14, '/': 15,
-        '0': 16, '1': 17, '2': 18, '3': 19, '4': 20, '5': 21, '6': 22, '7': 23,
-        '8': 24, '9': 25, ':': 26, ';': 27, '<': 28, '=': 29, '>': 30, '?': 31,
-        '@': 32, 'A': 33, 'B': 34, 'C': 35, 'D': 36, 'E': 37, 'F': 38, 'G': 39,
-        'H': 40, 'I': 41, 'J': 42, 'K': 43, 'L': 44, 'M': 45, 'N': 46, 'O': 47,
-        'P': 48, 'Q': 49, 'R': 50, 'S': 51, 'T': 52, 'U': 53, 'V': 54, 'W': 55,
-        'X': 56, 'Y': 57, 'Z': 58, '[': 59, '\\': 60, ']': 61, '^': 62, '_': 63,
-        'a': 64, 'b': 65, 'c': 66, 'd': 67, 'e': 68, 'f': 69, 'g': 70, 'h': 71,
-        'i': 72, 'j': 73, 'k': 74, 'l': 75, 'm': 76, 'n': 77, 'o': 78, 'p': 79,
-        'q': 80, 'r': 81, 's': 82, 't': 83, 'u': 84, 'v': 85, 'w': 86, 'x': 87,
-        'y': 88, 'z': 89
-    }
-
-    start_b = "11010010000"
-    stop_pattern = "1100011101011"
-
-    checksum = 104
-    bit_string = start_b
-    for idx, char in enumerate(code):
-        p = patterns.get(char, patterns[' '])
-        bit_string += p
-        checksum += val_map.get(char, 0) * (idx + 1)
-
-    check_val = checksum % 103
-    rev_map = {v: k for k, v in val_map.items()}
-    check_char = rev_map.get(check_val, ' ')
-    bit_string += patterns.get(check_char, patterns[' '])
-    bit_string += stop_pattern
-
-    bar_width = 1.4
-    quiet_width = quiet_modules * bar_width
-    rects = []
-    x = quiet_width
-    for bit in bit_string:
-        if bit == '1':
-            rects.append(f'<rect x="{x:.1f}" y="0" width="{bar_width:.1f}" height="{height}" fill="#000000" />')
-        x += bar_width
-
-    total_width = x + quiet_width
-    svg = (
-        f'<svg viewBox="0 0 {total_width:.1f} {height}" width="100%" height="{height}" '
-        f'xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet" style="display:block;">'
-        + "".join(rects)
-        + "</svg>"
-    )
-    return svg
 
 
 def _format_appointment_datetime(appt_date: date, appt_time: time) -> str:
@@ -155,25 +81,135 @@ def _format_appointment_datetime(appt_date: date, appt_time: time) -> str:
     return dt.strftime("%d-%b-%Y %H:%M")
 
 
-def _short_doctor_label(name: str | None) -> str:
-    if not name or not name.strip():
-        return "Consultant"
-    text = name.strip()
-    if len(text) <= 22:
-        return text
-    return text[:20].rstrip() + "…"
+def render_appointment_slip_html(
+    patient: Patient,
+    hospital: Hospital | None,
+    appointment: LabelAppointmentContext | None,
+    auto_print: bool = True,
+) -> str:
+    """Render a dedicated 80mm thermal receipt / OPD Token Slip."""
+    header_code, display_name = resolve_facility_branding(hospital)
+    p_name = _esc(patient.name or f"{patient.first_name} {patient.last_name}".strip())
+    p_uhid = _esc(patient.uhid)
+    sex_code = normalize_gender_short(patient.gender)
+    p_age = f"{patient.age}Y" if patient.age is not None else "—"
+
+    token_no = _esc(appointment.op_id if appointment else "OPD")
+    appt_dt = (
+        _format_appointment_datetime(appointment.appointment_date, appointment.appointment_time)
+        if appointment
+        else datetime.now().strftime("%d-%b-%Y %H:%M")
+    )
+    doctor = _esc(appointment.doctor_name if appointment and appointment.doctor_name else "Consultant")
+    dept = _esc(appointment.department_name if appointment and appointment.department_name else "General OPD")
+    fee = f"₹{appointment.consultation_fee:.2f}" if appointment and appointment.consultation_fee is not None else "—"
+    visit_type = _esc(appointment.visit_type or "OPD")
+
+    barcode_svg = generate_code128_svg(token_no, height=36, quiet_modules=8)
+    print_script = "<script>window.onload=function(){window.print();}</script>" if auto_print else ""
+
+    hosp_address = _esc(getattr(hospital, "address", "") or "")
+    hosp_phone = _esc(getattr(hospital, "phone", "") or "")
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=80mm, initial-scale=1"/>
+<title>OPD Token - {token_no}</title>
+<style>
+  @page {{
+    size: 80mm auto;
+    margin: 3mm 4mm;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    background: #ffffff;
+    color: #000000;
+    width: 72mm;
+    margin: 0 auto;
+    padding: 2mm 0;
+    font-size: 9pt;
+    line-height: 1.25;
+  }}
+  .text-center {{ text-align: center; }}
+  .bold {{ font-weight: 700; }}
+  .hosp-header {{ text-align: center; border-bottom: 1px dashed #000000; padding-bottom: 2mm; margin-bottom: 2mm; }}
+  .hosp-name {{ font-size: 11pt; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .hosp-meta {{ font-size: 7.5pt; color: #000000; }}
+  .token-box {{
+    border: 1.5px solid #000000;
+    border-radius: 2px;
+    padding: 2mm;
+    margin: 2mm 0;
+    text-align: center;
+  }}
+  .token-label {{ font-size: 7.5pt; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }}
+  .token-value {{ font-size: 16pt; font-weight: 900; letter-spacing: 1px; margin: 1mm 0; font-family: monospace; }}
+  .field-table {{ width: 100%; border-collapse: collapse; margin: 2mm 0; }}
+  .field-table td {{ padding: 1mm 0; font-size: 8.5pt; vertical-align: top; }}
+  .field-label {{ width: 26mm; color: #000000; font-weight: 600; }}
+  .field-val {{ font-weight: 700; }}
+  .divider {{ border-top: 1px dashed #000000; margin: 2mm 0; }}
+  .barcode-wrap {{ text-align: center; margin: 2mm 0; }}
+  .barcode-svg {{ display: block; margin: 0 auto; max-width: 60mm; }}
+  .barcode-txt {{ font-family: monospace; font-size: 8pt; font-weight: 700; margin-top: 1mm; }}
+  .footer-note {{ text-align: center; font-size: 7pt; font-style: italic; margin-top: 2mm; }}
+  @media print {{
+    body {{ width: 100%; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+  }}
+</style></head><body>
+  <div class="hosp-header">
+    <div class="hosp-name">{_esc(display_name)}</div>
+    {f'<div class="hosp-meta">{hosp_address}</div>' if hosp_address else ''}
+    {f'<div class="hosp-meta">Tel: {hosp_phone}</div>' if hosp_phone else ''}
+  </div>
+
+  <div class="token-box">
+    <div class="token-label">OPD APPOINTMENT TOKEN</div>
+    <div class="token-value">{token_no}</div>
+    <div style="font-size: 8pt; font-weight: 600;">{visit_type} · Slot: {appt_dt}</div>
+  </div>
+
+  <table class="field-table">
+    <tr><td class="field-label">Patient:</td><td class="field-val">{p_name}</td></tr>
+    <tr><td class="field-label">UHID:</td><td class="field-val" style="font-family: monospace;">{p_uhid}</td></tr>
+    <tr><td class="field-label">Age / Sex:</td><td class="field-val">{p_age} / {sex_code}</td></tr>
+    <tr><td class="field-label">Doctor:</td><td class="field-val">Dr. {doctor}</td></tr>
+    <tr><td class="field-label">Department:</td><td class="field-val">{dept}</td></tr>
+    <tr><td class="field-label">Consultation:</td><td class="field-val">{fee}</td></tr>
+  </table>
+
+  <div class="divider"></div>
+
+  <div class="barcode-wrap">
+    <div class="barcode-svg">{barcode_svg}</div>
+    <div class="barcode-txt">{token_no}</div>
+  </div>
+
+  <div class="footer-note">Please proceed to OPD Waiting Area. Present token when announced.</div>
+  {print_script}
+</body></html>"""
 
 
 def render_patient_label_html(
     patient: Patient,
     hospital: Hospital | None,
     encounter_id: str | None = None,
-    format_type: str = "standard",  # standard (50x25mm), wristband (250x25mm)
+    format_type: str = "standard",  # standard (50x25mm), wristband (250x25mm), slip / token (80mm)
     auto_print: bool = True,
     appointment: LabelAppointmentContext | None = None,
 ) -> str:
-    """Render patient identification label HTML adhering to Clinical Calm and standard thermal printer sizes."""
+    """Render patient identification label HTML adhering to high-contrast thermal printer standards."""
     header_code, _display_name = resolve_facility_branding(hospital)
+
+    # Dedicated appointment slip / token path
+    if format_type in {"slip", "token", "appointment_slip"}:
+        return render_appointment_slip_html(
+            patient=patient,
+            hospital=hospital,
+            appointment=appointment,
+            auto_print=auto_print,
+        )
 
     p_name = _esc(patient.name or f"{patient.first_name} {patient.last_name}".strip())
     p_uhid = _esc(patient.uhid)
@@ -183,16 +219,17 @@ def render_patient_label_html(
     p_blood = _esc(patient.blood_group or "—")
 
     created_dt = (
-        patient.created_at.strftime("%d-%b-%Y %H:%M")
+        patient.created_at.strftime("%d-%b-%Y")
         if hasattr(patient, "created_at") and patient.created_at
-        else datetime.now().strftime("%d-%b-%Y %H:%M")
+        else datetime.now().strftime("%d-%b-%Y")
     )
-    barcode_svg = generate_code128_svg(patient.uhid or "UNKNOWN", height=26, quiet_modules=10)
+    # 8.5mm barcode height for high readability on 203 DPI thermal heads
+    barcode_svg = generate_code128_svg(patient.uhid or "UNKNOWN", height=30, quiet_modules=8)
 
     print_script = "<script>window.onload=function(){window.print();}</script>" if auto_print else ""
+    enc_ref = encounter_id or (appointment.op_id if appointment else None)
 
-    enc_for_wrist = encounter_id or (appointment.op_id if appointment else None)
-
+    # Wristband format (250mm x 25mm)
     if format_type == "wristband":
         hosp_title = _esc(header_code)
         return f"""<!DOCTYPE html>
@@ -200,14 +237,23 @@ def render_patient_label_html(
 <style>
   @page {{ size: 250mm 25mm; margin: 0; }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #fff; color: #0f172a; width: 250mm; height: 25mm; display: flex; align-items: center; padding: 2mm 5mm; }}
-  .band {{ display: flex; align-items: center; justify-content: space-between; width: 100%; border-right: 1px dashed #cbd5e1; padding-right: 10mm; }}
-  .hosp {{ font-size: 8pt; font-weight: 700; text-transform: uppercase; color: #0284c7; letter-spacing: 0.5px; }}
-  .name {{ font-size: 11pt; font-weight: 800; color: #0f172a; line-height: 1.1; margin: 1mm 0; }}
-  .meta {{ font-size: 8pt; font-weight: 600; color: #334155; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    background: #ffffff;
+    color: #000000;
+    width: 250mm;
+    height: 25mm;
+    display: flex;
+    align-items: center;
+    padding: 2mm 5mm;
+  }}
+  .band {{ display: flex; align-items: center; justify-content: space-between; width: 100%; border-right: 1px dashed #000000; padding-right: 10mm; }}
+  .hosp {{ font-size: 8pt; font-weight: 800; text-transform: uppercase; color: #000000; letter-spacing: 0.5px; }}
+  .name {{ font-size: 11pt; font-weight: 900; color: #000000; line-height: 1.1; margin: 1mm 0; }}
+  .meta {{ font-size: 8pt; font-weight: 700; color: #000000; }}
   .barcode-wrap {{ width: 45mm; text-align: center; }}
-  .uhid-txt {{ font-size: 8.5pt; font-family: monospace; font-weight: 700; letter-spacing: 1px; margin-top: 1mm; }}
-  @media print {{ body {{ -webkit-print-color-adjust: exact; }} }}
+  .uhid-txt {{ font-size: 8.5pt; font-family: monospace; font-weight: 800; letter-spacing: 1px; margin-top: 1mm; color: #000000; }}
+  @media print {{ body {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }} }}
 </style></head><body>
   <div class="band">
     <div>
@@ -219,127 +265,101 @@ def render_patient_label_html(
       {barcode_svg}
       <div class="uhid-txt">{p_uhid}</div>
     </div>
-    <div style="font-size: 7pt; color: #64748b; text-align: right;">
-      {f'<div>ENC: {_esc(enc_for_wrist)}</div>' if enc_for_wrist else ''}
+    <div style="font-size: 7.5pt; color: #000000; font-weight: 600; text-align: right;">
+      {f'<div>ENC: {_esc(enc_ref)}</div>' if enc_ref else ''}
       <div>REG: {created_dt}</div>
     </div>
   </div>
   {print_script}
 </body></html>"""
 
-    appt_column = ""
-    header_right = f'<span class="reg-date">REG {created_dt}</span>'
+    # 50mm x 25mm Standard Patient Identification Label (Thermal Roll Sticker)
+    # Strictly prioritises PATIENT IDENTITY: Pure #000000 on #ffffff, no dithered blues/grays
+    blood_group_badge = f" · <strong>BG:</strong> {p_blood}" if p_blood and p_blood != "—" else ""
+    
+    appt_line = ""
     if appointment:
         appt_dt = _format_appointment_datetime(appointment.appointment_date, appointment.appointment_time)
-        doctor_line = _esc(_short_doctor_label(appointment.doctor_name))
-        dept_bit = (
-            f' · {_esc(appointment.department_name)}'
-            if appointment.department_name and appointment.department_name.strip()
-            else ""
-        )
-        header_right = f'<span class="reg-date">{_esc(appointment.op_id)}</span>'
-        appt_column = f"""
-    <div class="col-appt">
-      <div class="appt-label">APPOINTMENT</div>
-      <div class="appt-line">{_esc(appt_dt)}</div>
-      <div class="appt-line appt-doctor">{doctor_line}{dept_bit}</div>
-    </div>"""
-    elif encounter_id:
-        header_right = f'<span class="reg-date">ENC {_esc(encounter_id)}</span>'
+        doc_str = _esc(appointment.doctor_name or "Consultant")
+        enc_badge = f'<span class="enc-tag">APPOINTMENT: {_esc(appointment.op_id)}</span>'
+        appt_line = f'<div class="appt-meta">{_esc(appt_dt)} · Dr. {doc_str}</div>'
+    elif enc_ref:
+        enc_badge = f'<span class="enc-tag">{_esc(enc_ref)}</span>'
+    else:
+        enc_badge = f'<span class="enc-tag">REG {created_dt}</span>'
 
-    # Standard Patient Label / Sticker (50mm x 25mm landscape — width × height)
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=50mm, initial-scale=1"/>
-<title>Label - {p_uhid}</title>
+<title>Patient ID - {p_uhid}</title>
 <style>
   @page {{
     size: 50mm 25mm;
     margin: 0;
   }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  html {{
+  html, body {{
     width: 50mm;
     height: 25mm;
     background: #ffffff;
+    color: #000000;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   }}
   body {{
-    font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-    background: #ffffff;
-    color: #0f172a;
-    width: 50mm;
-    height: 25mm;
     padding: 1.1mm 1.6mm;
-    overflow: hidden;
   }}
   .label-container {{
     display: flex;
     flex-direction: column;
     height: 100%;
-    max-height: 100%;
-    gap: 0.25mm;
+    justify-content: space-between;
     overflow: hidden;
   }}
   .header {{
     display: flex;
     justify-content: space-between;
     align-items: center;
-    border-bottom: 0.5px solid #0f172a;
-    padding-bottom: 0.25mm;
+    border-bottom: 0.8px solid #000000;
+    padding-bottom: 0.2mm;
     flex-shrink: 0;
   }}
   .hosp-title {{
-    font-size: 5.5pt;
+    font-size: 5.8pt;
     font-weight: 800;
     text-transform: uppercase;
-    color: #0369a1;
+    color: #000000;
+    letter-spacing: 0.2px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 26mm;
-    letter-spacing: 0.2px;
+    max-width: 25mm;
   }}
-  .reg-date {{
-    font-size: 4.8pt;
-    font-weight: 600;
-    color: #475569;
+  .enc-tag {{
+    font-size: 5.2pt;
+    font-weight: 700;
+    font-family: monospace;
+    color: #000000;
     white-space: nowrap;
     text-align: right;
-    max-width: 22mm;
+    max-width: 23mm;
     overflow: hidden;
     text-overflow: ellipsis;
   }}
-  .main-row {{
-    display: flex;
+  .identity-body {{
     flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 0.2mm 0;
     min-height: 0;
-    gap: 0.8mm;
-    align-items: stretch;
-  }}
-  .col-identity {{
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 0.15mm;
-  }}
-  .col-appt {{
-    flex: 1;
-    min-width: 0;
-    border-left: 0.4px solid #0369a1;
-    padding-left: 0.5mm;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 0.1mm;
-    line-height: 1.1;
   }}
   .patient-name {{
-    font-size: 7.6pt;
-    font-weight: 800;
-    color: #0f172a;
+    font-size: 8.5pt;
+    font-weight: 900;
+    color: #000000;
     line-height: 1.05;
+    text-transform: uppercase;
     display: -webkit-box;
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
@@ -347,62 +367,49 @@ def render_patient_label_html(
     word-break: break-word;
   }}
   .demographics {{
-    font-size: 5.6pt;
-    font-weight: 600;
-    color: #334155;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }}
-  .appt-label {{
-    font-size: 4pt;
-    font-weight: 800;
-    letter-spacing: 0.35px;
-    color: #0369a1;
-    text-transform: uppercase;
-  }}
-  .appt-line {{
-    font-size: 5pt;
+    font-size: 6pt;
     font-weight: 700;
-    color: #0f172a;
+    color: #000000;
+    margin-top: 0.2mm;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }}
-  .appt-doctor {{
+  .appt-meta {{
+    font-size: 5.2pt;
     font-weight: 600;
-    color: #334155;
-    font-size: 4.8pt;
+    color: #000000;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }}
   .barcode-section {{
     display: flex;
     align-items: flex-end;
     justify-content: space-between;
-    gap: 0.8mm;
+    gap: 1mm;
     flex-shrink: 0;
-    min-height: 7.5mm;
+    height: 8mm;
   }}
   .barcode-box {{
     flex: 1;
-    min-width: 0;
-    height: 7mm;
-    max-height: 7mm;
-    padding: 0 0.5mm;
+    height: 8mm;
     overflow: hidden;
   }}
   .barcode-box svg {{
     display: block;
     width: 100%;
-    height: 100%;
-    max-height: 7mm;
+    height: 8mm;
   }}
   .uhid-display {{
-    font-size: 6.5pt;
-    font-family: ui-monospace, monospace;
-    font-weight: 800;
+    font-size: 7.2pt;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-weight: 900;
     letter-spacing: 0.35px;
+    color: #000000;
     white-space: nowrap;
-    flex-shrink: 0;
+    line-height: 1;
+    margin-bottom: 0.4mm;
   }}
   @media print {{
     @page {{
@@ -415,33 +422,24 @@ def render_patient_label_html(
       max-width: 50mm !important;
       max-height: 25mm !important;
       margin: 0 !important;
+      padding: 1.1mm 1.6mm !important;
       overflow: hidden !important;
-      page-break-after: avoid !important;
-      page-break-before: avoid !important;
       -webkit-print-color-adjust: exact;
       print-color-adjust: exact;
-    }}
-    body {{
-      padding: 1.1mm 1.6mm;
-    }}
-    .label-container {{
-      page-break-inside: avoid !important;
-      break-inside: avoid !important;
     }}
   }}
 </style></head><body>
   <div class="label-container">
     <div class="header">
       <span class="hosp-title">{_esc(header_code)}</span>
-      {header_right}
+      {enc_badge}
     </div>
-    <div class="main-row">
-      <div class="col-identity">
-        <div class="patient-name">{p_name}</div>
-        <div class="demographics">
-          <span>Age/Sex: {p_age}/{sex_code}</span> · <span>BG: {p_blood}</span>
-        </div>
-      </div>{appt_column}
+    <div class="identity-body">
+      <div class="patient-name">{p_name}</div>
+      <div class="demographics">
+        <span>Age/Sex: {p_age}/{sex_code}</span>{blood_group_badge}
+      </div>
+      {appt_line}
     </div>
     <div class="barcode-section">
       <div class="barcode-box">{barcode_svg}</div>

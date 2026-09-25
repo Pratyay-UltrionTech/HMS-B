@@ -6,19 +6,22 @@ from __future__ import annotations
 
 from io import BytesIO
 from typing import Any
+import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.radiology.actions.radiology_actions import (
+    AddAttachmentAction,
     CancelOrderAction,
     CancelRadPrescriptionRequestAction,
     CompleteScanAction,
     CreateOrdersAction,
     CreateScanAction,
+    DeleteAttachmentAction,
     DeleteScanAction,
     GetDashboardAction,
     GetOrderAction,
@@ -34,6 +37,8 @@ from modules.radiology.actions.radiology_actions import (
     UploadReportAction,
 )
 from modules.radiology.contracts.radiology_contracts import (
+    RadAttachmentResponse,
+    RadAttachmentUploadRequest,
     RadCatalogueSeedResult,
     RadDashboardResponse,
     RadOrderCreate,
@@ -336,3 +341,119 @@ def download_file(
         hospital.phone if hospital else None,
         hospital.email if hospital else None,
     )
+
+
+# ── Attachments (Dedicated Acquisition Flow) ──────────────────────────────────
+@router.post(
+    "/orders/{order_id}/attachments",
+    response_model=RadAttachmentResponse,
+    dependencies=[Depends(require_permission("radiology", "edit"))],
+)
+def upload_order_attachment(
+    order_id: UUID,
+    payload: RadAttachmentUploadRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> RadAttachmentResponse:
+    import base64
+    original_name = payload.file_name.strip()
+    mime_type = payload.mime_type.strip()
+
+    # Decode base64 data (strip optional data URI prefix).
+    # file_data is coalesced from the legacy file_data_base64 alias by validator.
+    raw_b64 = (payload.file_data or payload.file_data_base64 or "").strip()
+    if not raw_b64:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="file_data is required")
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+
+    try:
+        file_bytes = base64.b64decode(raw_b64)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid base64 attachment data")
+
+    file_size = len(file_bytes)
+
+    # 15MB limit for attachments
+    if file_size > 15 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File size exceeds the 15MB attachment limit.",
+        )
+
+    from shared.storage.local_storage import save_attachment_file
+    storage_path = save_attachment_file(
+        module="radiology",
+        hospital_id=hospital_id,
+        order_id=order_id,
+        file_id=uuid.uuid4(),
+        file_name=original_name,
+        data=file_bytes,
+    )
+
+    action = AddAttachmentAction(db, hospital_id, user)
+    return action.execute(
+        order_id=order_id,
+        file_name=original_name,
+        mime_type=mime_type,
+        file_size=file_size,
+        storage_path=storage_path,
+        attachment_type=payload.attachment_type,
+    )
+
+
+@router.get("/orders/{order_id}/attachments")
+def list_order_attachments(
+    order_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> list[RadAttachmentResponse]:
+    repo = RadiologyRepository(db, hospital_id)
+    attachments = repo.list_attachments_for_order(order_id)
+    return [RadAttachmentResponse.model_validate(a) for a in attachments]
+
+
+@router.get("/orders/{order_id}/attachments/{attachment_id}/file")
+def get_order_attachment_file(
+    order_id: UUID,
+    attachment_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> StreamingResponse:
+    repo = RadiologyRepository(db, hospital_id)
+    att = repo.get_attachment(attachment_id)
+    if not att or att.order_id != order_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found")
+
+    from shared.storage.local_storage import read_attachment_file
+    try:
+        file_bytes = read_attachment_file(att.storage_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment data missing on disk")
+
+    return StreamingResponse(
+        BytesIO(file_bytes),
+        media_type=att.mime_type,
+        headers={"Content-Disposition": f'inline; filename="{att.file_name}"'},
+    )
+
+
+@router.delete(
+    "/orders/{order_id}/attachments/{attachment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("radiology", "edit"))],
+)
+def delete_order_attachment(
+    order_id: UUID,
+    attachment_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> Response:
+    action = DeleteAttachmentAction(db, hospital_id, user)
+    action.execute(order_id, attachment_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+

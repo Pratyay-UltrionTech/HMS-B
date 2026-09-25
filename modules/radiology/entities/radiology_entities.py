@@ -186,6 +186,43 @@ class RadiologyOrder(Base):
     admission: Mapped["Admission | None"] = relationship("Admission", foreign_keys=[admission_id])
     doctor: Mapped["HospitalUser | None"] = relationship("HospitalUser", foreign_keys=[doctor_id])
     scan: Mapped["RadiologyScanCatalog | None"] = relationship("RadiologyScanCatalog", foreign_keys=[scan_id])
+    attachments: Mapped[list["RadiologyAttachment"]] = relationship(
+        "RadiologyAttachment",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        order_by="RadiologyAttachment.uploaded_at",
+    )
+
+
+class RadiologyAttachment(Base):
+    """Uploaded imaging studies, scans, or documents attached to a radiology order."""
+
+    __tablename__ = "radiology_attachments"
+    __table_args__ = (
+        Index("ix_rad_attachments_order", "order_id"),
+        Index("ix_rad_attachments_hospital", "hospital_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("radiology_orders.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(128), nullable=False, default="application/octet-stream")
+    file_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    storage_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    attachment_type: Mapped[str] = mapped_column(String(64), nullable=False, default="scan_plate")
+    uploaded_by: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    order: Mapped[RadiologyOrder] = relationship("RadiologyOrder", back_populates="attachments")
 
 
 class RadPrescriptionRequest(Base):

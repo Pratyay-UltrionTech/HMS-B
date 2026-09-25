@@ -41,10 +41,13 @@ from modules.laboratory.contracts.lab_contracts import (
     LabPrescriptionRequestResponse,
     LabReportSaveRequest,
     LabResultResponse,
+    LabSpecimenResponse,
     LabTestCreate,
     LabTestResponse,
     LabTestUpdate,
     SampleCollectRequest,
+    SpecimenCollectRequest,
+    SpecimenItemSummary,
 )
 from modules.laboratory.db.laboratory_repository import LaboratoryRepository
 from modules.laboratory.entities.lab_entities import (
@@ -60,8 +63,13 @@ from modules.laboratory.entities.lab_entities import (
     LabRequestItemStatus,
     LabResult,
     LabSampleType,
+    LabSpecimen,
+    LabSpecimenStatus,
     LabTestCatalog,
     LabTestPanel,
+)
+from modules.laboratory.services.lab_specimen_service import (
+    determine_specimen_requirement,
 )
 from modules.laboratory.services.lab_panels_service import (
     DEFAULT_PANEL_SEEDS,
@@ -89,6 +97,7 @@ from modules.laboratory.services.lab_report_service import (
 )
 from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
+from shared.audit.service import write_audit_log
 
 
 def _actor_name(user: dict) -> str:
@@ -112,6 +121,41 @@ def _build_order_response(order: LabOrder, fin: Any) -> LabOrderResponse:
     )
     is_financially_cleared = (fin.is_cleared if fin else False) or is_stat
     outstanding_amount = fin.outstanding_amount if fin else 0.0
+
+    specimens_res = []
+    for sp in (getattr(order, "specimens", None) or []):
+        sp_items = [
+            SpecimenItemSummary(
+                id=spi.id,
+                test_id=spi.test_id,
+                test_code=spi.test_code,
+                test_name=spi.test_name,
+                department=spi.department,
+                status=spi.status,
+            )
+            for spi in (sp.items or [])
+        ]
+        specimens_res.append(
+            LabSpecimenResponse(
+                id=sp.id,
+                hospital_id=sp.hospital_id,
+                order_id=sp.order_id,
+                specimen_no=sp.specimen_no,
+                sample_type=sp.sample_type,
+                container_type=sp.container_type,
+                status=sp.status,
+                collected_at=sp.collected_at,
+                collected_by=sp.collected_by,
+                collection_remarks=sp.collection_remarks,
+                barcode_value=sp.barcode_value,
+                reprint_count=sp.reprint_count,
+                last_reprinted_at=sp.last_reprinted_at,
+                last_reprinted_by=sp.last_reprinted_by,
+                created_at=sp.created_at,
+                updated_at=sp.updated_at,
+                items=sp_items,
+            )
+        )
 
     return LabOrderResponse(
         id=order.id,
@@ -155,6 +199,7 @@ def _build_order_response(order: LabOrder, fin: Any) -> LabOrderResponse:
                 department=i.department,
                 price=i.price,
                 status=i.status,
+                specimen_id=getattr(i, "specimen_id", None),
             )
             for i in items
         ],
@@ -172,6 +217,7 @@ def _build_order_response(order: LabOrder, fin: Any) -> LabOrderResponse:
             )
             for r in (order.results or [])
         ],
+        specimens=specimens_res,
     )
 
 
@@ -351,6 +397,16 @@ class CreateLabTestAction:
             is_active=payload.is_active,
         )
         self.db.add(row)
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="create",
+            entity_type="lab_test",
+            entity_id=row.id,
+            summary=f"Created lab test {row.test_name} ({row.test_code})",
+            details={"test_id": str(row.id), "test_code": row.test_code},
+        )
         self.db.commit()
         self.db.refresh(row)
         return LabTestResponse.model_validate(row)
@@ -386,6 +442,16 @@ class UpdateLabTestAction:
             row.description = payload.description.strip() if payload.description else None
         if payload.is_active is not None:
             row.is_active = payload.is_active
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="update",
+            entity_type="lab_test",
+            entity_id=row.id,
+            summary=f"Updated lab test {row.test_name} ({row.test_code})",
+            details={"test_id": str(row.id), "test_code": row.test_code},
+        )
         self.db.commit()
         self.db.refresh(row)
         return LabTestResponse.model_validate(row)
@@ -402,6 +468,16 @@ class DeleteLabTestAction:
         if not row:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lab test not found")
         row.is_active = False
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="deactivate",
+            entity_type="lab_test",
+            entity_id=test_id,
+            summary=f"Deactivated lab test {row.test_name}",
+            details={"test_id": str(test_id)},
+        )
         self.db.commit()
 
 
@@ -572,6 +648,16 @@ class CreateLabPanelAction:
                         )
                     )
 
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="create",
+            entity_type="lab_panel",
+            entity_id=panel.id,
+            summary=f"Created lab panel {panel.panel_name} ({panel.panel_code})",
+            details={"panel_id": str(panel.id), "panel_code": panel.panel_code},
+        )
         self.db.commit()
         return GetLabPanelAction(self.db, self.hospital_id).execute(panel.id)
 
@@ -615,6 +701,16 @@ class UpdateLabPanelAction:
                     )
                 )
 
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="update",
+            entity_type="lab_panel",
+            entity_id=panel.id,
+            summary=f"Updated lab panel {panel.panel_name} ({panel.panel_code})",
+            details={"panel_id": str(panel.id), "panel_code": panel.panel_code},
+        )
         self.db.commit()
         return GetLabPanelAction(self.db, self.hospital_id).execute(panel.id)
 
@@ -630,6 +726,16 @@ class DeleteLabPanelAction:
         if not panel:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Panel not found")
         panel.is_active = False
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="deactivate",
+            entity_type="lab_panel",
+            entity_id=panel_id,
+            summary=f"Deactivated lab panel {panel.panel_name}",
+            details={"panel_id": str(panel_id)},
+        )
         self.db.commit()
 
 
@@ -733,6 +839,16 @@ class CancelLabPrescriptionRequestAction:
     ) -> LabPrescriptionRequestResponse:
         req = apply_cancel_lab_prescription_request(self.db, request_id, self.hospital_id, reason)
         cancel_charge_for_source(self.db, self.hospital_id, BillingSourceType.laboratory, request_id)
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="cancel",
+            entity_type="lab_prescription_request",
+            entity_id=request_id,
+            summary="Cancelled lab prescription request",
+            details={"request_id": str(request_id)},
+        )
         if commit:
             self.db.commit()
         if sync_appointment and req.appointment_id:
@@ -761,6 +877,16 @@ class MarkLabRequestItemUnavailableAction:
             req.status = LabPrescriptionRequestStatus.cancelled
             req.cancel_reason = "All requested tests marked unavailable"
 
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="cancel_item",
+            entity_type="lab_prescription_request",
+            entity_id=request_id,
+            summary="Marked lab request item unavailable",
+            details={"request_id": str(request_id), "item_id": str(item_id)},
+        )
         self.db.commit()
         if req.appointment_id:
             sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
@@ -943,11 +1069,36 @@ class CreateLabOrderAction:
         self.db.add(order)
         self.db.flush()
 
+        # Pre-group items by physical specimen/container requirement
+        specimen_map: dict[tuple[LabSampleType, str], LabSpecimen] = {}
         for test_id, panel_id, panel_name, code, name, dept, price in item_rows:
+            # Determine required specimen container
+            cat_obj = self.db.query(LabTestCatalog).filter(LabTestCatalog.id == test_id).first() if test_id else None
+            t_sample_type = cat_obj.sample_type if cat_obj else sample_type
+            req_sample_type, req_container = determine_specimen_requirement(t_sample_type, code, name, dept)
+            spec_key = (req_sample_type, req_container)
+
+            if spec_key not in specimen_map:
+                spec_no = self.repo.next_specimen_no()
+                spec = LabSpecimen(
+                    hospital_id=self.hospital_id,
+                    order_id=order.id,
+                    specimen_no=spec_no,
+                    sample_type=req_sample_type,
+                    container_type=req_container,
+                    status=LabSpecimenStatus.pending,
+                    barcode_value=spec_no,
+                )
+                self.db.add(spec)
+                self.db.flush()
+                specimen_map[spec_key] = spec
+
+            specimen_obj = specimen_map[spec_key]
             self.db.add(
                 LabOrderItem(
                     hospital_id=self.hospital_id,
                     order_id=order.id,
+                    specimen_id=specimen_obj.id,
                     test_id=test_id,
                     panel_id=panel_id,
                     panel_name=panel_name,
@@ -1006,6 +1157,28 @@ class CreateLabOrderAction:
                 created_by_name=_actor_name(user),
             )
 
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="create",
+            entity_type="lab_order",
+            entity_id=order.id,
+            summary=f"Created lab order {order.order_no}",
+            details={"order_id": str(order.id), "order_no": order.order_no, "patient_id": str(order.patient_id)},
+        )
+        for s in specimen_map.values():
+            write_audit_log(
+                self.db,
+                hospital_id=self.hospital_id,
+                actor=user,
+                action="create",
+                entity_type="lab_specimen",
+                entity_id=s.id,
+                summary=f"Created specimen {s.specimen_no} for order {order.order_no}",
+                details={"order_id": str(order.id), "specimen_id": str(s.id), "specimen_no": s.specimen_no, "patient_id": str(order.patient_id)},
+            )
+
         self.db.commit()
 
         if appointment_id:
@@ -1034,6 +1207,16 @@ class CancelLabOrderAction:
         sync_request_after_order_change(self.db, order)
         cancel_charge_for_source(self.db, self.hospital_id, BillingSourceType.laboratory, order.id)
 
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="cancel",
+            entity_type="lab_order",
+            entity_id=order.id,
+            summary=f"Cancelled lab order {order.order_no}",
+            details={"order_id": str(order.id), "order_no": order.order_no, "patient_id": str(order.patient_id)},
+        )
         self.db.commit()
         if order.appointment_id:
             sync_appointment_after_clinical_change(self.db, self.hospital_id, order.appointment_id)
@@ -1074,18 +1257,154 @@ class CollectSampleAction:
             is_emergency_override=is_stat,
         )
 
-        order.collected_at = payload.collected_at or datetime.now(timezone.utc)
-        order.collected_by = payload.collected_by.strip()
+        coll_time = payload.collected_at or datetime.now(timezone.utc)
+        coll_by = payload.collected_by.strip()
+        order.collected_at = coll_time
+        order.collected_by = coll_by
         order.collection_remarks = (
             payload.collection_remarks.strip() if payload.collection_remarks else None
         )
         if payload.sample_type:
             order.sample_type = payload.sample_type
         order.status = LabOrderStatus.sample_collected
+
+        # Mark all pending specimens as collected
+        for sp in (order.specimens or []):
+            if sp.status == LabSpecimenStatus.pending:
+                sp.status = LabSpecimenStatus.collected
+                sp.collected_at = coll_time
+                sp.collected_by = coll_by
+                sp.collection_remarks = order.collection_remarks
+
         sync_request_after_order_change(self.db, order)
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="collect_sample",
+            entity_type="lab_order",
+            entity_id=order.id,
+            summary=f"Collected sample for lab order {order.order_no}",
+            details={"order_id": str(order.id), "order_no": order.order_no, "status": order.status.value, "patient_id": str(order.patient_id)},
+        )
 
         self.db.commit()
         return GetLabOrderAction(self.db, self.hospital_id).execute(order_id)
+
+
+class CollectSpecimenAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.hospital_id = hospital_id
+        self.repo = LaboratoryRepository(db, hospital_id)
+
+    def execute(self, order_id: UUID, specimen_id: UUID, payload: SpecimenCollectRequest, user: dict) -> LabOrderResponse:
+        order = self.repo.get_order(order_id)
+        if not order:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lab order not found")
+        if order.status in {LabOrderStatus.cancelled, LabOrderStatus.completed}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot collect specimen for this order",
+            )
+
+        specimen = next((s for s in (order.specimens or []) if s.id == specimen_id), None)
+        if not specimen:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Specimen not found on order")
+
+        if specimen.status == LabSpecimenStatus.collected:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Specimen has already been collected")
+
+        # Emergency STAT order bypasses financial clearance
+        is_stat = bool(
+            getattr(order, "is_emergency", False)
+            or (order.clinical_notes and "STAT" in order.clinical_notes.upper())
+            or (order.collection_remarks and "STAT" in order.collection_remarks.upper())
+        )
+
+        assert_service_financially_cleared(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.laboratory,
+            order.id,
+            action_description="collect specimen",
+            is_emergency_override=is_stat,
+        )
+
+        coll_time = payload.collected_at or datetime.now(timezone.utc)
+        coll_by = payload.collected_by.strip()
+
+        specimen.status = LabSpecimenStatus.collected
+        specimen.collected_at = coll_time
+        specimen.collected_by = coll_by
+        specimen.collection_remarks = (
+            payload.collection_remarks.strip() if payload.collection_remarks else None
+        )
+
+        # Update order-level collected info
+        if not order.collected_at:
+            order.collected_at = coll_time
+            order.collected_by = coll_by
+
+        # If all specimens are collected, transition order to sample_collected
+        all_specs = order.specimens or []
+        all_collected = all(s.status == LabSpecimenStatus.collected for s in all_specs)
+        if all_collected:
+            order.status = LabOrderStatus.sample_collected
+            sync_request_after_order_change(self.db, order)
+
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="collect",
+            entity_type="lab_specimen",
+            entity_id=specimen.id,
+            summary=f"Collected specimen {specimen.specimen_no} for order {order.order_no}",
+            details={"order_id": str(order.id), "specimen_id": str(specimen.id), "specimen_no": specimen.specimen_no, "patient_id": str(order.patient_id)},
+        )
+        if all_collected:
+            write_audit_log(
+                self.db,
+                hospital_id=self.hospital_id,
+                actor=user,
+                action="status_change",
+                entity_type="lab_order",
+                entity_id=order.id,
+                summary=f"Lab order {order.order_no} status changed to {order.status.value}",
+                details={"order_id": str(order.id), "status": order.status.value, "patient_id": str(order.patient_id)},
+            )
+
+        self.db.commit()
+        return GetLabOrderAction(self.db, self.hospital_id).execute(order_id)
+
+
+class ReprintSpecimenLabelAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.hospital_id = hospital_id
+        self.repo = LaboratoryRepository(db, hospital_id)
+
+    def execute(self, specimen_id: UUID, user: dict) -> LabSpecimen:
+        specimen = self.repo.get_specimen(specimen_id)
+        if not specimen:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Specimen not found")
+
+        specimen.reprint_count = int(specimen.reprint_count or 0) + 1
+        specimen.last_reprinted_at = datetime.now(timezone.utc)
+        specimen.last_reprinted_by = _actor_name(user)
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="reprint_label",
+            entity_type="lab_specimen",
+            entity_id=specimen.id,
+            summary=f"Reprinted label for specimen {specimen.specimen_no}",
+            details={"order_id": str(specimen.order_id), "specimen_id": str(specimen.id)},
+        )
+        self.db.commit()
+        return specimen
 
 
 class UpdateItemStatusAction:
@@ -1112,6 +1431,16 @@ class UpdateItemStatusAction:
                 order.status = LabOrderStatus.in_progress
         _sync_order_status_from_items(order)
 
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="update_item_status",
+            entity_type="lab_order",
+            entity_id=order.id,
+            summary=f"Updated item {item.test_name} status to {payload.status.value} on order {order.order_no}",
+            details={"order_id": str(order.id), "item_id": str(item_id), "status": payload.status.value, "patient_id": str(order.patient_id)},
+        )
         self.db.commit()
         order = self.repo.get_order(order_id)
         if order.status == LabOrderStatus.completed and order.appointment_id:
@@ -1170,6 +1499,28 @@ class SaveLabResultsAction:
             order.status = LabOrderStatus.in_progress
 
         sync_request_after_order_change(self.db, order)
+        action_name = "finalize" if payload.mark_completed else ("amend" if is_completed_edit else "save")
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action=action_name,
+            entity_type="lab_result",
+            entity_id=order.id,
+            summary=f"Saved laboratory results for order {order.order_no}",
+            details={"order_id": str(order.id), "order_no": order.order_no, "is_completed": bool(payload.mark_completed), "patient_id": str(order.patient_id)},
+        )
+        if payload.mark_completed:
+            write_audit_log(
+                self.db,
+                hospital_id=self.hospital_id,
+                actor=user,
+                action="complete",
+                entity_type="lab_order",
+                entity_id=order.id,
+                summary=f"Completed lab order {order.order_no}",
+                details={"order_id": str(order.id), "status": "completed", "patient_id": str(order.patient_id)},
+            )
         self.db.commit()
 
         order = self.repo.get_order(order_id)

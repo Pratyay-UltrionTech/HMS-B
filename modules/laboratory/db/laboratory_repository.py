@@ -26,9 +26,12 @@ from modules.laboratory.entities.lab_entities import (
     LabPrescriptionRequestStatus,
     LabRequestItemStatus,
     LabResult,
+    LabSpecimen,
+    LabSpecimenStatus,
     LabTestCatalog,
     LabTestPanel,
 )
+from modules.patients.entities.patient import Patient
 
 
 class LaboratoryRepository:
@@ -177,6 +180,10 @@ class LaboratoryRepository:
                 # selectinload fetches them in separate IN(...) queries instead.
                 selectinload(LabOrder.items),
                 selectinload(LabOrder.results),
+                # Response serialization includes specimen metadata and items.
+                # Eager-load both levels so a queue page does not issue one or
+                # two extra queries for every order while building the response.
+                selectinload(LabOrder.specimens).selectinload(LabSpecimen.items),
             )
             .filter(LabOrder.hospital_id == self.hospital_id)
         )
@@ -193,9 +200,50 @@ class LaboratoryRepository:
             end_dt = datetime.combine(order_date, time.max).replace(tzinfo=timezone.utc)
             q = q.filter(LabOrder.ordered_at >= start_dt, LabOrder.ordered_at <= end_dt)
         if search:
-            term = f"%{search}%"
-            q = q.filter(LabOrder.order_no.ilike(term))
+            term = f"%{search.strip()}%"
+            q = q.filter(
+                or_(
+                    LabOrder.order_no.ilike(term),
+                    LabOrder.patient.has(
+                        or_(
+                            Patient.name.ilike(term),
+                            Patient.uhid.ilike(term),
+                        )
+                    ),
+                )
+            )
         return q.order_by(LabOrder.ordered_at.desc()).limit(limit).offset(offset).all()
+
+    # ── Specimens ──────────────────────────────────────────────────────────────
+    def next_specimen_no(self) -> str:
+        today_str = datetime.now(timezone.utc).strftime("%d%m%y")
+        count = (
+            self.db.query(func.count(LabSpecimen.id))
+            .filter(LabSpecimen.hospital_id == self.hospital_id)
+            .scalar()
+            or 0
+        )
+        return f"S{today_str}{int(count) + 1:05d}"
+
+    def get_specimen(self, specimen_id: UUID) -> LabSpecimen | None:
+        return (
+            self.db.query(LabSpecimen)
+            .options(
+                joinedload(LabSpecimen.order).joinedload(LabOrder.patient),
+                selectinload(LabSpecimen.items),
+            )
+            .filter(LabSpecimen.id == specimen_id, LabSpecimen.hospital_id == self.hospital_id)
+            .first()
+        )
+
+    def list_specimens_for_order(self, order_id: UUID) -> list[LabSpecimen]:
+        return (
+            self.db.query(LabSpecimen)
+            .options(selectinload(LabSpecimen.items))
+            .filter(LabSpecimen.order_id == order_id, LabSpecimen.hospital_id == self.hospital_id)
+            .order_by(LabSpecimen.created_at.asc())
+            .all()
+        )
 
     def get_order(self, order_id: UUID) -> LabOrder | None:
         return (
@@ -203,11 +251,10 @@ class LaboratoryRepository:
             .options(
                 joinedload(LabOrder.patient),
                 joinedload(LabOrder.doctor),
-                # items/results are one-to-many: joinedload here would multiply
-                # each order row by (item_count * result_count) over the wire.
-                # selectinload fetches them in separate IN(...) queries instead.
+                # items/results/specimens are one-to-many:
                 selectinload(LabOrder.items),
                 selectinload(LabOrder.results),
+                selectinload(LabOrder.specimens).selectinload(LabSpecimen.items),
             )
             .filter(LabOrder.id == order_id, LabOrder.hospital_id == self.hospital_id)
             .first()

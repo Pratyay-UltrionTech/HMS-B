@@ -18,7 +18,48 @@ from modules.laboratory.entities.lab_entities import (
     LabPrescriptionRequestStatus,
     LabRequestItemStatus,
     LabSampleType,
+    LabSpecimenStatus,
 )
+
+
+# ── Specimens ──────────────────────────────────────────────────────────────────
+class SpecimenItemSummary(BaseModel):
+    id: UUID
+    test_id: UUID | None
+    test_code: str
+    test_name: str
+    department: str
+    status: LabItemStatus
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class LabSpecimenResponse(BaseModel):
+    id: UUID
+    hospital_id: UUID
+    order_id: UUID
+    specimen_no: str
+    sample_type: LabSampleType
+    container_type: str
+    status: LabSpecimenStatus
+    collected_at: datetime | None = None
+    collected_by: str | None = None
+    collection_remarks: str | None = None
+    barcode_value: str
+    reprint_count: int = 0
+    last_reprinted_at: datetime | None = None
+    last_reprinted_by: str | None = None
+    created_at: datetime
+    updated_at: datetime | None = None
+    items: list[SpecimenItemSummary] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SpecimenCollectRequest(BaseModel):
+    collected_by: str = Field(min_length=1, max_length=255)
+    collected_at: datetime | None = None
+    collection_remarks: str | None = None
 
 
 # ── Catalogue ──────────────────────────────────────────────────────────────────
@@ -186,6 +227,7 @@ class LabOrderItemResponse(BaseModel):
     department: str
     price: float
     status: LabItemStatus
+    specimen_id: UUID | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -245,6 +287,7 @@ class LabOrderResponse(BaseModel):
     panel_names: str | None = None
     items: list[LabOrderItemResponse] = []
     results: list[LabResultResponse] = []
+    specimens: list[LabSpecimenResponse] = []
     payment_status: str = "pending"
     is_financially_cleared: bool = False
     net_amount: float = 0.0
