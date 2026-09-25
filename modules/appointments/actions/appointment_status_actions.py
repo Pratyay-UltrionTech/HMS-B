@@ -506,6 +506,12 @@ class AdmitIpdAction:
                 bed_id=payload.bed_id,
             ) from exc
 
+        billing_svc.ensure_financial_account(
+            hospital_id=self.hospital_id,
+            patient_id=patient.id,
+            admission_id=admission.id,
+            created_by_name=actor_name,
+        )
         billing_svc.ensure_admission_charge(
             hospital_id=self.hospital_id,
             patient_id=patient.id,
@@ -514,6 +520,20 @@ class AdmitIpdAction:
             admission_fee=float(getattr(bed.ward, "admission_fee", 0) or 0) if bed.ward else 0.0,
             created_by_name=actor_name,
         )
+
+        consultant_id = getattr(payload, "doctor_id", None) or getattr(appt, "doctor_id", None)
+        if consultant_id:
+            from modules.inpatient.db.care_team_repository import CareTeamRepository
+            from modules.inpatient.entities.care_team import AdmissionCareTeamRole
+            user_id = user.get("id") or user.get("sub")
+            CareTeamRepository(self.db, self.hospital_id).add_member(
+                admission_id=admission.id,
+                doctor_id=consultant_id,
+                role=AdmissionCareTeamRole.primary_consultant,
+                assigned_by_id=UUID(str(user_id)) if user_id else None,
+                assigned_by_name=actor_name,
+                notes="Primary consultant assigned upon transfer from OPD",
+            )
 
         appt.status = AppointmentStatus.transferred_to_inpatient
         appt.admission_id = admission.id

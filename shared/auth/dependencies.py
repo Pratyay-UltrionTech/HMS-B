@@ -7,7 +7,7 @@ Admin functionality (super_admin, hospital_admin) remains frozen and fully bypas
 """
 
 import time
-from typing import Any
+from typing import Any, Sequence
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
@@ -176,6 +176,35 @@ def require_permission(module_key: str, action: str = "view"):
         db: Any = Depends(get_transitional_sync_session),
     ) -> dict[str, Any]:
         return authorization.require(user, (module_key, action), resource=None, db=db)
+
+    return _dependency
+
+
+def require_any_permission(allowed_specs: Sequence[tuple[str, str]]):
+    """
+    FastAPI dependency enforcing that the user has at least one of the specified
+    (module_key, action) permissions (e.g. view permissions across doctors, nurses, all_ipd, bed).
+    Admin roles (super_admin, hospital_admin) bypass checks.
+    """
+    from infrastructure.postgres.session import get_transitional_sync_session
+
+    def _dependency(
+        user: dict[str, Any] = Depends(require_hospital_user),
+        db: Any = Depends(get_transitional_sync_session),
+    ) -> dict[str, Any]:
+        role = user.get("role")
+        if role in {"super_admin", "hospital_admin"}:
+            return user
+
+        for module_key, action in allowed_specs:
+            decision = authorization.evaluate(user, (module_key, action), resource=None, db=db)
+            if decision.allowed:
+                return user
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: required permission not found in user roles",
+        )
 
     return _dependency
 

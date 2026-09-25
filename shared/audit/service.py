@@ -69,7 +69,7 @@ class AuditService:
         try:
             if hasattr(session, "info"):
                 session.info.setdefault("pending_sync_events", []).append(
-                    (hospital_id, entity_type, action, str(entity_id) if entity_id is not None else None)
+                    (hospital_id, entity_type, action, str(entity_id) if entity_id is not None else None, details)
                 )
         except Exception:
             pass
@@ -145,7 +145,7 @@ def write_audit_log_autonomous(
         audit_session.add(row)
         audit_session.commit()
     try:
-        sync_broker.publish(hospital_id, entity_type, action, entity_id)
+        sync_broker.publish(hospital_id, entity_type, action, entity_id, details=details)
     except Exception:
         pass
     return row
@@ -163,9 +163,14 @@ def _dispatch_pending_sync_events(session: Session) -> None:
     events = session.info.pop("pending_sync_events", None) if hasattr(session, "info") else None
     if not events:
         return
-    for h_id, ent_type, act, ent_id in events:
+    for item in events:
         try:
-            sync_broker.publish(h_id, ent_type, act, ent_id)
+            if len(item) >= 5:
+                h_id, ent_type, act, ent_id, details = item[:5]
+                sync_broker.publish(h_id, ent_type, act, ent_id, details=details)
+            else:
+                h_id, ent_type, act, ent_id = item
+                sync_broker.publish(h_id, ent_type, act, ent_id)
         except Exception:
             pass
 

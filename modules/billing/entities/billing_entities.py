@@ -18,6 +18,7 @@ Maps directly to:
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 import enum
 import uuid
 
@@ -30,10 +31,12 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -144,6 +147,14 @@ class FinancialAccount(Base):
     __tablename__ = "financial_accounts"
     __table_args__ = (
         UniqueConstraint("hospital_id", "account_number", name="uq_financial_account_number"),
+        Index(
+            "uq_financial_accounts_open_ipd_admission",
+            "hospital_id",
+            "admission_id",
+            unique=True,
+            postgresql_where=text("admission_id IS NOT NULL AND account_type = 'ipd' AND status = 'open'"),
+            sqlite_where=text("admission_id IS NOT NULL AND account_type = 'ipd' AND status = 'open'"),
+        ),
         Index("ix_financial_accounts_patient_status", "hospital_id", "patient_id", "status"),
     )
 
@@ -227,17 +238,17 @@ class BillingCharge(Base):
         UUID(as_uuid=True), nullable=True, index=True
     )
     description: Mapped[str] = mapped_column(String(512), nullable=False)
-    quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    unit_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    charge_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    discount_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("1.0"))
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    charge_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    discount_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
     discount_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     discount_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    tax_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
     gst_rate: Mapped[float | None] = mapped_column(Float, nullable=True, default=0.0)
     hsn_sac_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    net_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    amount_paid: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    net_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    amount_paid: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
     status: Mapped[BillingChargeStatus] = mapped_column(
         Enum(BillingChargeStatus, name="billing_charge_status"),
         nullable=False,
@@ -283,7 +294,7 @@ class BillingPayment(Base):
     account_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("financial_accounts.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     payment_date: Mapped[date] = mapped_column(Date, nullable=False)
     payment_method: Mapped[BillingPaymentMethod] = mapped_column(
         Enum(BillingPaymentMethod, name="billing_payment_method"),
@@ -291,6 +302,7 @@ class BillingPayment(Base):
         default=BillingPaymentMethod.cash,
     )
     reference_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     received_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
@@ -337,7 +349,7 @@ class BillingPaymentAllocation(Base):
     charge_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("billing_charges.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    allocated_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    allocated_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -374,6 +386,9 @@ class BillingDeposit(Base):
     account_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("financial_accounts.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    admission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     deposit_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     deposit_date: Mapped[date] = mapped_column(Date, nullable=False)
     deposit_type: Mapped[str] = mapped_column(String(32), nullable=False, default="admission")  # admission, surgical, general
@@ -382,8 +397,8 @@ class BillingDeposit(Base):
         nullable=False,
         default=BillingPaymentMethod.cash,
     )
-    original_amount: Mapped[float] = mapped_column(Float, nullable=False)
-    available_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    original_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    available_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     status: Mapped[DepositStatus] = mapped_column(
         Enum(DepositStatus, name="billing_deposit_status"),
         nullable=False,
@@ -391,6 +406,7 @@ class BillingDeposit(Base):
         index=True,
     )
     reference_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     received_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
@@ -446,7 +462,7 @@ class BillingRefund(Base):
         nullable=False,
         default=BillingPaymentMethod.cash,
     )
-    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     reason: Mapped[str] = mapped_column(String(512), nullable=False)
     status: Mapped[RefundStatus] = mapped_column(
         Enum(RefundStatus, name="billing_refund_status"),
@@ -490,14 +506,14 @@ class BillingInvoice(Base):
     )
     invoice_number: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     invoice_date: Mapped[date] = mapped_column(Date, nullable=False)
-    subtotal: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    discount_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    taxable_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    tax_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    cgst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    sgst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    igst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    grand_total: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    subtotal: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    discount_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    taxable_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    cgst_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    sgst_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    igst_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    grand_total: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
     status: Mapped[BillingInvoiceStatus] = mapped_column(
         Enum(BillingInvoiceStatus, name="billing_invoice_status"),
         nullable=False,
@@ -538,13 +554,13 @@ class BillingInvoiceLine(Base):
     )
     source_type: Mapped[str] = mapped_column(String(64), nullable=False, default="other")
     description: Mapped[str] = mapped_column(String(512), nullable=False)
-    quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("1.0"))
+    rate: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
     hsn_sac_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    gst_rate: Mapped[float | None] = mapped_column(Float, nullable=True, default=0.0)
-    cgst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    sgst_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    gst_rate: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True, default=Decimal("0.0"))
+    cgst_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
+    sgst_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.0"))
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -589,7 +605,7 @@ class BillingReceipt(Base):
         nullable=False,
         default=BillingPaymentMethod.cash,
     )
-    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     reference_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[BillingReceiptStatus] = mapped_column(

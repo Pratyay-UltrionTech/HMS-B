@@ -253,6 +253,7 @@ class BillingRepository:
         *,
         patient_id: UUID | None = None,
         account_id: UUID | None = None,
+        admission_id: UUID | None = None,
         status: DepositStatus | None = None,
         from_date: date | None = None,
         to_date: date | None = None,
@@ -268,6 +269,8 @@ class BillingRepository:
             q = q.filter(BillingDeposit.patient_id == patient_id)
         if account_id:
             q = q.filter(BillingDeposit.account_id == account_id)
+        if admission_id:
+            q = q.filter(BillingDeposit.admission_id == admission_id)
         if status:
             q = q.filter(BillingDeposit.status == status)
         if from_date:

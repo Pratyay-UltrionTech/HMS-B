@@ -187,6 +187,7 @@ class BillingPaymentCreate(BaseModel):
     payment_method: BillingPaymentMethod = BillingPaymentMethod.cash
     notes: str | None = None
     reference_number: str | None = Field(default=None, max_length=128)
+    idempotency_key: str | None = Field(default=None, max_length=128)
     linked_invoice_id: UUID | None = None
     # Selective payment allocations (if specified, funds allocate strictly to these charges)
     allocations: list[ChargeAllocationItem] | None = None
@@ -213,6 +214,7 @@ class BillingPaymentResponse(BaseModel):
     payment_date: date
     payment_method: BillingPaymentMethod
     reference_number: str | None = None
+    idempotency_key: str | None = None
     notes: str | None = None
     received_by_name: str = ""
     created_at: datetime
@@ -230,11 +232,13 @@ class BillingPaymentResponse(BaseModel):
 class BillingDepositCreate(BaseModel):
     patient_id: UUID
     account_id: UUID | None = None
+    admission_id: UUID | None = None
     amount: float = Field(gt=0)
     deposit_date: date | None = None
     deposit_type: str = "admission"  # admission, surgical, general
     payment_method: BillingPaymentMethod = BillingPaymentMethod.cash
     reference_number: str | None = Field(default=None, max_length=128)
+    idempotency_key: str | None = Field(default=None, max_length=128)
     notes: str | None = None
 
 
@@ -247,6 +251,7 @@ class BillingDepositResponse(BaseModel):
     hospital_id: UUID
     patient_id: UUID
     account_id: UUID | None = None
+    admission_id: UUID | None = None
     deposit_number: str
     deposit_date: date
     deposit_type: str
@@ -255,6 +260,7 @@ class BillingDepositResponse(BaseModel):
     available_amount: float
     status: DepositStatus
     reference_number: str | None = None
+    idempotency_key: str | None = None
     notes: str | None = None
     received_by_name: str = ""
     created_at: datetime

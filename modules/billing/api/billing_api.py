@@ -410,6 +410,7 @@ def close_financial_account_route(
 def list_deposits(
     patient_id: UUID | None = Query(default=None),
     account_id: UUID | None = Query(default=None),
+    admission_id: UUID | None = Query(default=None),
     status_filter: DepositStatus | None = Query(default=None, alias="status"),
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
@@ -422,6 +423,7 @@ def list_deposits(
     return ListDepositsAction(db, hospital_id).execute(
         patient_id=patient_id,
         account_id=account_id,
+        admission_id=admission_id,
         status=status_filter,
         from_date=from_date,
         to_date=to_date,

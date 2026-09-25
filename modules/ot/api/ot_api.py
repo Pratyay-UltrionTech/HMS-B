@@ -76,23 +76,26 @@ def dashboard(
 def list_surgeries(
     status_filter: str | None = Query(None, alias="status"),
     patient_id: UUID | None = None,
+    ward_id: UUID | None = Query(None),
     search: str | None = None,
     schedule_only: bool | None = Query(None),
     ongoing_only: bool | None = Query(None),
     history_only: bool | None = Query(None),
     notes_pending: bool | None = Query(None),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[OtSurgeryResponse]:
     return ListSurgeriesAction(db, hospital_id).execute(
         status_filter=status_filter,
         patient_id=patient_id,
+        ward_id=ward_id,
         search=search,
         schedule_only=schedule_only,
         ongoing_only=ongoing_only,
         history_only=history_only,
         notes_pending=notes_pending,
+        user=user,
     )
 
 

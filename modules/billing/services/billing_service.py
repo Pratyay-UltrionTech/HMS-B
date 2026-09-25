@@ -7,11 +7,12 @@ Conforms to UltrionTech-Backend-Template modules/billing/services/ specification
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from decimal import Decimal
 import math
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from modules.billing.entities.billing_entities import (
@@ -79,6 +80,18 @@ def get_or_create_financial_account(
         existing = query.filter(FinancialAccount.admission_id == admission_id).first()
         if existing:
             return existing
+        # Serialize first-account creation for this admission. A partial unique
+        # index below remains the database-level guard for callers racing here.
+        from modules.inpatient.entities.admission import Admission
+
+        db.query(Admission.id).filter(
+            Admission.id == admission_id,
+            Admission.hospital_id == hospital_id,
+            Admission.patient_id == patient_id,
+        ).with_for_update().first()
+        existing = query.filter(FinancialAccount.admission_id == admission_id).first()
+        if existing:
+            return existing
     elif appointment_id:
         existing = query.filter(FinancialAccount.appointment_id == appointment_id).first()
         if existing:
@@ -122,8 +135,17 @@ def get_or_create_financial_account(
         appointment_id=appointment_id,
         created_by_name=created_by_name,
     )
-    db.add(account)
-    db.flush()
+    try:
+        with db.begin_nested():
+            db.add(account)
+            db.flush()
+    except Exception:
+        # Concurrent insert might have completed for this admission
+        if admission_id:
+            existing = query.filter(FinancialAccount.admission_id == admission_id).first()
+            if existing:
+                return existing
+        raise
     return account
 
 
@@ -288,8 +310,11 @@ def ensure_admission_charge(
     ward_name: str | None,
     admission_fee: float,
     created_by_name: str = "",
-) -> BillingCharge:
+) -> BillingCharge | None:
     """Record one-time admission charge for IPD stay."""
+    fee = float(admission_fee or 0)
+    if fee <= 0:
+        return None
     return ensure_charge(
         db,
         hospital_id=hospital_id,
@@ -297,7 +322,7 @@ def ensure_admission_charge(
         source_type=BillingSourceType.admission,
         source_id=admission_id,
         description=f"Admission Charge — {ward_name or 'Ward'}"[:512],
-        charge_amount=float(admission_fee or 0),
+        charge_amount=fee,
         created_by_name=created_by_name or "System",
     )
 
@@ -346,6 +371,8 @@ def ensure_bed_charge_for_admission(
             notes_parts.append(f"seg(rate={seg_rate}, days={seg_days}, amt={seg_amount})")
         
         amount = round(total_amount, 2)
+        if amount <= 0:
+            return None
         days = max(1, total_days)
         day_label = "Day" if days == 1 else "Days"
         place = " / ".join(
@@ -367,6 +394,8 @@ def ensure_bed_charge_for_admission(
 
     days = bed_stay_days(admitted_at, discharged_at)
     amount = round(float(bed_charge_per_day or 0) * days, 2)
+    if amount <= 0:
+        return None
     day_label = "Day" if days == 1 else "Days"
     place = " / ".join(
         p for p in [ward_name or None, room_code or None, bed_code or None] if p
@@ -474,11 +503,18 @@ def allocate_specific_charges(
     payment_id: UUID | None = None,
     deposit_id: UUID | None = None,
     created_by_name: str = "Cashier",
+    account_id: UUID | None = None,
 ) -> float:
     """
     Selectively allocate money strictly to specific charges chosen by cashier.
     Applies any per-item discount requested at settlement before recording allocations.
+    Enforces that charges belong to the scoped account_id when account-bound.
     """
+    if deposit_id and account_id is None:
+        dep_row = db.query(BillingDeposit.account_id).filter(BillingDeposit.id == deposit_id).first()
+        if dep_row and dep_row[0]:
+            account_id = dep_row[0]
+
     total_allocated = 0.0
     for item in allocations_plan:
         cid = item["charge_id"]
@@ -499,6 +535,12 @@ def allocate_specific_charges(
         )
         if not charge:
             continue
+
+        if account_id and charge.account_id != account_id:
+            raise ValueError(
+                f"Cross-account allocation prohibited: Charge {charge.id} belongs to account {charge.account_id}, "
+                f"which does not match the required account {account_id}."
+            )
 
         # If discount is specified at payment settlement, apply and recalculate net.
         # Convention mirrors UpdateChargeAction: effective discount is
@@ -567,6 +609,7 @@ def create_payment(
     received_by_name: str,
     account_id: UUID | None = None,
     reference_number: str | None = None,
+    idempotency_key: str | None = None,
     allocations_plan: list[dict[str, Any]] | None = None,
     allocate: bool = True,
 ) -> BillingPayment:
@@ -574,7 +617,20 @@ def create_payment(
     Record patient payment tender.
     If allocations_plan is supplied, selectively allocates to those exact charges.
     Otherwise, if allocate=True, applies FIFO across open charges.
+    Idempotent on (hospital_id, idempotency_key).
     """
+    if idempotency_key:
+        existing = (
+            db.query(BillingPayment)
+            .filter(
+                BillingPayment.hospital_id == hospital_id,
+                BillingPayment.idempotency_key == idempotency_key,
+            )
+            .first()
+        )
+        if existing:
+            return existing
+
     pay = BillingPayment(
         hospital_id=hospital_id,
         patient_id=patient_id,
@@ -583,6 +639,7 @@ def create_payment(
         payment_date=payment_date,
         payment_method=payment_method,
         reference_number=reference_number,
+        idempotency_key=idempotency_key,
         notes=notes,
         received_by_name=received_by_name or "Staff",
     )
@@ -597,6 +654,7 @@ def create_payment(
             allocations_plan,
             payment_id=pay.id,
             created_by_name=received_by_name,
+            account_id=account_id,
         )
     elif allocate:
         allocate_payment_to_charges(
@@ -657,17 +715,82 @@ def create_deposit(
     deposit_type: str = "admission",
     payment_method: BillingPaymentMethod = BillingPaymentMethod.cash,
     account_id: UUID | None = None,
+    admission_id: UUID | None = None,
     reference_number: str | None = None,
+    idempotency_key: str | None = None,
     notes: str | None = None,
     received_by_name: str = "Cashier",
 ) -> BillingDeposit:
-    """Record advance deposit held as unearned liability."""
+    """Record advance deposit held as unearned liability. Validates admission and account integrity."""
+    if idempotency_key:
+        existing = (
+            db.query(BillingDeposit)
+            .filter(
+                BillingDeposit.hospital_id == hospital_id,
+                BillingDeposit.idempotency_key == idempotency_key,
+            )
+            .first()
+        )
+        if existing:
+            return existing
+
+    # Integrity verification
+    if admission_id is not None:
+        from modules.inpatient.entities.admission import Admission
+        adm = (
+            db.query(Admission)
+            .filter(Admission.id == admission_id, Admission.hospital_id == hospital_id)
+            .first()
+        )
+        if not adm:
+            raise ValueError(f"Admission {admission_id} not found in hospital")
+        if adm.patient_id != patient_id:
+            raise ValueError(f"Admission {admission_id} belongs to patient {adm.patient_id}, not {patient_id}")
+
+        if account_id is not None:
+            acc = (
+                db.query(FinancialAccount)
+                .filter(FinancialAccount.id == account_id, FinancialAccount.hospital_id == hospital_id)
+                .first()
+            )
+            if not acc:
+                raise ValueError(f"FinancialAccount {account_id} not found")
+            if acc.patient_id != patient_id:
+                raise ValueError(f"FinancialAccount {account_id} belongs to a different patient")
+            if acc.admission_id != admission_id:
+                raise ValueError(
+                    f"FinancialAccount {account_id} is associated with admission {acc.admission_id}, not {admission_id}"
+                )
+        else:
+            acc = get_or_create_financial_account(
+                db,
+                hospital_id=hospital_id,
+                patient_id=patient_id,
+                account_type=FinancialAccountType.ipd,
+                admission_id=admission_id,
+                created_by_name=received_by_name,
+            )
+            account_id = acc.id
+    elif account_id is not None:
+        acc = (
+            db.query(FinancialAccount)
+            .filter(FinancialAccount.id == account_id, FinancialAccount.hospital_id == hospital_id)
+            .first()
+        )
+        if not acc:
+            raise ValueError(f"FinancialAccount {account_id} not found")
+        if acc.patient_id != patient_id:
+            raise ValueError(f"FinancialAccount {account_id} belongs to a different patient")
+        if acc.admission_id:
+            admission_id = acc.admission_id
+
     dep_amt = round(float(amount), 2)
     deposit_num = next_deposit_number(db, hospital_id)
     deposit = BillingDeposit(
         hospital_id=hospital_id,
         patient_id=patient_id,
         account_id=account_id,
+        admission_id=admission_id,
         deposit_number=deposit_num,
         deposit_date=deposit_date,
         deposit_type=deposit_type,
@@ -676,6 +799,7 @@ def create_deposit(
         available_amount=dep_amt,
         status=DepositStatus.available,
         reference_number=reference_number,
+        idempotency_key=idempotency_key,
         notes=notes,
         received_by_name=received_by_name,
     )
@@ -691,9 +815,11 @@ def draw_down_deposit_for_charges(
     deposit_id: UUID,
     allocations_plan: list[dict[str, Any]] | None = None,
     created_by_name: str = "Staff",
+    max_amount: float | None = None,
 ) -> float:
     """
     Draw down available advance deposit funds against open charges (selective or FIFO).
+    Transactionally locks deposit and affected charges. Allocates only what is needed.
     """
     deposit = (
         db.query(BillingDeposit)
@@ -709,6 +835,11 @@ def draw_down_deposit_for_charges(
         return 0.0
 
     avail = float(deposit.available_amount)
+    if max_amount is not None:
+        avail = min(avail, float(max_amount))
+    if avail <= 0:
+        return 0.0
+
     if allocations_plan:
         allocated = allocate_specific_charges(
             db,
@@ -717,6 +848,7 @@ def draw_down_deposit_for_charges(
             allocations_plan,
             deposit_id=deposit.id,
             created_by_name=created_by_name,
+            account_id=deposit.account_id,
         )
     else:
         allocated = allocate_payment_to_charges(
@@ -729,7 +861,7 @@ def draw_down_deposit_for_charges(
             account_id=deposit.account_id,
         )
 
-    new_avail = round(avail - allocated, 2)
+    new_avail = round(float(deposit.available_amount) - allocated, 2)
     deposit.available_amount = max(0.0, new_avail)
     if deposit.available_amount <= 0:
         deposit.status = DepositStatus.exhausted
@@ -830,7 +962,7 @@ def process_refund(
         refund_number=refund_num,
         refund_date=refund_date,
         refund_method=refund_method,
-        amount=ref_amt,
+        amount=amount if isinstance(amount, Decimal) else Decimal(str(ref_amt)),
         reason=reason.strip()[:512],
         status=RefundStatus.processed,
         approved_by_name=approved_by_name,
@@ -886,10 +1018,18 @@ def patient_ledger_totals(
             q = q.filter(BillingDeposit.account_id == account_id)
         deposits = q.all()
 
-    total_charges = round(sum(float(c.net_amount) for c in charges), 2)
-    total_paid = round(sum(float(p.amount) for p in payments), 2)
-    total_deposits_avail = round(sum(float(d.available_amount) for d in deposits), 2)
-    outstanding = round(max(0.0, total_charges - total_paid), 2)
+    active_charges = [c for c in charges if c.status != BillingChargeStatus.cancelled]
+    total_charges = round(sum(float(c.net_amount or 0) for c in active_charges), 2)
+    total_paid_allocations = round(sum(float(c.amount_paid or 0) for c in active_charges), 2)
+    total_paid_tender = round(sum(float(p.amount or 0) for p in payments), 2)
+    total_deposits_avail = round(sum(float(d.available_amount or 0) for d in deposits), 2)
+
+    # 1.2 Allocation-based outstanding: Remaining Patient Liability = Net Charges - Allocations Applied
+    outstanding = round(
+        sum(max(0.0, float(c.net_amount or 0) - float(c.amount_paid or 0)) for c in active_charges),
+        2,
+    )
+    total_paid = total_paid_allocations if account_id else total_paid_tender
     net_patient_balance = round(outstanding - total_deposits_avail, 2)
 
     return {
@@ -898,7 +1038,7 @@ def patient_ledger_totals(
         "total_deposits_available": total_deposits_avail,
         "outstanding": outstanding,
         "net_patient_balance": net_patient_balance,
-        "charge_count": len(charges),
+        "charge_count": len(active_charges),
         "payment_count": len(payments),
     }
 
@@ -906,7 +1046,7 @@ def patient_ledger_totals(
 def patient_ledger_totals_bulk(
     db: Session, hospital_id: UUID, patient_ids: list[UUID]
 ) -> dict[UUID, dict[str, Any]]:
-    """Compute aggregate totals for many patients in bulk queries."""
+    """Compute aggregate totals for many patients in bulk queries using allocation-based outstanding."""
     unique_ids = list({pid for pid in patient_ids if pid is not None})
     result: dict[UUID, dict[str, Any]] = {
         pid: {
@@ -961,13 +1101,16 @@ def patient_ledger_totals_bulk(
         deposits_by_patient.setdefault(d.patient_id, []).append(d)
 
     for pid in unique_ids:
-        p_charges = charges_by_patient.get(pid, [])
+        p_charges = [c for c in charges_by_patient.get(pid, []) if c.status != BillingChargeStatus.cancelled]
         p_payments = payments_by_patient.get(pid, [])
         p_deposits = deposits_by_patient.get(pid, [])
-        total_charges = round(sum(float(c.net_amount) for c in p_charges), 2)
-        total_paid = round(sum(float(p.amount) for p in p_payments), 2)
-        total_dep = round(sum(float(d.available_amount) for d in p_deposits), 2)
-        outstanding = round(max(0.0, total_charges - total_paid), 2)
+        total_charges = round(sum(float(c.net_amount or 0) for c in p_charges), 2)
+        total_paid = round(sum(float(p.amount or 0) for p in p_payments), 2)
+        total_dep = round(sum(float(d.available_amount or 0) for d in p_deposits), 2)
+        outstanding = round(
+            sum(max(0.0, float(c.net_amount or 0) - float(c.amount_paid or 0)) for c in p_charges),
+            2,
+        )
         net_bal = round(outstanding - total_dep, 2)
         result[pid] = {
             "total_charges": total_charges,
@@ -1208,6 +1351,7 @@ def deposit_to_dict(d: BillingDeposit, patient: Patient | None = None) -> dict[s
         "hospital_id": d.hospital_id,
         "patient_id": d.patient_id,
         "account_id": d.account_id,
+        "admission_id": d.admission_id,
         "deposit_number": d.deposit_number,
         "deposit_date": d.deposit_date,
         "deposit_type": d.deposit_type,
@@ -1267,4 +1411,3 @@ def account_to_dict(acc: FinancialAccount, patient: Patient | None = None) -> di
         "patient_name": pat.name if pat else None,
         "patient_uhid": pat.uhid if pat else None,
     }
-

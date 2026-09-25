@@ -57,6 +57,7 @@ class OtRepository:
         self,
         status_filter: OtSurgeryStatus | None = None,
         patient_id: UUID | None = None,
+        ward_id: UUID | None = None,
         search: str | None = None,
         schedule_only: bool | None = None,
         ongoing_only: bool | None = None,
@@ -76,6 +77,15 @@ class OtRepository:
         )
         if patient_id:
             q = q.filter(OtSurgery.patient_id == patient_id)
+        if ward_id:
+            from modules.inpatient.entities.admission import Admission, AdmissionStatus
+            q = q.join(
+                Admission,
+                (Admission.patient_id == OtSurgery.patient_id)
+                & (Admission.hospital_id == OtSurgery.hospital_id)
+                & (Admission.ward_id == ward_id)
+                & (Admission.status.in_([AdmissionStatus.admitted, AdmissionStatus.discharge_requested])),
+            )
         if status_filter:
             q = q.filter(OtSurgery.status == status_filter)
         if schedule_only:

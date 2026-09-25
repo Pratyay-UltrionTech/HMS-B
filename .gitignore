@@ -70,3 +70,6 @@ logs/
 *.db
 instance/
 .cache/
+
+# Local storage uploads
+/storage/

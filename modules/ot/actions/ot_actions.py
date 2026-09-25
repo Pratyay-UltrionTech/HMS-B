@@ -119,12 +119,24 @@ class ListSurgeriesAction:
         self,
         status_filter: str | None = None,
         patient_id: UUID | None = None,
+        ward_id: UUID | None = None,
         search: str | None = None,
         schedule_only: bool | None = None,
         ongoing_only: bool | None = None,
         history_only: bool | None = None,
         notes_pending: bool | None = None,
+        user: dict[str, Any] | None = None,
     ) -> list[OtSurgeryResponse]:
+        if user and user.get("role") not in {"super_admin", "hospital_admin"}:
+            from shared.auth.service import authorization
+            dec = authorization.evaluate(user, ("ot", "view"), db=self.db)
+            if not dec.allowed:
+                if not ward_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Broad OT visibility requires ot:view permission. Ward nursing staff must specify an authorized ward scope.",
+                    )
+
         status_enum = None
         if status_filter:
             try:
@@ -135,6 +147,7 @@ class ListSurgeriesAction:
         rows = self.repo.list_surgeries(
             status_filter=status_enum,
             patient_id=patient_id,
+            ward_id=ward_id,
             search=search,
             schedule_only=schedule_only,
             ongoing_only=ongoing_only,

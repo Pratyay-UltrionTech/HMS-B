@@ -616,6 +616,18 @@ class CreatePaymentAction:
                 for item in payload.allocations
             ]
 
+        if payload.idempotency_key:
+            existing = (
+                self.db.query(BillingPayment)
+                .filter(
+                    BillingPayment.hospital_id == self.repo.hospital_id,
+                    BillingPayment.idempotency_key == payload.idempotency_key,
+                )
+                .first()
+            )
+            if existing:
+                return _payment_response_dto(self.db, existing, patient)
+
         try:
             pay = create_payment(
                 self.db,
@@ -626,6 +638,7 @@ class CreatePaymentAction:
                 payment_method=payload.payment_method,
                 account_id=payload.account_id,
                 reference_number=payload.reference_number,
+                idempotency_key=payload.idempotency_key,
                 notes=payload.notes,
                 received_by_name=_actor(user),
                 allocate=True,
@@ -1081,6 +1094,7 @@ class ListDepositsAction:
         *,
         patient_id: UUID | None = None,
         account_id: UUID | None = None,
+        admission_id: UUID | None = None,
         status: DepositStatus | None = None,
         from_date: date | None = None,
         to_date: date | None = None,
@@ -1090,6 +1104,7 @@ class ListDepositsAction:
         deposits = self.repo.list_deposits(
             patient_id=patient_id,
             account_id=account_id,
+            admission_id=admission_id,
             status=status,
             from_date=from_date,
             to_date=to_date,
@@ -1107,19 +1122,38 @@ class CreateDepositAction:
     def execute(self, payload: BillingDepositCreate, user: dict[str, Any]) -> BillingDepositResponse:
         patient = _get_patient_or_404(self.repo, payload.patient_id)
         dep_date = payload.deposit_date or date.today()
-        deposit = create_deposit(
-            self.db,
-            hospital_id=self.repo.hospital_id,
-            patient_id=payload.patient_id,
-            amount=payload.amount,
-            deposit_date=dep_date,
-            deposit_type=payload.deposit_type,
-            payment_method=payload.payment_method,
-            account_id=payload.account_id,
-            reference_number=payload.reference_number,
-            notes=payload.notes,
-            received_by_name=_actor(user),
-        )
+
+        if payload.idempotency_key:
+            existing = (
+                self.db.query(BillingDeposit)
+                .filter(
+                    BillingDeposit.hospital_id == self.repo.hospital_id,
+                    BillingDeposit.idempotency_key == payload.idempotency_key,
+                )
+                .first()
+            )
+            if existing:
+                return BillingDepositResponse.model_validate(deposit_to_dict(existing, patient))
+
+        try:
+            deposit = create_deposit(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                patient_id=payload.patient_id,
+                amount=payload.amount,
+                deposit_date=dep_date,
+                deposit_type=payload.deposit_type,
+                payment_method=payload.payment_method,
+                account_id=payload.account_id,
+                admission_id=payload.admission_id,
+                reference_number=payload.reference_number,
+                idempotency_key=payload.idempotency_key,
+                notes=payload.notes,
+                received_by_name=_actor(user),
+            )
+        except ValueError as e:
+            self.db.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         
         # Issue corresponding money receipt for the advance deposit
         rcpt = issue_receipt(
