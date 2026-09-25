@@ -60,7 +60,8 @@ from modules.inpatient.contracts.inpatient_contracts import (
     TransferRequest,
 )
 from modules.inpatient.db.admissions_repository import AdmissionsRepository
-from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
+from shared.auth.dependencies import get_hospital_context, require_any_permission, require_hospital_user, require_permission
+from shared.exceptions.base import NotFoundError
 
 router = APIRouter(prefix="/beds", tags=["beds"])
 registration_inpatient_router = APIRouter(prefix="/registration", tags=["registration"])
@@ -199,6 +200,23 @@ def get_open_admission(
     if not rows:
         return None
     return to_admission_detail(rows[0])
+
+
+@router.get(
+    "/admissions/{admission_id}", response_model=AdmissionDetail,
+    dependencies=[Depends(require_any_permission([("bed", "view"), ("all_ipd", "view"), ("doctors", "view"), ("nurses", "view")]))],
+)
+def get_admission_detail(
+    admission_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Resolve an exact encounter, including discharged historical stays."""
+    admission = AdmissionsRepository(db).get_admission_by_id(hospital_id, admission_id)
+    if admission is None:
+        raise NotFoundError("Admission not found")
+    return to_admission_detail(admission)
 
 
 @router.post("/admissions/{admission_id}/accept", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])

@@ -32,6 +32,9 @@ from modules.patients.contracts.allergy_contracts import CheckAllergyAlertReques
 from modules.pharmacy.actions.drug_interaction_actions import CheckDrugInteractionsAction
 from modules.pharmacy.contracts.drug_interaction_contracts import CheckDrugInteractionsRequest
 from shared.audit.service import write_audit_log
+from modules.inpatient.services.admission_lifecycle_policy import (
+    assert_can_document_clinical_record,
+)
 
 
 class ScheduleMedicationAction:
@@ -50,6 +53,7 @@ class ScheduleMedicationAction:
         admission = self.admission_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not admission:
             raise NotFoundError("Admission not found")
+        assert_can_document_clinical_record(admission, "schedule medication")
 
         # Feature 16 & 17 Clinical Safety Validation: Patient Allergy & Drug Interaction Gate
         allergy_checker = CheckPatientAllergyAlertAction(self.db, self.hospital_id)
@@ -146,6 +150,7 @@ class RecordMedicationExecutionAction:
         self.db = db
         self.hospital_id = hospital_id
         self.repo = NursingRepository(db, hospital_id)
+        self.admission_repo = AdmissionsRepository(db)
 
     def execute(
         self,
@@ -156,6 +161,31 @@ class RecordMedicationExecutionAction:
         record = self.repo.get_emar_record_by_id(record_id)
         if not record:
             raise NotFoundError("Medication administration record not found")
+
+        admission = self.admission_repo.get_admission_by_id(self.hospital_id, record.admission_id)
+        if admission:
+            assert_can_document_clinical_record(admission, "record medication administration")
+
+        # eMAR State Machine: Only scheduled records may be executed/transitioned
+        if record.status != MedicationAdminStatus.scheduled:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Cannot change medication record in '{record.status.value}' state: clinical record is already finalized",
+            )
+
+        if payload.status == MedicationAdminStatus.scheduled:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Target status cannot be 'scheduled'",
+            )
+
+        # Requirement: Non-administration requires a clinical reason
+        if payload.status in (MedicationAdminStatus.withheld, MedicationAdminStatus.refused, MedicationAdminStatus.missed):
+            if not payload.notes_or_reason or not payload.notes_or_reason.strip():
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"A documented reason is mandatory when status is '{payload.status.value}'",
+                )
 
         # Feature 18: High-alert dual sign-off validation
         if record.is_high_alert and payload.status == MedicationAdminStatus.administered:
@@ -168,6 +198,8 @@ class RecordMedicationExecutionAction:
         record.status = payload.status
         if payload.status == MedicationAdminStatus.administered:
             record.administered_at = datetime.now(timezone.utc)
+        else:
+            record.administered_at = None
 
         nurse_id_raw = actor.get("id") or actor.get("user_id")
         record.administering_nurse_id = UUID(str(nurse_id_raw)) if nurse_id_raw else None
@@ -175,7 +207,7 @@ class RecordMedicationExecutionAction:
         record.witness_nurse_id = UUID(str(payload.witness_nurse_id)) if payload.witness_nurse_id else None
         record.witness_nurse_name = payload.witness_nurse_name
         record.vitals_before_admin = payload.vitals_before_admin
-        record.notes_or_reason = payload.notes_or_reason
+        record.notes_or_reason = payload.notes_or_reason.strip() if payload.notes_or_reason else None
 
         self.repo.commit()
         self.repo.refresh(record)

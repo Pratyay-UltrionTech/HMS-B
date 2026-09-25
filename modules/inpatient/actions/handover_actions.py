@@ -22,6 +22,9 @@ from modules.inpatient.contracts.nursing_contracts import (
 from modules.inpatient.db.admissions_repository import AdmissionsRepository
 from modules.inpatient.db.nursing_repository import NursingRepository
 from modules.inpatient.entities.nursing_entities import NursingShiftHandover
+from modules.inpatient.services.admission_lifecycle_policy import (
+    assert_can_document_clinical_record,
+)
 from shared.audit.service import write_audit_log
 
 
@@ -43,6 +46,7 @@ class CreateNursingShiftHandoverAction:
         adm = self.adm_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not adm:
             raise NotFoundError("Admission not found")
+        assert_can_document_clinical_record(adm, "create shift handover")
 
         nurse_name = str(actor.get("name") or "Outgoing Nurse")
         nurse_id_raw = actor.get("user_id")
@@ -87,6 +91,7 @@ class AcknowledgeNursingShiftHandoverAction:
     def __init__(self, db: Session, hospital_id: UUID) -> None:
         self.db = db
         self.hospital_id = hospital_id
+        self.adm_repo = AdmissionsRepository(db)
         self.nursing_repo = NursingRepository(db, hospital_id)
 
     def execute(
@@ -98,6 +103,10 @@ class AcknowledgeNursingShiftHandoverAction:
         handover = self.nursing_repo.get_handover_by_id(handover_id)
         if not handover:
             raise NotFoundError("Handover record not found")
+
+        adm = self.adm_repo.get_admission_by_id(self.hospital_id, handover.admission_id)
+        if adm:
+            assert_can_document_clinical_record(adm, "acknowledge shift handover")
 
         nurse_name = str(actor.get("name") or "Incoming Nurse")
         nurse_id_raw = actor.get("user_id")

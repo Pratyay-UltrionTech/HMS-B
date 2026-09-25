@@ -12,6 +12,7 @@ import enum
 import uuid
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Enum,
     ForeignKey,
@@ -159,12 +160,24 @@ class Admission(Base):
     patient_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     gender: Mapped[str | None] = mapped_column(String(32), nullable=True)
     age_at_admission: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    department_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    department_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    no_discharge_meds: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="false")
+    no_discharge_meds_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    no_discharge_meds_doctor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospital_users.id", ondelete="SET NULL"), nullable=True
+    )
 
     patient: Mapped[Patient | None] = relationship("Patient", foreign_keys=[patient_id])
     ward: Mapped[Ward | None] = relationship("Ward", foreign_keys=[ward_id])
     room: Mapped[Room | None] = relationship("Room", foreign_keys=[room_id])
     bed: Mapped[Bed | None] = relationship("Bed", foreign_keys=[bed_id])
     doctor: Mapped[HospitalUser | None] = relationship("HospitalUser", foreign_keys=[doctor_id])
+    care_team: Mapped[list["AdmissionCareTeamMember"]] = relationship(
+        "AdmissionCareTeamMember", back_populates="admission", cascade="all, delete-orphan"
+    )
 
 
 class IpdFormSubmissionStatus(str, enum.Enum):

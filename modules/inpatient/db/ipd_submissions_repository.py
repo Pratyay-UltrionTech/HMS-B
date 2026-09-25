@@ -22,6 +22,8 @@ from modules.inpatient.entities.admission import (
     IpdFormSubmission,
     IpdFormSubmissionStatus,
 )
+from modules.inpatient.entities.form_addendum import IpdFormAddendum
+from sqlalchemy import func
 
 
 def html_to_data_url(html: str) -> str:
@@ -60,6 +62,20 @@ class IpdSubmissionsRepository:
             .first()
         )
 
+    def addenda_counts(self, hospital_id: UUID, submission_ids: list[UUID]) -> dict[UUID, int]:
+        if not submission_ids:
+            return {}
+        rows = (
+            self.db.query(IpdFormAddendum.submission_id, func.count(IpdFormAddendum.id))
+            .filter(
+                IpdFormAddendum.hospital_id == hospital_id,
+                IpdFormAddendum.submission_id.in_(submission_ids),
+            )
+            .group_by(IpdFormAddendum.submission_id)
+            .all()
+        )
+        return {submission_id: count for submission_id, count in rows}
+
     def list_submissions(
         self,
         hospital_id: UUID,
@@ -68,6 +84,7 @@ class IpdSubmissionsRepository:
         form_id: str | None = None,
         status_filter: IpdFormSubmissionStatus | None = None,
         limit: int = 200,
+        offset: int = 0,
     ) -> list[IpdFormSubmission]:
         """List IPD form submissions with filtering."""
         q = (
@@ -83,7 +100,7 @@ class IpdSubmissionsRepository:
             q = q.filter(IpdFormSubmission.form_id == form_id.strip())
         if status_filter:
             q = q.filter(IpdFormSubmission.status == status_filter)
-        return q.order_by(IpdFormSubmission.updated_at.desc()).limit(limit).all()
+        return q.order_by(IpdFormSubmission.updated_at.desc(), IpdFormSubmission.id.desc()).offset(offset).limit(limit).all()
 
     def sync_final_to_patient_record(
         self, sub: IpdFormSubmission, user_id: UUID | None = None
@@ -153,3 +170,43 @@ class IpdSubmissionsRepository:
                 rec.notes = notes
                 rec.file_name = file_name
                 rec.file_data = file_data
+
+    def create_addendum(
+        self,
+        *,
+        hospital_id: UUID,
+        submission_id: UUID,
+        admission_id: UUID | None,
+        patient_id: UUID,
+        author_id: UUID,
+        author_name: str,
+        author_role: str,
+        reason: str,
+        content: str,
+    ) -> IpdFormAddendum:
+        addendum = IpdFormAddendum(
+            hospital_id=hospital_id,
+            submission_id=submission_id,
+            admission_id=admission_id,
+            patient_id=patient_id,
+            author_id=author_id,
+            author_name=author_name,
+            author_role=author_role,
+            reason=reason,
+            content=content,
+        )
+        self.db.add(addendum)
+        self.db.flush()
+        return addendum
+
+    def list_addenda(self, hospital_id: UUID, submission_id: UUID) -> list[IpdFormAddendum]:
+        return (
+            self.db.query(IpdFormAddendum)
+            .filter(
+                IpdFormAddendum.hospital_id == hospital_id,
+                IpdFormAddendum.submission_id == submission_id,
+            )
+            .order_by(IpdFormAddendum.created_at.asc())
+            .all()
+        )
+

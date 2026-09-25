@@ -22,6 +22,9 @@ from modules.inpatient.contracts.nursing_contracts import (
 from modules.inpatient.db.admissions_repository import AdmissionsRepository
 from modules.inpatient.db.nursing_repository import NursingRepository
 from modules.inpatient.entities.nursing_entities import NursingCarePlan
+from modules.inpatient.services.admission_lifecycle_policy import (
+    assert_can_document_clinical_record,
+)
 from shared.audit.service import write_audit_log
 
 
@@ -43,6 +46,7 @@ class CreateNursingCarePlanAction:
         adm = self.adm_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not adm:
             raise NotFoundError("Admission not found")
+        assert_can_document_clinical_record(adm, "create care plan")
 
         nurse_name = str(actor.get("name") or "Primary Nurse")
 
@@ -79,6 +83,7 @@ class ReassessNursingCarePlanAction:
     def __init__(self, db: Session, hospital_id: UUID) -> None:
         self.db = db
         self.hospital_id = hospital_id
+        self.adm_repo = AdmissionsRepository(db)
         self.nursing_repo = NursingRepository(db, hospital_id)
 
     def execute(
@@ -90,6 +95,10 @@ class ReassessNursingCarePlanAction:
         plan = self.nursing_repo.get_care_plan_by_id(plan_id)
         if not plan:
             raise NotFoundError("Nursing care plan not found")
+
+        adm = self.adm_repo.get_admission_by_id(self.hospital_id, plan.admission_id)
+        if adm:
+            assert_can_document_clinical_record(adm, "reassess care plan")
 
         plan.status = payload.status
         plan.reassessment_notes = payload.reassessment_notes.strip()

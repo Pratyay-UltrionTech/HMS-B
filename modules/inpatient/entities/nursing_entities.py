@@ -18,6 +18,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Integer,
     JSON,
@@ -65,6 +66,11 @@ class MedicationAdminStatus(str, enum.Enum):
     withheld = "withheld"
     missed = "missed"
     refused = "refused"
+
+
+class IntakeOutputType(str, enum.Enum):
+    intake = "intake"
+    output = "output"
 
 
 class NursingCarePlan(Base):
@@ -248,3 +254,86 @@ class MedicationAdministrationRecord(Base):
 
     admission: Mapped[Admission] = relationship("Admission")
     patient: Mapped[Patient] = relationship("Patient")
+    order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ipd_medication_orders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    order: Mapped["IpdMedicationOrder | None"] = relationship("IpdMedicationOrder", back_populates="administrations")
+
+
+class IpdVitalSign(Base):
+    """
+    Structured Inpatient Vital Sign Observation.
+    Captures temperature, pulse, respiratory rate, blood pressure, SpO2,
+    consciousness (AVPU), pain score, weight, and clinical notes for an admission.
+    """
+
+    __tablename__ = "ipd_vitals"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    admission_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    temperature_c: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pulse_rate_bpm: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    respiratory_rate_bpm: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    systolic_bp: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    diastolic_bp: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    spo2_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pain_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    consciousness: Mapped[str | None] = mapped_column(String(64), nullable=True)  # Alert, Voice, Pain, Unresponsive
+    weight_kg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recorded_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    recorded_by_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    admission: Mapped[Admission] = relationship("Admission")
+    patient: Mapped[Patient] = relationship("Patient")
+
+
+class IpdIntakeOutput(Base):
+    """
+    Structured General Ward Intake & Output Observation.
+    Records fluid intake (oral, IV, feed, blood) and output (urine, drain, vomitus, stool)
+    with volume in mL and site/route details for fluid balance tracking.
+    """
+
+    __tablename__ = "ipd_intake_outputs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    admission_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admissions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    entry_type: Mapped[IntakeOutputType] = mapped_column(
+        Enum(IntakeOutputType, name="intake_output_type"), nullable=False, index=True
+    )
+    category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    volume_ml: Mapped[float] = mapped_column(Float, nullable=False)
+    unit: Mapped[str] = mapped_column(String(32), nullable=False, default="mL")
+    route_or_site: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recorded_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    recorded_by_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    admission: Mapped[Admission] = relationship("Admission")
+    patient: Mapped[Patient] = relationship("Patient")
+

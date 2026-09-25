@@ -111,6 +111,12 @@ class RegistrationAdmitAction:
         )
 
         actor_name = str(actor.get("name") or "System")
+        self.billing_svc.ensure_financial_account(
+            hospital_id=hospital_id,
+            patient_id=patient.id,
+            admission_id=admission.id,
+            created_by_name=actor_name,
+        )
         self.billing_svc.ensure_admission_charge(
             hospital_id=hospital_id,
             patient_id=patient.id,
@@ -119,6 +125,34 @@ class RegistrationAdmitAction:
             admission_fee=float(getattr(bed.ward, "admission_fee", 0) or 0) if bed.ward else 0.0,
             created_by_name=actor_name,
         )
+
+        if payload.doctor_id:
+            from modules.inpatient.db.care_team_repository import CareTeamRepository
+            from modules.inpatient.entities.care_team import AdmissionCareTeamRole
+            actor_id_str = actor.get("id") or actor.get("sub")
+            actor_id = None
+            if actor_id_str:
+                try:
+                    actor_id = UUID(str(actor_id_str))
+                except (ValueError, TypeError):
+                    actor_id = None
+            ct_repo = CareTeamRepository(self.db, hospital_id)
+            ct_repo.add_member(
+                admission_id=admission.id,
+                doctor_id=payload.doctor_id,
+                role=AdmissionCareTeamRole.admitting_doctor,
+                assigned_by_id=actor_id,
+                assigned_by_name=actor_name,
+                notes="Admitting doctor preserved at registration admission",
+            )
+            ct_repo.add_member(
+                admission_id=admission.id,
+                doctor_id=payload.doctor_id,
+                role=AdmissionCareTeamRole.primary_consultant,
+                assigned_by_id=actor_id,
+                assigned_by_name=actor_name,
+                notes="Primary consultant assigned at registration admission",
+            )
 
         from modules.inpatient.entities.admission import BedStaySegment
         initial_segment = BedStaySegment(
@@ -213,11 +247,17 @@ class RegistrationDischargeAction:
         )
         if not admission:
             raise NotFoundError("Admission not found")
-        if admission.status == AdmissionStatus.discharged:
-            raise ValidationError("Admission is already discharged")
-        if admission.status == AdmissionStatus.requested:
+        if admission.status != AdmissionStatus.discharge_requested:
+            if admission.status == AdmissionStatus.discharged:
+                raise ValidationError("Admission is already discharged")
+            if admission.status == AdmissionStatus.cancelled:
+                raise ValidationError("Cannot discharge a cancelled admission")
+            if admission.status == AdmissionStatus.requested:
+                raise ValidationError(
+                    "Admission has not been accepted yet — accept it before discharge"
+                )
             raise ValidationError(
-                "Admission has not been accepted yet — accept it before discharge"
+                f"Cannot discharge admission in '{admission.status.value}' state: discharge must be requested first"
             )
 
         now = datetime.now(timezone.utc)
@@ -232,12 +272,154 @@ class RegistrationDischargeAction:
             room_code=admission.room.room_code if admission.room else None,
             bed_code=admission.bed.bed_code if admission.bed else None,
             bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
-            created_by_name=actor.get("name") or "System",
         )
+        # Discharge Prescription Gate
+        if not getattr(admission, "no_discharge_meds", False):
+            from modules.clinical_records.entities.clinical_record import Prescription
+            has_rx = (
+                self.db.query(Prescription)
+                .filter(
+                    Prescription.hospital_id == hospital_id,
+                    Prescription.admission_id == admission.id,
+                    Prescription.status.in_(["issued", "dispensed", "completed"]),
+                )
+                .first()
+            )
+            if not has_rx:
+                raise ValidationError(
+                    "Discharge prescription required: Please prescribe discharge medications or record 'No discharge medicines required' before discharge."
+                )
+
+        # Reconcile unallocated payments & draw down available deposits before financial clearance check
+        from modules.billing.entities.billing_entities import (
+            BillingCharge,
+            BillingChargeStatus,
+            BillingDeposit,
+            BillingInvoice,
+            BillingInvoiceStatus,
+            BillingPayment,
+            BillingPaymentAllocation,
+            DepositStatus,
+            FinancialAccount,
+        )
+        from modules.billing.services.billing_service import (
+            draw_down_deposit_for_charges,
+            allocate_payment_to_charges,
+        )
+        from sqlalchemy import or_
+
+        acc = (
+            self.db.query(FinancialAccount)
+            .filter(
+                FinancialAccount.hospital_id == hospital_id,
+                FinancialAccount.admission_id == admission.id,
+            )
+            .first()
+        )
+        if acc:
+            # Final Billing Gate: An admission-scoped final generated invoice must exist
+            latest_invoice = (
+                self.db.query(BillingInvoice)
+                .filter(
+                    BillingInvoice.hospital_id == hospital_id,
+                    BillingInvoice.account_id == acc.id,
+                    BillingInvoice.status.in_([BillingInvoiceStatus.generated, BillingInvoiceStatus.paid]),
+                )
+                .order_by(BillingInvoice.created_at.desc())
+                .first()
+            )
+            if not latest_invoice:
+                raise ValidationError(
+                    "Final billing required: A generated final invoice must exist for the admission account before discharge."
+                )
+
+            # Avoid Stale Final Bills: Check if any charges were posted after invoice generation
+            stale_charges = (
+                self.db.query(BillingCharge)
+                .filter(
+                    BillingCharge.hospital_id == hospital_id,
+                    BillingCharge.account_id == acc.id,
+                    BillingCharge.created_at > latest_invoice.created_at,
+                )
+                .all()
+            )
+            if stale_charges:
+                raise ValidationError(
+                    "Final bill out of date: New billable charges were added after the final invoice was generated. Please regenerate the final bill before discharge."
+                )
+
+            acc_payments = (
+                self.db.query(BillingPayment)
+                .filter(
+                    BillingPayment.hospital_id == hospital_id,
+                    BillingPayment.account_id == acc.id,
+                )
+                .all()
+            )
+            for pay in acc_payments:
+                alloc_sum = sum(
+                    float(a.allocated_amount or 0)
+                    for a in self.db.query(BillingPaymentAllocation).filter(BillingPaymentAllocation.payment_id == pay.id).all()
+                )
+                unalloc_tender = round(float(pay.amount or 0) - alloc_sum, 2)
+                if unalloc_tender > 0:
+                    allocate_payment_to_charges(
+                        self.db,
+                        hospital_id,
+                        admission.patient_id,
+                        unalloc_tender,
+                        payment_id=pay.id,
+                        created_by_name=actor.get("name") or "Registration Discharge",
+                        account_id=acc.id,
+                    )
+
+            available_deposits = (
+                self.db.query(BillingDeposit)
+                .filter(
+                    BillingDeposit.hospital_id == hospital_id,
+                    or_(
+                        BillingDeposit.admission_id == admission.id,
+                        BillingDeposit.account_id == acc.id,
+                    ),
+                    BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
+                    BillingDeposit.available_amount > 0,
+                )
+                .order_by(BillingDeposit.created_at.asc())
+                .with_for_update()
+                .all()
+            )
+            for dep in available_deposits:
+                open_charges_due = sum(
+                    max(0.0, float(c.net_amount or 0) - float(c.amount_paid or 0))
+                    for c in self.db.query(BillingCharge)
+                    .filter(
+                        BillingCharge.hospital_id == hospital_id,
+                        BillingCharge.account_id == acc.id,
+                        BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
+                    )
+                    .all()
+                )
+                if open_charges_due <= 0.009:
+                    break
+                draw_down_deposit_for_charges(
+                    self.db,
+                    hospital_id=hospital_id,
+                    deposit_id=dep.id,
+                    max_amount=open_charges_due,
+                    created_by_name=actor.get("name") or "Registration Discharge",
+                )
+
         fin = self.billing_svc.get_ledger_totals(hospital_id, admission.patient_id, admission_id=admission.id)
         outstanding = float(fin.get("outstanding") or 0)
         if outstanding > 0.009:
-            raise ValidationError(f"Cannot discharge — outstanding balance ₹{outstanding:,.2f}. Clear all dues before discharging.")
+            from modules.inpatient.db.discharge_exception_repository import DischargeExceptionRepository
+            from modules.inpatient.entities.discharge_exception import ExceptionStatus
+            exc_repo = DischargeExceptionRepository(self.db, hospital_id)
+            active_exc = exc_repo.get_active_exception(hospital_id, admission.id)
+            if not (active_exc and active_exc.status == ExceptionStatus.approved):
+                raise ValidationError(
+                    f"Cannot discharge — outstanding net balance ₹{outstanding:,.2f}. Clear all dues or obtain an approved financial exception before discharging."
+                )
 
         admission.status = AdmissionStatus.discharged
         admission.discharged_at = now

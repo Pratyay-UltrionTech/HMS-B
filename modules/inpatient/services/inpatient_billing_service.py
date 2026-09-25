@@ -135,6 +135,24 @@ class InpatientBillingService:
             created_by_name=created_by_name,
         )
 
+    def ensure_financial_account(
+        self,
+        hospital_id: UUID,
+        patient_id: UUID,
+        admission_id: UUID,
+        created_by_name: str = "System",
+    ) -> Any:
+        from modules.billing.entities.billing_entities import FinancialAccountType
+        from modules.billing.services.billing_service import get_or_create_financial_account
+        return get_or_create_financial_account(
+            self.db,
+            hospital_id=hospital_id,
+            patient_id=patient_id,
+            account_type=FinancialAccountType.ipd,
+            admission_id=admission_id,
+            created_by_name=created_by_name,
+        )
+
     def get_ledger_totals(
         self,
         hospital_id: UUID,
@@ -142,10 +160,19 @@ class InpatientBillingService:
         admission_id: UUID | None = None,
     ) -> dict[str, Any]:
         """Compute patient financial totals: charges, payments, outstanding balance.
-        When admission_id is provided, scopes to the admission's IPD FinancialAccount.
+        When admission_id is provided, scopes strictly to the admission's IPD FinancialAccount,
+        preventing cross-episode debt leakage.
         """
-        from modules.billing.entities.billing_entities import FinancialAccount
-        from modules.billing.services.billing_service import patient_ledger_totals
+        from modules.billing.entities.billing_entities import (
+            BillingDeposit,
+            DepositStatus,
+            FinancialAccount,
+            FinancialAccountType,
+        )
+        from modules.billing.services.billing_service import (
+            get_or_create_financial_account,
+            patient_ledger_totals,
+        )
 
         account_id = None
         if admission_id:
@@ -157,12 +184,39 @@ class InpatientBillingService:
                 )
                 .first()
             )
-            if acc:
-                account_id = acc.id
+            if not acc:
+                # Safe fallback / backfill for legacy admissions without an account
+                acc = get_or_create_financial_account(
+                    self.db,
+                    hospital_id=hospital_id,
+                    patient_id=patient_id,
+                    account_type=FinancialAccountType.ipd,
+                    admission_id=admission_id,
+                    created_by_name="System",
+                )
+            account_id = acc.id
 
-        return patient_ledger_totals(
+        totals = patient_ledger_totals(
             self.db, hospital_id, patient_id, account_id=account_id
         )
+
+        if admission_id and account_id:
+            extra_deps = (
+                self.db.query(BillingDeposit)
+                .filter(
+                    BillingDeposit.hospital_id == hospital_id,
+                    BillingDeposit.admission_id == admission_id,
+                    BillingDeposit.account_id != account_id,
+                    BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
+                )
+                .all()
+            )
+            if extra_deps:
+                extra_avail = round(sum(float(d.available_amount) for d in extra_deps), 2)
+                totals["total_deposits_available"] = round(totals.get("total_deposits_available", 0.0) + extra_avail, 2)
+                totals["net_patient_balance"] = round(totals.get("outstanding", 0.0) - totals["total_deposits_available"], 2)
+
+        return totals
 
     def get_ledger_totals_bulk(
         self,

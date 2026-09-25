@@ -15,6 +15,7 @@ from modules.inpatient.entities.nursing_entities import (
     CarePlanStatus,
     ClinicalNoteType,
     HandoverShiftType,
+    IntakeOutputType,
     MedicationAdminStatus,
     ShiftType,
 )
@@ -167,3 +168,79 @@ class MedicationAdminResponse(BaseModel):
     vitals_before_admin: dict | None
     notes_or_reason: str | None
     created_at: datetime
+
+
+class IpdVitalSignCreate(BaseModel):
+    temperature_c: float | None = None
+    pulse_rate_bpm: int | None = None
+    respiratory_rate_bpm: int | None = None
+    systolic_bp: int | None = None
+    diastolic_bp: int | None = None
+    spo2_percent: float | None = None
+    pain_score: int | None = None
+    consciousness: str | None = None
+    weight_kg: float | None = None
+    notes: str | None = None
+    recorded_at: datetime | None = None
+
+
+class IpdVitalSignResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    hospital_id: UUID
+    admission_id: UUID
+    patient_id: UUID
+    temperature_c: float | None
+    pulse_rate_bpm: int | None
+    respiratory_rate_bpm: int | None
+    systolic_bp: int | None
+    diastolic_bp: int | None
+    spo2_percent: float | None
+    pain_score: int | None
+    consciousness: str | None
+    weight_kg: float | None
+    notes: str | None
+    recorded_by_id: UUID | None
+    recorded_by_name: str
+    recorded_at: datetime
+    created_at: datetime
+
+
+class IpdIntakeOutputCreate(BaseModel):
+    entry_type: IntakeOutputType
+    category: str = Field(min_length=1)
+    volume_ml: float = Field(gt=0)
+    unit: str = "mL"
+    route_or_site: str | None = None
+    notes: str | None = None
+    recorded_at: datetime | None = None
+
+
+class IpdIntakeOutputResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    hospital_id: UUID
+    admission_id: UUID
+    patient_id: UUID
+    entry_type: IntakeOutputType
+    category: str
+    volume_ml: float
+    unit: str
+    route_or_site: str | None
+    notes: str | None
+    recorded_by_id: UUID | None
+    recorded_by_name: str
+    recorded_at: datetime
+    created_at: datetime
+
+
+class IpdIntakeOutputSummary(BaseModel):
+    total_intake_ml: float
+    total_output_ml: float
+    net_balance_ml: float
+    intake_by_category: dict[str, float]
+    output_by_category: dict[str, float]
+    period_hours: int = 24
+

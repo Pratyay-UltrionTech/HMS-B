@@ -24,6 +24,7 @@ from modules.inpatient.contracts.inpatient_contracts import (
 from modules.inpatient.db.ipd_submissions_repository import IpdSubmissionsRepository
 from modules.inpatient.entities.admission import (
     Admission,
+    AdmissionStatus,
     IpdFormSubmission,
     IpdFormSubmissionStatus,
 )
@@ -62,6 +63,12 @@ def resolve_actor_id(user: dict[str, Any]) -> UUID | None:
         return UUID(str(raw))
     except (ValueError, TypeError):
         return None
+
+
+def _require_open_document_admission(admission: Admission) -> None:
+    """Normal document entry is limited to an open inpatient episode."""
+    if admission.status in (AdmissionStatus.discharged, AdmissionStatus.cancelled):
+        raise ValidationError("This admission is closed; new IPD documentation is not allowed")
 
 
 def _ensure_request_for_final(
@@ -152,6 +159,7 @@ class CreateFormSubmissionAction:
             )
             if not adm:
                 raise ValidationError("Invalid admission for patient")
+            _require_open_document_admission(adm)
         elif payload.status == IpdFormSubmissionStatus.final:
             # Spec §3: finalizing a form without an admission means the doctor
             # has requested/planned inpatient admission. Enter the canonical
@@ -218,11 +226,14 @@ class UpdateFormSubmissionAction:
         if sub.status == IpdFormSubmissionStatus.final:
             raise ValidationError("Finalized clinical forms cannot be edited. Submit an addendum.")
 
-        if payload.admission_id is not None:
+        if "admission_id" in payload.model_fields_set and payload.admission_id != sub.admission_id:
+            raise ValidationError("A document's admission cannot be changed")
+
+        if sub.admission_id is not None:
             adm = (
                 self.db.query(Admission)
                 .filter(
-                    Admission.id == payload.admission_id,
+                    Admission.id == sub.admission_id,
                     Admission.hospital_id == hospital_id,
                     Admission.patient_id == sub.patient_id,
                 )
@@ -230,7 +241,7 @@ class UpdateFormSubmissionAction:
             )
             if not adm:
                 raise ValidationError("Invalid admission for patient")
-            sub.admission_id = payload.admission_id
+            _require_open_document_admission(adm)
 
         if payload.form_data is not None:
             sub.form_data = payload.form_data
@@ -241,25 +252,10 @@ class UpdateFormSubmissionAction:
         if payload.status is not None:
             sub.status = payload.status
 
-        # Spec §3: finalization via update (draft → final) carries the same
-        # lifecycle meaning as creating a finalized form. Attach the canonical
-        # request when the form has none.
-        if (
-            sub.status == IpdFormSubmissionStatus.final
-            and sub.admission_id is None
-        ):
-            patient_row = (
-                self.db.query(Patient)
-                .filter(
-                    Patient.id == sub.patient_id,
-                    Patient.hospital_id == hospital_id,
-                )
-                .first()
+        if sub.status == IpdFormSubmissionStatus.final and sub.admission_id is None:
+            raise ValidationError(
+                "This legacy document has no linked admission and cannot be finalized through normal editing"
             )
-            if patient_row:
-                sub.admission_id = _ensure_request_for_final(
-                    self.db, hospital_id, patient_row, actor
-                )
 
         actor_id = resolve_actor_id(actor)
         sub.filled_by_id = actor_id or sub.filled_by_id
@@ -296,11 +292,14 @@ class ListFormSubmissionsAction:
         admission_id: UUID | None = None,
         form_id: str | None = None,
         status_filter: IpdFormSubmissionStatus | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[IpdFormSubmissionResponse]:
         rows = self.repo.list_submissions(
-            hospital_id, patient_id, admission_id, form_id, status_filter
+            hospital_id, patient_id, admission_id, form_id, status_filter, limit, offset
         )
-        return [to_form_response(r) for r in rows]
+        counts = self.repo.addenda_counts(hospital_id, [row.id for row in rows])
+        return [to_form_response(row).model_copy(update={"addenda_count": counts.get(row.id, 0)}) for row in rows]
 
 
 class GetFormSubmissionAction:
@@ -311,7 +310,8 @@ class GetFormSubmissionAction:
         sub = self.repo.get_by_id(hospital_id, submission_id)
         if not sub:
             raise NotFoundError("Submission not found")
-        return to_form_response(sub)
+        count = self.repo.addenda_counts(hospital_id, [sub.id]).get(sub.id, 0)
+        return to_form_response(sub).model_copy(update={"addenda_count": count})
 
 
 class ViewFormSubmissionHtmlAction:

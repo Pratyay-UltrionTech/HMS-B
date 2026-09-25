@@ -359,8 +359,15 @@ class AcceptAdmissionAction:
                 src.status = AppointmentStatus.transferred_to_inpatient
                 src.admission_id = admission.id
 
+        billing = InpatientBillingService(self.db)
+        actor_name = str(actor.get("name") or "System")
+        billing.ensure_financial_account(
+            hospital_id=hospital_id,
+            patient_id=admission.patient_id,
+            admission_id=admission.id,
+            created_by_name=actor_name,
+        )
         if with_bed and bed is not None:
-            billing = InpatientBillingService(self.db)
             billing.ensure_admission_charge(
                 hospital_id=hospital_id,
                 patient_id=admission.patient_id,
@@ -369,7 +376,35 @@ class AcceptAdmissionAction:
                 admission_fee=float(getattr(bed.ward, "admission_fee", 0) or 0)
                 if bed.ward
                 else 0.0,
-                created_by_name=str(actor.get("name") or "System"),
+                created_by_name=actor_name,
+            )
+
+        if admission.doctor_id:
+            from modules.inpatient.db.care_team_repository import CareTeamRepository
+            from modules.inpatient.entities.care_team import AdmissionCareTeamRole
+            actor_id_str = actor.get("id") or actor.get("sub")
+            actor_id = None
+            if actor_id_str:
+                try:
+                    actor_id = UUID(str(actor_id_str))
+                except (ValueError, TypeError):
+                    actor_id = None
+            ct_repo = CareTeamRepository(self.db, hospital_id)
+            ct_repo.add_member(
+                admission_id=admission.id,
+                doctor_id=admission.doctor_id,
+                role=AdmissionCareTeamRole.admitting_doctor,
+                assigned_by_id=actor_id,
+                assigned_by_name=actor_name,
+                notes="Admitting doctor preserved upon admission accept",
+            )
+            ct_repo.add_member(
+                admission_id=admission.id,
+                doctor_id=admission.doctor_id,
+                role=AdmissionCareTeamRole.primary_consultant,
+                assigned_by_id=actor_id,
+                assigned_by_name=actor_name,
+                notes="Primary consultant assigned upon admission accept",
             )
 
         write_audit_log(

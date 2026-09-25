@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 from uuid import UUID
 
-from shared.exceptions.base import NotFoundError
+from shared.exceptions.base import NotFoundError, ValidationError
 from sqlalchemy.orm import Session
 
 from modules.inpatient.contracts.nursing_contracts import (
@@ -23,6 +23,9 @@ from modules.inpatient.db.nursing_repository import NursingRepository
 from modules.inpatient.entities.nursing_entities import (
     ClinicalNoteType,
     IpdClinicalNote,
+)
+from modules.inpatient.services.admission_lifecycle_policy import (
+    assert_can_document_clinical_record,
 )
 from shared.audit.service import write_audit_log
 
@@ -45,6 +48,7 @@ class CreateIpdClinicalNoteAction:
         adm = self.adm_repo.get_admission_by_id(self.hospital_id, admission_id)
         if not adm:
             raise NotFoundError("Admission not found")
+        assert_can_document_clinical_record(adm, "add clinical notes")
 
         author_name = str(actor.get("name") or "Clinical Staff")
         author_role = str(actor.get("staff_role_name") or actor.get("role") or "nurse")
@@ -90,6 +94,7 @@ class ListIpdClinicalNotesAction:
     def __init__(self, db: Session, hospital_id: UUID) -> None:
         self.db = db
         self.hospital_id = hospital_id
+        self.adm_repo = AdmissionsRepository(db)
         self.nursing_repo = NursingRepository(db, hospital_id)
 
     def execute(
@@ -98,6 +103,8 @@ class ListIpdClinicalNotesAction:
         note_type: ClinicalNoteType | None = None,
         note_types: Sequence[ClinicalNoteType] | None = None,
     ) -> list[IpdClinicalNoteResponse]:
+        if not self.adm_repo.get_admission_by_id(self.hospital_id, admission_id):
+            raise NotFoundError("Admission not found")
         filters = list(note_types) if note_types else []
         if note_type and note_type not in filters:
             filters.append(note_type)
