@@ -249,10 +249,22 @@ def test_flaw_ipd_02_episode_financial_clearance_scenarios(db_session: Session, 
         hospital.id, DischargeRequestCreate(admission_id=detail.id), ACTOR
     )
 
+    acc = (
+        db_session.query(FinancialAccount)
+        .filter(FinancialAccount.hospital_id == hospital.id, FinancialAccount.admission_id == detail.id)
+        .first()
+    )
+    assert acc is not None
+
+    from modules.billing.services.invoice_service import create_invoice_from_charges
+    charges = db_session.query(BillingCharge).filter(BillingCharge.account_id == acc.id).all()
+    if charges:
+        create_invoice_from_charges(db_session, hospital_id=hospital.id, patient_id=patient.id, charge_ids=[c.id for c in charges], account_id=acc.id)
+
     # Scenario B: Unpaid IPD charges exist (admission fee + bed fee) -> discharge blocked
     with pytest.raises(ValidationError) as exc:
         DischargePatientAction(db_session).execute(
-            hospital.id, DischargeRequest(admission_id=detail.id), ACTOR
+            hospital.id, DischargeRequest(admission_id=detail.id, no_discharge_meds=True), ACTOR
         )
     assert "outstanding balance" in str(exc.value)
 
@@ -262,13 +274,6 @@ def test_flaw_ipd_02_episode_financial_clearance_scenarios(db_session: Session, 
     )
     ipd_due = float(ipd_totals.get("outstanding") or 0)
     assert ipd_due > 0
-
-    acc = (
-        db_session.query(FinancialAccount)
-        .filter(FinancialAccount.hospital_id == hospital.id, FinancialAccount.admission_id == detail.id)
-        .first()
-    )
-    assert acc is not None
 
     db_session.add(
         BillingPayment(
@@ -288,7 +293,7 @@ def test_flaw_ipd_02_episode_financial_clearance_scenarios(db_session: Session, 
 
     # But IPD discharge succeeds because IPD account is cleared!
     discharged = DischargePatientAction(db_session).execute(
-        hospital.id, DischargeRequest(admission_id=detail.id), ACTOR
+        hospital.id, DischargeRequest(admission_id=detail.id, no_discharge_meds=True), ACTOR
     )
     assert discharged.status == AdmissionStatus.discharged
 

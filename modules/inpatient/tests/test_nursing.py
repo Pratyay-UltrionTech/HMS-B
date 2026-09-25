@@ -28,12 +28,14 @@ from infrastructure.postgres.session import get_transitional_sync_session
 from modules.inpatient.api.nursing_api import router as nursing_router
 from modules.inpatient.entities.admission import Admission, AdmissionStatus
 from shared.auth.jwt import create_access_token
+from shared.exceptions.handlers import register_exception_handlers
 from tests.conftest import db_session, doctor, hospital, hospital_b, patient, patient_b
 
 
 @pytest.fixture(scope="function")
 def nursing_app(db_session: Session) -> FastAPI:
     test_app = FastAPI(title="Nursing Test App")
+    register_exception_handlers(test_app)
     test_app.include_router(nursing_router, prefix="/api")
 
     def _override_db():
@@ -65,6 +67,31 @@ def nurse_headers(hospital: Hospital) -> dict[str, str]:
         "Authorization": f"Bearer {token}",
         "X-Hospital-ID": str(hospital.id),
     }
+
+
+@pytest.fixture(scope="function")
+def doctor_headers(hospital: Hospital) -> dict[str, str]:
+    token = create_access_token(
+        data={
+            "sub": "doctor.lee@hospital.test",
+            "name": "Dr. Lee",
+            "email": "doctor.lee@hospital.test",
+            "role": "hospital_admin",
+            "staff_role_name": "doctor",
+            "hospital_uuid": str(hospital.id),
+            "user_id": str(uuid.uuid4()),
+        }
+    )
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Hospital-ID": str(hospital.id),
+    }
+
+
+@pytest.fixture(scope="function")
+def other_hospital_headers(hospital_b: Hospital) -> dict[str, str]:
+    token = create_access_token(data={"sub": "doctor.other@test", "name": "Other Doctor", "role": "hospital_admin", "staff_role_name": "doctor", "hospital_uuid": str(hospital_b.id)})
+    return {"Authorization": f"Bearer {token}", "X-Hospital-ID": str(hospital_b.id)}
 
 
 @pytest.fixture(scope="function")
@@ -299,3 +326,81 @@ def test_feature_15_and_18_emar_dual_signoff(client: TestClient, nurse_headers: 
     assert res.status_code == 200
     records = res.json()
     assert len(records) == 2
+
+
+def test_doctor_creates_admission_progress_note(
+    client: TestClient,
+    doctor_headers: dict[str, str],
+    test_admission: Admission,
+):
+    response = client.post(
+        f"/api/ipd/admissions/{test_admission.id}/doctor-notes",
+        headers=doctor_headers,
+        json={
+            "subjective": "Pain improved after analgesia",
+            "assessment": "Haemodynamically stable",
+            "plan": "Continue current treatment",
+            "note_content": "Daily inpatient round completed",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["note_type"] == "doctor_progress"
+    assert response.json()["author_role"] == "doctor"
+
+
+def test_doctor_progress_note_rejects_discharged_admission(
+    client: TestClient,
+    db_session: Session,
+    doctor_headers: dict[str, str],
+    test_admission: Admission,
+):
+    test_admission.status = AdmissionStatus.discharged
+    db_session.commit()
+
+    response = client.post(
+        f"/api/ipd/admissions/{test_admission.id}/doctor-notes",
+        headers=doctor_headers,
+        json={
+            "subjective": "Valid clinical payload",
+            "assessment": "No acute distress",
+            "plan": "Documented after discharge",
+            "note_content": "This must be rejected because the admission is discharged",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Cannot add clinical notes to a discharged admission"
+
+
+def test_admission_chart_aggregates_existing_clinical_history(
+    client: TestClient,
+    doctor_headers: dict[str, str],
+    test_admission: Admission,
+):
+    note_response = client.post(
+        f"/api/ipd/admissions/{test_admission.id}/doctor-notes",
+        headers=doctor_headers,
+        json={"note_content": "Daily clinical round", "assessment": "Stable"},
+    )
+    assert note_response.status_code == 201, note_response.text
+
+    response = client.get(
+        f"/api/ipd/admissions/{test_admission.id}/chart",
+        headers=doctor_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    chart = response.json()
+    assert chart["admission"]["id"] == str(test_admission.id)
+    assert chart["doctor_notes"][0]["id"] == note_response.json()["id"]
+    assert chart["nursing_notes"] == []
+    assert chart["bed_history"] == []
+
+
+def test_doctor_notes_and_chart_hide_cross_hospital_admission(
+    client: TestClient, test_admission: Admission, other_hospital_headers: dict[str, str]
+):
+    for path in ("doctor-notes", "chart"):
+        response = client.get(f"/api/ipd/admissions/{test_admission.id}/{path}", headers=other_hospital_headers)
+        assert response.status_code == 404

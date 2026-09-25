@@ -18,7 +18,8 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import Hospital, Patient
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.base import Base
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.patients.api.allergy_api import router as allergy_router
@@ -51,7 +52,7 @@ def staff_headers(hospital: Hospital) -> dict[str, str]:
             "sub": "doctor.sharma@hospital.test",
             "name": "Dr. Sharma",
             "email": "doctor.sharma@hospital.test",
-            "role": "hospital_staff",
+            "role": "hospital_admin",
             "staff_role_name": "doctor",
             "hospital_uuid": str(hospital.id),
             "user_id": str(uuid.uuid4()),

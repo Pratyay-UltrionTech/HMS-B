@@ -21,7 +21,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Hospital, HospitalUser as LegacyHospitalUser, Patient, StaffRole
 from infrastructure.postgres.base import Base as TargetBase
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.appointments.entities.appointment import Appointment
@@ -34,9 +33,6 @@ from modules.clinical_records.entities.clinical_record import Prescription
 from modules.doctors.entities.doctor import HospitalUser
 from modules.inpatient.entities.admission import Admission, AdmissionStatus
 from modules.beds.entities.bed import Bed, Room, Ward, WardType
-from modules.clinical_records.entities.clinical_record import Prescription
-from modules.doctors.entities.doctor import HospitalUser
-from modules.inpatient.entities.admission import Admission, AdmissionStatus
 from modules.insurance.api.insurance_api import router as insurance_router
 from modules.insurance.entities.insurance_entities import (
     ClaimStatus,
@@ -47,8 +43,8 @@ from modules.insurance.entities.insurance_entities import (
     SubmissionStatus,
 )
 from modules.masters.entities.insurance_entities import InsuranceProvider
-from modules.patients.entities.patient import Patient as TargetPatient
-from modules.tenancy.entities.hospital import Hospital as TargetHospital
+from modules.patients.entities.patient import Patient
+from modules.tenancy.entities.hospital import Hospital
 from shared.auth.jwt import create_access_token
 from tests.conftest import db_session, hospital, hospital_b, patient, patient_b, doctor
 
@@ -72,11 +68,11 @@ def client(insurance_app: FastAPI) -> TestClient:
 
 
 @pytest.fixture(scope="function")
-def staff_auth(hospital: Hospital, doctor: LegacyHospitalUser) -> dict[str, str]:
+def staff_auth(hospital: Hospital, doctor: HospitalUser) -> dict[str, str]:
     token = create_access_token({
         "sub": "billing_staff@hospital.com",
         "name": "Insurance Coordinator",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital.id),
         "user_id": str(doctor.id),
     })
@@ -84,11 +80,11 @@ def staff_auth(hospital: Hospital, doctor: LegacyHospitalUser) -> dict[str, str]
 
 
 @pytest.fixture(scope="function")
-def staff_auth_b(hospital_b: Hospital, doctor: LegacyHospitalUser) -> dict[str, str]:
+def staff_auth_b(hospital_b: Hospital, doctor: HospitalUser) -> dict[str, str]:
     token = create_access_token({
         "sub": "staff_b@hospitalb.com",
         "name": "Hospital B Staff",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital_b.id),
         "user_id": str(doctor.id),
     })

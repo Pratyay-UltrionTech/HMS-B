@@ -118,7 +118,10 @@ def db_session() -> Generator[Session, None, None]:
         with test_engine.begin() as conn:
             conn.execute(text("PRAGMA foreign_keys = OFF"))
             for table in Base.metadata.tables.values():
-                conn.execute(table.delete())
+                try:
+                    conn.execute(table.delete())
+                except Exception:
+                    pass
             conn.execute(text("PRAGMA foreign_keys = ON"))
 
 

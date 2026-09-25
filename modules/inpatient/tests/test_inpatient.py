@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from modules.beds.entities.bed import Bed, Room, Ward, WardType
 from modules.doctors.entities.doctor import HospitalUser, StaffRole
 from modules.patients.entities.patient import Patient
+from modules.inpatient.entities.admission import Admission, AdmissionStatus
 from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.beds.api.beds_api import (
@@ -212,11 +213,19 @@ def test_ipd_form_submission_lifecycle(
 ):
     """Test IPD form submission creation, update, listing, and HTML view."""
     patient = test_setup["patient"]
+    admit = client.post("/api/beds/admit", json={
+        "patient_id": str(patient.id),
+        "ward_id": str(test_setup["ward"].id),
+        "room_id": str(test_setup["room"].id),
+        "bed_id": str(test_setup["bed1"].id),
+    }, headers=staff_auth)
+    assert admit.status_code == 201, admit.text
+    admission_id = admit.json()["id"]
 
     # 1. Create IPD Form Submission
     create_payload = {
         "patient_id": str(patient.id),
-        "admission_id": None,
+        "admission_id": admission_id,
         "form_id": "consent_surgery",
         "form_title": "Consent for Surgery",
         "form_data": {"procedure": "Appendectomy", "risks_explained": True},
@@ -263,3 +272,43 @@ def test_ipd_form_submission_lifecycle(
     assert "text/html" in view_res.headers.get("content-type", "")
     assert "Consent for Surgery" in view_res.text
     assert "Appendectomy" in view_res.text
+
+
+def test_generic_ipd_document_routes_require_clinical_module_permission(
+    client: TestClient, hospital: Hospital,
+):
+    token = create_access_token({
+        "sub": "unassigned@hospital.com", "role": "hospital_staff",
+        "hospital_uuid": str(hospital.id),
+    })
+    headers = {"Authorization": f"Bearer {token}"}
+    doc_id = uuid4()
+    assert client.get("/api/ipd/form-submissions", headers=headers).status_code == 403
+    assert client.get(f"/api/ipd/form-submissions/{doc_id}", headers=headers).status_code == 403
+    assert client.get(f"/api/ipd/form-submissions/{doc_id}/view", headers=headers).status_code == 403
+    assert client.get(f"/api/ipd/form-submissions/{doc_id}/addenda", headers=headers).status_code == 403
+    assert client.post("/api/ipd/form-submissions", json={}, headers=headers).status_code == 403
+    assert client.put(f"/api/ipd/form-submissions/{doc_id}", json={}, headers=headers).status_code == 403
+    assert client.post(f"/api/ipd/form-submissions/{doc_id}/addenda", json={}, headers=headers).status_code == 403
+
+
+def test_admission_detail_can_be_loaded_by_exact_id_for_historical_document(
+    client: TestClient,
+    staff_auth: dict[str, str],
+    db_session: Session,
+    hospital: Hospital,
+    test_setup: dict[str, any],
+):
+    admission = Admission(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        patient_id=test_setup["patient"].id,
+        status=AdmissionStatus.discharged,
+    )
+    db_session.add(admission)
+    db_session.commit()
+
+    response = client.get(f"/api/beds/admissions/{admission.id}", headers=staff_auth)
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == str(admission.id)
+    assert response.json()["status"] == "discharged"

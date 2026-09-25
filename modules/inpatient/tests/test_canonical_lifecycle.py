@@ -46,7 +46,7 @@ from modules.inpatient.entities.admission import (
 )
 from modules.patients.entities.patient import Patient, PatientStatus
 from modules.tenancy.entities.hospital import Hospital
-from shared.exceptions.base import ConflictError
+from shared.exceptions.base import ConflictError, ValidationError
 from tests.conftest import db_session, hospital  # noqa: F401  (fixtures)
 
 
@@ -328,7 +328,8 @@ def test_11_discharge(db_session: Session, hospital: Hospital):
     RequestDischargeAction(db_session).execute(
         hospital.id, DischargeRequestCreate(admission_id=detail.id), ACTOR
     )
-    from modules.billing.entities.billing_entities import BillingPayment, FinancialAccount
+    from modules.billing.entities.billing_entities import BillingCharge, BillingPayment, FinancialAccount
+    from modules.billing.services.invoice_service import create_invoice_from_charges
     from modules.inpatient.services.inpatient_billing_service import InpatientBillingService
     acc = (
         db_session.query(FinancialAccount)
@@ -338,6 +339,15 @@ def test_11_discharge(db_session: Session, hospital: Hospital):
         )
         .first()
     )
+    charges = db_session.query(BillingCharge).filter(BillingCharge.account_id == acc.id).all()
+    if charges:
+        create_invoice_from_charges(
+            db_session,
+            hospital_id=hospital.id,
+            patient_id=patient.id,
+            charge_ids=[c.id for c in charges],
+            account_id=acc.id,
+        )
     outstanding = float(
         InpatientBillingService(db_session).get_ledger_totals(hospital.id, patient.id, admission_id=detail.id).get("outstanding") or 0
     )
@@ -351,7 +361,7 @@ def test_11_discharge(db_session: Session, hospital: Hospital):
     )
     db_session.commit()
     out = DischargePatientAction(db_session).execute(
-        hospital.id, DischargeRequest(admission_id=detail.id), ACTOR
+        hospital.id, DischargeRequest(admission_id=detail.id, no_discharge_meds=True), ACTOR
     )
     assert out.status == AdmissionStatus.discharged
     assert out.discharged_at is not None  # discharged ⇔ discharged_at invariant
@@ -472,8 +482,8 @@ def test_16_request_queue_and_accept_endpoints(db_session: Session, hospital: Ho
     census = client.get("/api/beds/admissions/active", headers=headers)
     assert census.status_code == 200
     assert any(r["id"] == admission_id for r in census.json())
-# ── Test 15: draft → final via update also enters the lifecycle ─────────────
-def test_15_update_finalize_creates_request(db_session: Session, hospital: Hospital):
+# ── Test 15: legacy unlinked draft cannot acquire an admission on update ─────
+def test_15_update_finalize_unlinked_draft_is_rejected(db_session: Session, hospital: Hospital):
     from modules.inpatient.actions.ipd_actions import UpdateFormSubmissionAction
     from modules.inpatient.contracts.inpatient_contracts import IpdFormSubmissionUpdate
 
@@ -491,12 +501,11 @@ def test_15_update_finalize_creates_request(db_session: Session, hospital: Hospi
     repo = AdmissionsRepository(db_session)
     assert repo.get_open_admission(hospital.id, patient.id) is None
 
-    final = UpdateFormSubmissionAction(db_session).execute(
-        hospital.id, draft.id,
-        IpdFormSubmissionUpdate(status=IpdFormSubmissionStatus.final),
-        ACTOR,
-    )
-    assert final.admission_id is not None
-    adm = repo.get_admission_by_id(hospital.id, final.admission_id)
-    assert adm.status == AdmissionStatus.requested
-    assert any(r.id == adm.id for r in repo.list_admission_requests(hospital.id))
+    with pytest.raises(ValidationError, match="no linked admission"):
+        UpdateFormSubmissionAction(db_session).execute(
+            hospital.id, draft.id,
+            IpdFormSubmissionUpdate(status=IpdFormSubmissionStatus.final),
+            ACTOR,
+        )
+    db_session.rollback()
+    assert repo.get_open_admission(hospital.id, patient.id) is None

@@ -255,6 +255,25 @@ def test_billing_gated_lab_workflow_full_lifecycle(lab_gated_client, lab_gated_d
     assert order_data["status"] == "ordered"
     assert order_data["is_financially_cleared"] is True
 
+    # Accession response, persisted row, detail lookup, and queue filters must
+    # all refer to the same order. The queue search accepts the patient fields
+    # shown in its UI as well as the order number.
+    persisted_order = lab_gated_db.query(LabOrder).filter(LabOrder.id == order_id).one()
+    assert persisted_order.hospital_id == h_id
+    assert persisted_order.patient_id == patient.id
+    assert persisted_order.prescription_request_id == lab_req.id
+    assert persisted_order.status == LabOrderStatus.ordered
+    detail_resp = lab_gated_client.get(f"/api/laboratory/orders/{order_id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["id"] == order_data["id"]
+    assert detail_resp.json()["status"] == order_data["status"] == "ordered"
+    queue_resp = lab_gated_client.get("/api/laboratory/orders?status=ordered")
+    assert queue_resp.status_code == 200
+    assert any(row["id"] == order_data["id"] for row in queue_resp.json())
+    patient_search_resp = lab_gated_client.get("/api/laboratory/orders", params={"search": patient.name})
+    assert patient_search_resp.status_code == 200
+    assert any(row["id"] == order_data["id"] for row in patient_search_resp.json())
+
     # 7. Zero Duplicate Charges: Ensure the charge was re-pointed to order.id
     all_lab_charges = (
         lab_gated_db.query(BillingCharge)

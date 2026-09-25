@@ -235,6 +235,24 @@ def test_billing_gated_radiology_full_lifecycle(rad_gated_client, rad_gated_db):
     order_id = UUID(order["id"])
     assert order["status"] == "ordered"
 
+    # Verify the created prescription order is persisted and returned by both
+    # detail and acquisition queue queries using the API order ID.
+    persisted_order = rad_gated_db.query(RadiologyOrder).filter(RadiologyOrder.id == order_id).one()
+    assert persisted_order.hospital_id == h_id
+    assert persisted_order.patient_id == patient.id
+    assert persisted_order.prescription_request_id == rad_req.id
+    assert persisted_order.status == RadiologyOrderStatus.ordered
+    detail_resp = rad_gated_client.get(f"/api/radiology/orders/{order_id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["id"] == order["id"]
+    assert detail_resp.json()["status"] == order["status"] == "ordered"
+    queue_resp = rad_gated_client.get("/api/radiology/orders?status=ordered")
+    assert queue_resp.status_code == 200
+    assert any(row["id"] == order["id"] for row in queue_resp.json())
+    patient_search_resp = rad_gated_client.get("/api/radiology/orders", params={"search": patient.name})
+    assert patient_search_resp.status_code == 200
+    assert any(row["id"] == order["id"] for row in patient_search_resp.json())
+
     # 7. Zero Duplicate Charges: Existing charge re-pointed to order_id
     all_rad_charges = (
         rad_gated_db.query(BillingCharge)

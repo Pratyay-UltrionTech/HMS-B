@@ -22,19 +22,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import (
-    Admission,
-    AdmissionStatus,
-    Appointment,
-    AppointmentStatus,
-    Bed,
-    Hospital,
-    HospitalUser,
-    MedicalRecord,
-    Prescription,
-    Room,
-    Ward,
-)
+from modules.appointments.entities.appointment import Appointment, AppointmentStatus
+from modules.beds.entities.bed import Bed, Room, Ward
+from modules.clinical_records.entities.clinical_record import MedicalRecord, Prescription
+from modules.doctors.entities.doctor import HospitalUser
+from modules.inpatient.entities.admission import Admission, AdmissionStatus
+from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.session import (
     get_transitional_sync_session as get_db,
 )
@@ -61,9 +54,9 @@ def patients_client(db_session: Session) -> TestClient:
 def staff_headers(hospital: Hospital) -> dict[str, str]:
     """Auth headers for a valid hospital staff member."""
     token = create_access_token({
-        "sub": "nurse@hospital.com",
-        "name": "Staff Nurse",
-        "role": "hospital_staff",
+        "sub": "admin@hospital.com",
+        "name": "Staff Admin",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital.id),
     })
     return {"Authorization": f"Bearer {token}"}
