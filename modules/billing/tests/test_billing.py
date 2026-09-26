@@ -693,13 +693,26 @@ def test_emergency_clearance_override(
         )
     assert exc.value.status_code == 402
 
-    # Emergency override clears successfully
+    # Emergency override without mandatory reason or authorized actor is rejected
+    with pytest.raises(HTTPException) as exc_no_reason:
+        assert_service_financially_cleared(
+            db_session,
+            hospital.id,
+            BillingSourceType.laboratory,
+            order_id,
+            is_emergency_override=True,
+        )
+    assert exc_no_reason.value.status_code == 400
+
+    # Emergency override clears successfully when authorized actor and reason provided
     cleared_state = assert_service_financially_cleared(
         db_session,
         hospital.id,
         BillingSourceType.laboratory,
         order_id,
         is_emergency_override=True,
+        actor={"role": "doctor", "name": "Dr. House"},
+        emergency_reason="Acute STEMI requiring emergency cardiac enzymes",
     )
     assert cleared_state.is_cleared is True
     assert "override" in cleared_state.reason.lower()

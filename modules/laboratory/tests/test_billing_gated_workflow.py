@@ -187,10 +187,18 @@ def test_billing_gated_lab_workflow_full_lifecycle(lab_gated_client, lab_gated_d
     assert dash_data["pending_doctor_requests"] == 0
     assert len(dash_data["pending_requests"]) == 0
 
-    # Default pending list query (for laboratory queue) excludes unreleased requests
+    # Requirement 2: Default pending list query MUST keep unpaid orders visible with financial status
     list_resp = lab_gated_client.get("/api/laboratory/prescription-requests?status=pending")
     assert list_resp.status_code == 200
-    assert len(list_resp.json()) == 0
+    pending_items = list_resp.json()
+    assert len(pending_items) == 1
+    assert pending_items[0]["is_financially_cleared"] is False
+    assert pending_items[0]["payment_status"] == "pending"
+
+    # Only when released_only=true is explicitly requested are unreleased requests filtered out
+    released_resp = lab_gated_client.get("/api/laboratory/prescription-requests?status=pending&released_only=true")
+    assert released_resp.status_code == 200
+    assert len(released_resp.json()) == 0
 
     # Patient-specific history displays it with clear financial status
     pt_list_resp = lab_gated_client.get(f"/api/laboratory/prescription-requests?patient_id={patient.id}")
@@ -353,14 +361,29 @@ def test_billing_gated_stat_emergency_bypass(lab_gated_client, lab_gated_db):
     assert dash_resp.status_code == 200
     assert dash_resp.json()["pending_doctor_requests"] == 1
 
-    # Accession succeeds immediately (emergency bypass)
-    accession_resp = lab_gated_client.post(
+    # Accession with only "STAT" text in notes without structured override MUST fail (Requirement 9)
+    accession_stat = lab_gated_client.post(
         "/api/laboratory/orders",
         json={
             "patient_id": str(patient.id),
             "doctor_id": str(user_id),
             "prescription_request_id": str(lab_req.id),
             "clinical_notes": "STAT accession",
+            "is_emergency_override": False,
+        },
+    )
+    assert accession_stat.status_code == 402
+
+    # Accession with structured emergency override succeeds immediately (emergency protocol)
+    accession_resp = lab_gated_client.post(
+        "/api/laboratory/orders",
+        json={
+            "patient_id": str(patient.id),
+            "doctor_id": str(user_id),
+            "prescription_request_id": str(lab_req.id),
+            "clinical_notes": "STAT emergency accession",
+            "is_emergency_override": True,
+            "emergency_override_reason": "Acute chest pain; critical cardiac biomarker protocol",
         },
     )
     assert accession_resp.status_code == 201

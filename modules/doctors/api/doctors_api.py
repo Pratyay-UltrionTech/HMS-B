@@ -62,6 +62,8 @@ from modules.doctors.contracts.doctor_contracts import (
     DoctorAppointmentCreate,
     DoctorAppointmentResponse,
     DoctorAppointmentUpdate,
+    DoctorIpdAdmissionRequest,
+    DoctorIpdAdmissionResponse,
     DoctorLeaveCreate,
     DoctorLeaveRangeCreate,
     DoctorLeaveResponse,
@@ -163,6 +165,31 @@ def doctor_patient_history(
 ):
     resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
     return GetDoctorPatientHistoryAction(db).execute(hospital_id, resolved, patient_id, user)
+
+
+@router.post(
+    "/{doctor_id}/patients/{patient_id}/request-ipd",
+    response_model=DoctorIpdAdmissionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("doctors", "edit"))],
+)
+def doctor_request_ipd_admission(
+    doctor_id: UUID,
+    patient_id: UUID,
+    payload: DoctorIpdAdmissionRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> DoctorIpdAdmissionResponse:
+    from modules.doctors.actions.doctor_appointment_actions import DoctorRequestIpdAdmissionAction
+    resolved = resolve_doctor_id(user, doctor_id, hospital_id, db)
+    return DoctorRequestIpdAdmissionAction(db).execute(
+        hospital_id=hospital_id,
+        doctor_id=resolved,
+        patient_id=patient_id,
+        payload=payload,
+        actor=user,
+    )
 
 
 # ── Doctor Appointments & Calendar ──────────────────────────────────────────

@@ -21,6 +21,8 @@ from modules.doctors.contracts.doctor_contracts import (
     DoctorAppointmentCreate,
     DoctorAppointmentResponse,
     DoctorAppointmentUpdate,
+    DoctorIpdAdmissionRequest,
+    DoctorIpdAdmissionResponse,
     DoctorScheduleContext,
     TransferToInpatientRequest,
 )
@@ -295,10 +297,10 @@ class TransferAppointmentToInpatientAction:
             )
         if appt.status == AppointmentStatus.ipd_transfer_requested:
             return to_doctor_appointment_response(appt)
-        if appt.status in TERMINAL:
+        if appt.status in (AppointmentStatus.cancelled, AppointmentStatus.no_show):
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot transfer a {appt.status.value} visit to inpatient",
+                detail=f"Cannot transfer a {appt.status.value} visit to inpatient. Please create a direct IPD admission request instead.",
             )
 
         from sqlalchemy.exc import IntegrityError as _IntegrityError
@@ -311,7 +313,21 @@ class TransferAppointmentToInpatientAction:
             admission_conflict as _transfer_conflict,
         )
 
-        appt.status = AppointmentStatus.ipd_transfer_requested
+        from modules.inpatient.db.admissions_repository import AdmissionsRepository
+        repo = AdmissionsRepository(self.db)
+        open_adm = repo.get_open_admission(hospital_id, appt.patient_id)
+        if open_adm and open_adm.status != _AdmStatus.requested:
+            raise _transfer_conflict(
+                f"Patient already has an active inpatient admission ({open_adm.status.value})",
+                admission_id=open_adm.id,
+                admission_status=open_adm.status,
+                bed_id=open_adm.bed_id,
+                doctor_id=open_adm.doctor_id,
+            )
+
+        is_completed = appt.status == AppointmentStatus.completed
+        if not is_completed:
+            appt.status = AppointmentStatus.ipd_transfer_requested
         if payload.notes:
             appt.notes = payload.notes.strip()
         self.db.flush()
@@ -330,6 +346,7 @@ class TransferAppointmentToInpatientAction:
                 source_appointment_id=appt.id,
                 commit=False,
             )
+            appt.admission_id = admission.id
             self.db.flush()
         except _IntegrityError as exc:
             self.db.rollback()
@@ -338,16 +355,12 @@ class TransferAppointmentToInpatientAction:
                 admission_status=_AdmStatus.requested,
                 doctor_id=doctor_id,
             ) from exc
-        if admission.status != _AdmStatus.requested:
-            self.db.rollback()
-            raise _transfer_conflict(
-                f"Patient already has an {admission.status.value} admission",
-                admission_id=admission.id,
-                admission_status=admission.status,
-                bed_id=admission.bed_id,
-                doctor_id=admission.doctor_id,
-            )
 
+        action_summary = (
+            f"Transferred completed visit {appt.id} to IPD (episode {admission.id})"
+            if is_completed
+            else f"Transferred visit {appt.id} to IPD (request {admission.id})"
+        )
         write_audit_log(
             self.db,
             hospital_id=hospital_id,
@@ -355,10 +368,7 @@ class TransferAppointmentToInpatientAction:
             action="update",
             entity_type="appointment",
             entity_id=str(appt.id),
-            summary=(
-                f"Requested IPD transfer for {appt.patient.name if appt.patient else 'patient'} "
-                f"({getattr(appt, 'op_id', None) or 'OP'}) — waiting for nurse to book a bed"
-            ),
+            summary=action_summary,
         )
         self.db.commit()
         refreshed = (
@@ -368,6 +378,93 @@ class TransferAppointmentToInpatientAction:
             .first()
         )
         return to_doctor_appointment_response(refreshed or appt)
+
+
+class DoctorRequestIpdAdmissionAction:
+    """Doctor-initiated IPD admission request for an existing patient directly from dossier/profile."""
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def execute(
+        self,
+        hospital_id: UUID,
+        doctor_id: UUID,
+        patient_id: UUID,
+        payload: DoctorIpdAdmissionRequest,
+        actor: dict[str, Any],
+    ) -> DoctorIpdAdmissionResponse:
+        from modules.patients.entities.patient import Patient
+        patient = (
+            self.db.query(Patient)
+            .filter(Patient.id == patient_id, Patient.hospital_id == hospital_id)
+            .first()
+        )
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found")
+
+        src_appt_id = payload.source_appointment_id
+        if src_appt_id:
+            src_appt = (
+                self.db.query(Appointment)
+                .filter(Appointment.id == src_appt_id, Appointment.hospital_id == hospital_id)
+                .first()
+            )
+            if not src_appt or src_appt.patient_id != patient_id:
+                src_appt_id = None
+
+        from modules.inpatient.actions.admission_lifecycle_actions import EnsureAdmissionRequestAction
+        notes_text = (payload.clinical_reason or payload.notes or "").strip() or None
+
+        admission, is_new = EnsureAdmissionRequestAction(self.db).execute(
+            hospital_id=hospital_id,
+            patient_id=patient_id,
+            actor=actor,
+            doctor_id=doctor_id,
+            notes=notes_text,
+            source_appointment_id=src_appt_id,
+            ward_id=getattr(payload, "ward_id", None),
+            commit=True,
+        )
+
+        if src_appt_id:
+            src_appt = (
+                self.db.query(Appointment)
+                .filter(Appointment.id == src_appt_id, Appointment.hospital_id == hospital_id)
+                .first()
+            )
+            if src_appt and not src_appt.admission_id:
+                src_appt.admission_id = admission.id
+                self.db.commit()
+
+        # Compute initial admission advance financial status
+        from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
+        fin = evaluate_bed_allocation_clearance(
+            self.db, hospital_id, admission.id, ward_id=admission.ward_id
+        )
+        if fin.is_cleared:
+            guidance = "Admission is financially cleared. Patient may proceed directly to the nursing station for bed allocation."
+        elif fin.shortfall > 0:
+            guidance = f"Billing / Cash Counter must collect admission advance of ₹{fin.shortfall:.2f} before final bed allocation."
+        else:
+            guidance = "Billing / Cash Counter will verify admission advance requirements before final bed allocation."
+
+        return DoctorIpdAdmissionResponse(
+            admission_id=admission.id,
+            patient_id=patient_id,
+            doctor_id=doctor_id,
+            status=admission.status.value,
+            ip_id=admission.ip_id,
+            notes=admission.notes,
+            source_appointment_id=admission.source_appointment_id,
+            created_at=admission.admitted_at,
+            financial_account_id=fin.ipd_account_id,
+            financial_status=fin.status,
+            required_advance=fin.required_advance,
+            paid_or_deposited=fin.paid_or_allocated_amount + fin.available_deposit,
+            shortfall=fin.shortfall,
+            financial_guidance=guidance,
+        )
 
 
 class GetDoctorScheduleContextAction:

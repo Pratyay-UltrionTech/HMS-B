@@ -245,3 +245,35 @@ class PatientHistoryResponse(BaseModel):
     vitals: list[Any] = Field(default_factory=list)
     ipd_forms: list[IpdFormHistoryItem] = Field(default_factory=list)
     financial_summary: dict[str, Any] | None = None
+    ipd_admissions: list[Any] = Field(default_factory=list)
+
+
+class DoctorIpdAdmissionRequest(BaseModel):
+    clinical_reason: str | None = None
+    notes: str | None = None
+    ward_id: UUID | None = None
+    department_id: UUID | None = None
+    priority: str | None = "routine"
+    source_appointment_id: UUID | None = None
+
+
+class DoctorIpdAdmissionResponse(BaseModel):
+    admission_id: UUID
+    patient_id: UUID
+    doctor_id: UUID | None = None
+    status: str
+    ip_id: str | None = None
+    notes: str | None = None
+    source_appointment_id: UUID | None = None
+    created_at: datetime
+    message: str = "IPD admission requested successfully"
+    financial_account_id: UUID | None = None
+    financial_status: str | None = None
+    required_advance: float | None = None
+    paid_or_deposited: float | None = None
+    shortfall: float | None = None
+    financial_guidance: str | None = None
+
+    @property
+    def id(self) -> UUID:
+        return self.admission_id

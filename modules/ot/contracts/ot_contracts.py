@@ -53,6 +53,11 @@ class OtRescheduleRequest(BaseModel):
     remarks: str | None = None
 
 
+class OtStartSurgeryRequest(BaseModel):
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
+
+
 class OtCompleteRequest(BaseModel):
     shifted_to: str | None = Field(default=None, max_length=64)
     actual_duration_minutes: int | None = Field(default=None, ge=1, le=1440)

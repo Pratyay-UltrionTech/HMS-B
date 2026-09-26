@@ -26,7 +26,12 @@ from modules.patients.contracts.allergy_contracts import (
     PatientAllergyCreate,
     PatientAllergyResponse,
 )
-from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
+from shared.auth.dependencies import (
+    get_hospital_context,
+    require_any_permission,
+    require_hospital_user,
+    require_permission,
+)
 
 router = APIRouter(prefix="/patients", tags=["patients", "allergies"])
 
@@ -95,3 +100,29 @@ def check_allergy_alert(
     Returns structured conflict alerts requiring clinical override if a risk is detected.
     """
     return CheckPatientAllergyAlertAction(db, hospital_id).execute(patient_id, payload)
+
+
+@router.get(
+    "/{patient_id}/medical-record",
+    summary="Get unified patient medical record across IPD and OPD episodes",
+    dependencies=[
+        Depends(
+            require_any_permission([
+                ("registration", "view"),
+                ("doctors", "view"),
+                ("nurses", "view"),
+                ("all_ipd", "view"),
+                ("dms", "view"),
+            ])
+        )
+    ],
+)
+def get_unified_medical_record(
+    patient_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+):
+    """Canonical patient medical record / clinical timeline aggregation across IPD & OPD."""
+    from modules.clinical_records.services.unified_medical_record_service import UnifiedMedicalRecordService
+    return UnifiedMedicalRecordService(db, hospital_id).get_patient_medical_record(patient_id)

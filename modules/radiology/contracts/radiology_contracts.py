@@ -62,6 +62,10 @@ class RadOrderCreate(BaseModel):
     prescription_request_id: UUID | None = None
     scan_ids: list[UUID] = Field(default_factory=list)
     clinical_notes: str | None = None
+    is_emergency: bool = False
+    emergency_reason: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
     @model_validator(mode="after")
     def require_scans_or_request(self):
@@ -123,6 +127,13 @@ class RadScheduleRequest(BaseModel):
     scheduled_at: datetime
     machine: str = Field(min_length=1, max_length=128)
     technician_name: str = Field(min_length=1, max_length=255)
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
+
+
+class RadStartScanRequest(BaseModel):
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class RadReportRequest(BaseModel):

@@ -438,6 +438,27 @@ class GetDoctorPatientHistoryAction:
             except Exception:
                 pass
 
+        admissions = (
+            self.db.query(Admission)
+            .filter(Admission.hospital_id == hospital_id, Admission.patient_id == patient_id)
+            .order_by(Admission.admitted_at.desc())
+            .all()
+        )
+        ipd_admissions_payload = [
+            {
+                "id": str(adm.id),
+                "ip_id": adm.ip_id,
+                "admission_date": (adm.admitted_at.isoformat() if getattr(adm, "admitted_at", None) else (adm.admission_date.isoformat() if getattr(adm, "admission_date", None) else None)),
+                "discharged_at": adm.discharged_at.isoformat() if adm.discharged_at else None,
+                "status": adm.status.value if hasattr(adm.status, "value") else str(adm.status),
+                "reason": getattr(adm, "notes", None) or getattr(adm, "reason", None) or getattr(adm, "admission_reason", None),
+                "bed_number": (getattr(adm.bed, "bed_code", None) or getattr(adm.bed, "bed_number", None)) if getattr(adm, "bed", None) else getattr(adm, "bed_number", None),
+                "ward_name": (getattr(adm.ward, "name", None) or getattr(adm.ward, "ward_name", None)) if getattr(adm, "ward", None) else getattr(adm, "ward_name", None),
+                "doctor_name": adm.doctor.name if adm.doctor else None,
+            }
+            for adm in admissions
+        ]
+
         return PatientHistoryResponse(
             patient=to_doctor_patient_response(
                 patient,
@@ -469,6 +490,7 @@ class GetDoctorPatientHistoryAction:
                 for f in ipd_forms
             ],
             financial_summary=financial_summary,
+            ipd_admissions=ipd_admissions_payload,
         )
 
 

@@ -50,6 +50,12 @@ from shared.exceptions.base import ConflictError, ValidationError
 from tests.conftest import db_session, hospital  # noqa: F401  (fixtures)
 
 
+@pytest.fixture(autouse=True)
+def disable_advance_policy_for_clinical_lifecycle(hospital: Hospital, db_session: Session):
+    hospital.facility_settings = {"admission_advance_policy": {"enabled": False}}
+    db_session.commit()
+
+
 def _make_staff(db_session: Session, hospital: Hospital, name="Dr. Who", email=None):
     role = StaffRole(id=uuid4(), hospital_id=hospital.id, name="Doctor")
     db_session.add(role)

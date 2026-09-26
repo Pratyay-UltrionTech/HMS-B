@@ -180,10 +180,18 @@ def test_billing_gated_radiology_full_lifecycle(rad_gated_client, rad_gated_db):
     assert charge.charge_amount == 500.0
     assert charge.status == BillingChargeStatus.pending
 
-    # 3. Queue Isolation: Unpaid request must not be in released worklist
+    # Requirement 2: Default pending list query MUST keep unpaid orders visible with financial status
     list_resp = rad_gated_client.get("/api/radiology/prescription-requests?status=pending")
     assert list_resp.status_code == 200
-    assert len(list_resp.json()) == 0
+    pending_items = list_resp.json()
+    assert len(pending_items) == 1
+    assert pending_items[0]["is_financially_cleared"] is False
+    assert pending_items[0]["payment_status"] == "pending"
+
+    # Only when released_only=true is explicitly requested are unreleased requests filtered out
+    released_resp = rad_gated_client.get("/api/radiology/prescription-requests?status=pending&released_only=true")
+    assert released_resp.status_code == 200
+    assert len(released_resp.json()) == 0
 
     pt_list_resp = rad_gated_client.get(f"/api/radiology/prescription-requests?patient_id={patient.id}")
     assert pt_list_resp.status_code == 200
@@ -347,23 +355,51 @@ def test_billing_gated_radiology_stat_bypass(rad_gated_client, rad_gated_db):
     )
     rad_gated_db.commit()
 
-    # Appears in actionable queue immediately due to STAT override
+    # 1. Unpaid order remains visible in pending queue with is_financially_cleared=False despite 'STAT' text in notes
     list_resp = rad_gated_client.get("/api/radiology/prescription-requests?status=pending")
     assert list_resp.status_code == 200
-    assert len(list_resp.json()) == 1
+    pending_items = list_resp.json()
+    assert len(pending_items) == 1
+    assert pending_items[0]["is_financially_cleared"] is False
+    assert pending_items[0]["payment_status"] == "pending"
 
-    # Accession succeeds immediately without payment
+    # 2. Accession attempt fails with 402 Payment Required because STAT string alone is not an override
+    failed_accession_resp = rad_gated_client.post(
+        "/api/radiology/orders",
+        json={
+            "patient_id": str(patient.id),
+            "doctor_id": str(user_id),
+            "prescription_request_id": str(rad_req.id),
+            "clinical_notes": "STAT accession without override",
+        },
+    )
+    assert failed_accession_resp.status_code == 402
+    assert "Payment required" in failed_accession_resp.json()["detail"]["message"]
+
+    # 3. Accession succeeds with structured emergency override
     accession_resp = rad_gated_client.post(
         "/api/radiology/orders",
         json={
             "patient_id": str(patient.id),
             "doctor_id": str(user_id),
             "prescription_request_id": str(rad_req.id),
-            "clinical_notes": "STAT accession",
+            "clinical_notes": "Emergency accession",
+            "is_emergency_override": True,
+            "emergency_override_reason": "Traumatic brain injury resuscitation",
         },
     )
     assert accession_resp.status_code == 201
     assert accession_resp.json()[0]["status"] == "ordered"
+
+    # 4. Verify charge remains unpaid (receivable preserved, no fake money)
+    rad_charge = (
+        rad_gated_db.query(BillingCharge)
+        .filter(BillingCharge.hospital_id == h_id, BillingCharge.patient_id == patient.id)
+        .first()
+    )
+    assert rad_charge is not None
+    assert rad_charge.status == BillingChargeStatus.pending
+    assert float(rad_charge.amount_paid) == 0.0
 
 
 def test_radiology_prescription_cancel_cancels_billing_charge(rad_gated_client, rad_gated_db):

@@ -160,6 +160,8 @@ class AllocateRequest(BaseModel):
     ward_id: UUID
     room_id: UUID
     bed_id: UUID
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class TransferRequest(BaseModel):
@@ -260,6 +262,15 @@ class AdmissionDetail(BaseModel):
     no_discharge_meds_doctor_id: UUID | None = None
     care_team: list[AdmissionCareTeamResponse] = Field(default_factory=list)
 
+    # Admission Financial Clearance Status
+    required_advance: float = 0.0
+    paid_or_allocated_amount: float = 0.0
+    available_deposit: float = 0.0
+    advance_shortfall: float = 0.0
+    financial_clearance_status: str = "pending"
+    is_financially_cleared: bool = False
+    financial_account_id: UUID | None = None
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -307,6 +318,8 @@ class AdmissionAcceptRequest(BaseModel):
     bed_id: UUID | None = None
     doctor_id: UUID | None = None
     notes: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class AdmissionSummary(BaseModel):

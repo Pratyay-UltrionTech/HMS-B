@@ -1180,6 +1180,17 @@ class CreateDepositAction:
             entity_id=deposit.id,
             summary=f"Advance deposit {deposit.deposit_number} (₹{deposit.original_amount:.2f}) received for {patient.name}",
         )
+        if deposit.admission_id:
+            write_audit_log(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                actor=user,
+                action="financial_update",
+                entity_type="admission",
+                entity_id=deposit.admission_id,
+                summary=f"Advance deposit {deposit.deposit_number} (₹{deposit.original_amount:.2f}) linked to admission",
+                details={"deposit_id": str(deposit.id), "amount": float(deposit.original_amount)},
+            )
         self.db.commit()
         return BillingDepositResponse.model_validate(deposit_to_dict(deposit, patient))
 

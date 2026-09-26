@@ -105,7 +105,11 @@ class IpdSubmissionsRepository:
     def sync_final_to_patient_record(
         self, sub: IpdFormSubmission, user_id: UUID | None = None
     ) -> None:
-        """Mirror a finalized IPD form into DMS patient documents (+ medical record when doctor)."""
+        """
+        Update historical mirrored patient document / medical record if one was already linked.
+        Per audit requirement 19, do NOT manufacture new physical duplicate rows; the canonical
+        IpdFormSubmission is surfaced directly via the unified medical-record layer.
+        """
         notes = f"IPD form `{sub.form_id}` · status {sub.status.value} · submission {sub.id}"
         file_data = html_to_data_url(sub.html_snapshot) if sub.html_snapshot else None
         file_name = f"{sub.form_id}-{sub.id}.html" if sub.html_snapshot else None
@@ -125,41 +129,8 @@ class IpdSubmissionsRepository:
                 doc.file_data = file_data
                 doc.uploaded_by_name = sub.filled_by_name
                 doc.uploaded_by_role = sub.filled_by_role
-            else:
-                sub.patient_document_id = None
 
-        if not sub.patient_document_id:
-            doc = PatientDocument(
-                hospital_id=sub.hospital_id,
-                patient_id=sub.patient_id,
-                category=category,
-                title=sub.form_title,
-                notes=notes,
-                file_name=file_name,
-                file_data=file_data,
-                uploaded_by_name=sub.filled_by_name,
-                uploaded_by_role=sub.filled_by_role,
-            )
-            self.db.add(doc)
-            self.db.flush()
-            sub.patient_document_id = doc.id
-
-        doctor_id = sub.filled_by_id or user_id
-        if doctor_id and not sub.medical_record_id:
-            rec = MedicalRecord(
-                hospital_id=sub.hospital_id,
-                doctor_id=doctor_id,
-                patient_id=sub.patient_id,
-                report_type="IPD Form",
-                title=sub.form_title,
-                notes=notes,
-                file_name=file_name,
-                file_data=file_data,
-            )
-            self.db.add(rec)
-            self.db.flush()
-            sub.medical_record_id = rec.id
-        elif sub.medical_record_id:
+        if sub.medical_record_id:
             rec = (
                 self.db.query(MedicalRecord)
                 .filter(MedicalRecord.id == sub.medical_record_id)

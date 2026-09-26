@@ -13,6 +13,10 @@ from modules.billing.entities.billing_entities import (
     BillingSourceType,
     ConsultationPricing,
 )
+from modules.billing.entities.financial_exception import (
+    FinancialClearanceException,
+    FinancialExceptionStatus,
+)
 
 __all__ = [
     "BillingCharge",
@@ -26,4 +30,6 @@ __all__ = [
     "BillingReceiptStatus",
     "BillingSourceType",
     "ConsultationPricing",
+    "FinancialClearanceException",
+    "FinancialExceptionStatus",
 ]

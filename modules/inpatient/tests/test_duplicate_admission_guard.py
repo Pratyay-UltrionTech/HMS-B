@@ -72,6 +72,7 @@ def _seed(sdb: Session, beds=2):
         id=hid, hospital_id=f"H-{uuid4().hex[:6]}", name="T",
         address="a", phone="1", email=f"{uuid4().hex[:6]}@h.org",
         password_hash="h",
+        facility_settings={"admission_advance_policy": {"enabled": False}},
     )
     sdb.add(hosp)
     sdb.flush()

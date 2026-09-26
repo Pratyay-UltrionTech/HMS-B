@@ -50,6 +50,7 @@ from modules.radiology.contracts.radiology_contracts import (
     RadScanResponse,
     RadScanUpdate,
     RadScheduleRequest,
+    RadStartScanRequest,
 )
 from modules.radiology.db.radiology_repository import RadiologyRepository
 from modules.radiology.entities.radiology_entities import (
@@ -254,11 +255,12 @@ def schedule_order(
 @router.post("/orders/{order_id}/start", response_model=RadOrderResponse, dependencies=[Depends(require_permission("radiology", "edit"))])
 def start_scan(
     order_id: UUID,
+    payload: RadStartScanRequest | None = None,
     db: Session = Depends(get_transitional_sync_session),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> RadOrderResponse:
-    return StartScanAction(db, hospital_id, user).execute(order_id)
+    return StartScanAction(db, hospital_id, user).execute(order_id, payload)
 
 
 @router.post("/orders/{order_id}/complete-scan", response_model=RadOrderResponse,
@@ -294,16 +296,6 @@ def report_html(
     order = repo.get_order(order_id)
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
-
-    from modules.billing.entities.billing_entities import BillingSourceType
-    from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-    assert_service_financially_cleared(
-        db,
-        hospital_id,
-        BillingSourceType.radiology,
-        order.id,
-        action_description="view radiology report",
-    )
 
     hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
     html = generate_radiology_report_html(

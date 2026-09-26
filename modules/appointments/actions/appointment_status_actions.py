@@ -320,7 +320,7 @@ class AssignNurseAction:
 
 
 class AdmitIpdAction:
-    """Admit patient to Inpatient ward/bed directly from appointment."""
+    """Admit patient to Inpatient ward/bed directly from appointment (Legacy adapter)."""
 
     def __init__(
         self,
@@ -338,255 +338,43 @@ class AdmitIpdAction:
         payload: AdmitIpdRequest,
         user: dict[str, Any],
     ) -> dict[str, Any]:
-        from sqlalchemy.exc import IntegrityError
-
         appt = self.repo.get_by_id(appointment_id)
         if not appt:
             raise AppointmentNotFoundError()
 
-        from modules.patients.entities.patient import Patient
-        patient = (
-            self.db.query(Patient)
-            .filter(Patient.id == appt.patient_id, Patient.hospital_id == self.hospital_id)
-            .first()
+        from modules.inpatient.actions.admission_lifecycle_actions import (
+            EnsureAdmissionRequestAction,
+            AcceptAdmissionAction,
         )
-        if not patient:
-            raise AppointmentNotFoundError("Patient not found")
-
-        from modules.inpatient.entities.admission import Admission, AdmissionStatus
-        from modules.patients.entities.patient import PatientStatus as _PatientStatus
-        # Invariant 1: requested/admitted/discharge_requested all block a new
-        # episode. A pre-existing REQUESTED admission (form finalize or
-        # Transfer button) is accepted with this bed instead (Invariant 11).
-        from modules.inpatient.utils.admission_conflicts import (
-            admission_conflict as _ipd_conflict,
-            bed_conflict as _ipd_bed_conflict,
-        )
-
-        existing = (
-            self.db.query(Admission)
-            .filter(
-                Admission.patient_id == appt.patient_id,
-                Admission.hospital_id == self.hospital_id,
-                Admission.status.in_(
-                    [
-                        AdmissionStatus.requested,
-                        AdmissionStatus.admitted,
-                        AdmissionStatus.discharge_requested,
-                    ]
-                ),
-            )
-            .with_for_update()
-            .first()
-        )
-        if existing and existing.status != AdmissionStatus.requested:
-            raise _ipd_conflict(
-                "Patient is already admitted to another bed",
-                admission_id=existing.id,
-                admission_status=existing.status,
-                bed_id=existing.bed_id,
-                doctor_id=existing.doctor_id,
-            )
-        if existing and existing.source_appointment_id not in (None, appt.id):
-            # Request belongs to a different visit; still a single open episode.
-            raise _ipd_conflict(
-                "Patient already has an admission request",
-                admission_id=existing.id,
-                admission_status=existing.status,
-                doctor_id=existing.doctor_id,
-            )
-
+        from modules.inpatient.contracts.inpatient_contracts import AdmissionAcceptRequest
         from modules.beds.entities.bed import Bed
-        # Row-level lock on the target bed to prevent concurrent double-booking
-        bed = (
-            self.db.query(Bed)
-            .filter(
-                Bed.id == payload.bed_id,
-                Bed.hospital_id == self.hospital_id,
-                Bed.room_id == payload.room_id,
-                Bed.ward_id == payload.ward_id,
-            )
-            .with_for_update()
-            .first()
-        )
-        if not bed:
-            raise AppointmentNotFoundError("Selected bed not found")
-        if bed.is_occupied:
-            raise _ipd_bed_conflict(
-                "Selected bed is already occupied or was just taken",
-                bed_id=bed.id,
-                admission_id=existing.id if existing is not None else None,
-                admission_status=existing.status if existing is not None else None,
-            )
 
-        from modules.inpatient.db.admissions_repository import AdmissionsRepository
-        from modules.inpatient.services.inpatient_billing_service import (
-            InpatientBillingService,
-            next_ip_encounter_id,
-        )
-
-        billing_svc = InpatientBillingService(self.db)
-        actor_name = str(user.get("name") or "Nurse")
-
-        try:
-            if existing is not None:
-                # Converge: accept the canonical request with this bed.
-                from datetime import datetime as _dt
-                from datetime import timezone as _tz
-
-                now = _dt.now(_tz.utc)
-                existing.status = AdmissionStatus.admitted
-                existing.admitted_at = now
-                existing.ward_id = payload.ward_id
-                existing.room_id = payload.room_id
-                existing.bed_id = bed.id
-                if not existing.ip_id:
-                    existing.ip_id = next_ip_encounter_id(self.db, self.hospital_id)
-                if not existing.source_appointment_id:
-                    existing.source_appointment_id = appt.id
-                bed.is_occupied = True
-                patient.status = _PatientStatus.admitted
-                from modules.inpatient.entities.admission import BedStaySegment
-
-                self.db.add(
-                    BedStaySegment(
-                        hospital_id=self.hospital_id,
-                        admission_id=existing.id,
-                        ward_id=bed.ward_id,
-                        room_id=bed.room_id,
-                        bed_id=bed.id,
-                        rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0)
-                        if bed.ward
-                        else 0.0,
-                        started_at=now,
-                        ended_at=None,
-                    )
-                )
-                admission = existing
-                ip_id = existing.ip_id
-            else:
-                ip_id = next_ip_encounter_id(self.db, self.hospital_id)
-
-                admissions_repo = AdmissionsRepository(self.db)
-                admission = admissions_repo.create_admission(
-                    hospital_id=self.hospital_id,
-                    patient=patient,
-                    bed=bed,
-                    ward_id=payload.ward_id,
-                    room_id=payload.room_id,
-                    doctor_id=appt.doctor_id,
-                    ip_id=ip_id,
-                    notes=payload.notes,
-                    source_appointment_id=appt.id,
-                )
-                # create_admission leaves history to the caller: open the stay
-                # segment for this bed assignment (Invariant 7).
-                from datetime import datetime as _dt2
-                from datetime import timezone as _tz2
-                from modules.inpatient.entities.admission import BedStaySegment as _Seg
-
-                self.db.add(
-                    _Seg(
-                        hospital_id=self.hospital_id,
-                        admission_id=admission.id,
-                        ward_id=bed.ward_id,
-                        room_id=bed.room_id,
-                        bed_id=bed.id,
-                        rate_per_day=float(getattr(bed.ward, "bed_charge_per_day", 0) or 0)
-                        if bed.ward
-                        else 0.0,
-                        started_at=_dt2.now(_tz2.utc),
-                        ended_at=None,
-                    )
-                )
-        except IntegrityError as exc:
-            self.db.rollback()
-            raise _ipd_bed_conflict(
-                "Admission was just created or bed just taken; please retry",
-                bed_id=payload.bed_id,
-            ) from exc
-
-        billing_svc.ensure_financial_account(
+        # 1. Canonical admission request
+        ensured, _ = EnsureAdmissionRequestAction(self.db).execute(
             hospital_id=self.hospital_id,
-            patient_id=patient.id,
-            admission_id=admission.id,
-            created_by_name=actor_name,
-        )
-        billing_svc.ensure_admission_charge(
-            hospital_id=self.hospital_id,
-            patient_id=patient.id,
-            admission_id=admission.id,
-            ward_name=bed.ward.name if bed.ward else None,
-            admission_fee=float(getattr(bed.ward, "admission_fee", 0) or 0) if bed.ward else 0.0,
-            created_by_name=actor_name,
+            patient_id=appt.patient_id,
+            doctor_id=getattr(payload, "doctor_id", None) or appt.doctor_id,
+            source_appointment_id=appt.id,
+            notes=payload.notes,
+            actor=user,
         )
 
-        consultant_id = getattr(payload, "doctor_id", None) or getattr(appt, "doctor_id", None)
-        if consultant_id:
-            from modules.inpatient.db.care_team_repository import CareTeamRepository
-            from modules.inpatient.entities.care_team import AdmissionCareTeamRole
-            user_id = user.get("id") or user.get("sub")
-            CareTeamRepository(self.db, self.hospital_id).add_member(
-                admission_id=admission.id,
-                doctor_id=consultant_id,
-                role=AdmissionCareTeamRole.primary_consultant,
-                assigned_by_id=UUID(str(user_id)) if user_id else None,
-                assigned_by_name=actor_name,
-                notes="Primary consultant assigned upon transfer from OPD",
-            )
-
-        appt.status = AppointmentStatus.transferred_to_inpatient
-        appt.admission_id = admission.id
-
-        write_audit_log(
-            self.db,
+        # 2. Canonical accept / bed allocation
+        accepted = AcceptAdmissionAction(self.db).execute(
             hospital_id=self.hospital_id,
             actor=user,
-            action="create",
-            entity_type="admission",
-            entity_id=str(admission.id),
-            summary=f"Admitted patient {patient.name} ({patient.uhid}) to Bed {bed.bed_code} ({ip_id}) from visit {appt.op_id or str(appt.id)}",
+            admission_id=ensured.id,
+            ward_id=payload.ward_id,
+            room_id=payload.room_id,
+            bed_id=payload.bed_id,
         )
-        write_audit_log(
-            self.db,
-            hospital_id=self.hospital_id,
-            actor=user,
-            action="update",
-            entity_type="bed",
-            entity_id=str(bed.id),
-            summary=f"Bed {bed.bed_code} occupied by admission {admission.id}",
-        )
-        write_audit_log(
-            self.db,
-            hospital_id=self.hospital_id,
-            actor=user,
-            action="update",
-            entity_type="patient",
-            entity_id=str(patient.id),
-            summary="Patient admitted from appointment",
-        )
-        write_audit_log(
-            self.db,
-            hospital_id=self.hospital_id,
-            actor=user,
-            action="update",
-            entity_type="appointment",
-            entity_id=str(appt.id),
-            summary="Appointment transferred to inpatient",
-        )
-        try:
-            self.db.commit()
-        except IntegrityError as exc:
-            self.db.rollback()
-            raise _ipd_bed_conflict(
-                "Admission was just created or bed just taken; please retry",
-                bed_id=payload.bed_id,
-                admission_id=admission.id,
-                admission_status=admission.status,
-            ) from exc
+
+        bed = self.db.query(Bed).filter(Bed.id == payload.bed_id).first()
+        bed_code = bed.bed_code if bed else ""
+
         return {
             "status": "admitted",
-            "admission_id": str(admission.id),
-            "ip_id": ip_id,
-            "bed_code": bed.bed_code,
+            "admission_id": str(accepted.id),
+            "ip_id": accepted.ip_id,
+            "bed_code": bed_code,
         }

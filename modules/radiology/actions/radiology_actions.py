@@ -302,19 +302,24 @@ class CreateOrdersAction:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Doctor-prescribed orders cannot add or change scans; fulfill the prescription as written",
                 )
-            fulfill_items = assert_request_fulfillable(self.db, rad_request)
-            is_stat = bool(
-                (rad_request.clinical_notes and "STAT" in rad_request.clinical_notes.upper())
-                or (clinical_notes and "STAT" in clinical_notes.upper())
-            )
+
+            # Enforce financial clearance when accessioning doctor-prescribed radiology requests
+            is_em = bool(getattr(rad_request, "is_emergency", False) or getattr(payload, "is_emergency", False) or getattr(payload, "is_emergency_override", False))
+            em_reason = getattr(payload, "emergency_override_reason", None) or getattr(payload, "emergency_reason", None) or getattr(rad_request, "emergency_reason", None)
             assert_service_financially_cleared(
                 self.db,
                 self.hospital_id,
                 BillingSourceType.radiology,
                 rad_request.id,
-                action_description="accession doctor-prescribed radiology request",
-                is_emergency_override=is_stat,
+                action_description="accession radiology prescription request",
+                is_emergency_override=is_em,
+                actor=self.user,
+                emergency_reason=em_reason,
+                admission_id=rad_request.admission_id,
+                patient_id=rad_request.patient_id,
             )
+
+            fulfill_items = assert_request_fulfillable(self.db, rad_request)
             appointment_id = rad_request.appointment_id or appointment_id
             doctor = rad_request.doctor or doctor
             if not clinical_notes:
@@ -456,14 +461,10 @@ class ListRadPrescriptionRequestsAction:
             status=status, patient_id=patient_id, doctor_id=doctor_id
         )
 
-        apply_release_filter = released_only is True or (
-            released_only is None
-            and status == RadPrescriptionRequestStatus.pending
-            and not patient_id
-        )
+        apply_release_filter = released_only is True
 
         if not apply_release_filter:
-            # No release filter — simple batch path: bulk-fetch billing states and build responses.
+            # Return all requests including unpaid, with clearance & payment status populated
             return [RadPrescriptionRequestResponse(**request_to_response_dict(r, self.db)) for r in reqs]
 
         # Release filter is active.  Bulk-fetch clearance for all request IDs so that
@@ -477,7 +478,7 @@ class ListRadPrescriptionRequestsAction:
         stat_reqs: list = []
         non_stat_reqs: list = []
         for r in reqs:
-            is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
+            is_stat = bool(getattr(r, "is_emergency", False))
             if is_stat:
                 stat_reqs.append(r)  # always released; skip billing lookup
             else:
@@ -508,7 +509,7 @@ class ListRadPrescriptionRequestsAction:
         from modules.radiology.services.rad_prescription_service import request_to_response_dict as _base_rtrd
 
         def _build_response(r) -> dict:
-            is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
+            is_stat = bool(getattr(r, "is_emergency", False))
             if is_stat:
                 # For STAT, use normal single-request path (charge may or may not exist)
                 return _base_rtrd(r, self.db)
@@ -680,17 +681,22 @@ class ScheduleOrderAction:
         if order.status in {RadiologyOrderStatus.cancelled, RadiologyOrderStatus.completed}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot schedule this order")
 
-        # Enforce financial clearance (with emergency STAT override)
+        # Enforce financial clearance before scheduling scan
         from modules.billing.entities.billing_entities import BillingSourceType
         from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-        is_stat = bool(order.clinical_notes and "STAT" in order.clinical_notes.upper())
+        is_em = bool(getattr(order, "is_emergency", False) or getattr(payload, "is_emergency_override", False))
+        em_reason = getattr(payload, "emergency_override_reason", None) or getattr(order, "emergency_reason", None)
         assert_service_financially_cleared(
             self.db,
             self.hospital_id,
             BillingSourceType.radiology,
             order.id,
             action_description="schedule scan",
-            is_emergency_override=is_stat,
+            is_emergency_override=is_em,
+            actor=self.user,
+            emergency_reason=em_reason,
+            admission_id=order.admission_id,
+            patient_id=order.patient_id,
         )
 
         order.scheduled_at = payload.scheduled_at
@@ -719,7 +725,7 @@ class StartScanAction:
         self.user = user
         self.repo = RadiologyRepository(db, hospital_id)
 
-    def execute(self, order_id: UUID) -> RadOrderResponse:
+    def execute(self, order_id: UUID, payload: Any | None = None) -> RadOrderResponse:
         order = self.repo.get_order(order_id)
         if not order:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
@@ -729,17 +735,22 @@ class StartScanAction:
                 detail="Order must be scheduled (or ordered) to start",
             )
 
-        # Enforce financial clearance (with emergency STAT override)
+        # Enforce financial clearance before scan start
         from modules.billing.entities.billing_entities import BillingSourceType
         from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-        is_stat = bool(order.clinical_notes and "STAT" in order.clinical_notes.upper())
+        is_em = bool(getattr(order, "is_emergency", False) or (payload and getattr(payload, "is_emergency_override", False)))
+        em_reason = (payload and getattr(payload, "emergency_override_reason", None)) or getattr(order, "emergency_reason", None)
         assert_service_financially_cleared(
             self.db,
             self.hospital_id,
             BillingSourceType.radiology,
             order.id,
             action_description="start scan acquisition",
-            is_emergency_override=is_stat,
+            is_emergency_override=is_em,
+            actor=self.user,
+            emergency_reason=em_reason,
+            admission_id=order.admission_id,
+            patient_id=order.patient_id,
         )
 
         order.status = RadiologyOrderStatus.in_progress
@@ -775,17 +786,6 @@ class CompleteScanAction:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Scan is not in progress",
             )
-
-        # Enforce financial clearance
-        from modules.billing.entities.billing_entities import BillingSourceType
-        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-        assert_service_financially_cleared(
-            self.db,
-            self.hospital_id,
-            BillingSourceType.radiology,
-            order.id,
-            action_description="complete scan acquisition",
-        )
 
         order.status = RadiologyOrderStatus.completed
         order.completed_at = datetime.now(timezone.utc)
@@ -823,19 +823,6 @@ class UploadReportAction:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
         if order.status == RadiologyOrderStatus.cancelled:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is cancelled")
-
-        # Enforce financial clearance before uploading/signing report (with emergency STAT override)
-        from modules.billing.entities.billing_entities import BillingSourceType
-        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-        is_stat = bool(order.clinical_notes and "STAT" in order.clinical_notes.upper())
-        assert_service_financially_cleared(
-            self.db,
-            self.hospital_id,
-            BillingSourceType.radiology,
-            order.id,
-            action_description="finalize and sign off radiology report",
-            is_emergency_override=is_stat,
-        )
 
         if payload.report_file_data and len(payload.report_file_data) > 2_500_000:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Report file too large (max ~1.5MB)")

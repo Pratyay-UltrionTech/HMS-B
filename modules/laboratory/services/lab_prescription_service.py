@@ -194,13 +194,21 @@ def is_lab_request_released(db: Session, req: LabPrescriptionRequest) -> bool:
     """Check if a LabPrescriptionRequest is operationally released to the lab queue."""
     if req.status == LabPrescriptionRequestStatus.cancelled:
         return False
-    is_stat = bool(req.clinical_notes and "STAT" in req.clinical_notes.upper())
-    if is_stat:
+    if bool(getattr(req, "is_emergency", False)):
         return True
     from modules.billing.entities.billing_entities import BillingSourceType
     from modules.billing.services.service_financial_clearance import check_service_financial_clearance
     fin = check_service_financial_clearance(db, req.hospital_id, BillingSourceType.laboratory, req.id)
-    return fin.is_cleared
+    if fin.is_cleared:
+        return True
+    from modules.billing.entities.financial_exception import FinancialClearanceException, FinancialExceptionStatus
+    exc = db.query(FinancialClearanceException).filter(
+        FinancialClearanceException.hospital_id == req.hospital_id,
+        FinancialClearanceException.source_id == req.id,
+        FinancialClearanceException.status == FinancialExceptionStatus.approved.value,
+        FinancialClearanceException.is_consumed == False,
+    ).first()
+    return bool(exc)
 
 
 def request_to_response_dict(req: LabPrescriptionRequest, db: Session | None = None) -> dict[str, Any]:
@@ -217,8 +225,18 @@ def request_to_response_dict(req: LabPrescriptionRequest, db: Session | None = N
             from modules.billing.services.service_financial_clearance import check_service_financial_clearance
             fin = check_service_financial_clearance(target_db, req.hospital_id, BillingSourceType.laboratory, req.id)
             payment_status = fin.status
-            is_stat = bool(req.clinical_notes and "STAT" in req.clinical_notes.upper())
-            is_financially_cleared = fin.is_cleared or is_stat
+            is_em = bool(getattr(req, "is_emergency", False))
+            is_financially_cleared = fin.is_cleared or is_em
+            if not is_financially_cleared:
+                from modules.billing.entities.financial_exception import FinancialClearanceException, FinancialExceptionStatus
+                exc = target_db.query(FinancialClearanceException).filter(
+                    FinancialClearanceException.hospital_id == req.hospital_id,
+                    FinancialClearanceException.source_id == req.id,
+                    FinancialClearanceException.status == FinancialExceptionStatus.approved.value,
+                    FinancialClearanceException.is_consumed == False,
+                ).first()
+                if exc:
+                    is_financially_cleared = True
             outstanding_amount = fin.outstanding_amount
         except Exception:
             pass

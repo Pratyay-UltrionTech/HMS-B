@@ -86,6 +86,7 @@ from modules.laboratory.services.lab_prescription_service import (
     request_to_response_dict,
     sync_request_after_order_change,
 )
+from modules.billing.entities.billing_entities import BillingSourceType
 from modules.billing.services.service_financial_clearance import (
     assert_service_financially_cleared,
     bulk_check_service_financial_clearance,
@@ -114,12 +115,7 @@ def _build_order_response(order: LabOrder, fin: Any) -> LabOrderResponse:
     source = getattr(order, "order_source", None) or LabOrderSource.self_requested
 
     payment_status = fin.status if fin else "pending"
-    is_stat = bool(
-        getattr(order, "is_emergency", False)
-        or (order.clinical_notes and "STAT" in order.clinical_notes.upper())
-        or (order.collection_remarks and "STAT" in order.collection_remarks.upper())
-    )
-    is_financially_cleared = (fin.is_cleared if fin else False) or is_stat
+    is_financially_cleared = (fin.is_cleared if fin else False)
     outstanding_amount = fin.outstanding_amount if fin else 0.0
 
     specimens_res = []
@@ -756,51 +752,36 @@ class ListLabPrescriptionRequestsAction:
             status=status, patient_id=patient_id, doctor_id=doctor_id
         )
 
-        apply_release_filter = released_only is True or (
-            released_only is None
-            and status == LabPrescriptionRequestStatus.pending
-            and not patient_id
-        )
+        apply_release_filter = released_only is True
 
-        stat_reqs: list = []
-        non_stat_reqs: list = []
-        for r in reqs:
-            if r.status == LabPrescriptionRequestStatus.cancelled:
-                continue
-            is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
-            if is_stat:
-                stat_reqs.append(r)
-            else:
-                non_stat_reqs.append(r)
+        all_valid_reqs = [r for r in reqs if r.status != LabPrescriptionRequestStatus.cancelled]
 
         fin_states: dict = {}
-        if non_stat_reqs:
+        if all_valid_reqs:
             try:
                 fin_states = bulk_check_service_financial_clearance(
                     self.db,
                     self.hospital_id,
                     BillingSourceType.laboratory,
-                    [r.id for r in non_stat_reqs],
+                    [r.id for r in all_valid_reqs],
                 )
             except Exception:
                 pass
 
         if apply_release_filter:
-            released_non_stat = [
-                r for r in non_stat_reqs
+            final_reqs = [
+                r for r in all_valid_reqs
                 if fin_states.get(r.id) and fin_states[r.id].is_cleared
             ]
-            final_reqs = stat_reqs + released_non_stat
         else:
-            final_reqs = reqs
+            final_reqs = all_valid_reqs
 
         def _build_req_dict(r) -> dict:
             fin = fin_states.get(r.id)
             if fin is not None:
-                is_stat = bool(r.clinical_notes and "STAT" in r.clinical_notes.upper())
                 res = request_to_response_dict(r)
                 res["payment_status"] = fin.status
-                res["is_financially_cleared"] = fin.is_cleared or is_stat
+                res["is_financially_cleared"] = fin.is_cleared
                 res["outstanding_amount"] = fin.outstanding_amount
                 return res
             return request_to_response_dict(r, self.db)
@@ -977,19 +958,24 @@ class CreateLabOrderAction:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Doctor-prescribed orders cannot add or change tests; fulfill the prescription as written",
                 )
-            fulfill_items = assert_request_fulfillable(self.db, rx_request)
-            is_stat = bool(
-                (rx_request.clinical_notes and "STAT" in rx_request.clinical_notes.upper())
-                or (clinical_notes and "STAT" in clinical_notes.upper())
-            )
+
+            # Enforce financial clearance when accessioning doctor-prescribed requests
+            is_em = bool(getattr(rx_request, "is_emergency", False) or getattr(payload, "is_emergency_override", False))
+            em_reason = getattr(payload, "emergency_override_reason", None) or getattr(rx_request, "emergency_reason", None)
             assert_service_financially_cleared(
                 self.db,
                 self.hospital_id,
                 BillingSourceType.laboratory,
                 rx_request.id,
-                action_description="accession lab order from prescription",
-                is_emergency_override=is_stat,
+                action_description="accession laboratory prescription request",
+                is_emergency_override=is_em,
+                actor=user,
+                emergency_reason=em_reason,
+                admission_id=rx_request.admission_id,
+                patient_id=rx_request.patient_id,
             )
+
+            fulfill_items = assert_request_fulfillable(self.db, rx_request)
             order_source = LabOrderSource.doctor_prescribed
             prescription_id = rx_request.prescription_id
             appointment_id = rx_request.appointment_id or appointment_id
@@ -1241,12 +1227,8 @@ class CollectSampleAction:
                 detail="Cannot collect sample for this order",
             )
 
-        # Emergency STAT order bypasses financial clearance
-        is_stat = bool(
-            getattr(order, "is_emergency", False)
-            or (order.clinical_notes and "STAT" in order.clinical_notes.upper())
-            or (order.collection_remarks and "STAT" in order.collection_remarks.upper())
-        )
+        is_em = bool(getattr(order, "is_emergency", False) or getattr(payload, "is_emergency_override", False))
+        em_reason = getattr(payload, "emergency_override_reason", None) or getattr(order, "emergency_reason", None)
 
         assert_service_financially_cleared(
             self.db,
@@ -1254,7 +1236,11 @@ class CollectSampleAction:
             BillingSourceType.laboratory,
             order.id,
             action_description="collect specimen",
-            is_emergency_override=is_stat,
+            is_emergency_override=is_em,
+            actor=user,
+            emergency_reason=em_reason,
+            admission_id=order.admission_id,
+            patient_id=order.patient_id,
         )
 
         coll_time = payload.collected_at or datetime.now(timezone.utc)
@@ -1315,12 +1301,8 @@ class CollectSpecimenAction:
         if specimen.status == LabSpecimenStatus.collected:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Specimen has already been collected")
 
-        # Emergency STAT order bypasses financial clearance
-        is_stat = bool(
-            getattr(order, "is_emergency", False)
-            or (order.clinical_notes and "STAT" in order.clinical_notes.upper())
-            or (order.collection_remarks and "STAT" in order.collection_remarks.upper())
-        )
+        is_em = bool(getattr(order, "is_emergency", False) or getattr(payload, "is_emergency_override", False))
+        em_reason = getattr(payload, "emergency_override_reason", None) or getattr(order, "emergency_reason", None)
 
         assert_service_financially_cleared(
             self.db,
@@ -1328,7 +1310,11 @@ class CollectSpecimenAction:
             BillingSourceType.laboratory,
             order.id,
             action_description="collect specimen",
-            is_emergency_override=is_stat,
+            is_emergency_override=is_em,
+            actor=user,
+            emergency_reason=em_reason,
+            admission_id=order.admission_id,
+            patient_id=order.patient_id,
         )
 
         coll_time = payload.collected_at or datetime.now(timezone.utc)

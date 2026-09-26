@@ -231,6 +231,14 @@ def test_multi_specimen_order_creation_and_partial_collection(specimen_test_cont
     assert edta_spec["specimen_no"] != urine_spec["specimen_no"]
     assert edta_spec["status"] == "pending"
 
+    # Mark billing charge as paid to simulate cashier settlement prior to phlebotomy collection
+    from modules.billing.entities.billing_entities import BillingCharge, BillingChargeStatus
+    charge = specimen_test_context["db"].query(BillingCharge).filter(BillingCharge.source_id == uuid.UUID(order_id)).first()
+    if charge:
+        charge.status = BillingChargeStatus.paid
+        charge.amount_paid = charge.net_amount
+        specimen_test_context["db"].commit()
+
     # PARTIAL COLLECTION: Collect only the EDTA specimen
     collect_res = client.post(
         f"/laboratory/orders/{order_id}/specimens/{edta_spec['id']}/collect",
@@ -288,6 +296,14 @@ def test_specimen_label_rendering_and_reprint(specimen_test_context):
     order_id = order_data["id"]
     specimen = order_data["specimens"][0]
     specimen_id = specimen["id"]
+
+    # Mark billing charge as paid to simulate cashier settlement prior to collection
+    from modules.billing.entities.billing_entities import BillingCharge, BillingChargeStatus
+    charge = specimen_test_context["db"].query(BillingCharge).filter(BillingCharge.source_id == uuid.UUID(order_id)).first()
+    if charge:
+        charge.status = BillingChargeStatus.paid
+        charge.amount_paid = charge.net_amount
+        specimen_test_context["db"].commit()
 
     # Collect specimen
     collect_res = client.post(

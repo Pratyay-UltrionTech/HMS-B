@@ -34,6 +34,7 @@ from modules.ot.contracts.ot_contracts import (
 )
 from modules.ot.db.ot_repository import OtRepository
 from modules.ot.entities.ot_entities import (
+    OtPriority,
     OtRoom,
     OtSurgery,
     OtSurgeryStatus,
@@ -451,7 +452,7 @@ class StartSurgeryAction:
         self.user = user
         self.repo = OtRepository(db, hospital_id)
 
-    def execute(self, surgery_id: UUID) -> OtSurgeryResponse:
+    def execute(self, surgery_id: UUID, payload: Any | None = None) -> OtSurgeryResponse:
         item = self.repo.get_surgery(surgery_id)
         if not item:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Surgery not found")
@@ -460,6 +461,25 @@ class StartSurgeryAction:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Surgery cannot be started from current status",
             )
+
+        # Enforce financial clearance before entering execution state
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+        is_em = bool((item.priority == OtPriority.emergency) or (payload and getattr(payload, "is_emergency_override", False)))
+        em_reason = (payload and getattr(payload, "emergency_override_reason", None)) or (f"Emergency OT surgery ({item.surgery_no}) override")
+
+        assert_service_financially_cleared(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.ot,
+            item.id,
+            action_description="start OT surgery procedure",
+            is_emergency_override=is_em,
+            actor=self.user,
+            emergency_reason=em_reason,
+            admission_id=item.admission_id,
+            patient_id=item.patient_id,
+        )
 
         item.status = OtSurgeryStatus.in_progress
         item.started_at = datetime.now(timezone.utc)

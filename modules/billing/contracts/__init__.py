@@ -16,6 +16,12 @@ from modules.billing.contracts.billing_contracts import (
     PatientFinancialSummary,
     PatientLedgerResponse,
 )
+from modules.billing.contracts.exception_contracts import (
+    EmergencyOverrideRequest,
+    FinancialExceptionDecision,
+    FinancialExceptionRequest,
+    FinancialExceptionResponse,
+)
 
 __all__ = [
     "BillingChargeCreate",
@@ -29,6 +35,10 @@ __all__ = [
     "BillingPaymentResponse",
     "BillingReceiptCreate",
     "BillingReceiptResponse",
+    "EmergencyOverrideRequest",
+    "FinancialExceptionDecision",
+    "FinancialExceptionRequest",
+    "FinancialExceptionResponse",
     "LedgerEntry",
     "PatientFinancialSummary",
     "PatientLedgerResponse",

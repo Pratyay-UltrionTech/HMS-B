@@ -33,6 +33,11 @@ from modules.radiology.entities.radiology_entities import (
     RadiologyScanCatalog,
 )
 from modules.tenancy.entities.hospital import Hospital
+from modules.billing.entities.billing_entities import (
+    BillingCharge,
+    BillingChargeStatus,
+    BillingSourceType,
+)
 from shared.auth import get_hospital_context, require_hospital_user, require_permission
 
 
@@ -100,6 +105,22 @@ def rad_attachment_context():
         status=RadiologyOrderStatus.ordered,
     )
     db.add(order)
+
+    charge = BillingCharge(
+        id=uuid.uuid4(),
+        hospital_id=h_id,
+        patient_id=patient.id,
+        source_type=BillingSourceType.radiology,
+        source_id=order.id,
+        description=order.scan_name,
+        charge_amount=order.price,
+        discount_amount=0.0,
+        tax_amount=0.0,
+        net_amount=order.price,
+        amount_paid=order.price,
+        status=BillingChargeStatus.paid,
+    )
+    db.add(charge)
     db.commit()
 
     app = FastAPI()

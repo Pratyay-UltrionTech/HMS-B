@@ -315,6 +315,8 @@ class SaleCreate(BaseModel):
     payment_method: str = "cash"
     amount_paid: float | None = None
     notes: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
     items: list[SaleItemCreate] = Field(min_length=1)
 
 

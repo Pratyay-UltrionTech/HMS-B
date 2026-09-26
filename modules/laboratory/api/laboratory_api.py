@@ -215,12 +215,13 @@ def list_prescription_requests(
     status: LabPrescriptionRequestStatus | None = Query(default=None),
     patient_id: UUID | None = Query(default=None),
     doctor_id: UUID | None = Query(default=None),
+    released_only: bool | None = Query(default=None),
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[LabPrescriptionRequestResponse]:
     return ListLabPrescriptionRequestsAction(db, hospital_id).execute(
-        status=status, patient_id=patient_id, doctor_id=doctor_id
+        status=status, patient_id=patient_id, doctor_id=doctor_id, released_only=released_only
     )
 
 
@@ -367,16 +368,6 @@ def report_html(
     order = repo.get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Lab order not found")
-
-    from modules.billing.entities.billing_entities import BillingSourceType
-    from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-    assert_service_financially_cleared(
-        db,
-        hospital_id,
-        BillingSourceType.laboratory,
-        order.id,
-        action_description="view laboratory report",
-    )
 
     html, filename = GetLabReportHtmlAction(db, hospital_id).execute(order_id)
     return StreamingResponse(

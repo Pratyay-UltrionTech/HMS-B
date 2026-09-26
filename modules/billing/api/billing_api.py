@@ -66,6 +66,16 @@ from modules.billing.contracts.billing_contracts import (
     PatientFinancialSummary,
     PatientLedgerResponse,
 )
+from modules.billing.contracts.exception_contracts import (
+    EmergencyOverrideRequest,
+    FinancialExceptionDecision,
+    FinancialExceptionRequest,
+    FinancialExceptionResponse,
+)
+from modules.billing.contracts.policy_contracts import (
+    AdmissionFinancialPolicy,
+    AdmissionFinancialPolicyUpdate,
+)
 from modules.billing.entities.billing_entities import (
     BillingChargeStatus,
     BillingInvoiceStatus,
@@ -492,4 +502,182 @@ def print_refund_voucher(
 ) -> StreamingResponse:
     html = PrintRefundAction(db, hospital_id).execute(refund_id, auto_print=not download)
     return _html_response(html, f"refund_{refund_id}.html", download=download)
+
+
+# ── Financial Clearance Exceptions & Overrides ──────────────────────────────
+
+@router.post(
+    "/exceptions/request",
+    response_model=FinancialExceptionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_hospital_user)],
+)
+def request_financial_exception(
+    payload: FinancialExceptionRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> FinancialExceptionResponse:
+    from modules.billing.services.financial_exception_service import FinancialExceptionService
+    return FinancialExceptionService(db, hospital_id).request_exception(payload, user)
+
+
+@router.post(
+    "/exceptions/{exception_id}/decide",
+    response_model=FinancialExceptionResponse,
+    dependencies=[Depends(require_permission("billing", "approve"))],
+)
+def decide_financial_exception(
+    exception_id: UUID,
+    payload: FinancialExceptionDecision,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> FinancialExceptionResponse:
+    from modules.billing.services.financial_exception_service import FinancialExceptionService
+    return FinancialExceptionService(db, hospital_id).decide_exception(exception_id, payload, user)
+
+
+@router.post(
+    "/exceptions/emergency-override",
+    response_model=FinancialExceptionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_hospital_user)],
+)
+def emergency_financial_override(
+    payload: EmergencyOverrideRequest,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> FinancialExceptionResponse:
+    from modules.billing.services.financial_exception_service import FinancialExceptionService
+    return FinancialExceptionService(db, hospital_id).emergency_override(payload, user)
+
+
+@router.get(
+    "/exceptions",
+    response_model=list[FinancialExceptionResponse],
+    dependencies=[Depends(require_hospital_user)],
+)
+def list_financial_exceptions(
+    patient_id: UUID | None = Query(default=None),
+    admission_id: UUID | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> list[FinancialExceptionResponse]:
+    from modules.billing.services.financial_exception_service import FinancialExceptionService
+    return FinancialExceptionService(db, hospital_id).list_exceptions(
+        patient_id=patient_id, admission_id=admission_id, status_filter=status_filter, limit=limit
+    )
+
+
+@router.get(
+    "/admissions/{admission_id}/bed-clearance",
+    dependencies=[Depends(require_hospital_user)],
+)
+def get_bed_allocation_clearance(
+    admission_id: UUID,
+    ward_id: UUID | None = Query(default=None),
+    bed_id: UUID | None = Query(default=None),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> dict[str, Any]:
+    from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
+    state = evaluate_bed_allocation_clearance(
+        db, hospital_id, admission_id, ward_id=ward_id, bed_id=bed_id
+    )
+    return {
+        "is_cleared": state.is_cleared,
+        "status": state.status,
+        "required_advance": state.required_advance,
+        "admission_fee": state.admission_fee,
+        "bed_charge_per_day": state.bed_charge_per_day,
+        "paid_or_allocated_amount": state.paid_or_allocated_amount,
+        "available_deposit": state.available_deposit,
+        "shortfall": state.shortfall,
+        "ipd_account_id": str(state.ipd_account_id) if state.ipd_account_id else None,
+        "current_ipd_outstanding": state.current_ipd_outstanding,
+        "historical_patient_balance": state.historical_patient_balance,
+        "active_exception_id": str(state.active_exception_id) if state.active_exception_id else None,
+        "active_exception_status": state.active_exception_status,
+        "reason": state.reason,
+    }
+
+
+@router.get(
+    "/admission-financial-policy",
+    response_model=AdmissionFinancialPolicy,
+    dependencies=[Depends(require_hospital_user)],
+)
+def get_admission_policy_endpoint(
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    _: dict = Depends(require_hospital_user),
+) -> AdmissionFinancialPolicy:
+    from modules.billing.services.service_financial_clearance import get_admission_financial_policy
+    return get_admission_financial_policy(db, hospital_id)
+
+
+@router.put(
+    "/admission-financial-policy",
+    response_model=AdmissionFinancialPolicy,
+    dependencies=[Depends(require_permission("billing", "edit"))],
+)
+def update_admission_policy_endpoint(
+    payload: AdmissionFinancialPolicyUpdate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    user: dict = Depends(require_hospital_user),
+) -> AdmissionFinancialPolicy:
+    from modules.billing.services.service_financial_clearance import set_admission_financial_policy
+    return set_admission_financial_policy(db, hospital_id, payload, user)
+
+
+@router.get(
+    "/admission-advances",
+    dependencies=[Depends(require_hospital_user)],
+)
+def list_pending_admission_advances(
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    _: dict = Depends(require_hospital_user),
+) -> list[dict[str, Any]]:
+    """List requested IPD admissions awaiting admission advance deposit for billing/cashier staff."""
+    from modules.inpatient.db.admissions_repository import AdmissionsRepository
+    from modules.inpatient.actions.admission_actions import to_admission_detail
+    from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
+
+    rows = AdmissionsRepository(db).list_admission_requests(hospital_id)
+    results: list[dict[str, Any]] = []
+    for a in rows:
+        d = to_admission_detail(a)
+        fin = evaluate_bed_allocation_clearance(db, hospital_id, a.id, ward_id=a.ward_id, bed_id=a.bed_id)
+        results.append({
+            "id": str(a.id),
+            "admission_id": str(a.id),
+            "ip_id": a.ip_id,
+            "patient_id": str(a.patient_id),
+            "patient_name": d.patient_name or (a.patient.name if a.patient else None),
+            "patient_uhid": d.patient_uhid or (a.patient.uhid if a.patient else None),
+            "doctor_name": d.doctor_name,
+            "admitted_at": a.admitted_at.isoformat() if a.admitted_at else None,
+            "ward_name": d.ward_name,
+            "notes": a.notes,
+            "financial_account_id": str(fin.ipd_account_id) if fin.ipd_account_id else None,
+            "required_advance": fin.required_advance,
+            "paid_or_allocated_amount": fin.paid_or_allocated_amount,
+            "available_deposit": fin.available_deposit,
+            "shortfall": fin.shortfall,
+            "advance_shortfall": fin.shortfall,
+            "status": fin.status,
+            "financial_clearance_status": fin.status,
+            "is_cleared": fin.is_cleared,
+            "is_financially_cleared": fin.is_cleared,
+            "reason": fin.reason,
+        })
+    return results
 

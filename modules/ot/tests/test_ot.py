@@ -340,7 +340,27 @@ def test_surgery_full_lifecycle_and_medical_records(ot_client, ot_db):
     assert resched_resp.status_code == 200
     assert resched_resp.json()["duration_minutes"] == 75
 
-    # 3. Start surgery
+    # 2b. Attempt to start without financial clearance -> 402 Payment Required
+    unpaid_start_resp = ot_client.post(f"/api/ot/surgeries/{surgery_id}/start")
+    assert unpaid_start_resp.status_code == 402
+    assert "Payment required" in unpaid_start_resp.json()["detail"]["message"]
+
+    # Clear financial charge for elective surgery
+    charge = (
+        ot_db.query(BillingCharge)
+        .filter(
+            BillingCharge.hospital_id == h_id,
+            BillingCharge.source_id == UUID(surgery_id),
+            BillingCharge.source_type == BillingSourceType.ot,
+        )
+        .first()
+    )
+    assert charge is not None
+    charge.status = BillingChargeStatus.paid
+    charge.amount_paid = charge.net_amount
+    ot_db.commit()
+
+    # 3. Start surgery with financial clearance
     start_resp = ot_client.post(f"/api/ot/surgeries/{surgery_id}/start")
     assert start_resp.status_code == 200
     assert start_resp.json()["status"] == "in_progress"

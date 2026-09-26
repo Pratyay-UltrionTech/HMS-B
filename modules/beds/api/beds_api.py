@@ -179,8 +179,24 @@ def list_admission_requests(
     Nurse/Admissions worklist for operational acceptance. Replaces exclusive
     reliance on Appointment.ipd_transfer_requested (spec §7).
     """
+    from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
     rows = AdmissionsRepository(db).list_admission_requests(hospital_id)
-    return [to_admission_detail(a) for a in rows]
+    items: list[AdmissionDetail] = []
+    for a in rows:
+        d = to_admission_detail(a)
+        try:
+            fin = evaluate_bed_allocation_clearance(db, hospital_id, a.id, ward_id=a.ward_id, bed_id=a.bed_id)
+            d.required_advance = fin.required_advance
+            d.paid_or_allocated_amount = fin.paid_or_allocated_amount
+            d.available_deposit = fin.available_deposit
+            d.advance_shortfall = fin.shortfall
+            d.financial_clearance_status = fin.status
+            d.is_financially_cleared = fin.is_cleared
+            d.financial_account_id = fin.ipd_account_id
+        except Exception:
+            pass
+        items.append(d)
+    return items
 
 
 @router.get("/admissions/open", response_model=AdmissionDetail | None)
@@ -241,6 +257,8 @@ def accept_admission(
         bed_id=payload.bed_id,
         doctor_id=payload.doctor_id,
         notes=payload.notes,
+        is_emergency_override=payload.is_emergency_override,
+        emergency_override_reason=payload.emergency_override_reason,
     )
 
 

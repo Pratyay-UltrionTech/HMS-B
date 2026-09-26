@@ -9,6 +9,8 @@ Conforms to healthcare service gating requirements without using simplistic pati
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -19,6 +21,153 @@ from modules.billing.entities.billing_entities import (
     BillingChargeStatus,
     BillingSourceType,
 )
+from modules.billing.entities.financial_exception import (
+    FinancialClearanceException,
+    FinancialExceptionStatus,
+)
+from modules.billing.contracts.policy_contracts import (
+    AdmissionFinancialPolicy,
+    AdmissionFinancialPolicyUpdate,
+)
+
+
+def validate_emergency_override_actor(
+    actor: dict[str, Any] | None,
+    reason: str | None,
+    service_type: str = "general",
+) -> tuple[UUID | None, str]:
+    """
+    Validate that an emergency override is accompanied by a mandatory reason
+    and that the actor is authorized (admin, physician/doctor/surgeon, clinical supervisor,
+    or explicit override permission). Raises 400 or 403 on invalid invocation.
+    """
+    if not reason or not reason.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Emergency override reason is mandatory when executing an emergency financial override.",
+        )
+
+    actor_dict = actor or {}
+    role = str(actor_dict.get("role") or "").lower()
+    staff_role = str(actor_dict.get("staff_role_name") or "").lower()
+    permissions = actor_dict.get("permissions") or []
+
+    is_admin = role in {"super_admin", "hospital_admin"}
+    actor_name_lower = str(actor_dict.get("name") or "").lower()
+    is_doctor = (
+        role in {"doctor", "physician", "surgeon"}
+        or "doctor" in staff_role
+        or "physician" in staff_role
+        or "surgeon" in staff_role
+        or actor_dict.get("is_doctor") is True
+        or "doctor" in actor_name_lower
+        or actor_name_lower.startswith("dr.")
+        or actor_name_lower.startswith("dr ")
+    )
+    is_clinical_lead = (
+        "supervisor" in staff_role
+        or "in-charge" in staff_role
+        or "charge" in staff_role
+        or "head" in staff_role
+        or role in {"nurse_supervisor", "clinical_supervisor"}
+    )
+    has_explicit_perm = any(
+        p in permissions
+        for p in [
+            "billing:approve",
+            "all_ipd:approve",
+            "emergency:administer",
+            "emergency:create",
+            "emergency:edit",
+            "doctors:edit",
+        ]
+    )
+
+    if not (is_admin or is_doctor or is_clinical_lead or has_explicit_perm):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Forbidden: Actor '{actor_dict.get('name') or actor_dict.get('sub')}' with role '{staff_role or role}' is not authorized to grant emergency financial overrides.",
+        )
+
+    actor_id = None
+    actor_id_str = actor_dict.get("id") or actor_dict.get("sub") or actor_dict.get("user_id")
+    if actor_id_str:
+        try:
+            actor_id = UUID(str(actor_id_str))
+        except (ValueError, TypeError):
+            actor_id = None
+
+    actor_name = str(actor_dict.get("name") or "Authorized Emergency Clinician")
+    return actor_id, actor_name
+
+
+def get_admission_financial_policy(db: Session, hospital_id: UUID) -> AdmissionFinancialPolicy:
+    from modules.tenancy.entities.hospital import Hospital
+    hosp = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    if not hosp:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    settings = hosp.facility_settings or {}
+    stored = settings.get("admission_financial_policy") or settings.get("admission_advance_policy") or {}
+    return AdmissionFinancialPolicy(
+        financial_gate_enabled=stored.get("financial_gate_enabled", stored.get("enabled", True)),
+        advance_mode=stored.get("advance_mode", "mandatory"),
+        minimum_advance_amount=float(stored.get("minimum_advance_amount", stored.get("fixed_minimum_amount", 0.0)) or 0.0),
+        include_admission_fee=stored.get("include_admission_fee", True),
+        include_first_day_bed_tariff=stored.get("include_first_day_bed_tariff", True),
+        emergency_bypass_allowed=stored.get("emergency_bypass_allowed", True),
+    )
+
+
+def set_admission_financial_policy(
+    db: Session,
+    hospital_id: UUID,
+    payload: AdmissionFinancialPolicyUpdate,
+    actor: dict[str, Any],
+) -> AdmissionFinancialPolicy:
+    from modules.tenancy.entities.hospital import Hospital
+    hosp = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    if not hosp:
+        raise HTTPException(status_code=404, detail="Hospital not found")
+    settings = dict(hosp.facility_settings or {})
+    current = dict(settings.get("admission_financial_policy") or settings.get("admission_advance_policy") or {})
+
+    update_dict = payload.model_dump(exclude_unset=True)
+    current.update(update_dict)
+    settings["admission_financial_policy"] = current
+    settings["admission_advance_policy"] = current
+    hosp.facility_settings = settings
+    db.commit()
+    db.refresh(hosp)
+
+    from shared.audit.service import write_audit_log
+    write_audit_log(
+        db,
+        hospital_id=hospital_id,
+        actor=actor,
+        action="update",
+        entity_type="admission_financial_policy",
+        entity_id=hospital_id,
+        summary=f"Updated admission financial policy: mode={current.get('advance_mode')}, min={current.get('minimum_advance_amount')}",
+    )
+    return get_admission_financial_policy(db, hospital_id)
+
+
+@dataclass(frozen=True)
+class BedAllocationClearanceState:
+    is_cleared: bool
+    status: str  # "financially_cleared", "payment_required", "exception_pending", "exception_approved", "emergency_override"
+    required_advance: float
+    admission_fee: float
+    bed_charge_per_day: float
+    paid_or_allocated_amount: float
+    available_deposit: float
+    shortfall: float
+    ipd_account_id: UUID | None
+    current_ipd_outstanding: float
+    historical_patient_balance: float
+    active_exception_id: UUID | None
+    active_exception_status: str | None
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -491,6 +640,205 @@ def bulk_check_service_financial_clearance(
     }
 
 
+def evaluate_bed_allocation_clearance(
+    db: Session,
+    hospital_id: UUID,
+    admission_id: UUID,
+    ward_id: UUID | None = None,
+    bed_id: UUID | None = None,
+) -> BedAllocationClearanceState:
+    """
+    Evaluate authoritative financial readiness for IPD bed allocation.
+    Evaluates strictly against the current requested IPD episode's advance requirement
+    (admission fee + selected bed/ward tariff, or configured hospital minimum),
+    accounting for allocated payments and available deposits.
+    Separates historical patient balance (informational only) without hard-blocking.
+    Respects approved FinancialClearanceExceptions.
+    """
+    from modules.beds.entities.bed import Bed, Ward
+    from modules.billing.services.billing_service import patient_ledger_totals
+    from modules.inpatient.entities.admission import Admission
+    from modules.inpatient.services.inpatient_billing_service import InpatientBillingService
+    from modules.tenancy.entities.hospital import Hospital
+
+    admission = (
+        db.query(Admission)
+        .filter(Admission.id == admission_id, Admission.hospital_id == hospital_id)
+        .first()
+    )
+    if not admission:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Admission not found for financial clearance evaluation.",
+        )
+
+    # Resolve target ward & bed
+    resolved_ward_id = ward_id
+    if not resolved_ward_id and bed_id:
+        target_bed = db.query(Bed).filter(Bed.id == bed_id, Bed.hospital_id == hospital_id).first()
+        if target_bed:
+            resolved_ward_id = target_bed.ward_id
+    if not resolved_ward_id and admission.ward_id:
+        resolved_ward_id = admission.ward_id
+
+    ward = None
+    if resolved_ward_id:
+        ward = db.query(Ward).filter(Ward.id == resolved_ward_id, Ward.hospital_id == hospital_id).first()
+
+    # Read hospital admission advance policy
+    policy = get_admission_financial_policy(db, hospital_id)
+
+    is_provisional_ward = False
+    if not ward and policy.financial_gate_enabled and policy.advance_mode == "mandatory":
+        from modules.beds.entities.bed import WardType
+        default_ward = (
+            db.query(Ward)
+            .filter(Ward.hospital_id == hospital_id, Ward.is_active == True)
+            .order_by((Ward.ward_type == WardType.general).desc(), Ward.admission_fee.asc())
+            .first()
+        )
+        if default_ward:
+            ward = default_ward
+            is_provisional_ward = True
+
+    admission_fee = float(getattr(ward, "admission_fee", 0.0) or 0.0) if ward else 0.0
+    bed_charge_per_day = float(getattr(ward, "bed_charge_per_day", 0.0) or 0.0) if ward else 0.0
+
+    if not policy.financial_gate_enabled or policy.advance_mode == "waived":
+        required_advance = 0.0
+    elif policy.advance_mode == "optional":
+        required_advance = 0.0
+    else:
+        # Mandatory advance
+        fee = admission_fee if policy.include_admission_fee else 0.0
+        tariff = bed_charge_per_day if policy.include_first_day_bed_tariff else 0.0
+        base_advance = round(fee + tariff, 2)
+        required_advance = max(base_advance, policy.minimum_advance_amount) if policy.minimum_advance_amount > 0 else base_advance
+
+    # Ensure IPD financial account exists
+    billing_svc = InpatientBillingService(db)
+    acc = billing_svc.ensure_financial_account(
+        hospital_id=hospital_id,
+        patient_id=admission.patient_id,
+        admission_id=admission.id,
+        created_by_name="System",
+    )
+    ipd_account_id = acc.id if acc else None
+
+    # Compute episode-specific ledger totals
+    ledger = billing_svc.get_ledger_totals(
+        hospital_id, admission.patient_id, admission_id=admission.id
+    )
+    paid = round(float(ledger.get("total_paid", 0.0) or ledger.get("total_payments", 0.0) or 0.0), 2)
+    deposit = round(
+        float(ledger.get("deposits_available", 0.0) or ledger.get("total_deposits_available", 0.0) or 0.0),
+        2,
+    )
+    current_ipd_outstanding = round(float(ledger.get("outstanding", 0.0) or 0.0), 2)
+
+    # Compute historical patient balance (all episodes minus current IPD account)
+    lifetime_ledger = patient_ledger_totals(db, hospital_id, admission.patient_id, account_id=None)
+    lifetime_outstanding = round(float(lifetime_ledger.get("outstanding", 0.0) or 0.0), 2)
+    historical_patient_balance = max(0.0, round(lifetime_outstanding - current_ipd_outstanding, 2))
+
+    total_coverage = round(paid + deposit, 2)
+    shortfall = max(0.0, round(required_advance - total_coverage, 2))
+
+    # Check for active FinancialClearanceException for this admission
+    active_exc = (
+        db.query(FinancialClearanceException)
+        .filter(
+            FinancialClearanceException.hospital_id == hospital_id,
+            FinancialClearanceException.admission_id == admission.id,
+            FinancialClearanceException.service_type.in_(["admission_bed", "ipd_bed_allocation", "bed_allocation", "admission"]),
+            FinancialClearanceException.is_consumed == False,
+        )
+        .order_by(FinancialClearanceException.created_at.desc())
+        .first()
+    )
+
+    if active_exc and active_exc.status == FinancialExceptionStatus.approved.value:
+        status_str = "emergency_override" if active_exc.is_emergency else "exception_approved"
+        reason_str = (
+            f"Emergency clinical override active: {active_exc.reason}"
+            if active_exc.is_emergency
+            else f"Approved financial exception ({active_exc.reason_category}): {active_exc.reason}"
+        )
+        return BedAllocationClearanceState(
+            is_cleared=True,
+            status=status_str,
+            required_advance=required_advance,
+            admission_fee=admission_fee,
+            bed_charge_per_day=bed_charge_per_day,
+            paid_or_allocated_amount=paid,
+            available_deposit=deposit,
+            shortfall=shortfall,
+            ipd_account_id=ipd_account_id,
+            current_ipd_outstanding=current_ipd_outstanding,
+            historical_patient_balance=historical_patient_balance,
+            active_exception_id=active_exc.id,
+            active_exception_status=active_exc.status,
+            reason=reason_str,
+        )
+
+    if active_exc and active_exc.status == FinancialExceptionStatus.pending.value:
+        return BedAllocationClearanceState(
+            is_cleared=False,
+            status="exception_pending",
+            required_advance=required_advance,
+            admission_fee=admission_fee,
+            bed_charge_per_day=bed_charge_per_day,
+            paid_or_allocated_amount=paid,
+            available_deposit=deposit,
+            shortfall=shortfall,
+            ipd_account_id=ipd_account_id,
+            current_ipd_outstanding=current_ipd_outstanding,
+            historical_patient_balance=historical_patient_balance,
+            active_exception_id=active_exc.id,
+            active_exception_status=active_exc.status,
+            reason=f"Financial exception request pending review ({active_exc.reason_category}). Shortfall: ₹{shortfall:.2f}",
+        )
+
+    if shortfall <= 0.0:
+        return BedAllocationClearanceState(
+            is_cleared=True,
+            status="financially_cleared",
+            required_advance=required_advance,
+            admission_fee=admission_fee,
+            bed_charge_per_day=bed_charge_per_day,
+            paid_or_allocated_amount=paid,
+            available_deposit=deposit,
+            shortfall=0.0,
+            ipd_account_id=ipd_account_id,
+            current_ipd_outstanding=current_ipd_outstanding,
+            historical_patient_balance=historical_patient_balance,
+            active_exception_id=None,
+            active_exception_status=None,
+            reason="Financially cleared for standard ward admission (pending bed allocation)." if is_provisional_ward else "Financially cleared for bed allocation.",
+        )
+
+    return BedAllocationClearanceState(
+        is_cleared=False,
+        status="payment_required",
+        required_advance=required_advance,
+        admission_fee=admission_fee,
+        bed_charge_per_day=bed_charge_per_day,
+        paid_or_allocated_amount=paid,
+        available_deposit=deposit,
+        shortfall=shortfall,
+        ipd_account_id=ipd_account_id,
+        current_ipd_outstanding=current_ipd_outstanding,
+        historical_patient_balance=historical_patient_balance,
+        active_exception_id=None,
+        active_exception_status=None,
+        reason=(
+            f"Payment or deposit of ₹{shortfall:.2f} required (estimated for standard ward). Final amount adjusts upon specific bed allocation."
+            if is_provisional_ward
+            else f"Payment or deposit of ₹{shortfall:.2f} required for admission advance."
+        ),
+    )
+
+
 def assert_service_financially_cleared(
     db: Session,
     hospital_id: UUID,
@@ -498,18 +846,54 @@ def assert_service_financially_cleared(
     source_id: UUID,
     action_description: str = "proceed with service",
     is_emergency_override: bool = False,
+    actor: dict[str, Any] | None = None,
+    emergency_reason: str | None = None,
+    admission_id: UUID | None = None,
+    patient_id: UUID | None = None,
 ) -> ServiceFinancialState:
     """
     Assert that the service charge is financially cleared.
     Raises HTTPException 402 PAYMENT_REQUIRED (or 400 if cancelled) if blocked.
-    If is_emergency_override is True, emergency/STAT clinical workflow is permitted to proceed.
+    If an approved FinancialClearanceException exists, allows service to proceed.
+    If is_emergency_override is True, structured emergency exception is recorded and care proceeds immediately.
     """
     state = check_service_financial_clearance(db, hospital_id, source_type, source_id)
     if state.is_cleared:
         return state
 
-    if is_emergency_override:
-        # Permitted under clinical life-safety / emergency STAT exception protocol
+    # 1. Check for approved FinancialClearanceException strictly scoped to service_type & patient
+    exc_q = (
+        db.query(FinancialClearanceException)
+        .filter(
+            FinancialClearanceException.hospital_id == hospital_id,
+            FinancialClearanceException.status == FinancialExceptionStatus.approved.value,
+            FinancialClearanceException.is_consumed == False,
+            FinancialClearanceException.service_type == source_type.value,
+        )
+    )
+    if patient_id:
+        exc_q = exc_q.filter(FinancialClearanceException.patient_id == patient_id)
+    if source_id:
+        exc_q = exc_q.filter(
+            (FinancialClearanceException.source_id == source_id)
+            | (FinancialClearanceException.source_id.is_(None))
+        )
+    if admission_id:
+        exc_q = exc_q.filter(
+            (FinancialClearanceException.admission_id == admission_id)
+            | (FinancialClearanceException.admission_id.is_(None))
+        )
+
+    approved_exc = exc_q.order_by(FinancialClearanceException.created_at.desc()).first()
+    if approved_exc:
+        # Mark exception consumed to prevent unauthorized replay
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+        approved_exc.is_consumed = True
+        approved_exc.consumed_at = _dt.now(_tz.utc)
+        approved_exc.status = FinancialExceptionStatus.consumed.value
+        db.flush()
+
         return ServiceFinancialState(
             charge_exists=state.charge_exists,
             charge_id=state.charge_id,
@@ -518,7 +902,74 @@ def assert_service_financially_cleared(
             amount_paid=state.amount_paid,
             outstanding_amount=state.outstanding_amount,
             is_cleared=True,
-            reason="Emergency / STAT clinical override active.",
+            reason=f"Approved financial exception ({approved_exc.reason_category}): {approved_exc.reason}",
+        )
+
+    # 2. Structured emergency override
+    if is_emergency_override:
+        actor_id, actor_name = validate_emergency_override_actor(
+            actor, emergency_reason, service_type=source_type.value
+        )
+        reason_text = (emergency_reason or "").strip()
+
+        # If patient_id is not given, derive from charge
+        target_patient_id = patient_id
+        if not target_patient_id and state.charge_id:
+            chg = db.query(BillingCharge).filter(BillingCharge.id == state.charge_id).first()
+            if chg:
+                target_patient_id = chg.patient_id
+
+        if target_patient_id and actor_id:
+            try:
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
+                now = _dt.now(_tz.utc)
+                em_exc = FinancialClearanceException(
+                    hospital_id=hospital_id,
+                    patient_id=target_patient_id,
+                    admission_id=admission_id,
+                    service_type=source_type.value,
+                    action_type="emergency_execution",
+                    source_id=source_id,
+                    is_emergency=True,
+                    required_amount=Decimal(str(state.net_amount)),
+                    amount_covered=Decimal(str(state.amount_paid)),
+                    shortfall_amount=Decimal(str(state.outstanding_amount)),
+                    reason_category="emergency_life_safety",
+                    reason=reason_text,
+                    status=FinancialExceptionStatus.consumed.value,
+                    is_consumed=True,
+                    consumed_at=now,
+                    requested_by_id=actor_id,
+                    requested_by_name=actor_name,
+                    approved_by_id=actor_id,
+                    approved_by_name=actor_name,
+                    approval_remarks="Auto-authorized under emergency life-safety override protocol",
+                )
+                db.add(em_exc)
+                db.flush()
+                from shared.audit.service import write_audit_log
+                write_audit_log(
+                    db,
+                    hospital_id=hospital_id,
+                    actor=actor or {"id": str(actor_id), "name": actor_name},
+                    action="emergency_override",
+                    entity_type="financial_clearance_exception",
+                    entity_id=em_exc.id,
+                    summary=f"Emergency financial override applied for {source_type.value} ({source_id}): {reason_text}",
+                )
+            except Exception:
+                pass
+
+        return ServiceFinancialState(
+            charge_exists=state.charge_exists,
+            charge_id=state.charge_id,
+            status=state.status,
+            net_amount=state.net_amount,
+            amount_paid=state.amount_paid,
+            outstanding_amount=state.outstanding_amount,
+            is_cleared=True,
+            reason=f"Emergency clinical override active: {reason_text}",
         )
 
     if state.status == "cancelled":

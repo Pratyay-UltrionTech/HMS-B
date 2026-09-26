@@ -769,6 +769,13 @@ class PharmacyActions:
         return self._sale_to_response(row)
 
     def create_sale(self, payload: SaleCreate) -> SaleResponse:
+        try:
+            return self._create_sale_internal(payload)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def _create_sale_internal(self, payload: SaleCreate) -> SaleResponse:
         actor = actor_name(self.user)
         today = payload.sale_date or date.today()
 
@@ -876,6 +883,7 @@ class PharmacyActions:
         total_gst = 0.0
         total_net = 0.0
         warnings: list[str] = []
+        stock_decrements: list[tuple[UUID, UUID, float]] = []
 
         for it in payload.items:
             med = self.repo.get_medicine_by_id(it.medicine_id, self.hospital_id)
@@ -931,19 +939,7 @@ class PharmacyActions:
                     net_amount=net,
                 )
                 self.db.add(sale_item)
-
-                apply_stock_change(
-                    self.db,
-                    hospital_id=self.hospital_id,
-                    medicine_id=it.medicine_id,
-                    batch_id=b.id,
-                    quantity_delta=-qty,
-                    transaction_type=StockTransactionType.sale,
-                    reference_type="pharmacy_sale",
-                    reference_id=sale.id,
-                    notes=f"Sale {invoice_number}",
-                    created_by_name=actor,
-                )
+                stock_decrements.append((it.medicine_id, b.id, qty))
 
             if rx_request:
                 rx_dispense_map[it.medicine_id] = rx_dispense_map.get(it.medicine_id, 0.0) + float(it.quantity)
@@ -1030,6 +1026,68 @@ class PharmacyActions:
                     allocate=True,
                     allocations_plan=[{"charge_id": charge.id, "amount": min(paid, float(charge.net_amount))}],
                 )
+
+            # Check clearance if not fully paid at counter
+            if paid < final_net - 0.0001:
+                from modules.billing.entities.billing_entities import BillingDeposit
+                from modules.billing.services.billing_service import draw_down_deposit_for_charges
+                dep_q = (
+                    self.db.query(BillingDeposit)
+                    .filter(
+                        BillingDeposit.hospital_id == self.hospital_id,
+                        BillingDeposit.patient_id == payload.patient_id,
+                        BillingDeposit.available_amount > 0,
+                    )
+                )
+                if account_id:
+                    dep_q = dep_q.filter(
+                        (BillingDeposit.account_id == account_id) | (BillingDeposit.account_id.is_(None))
+                    )
+                dep = dep_q.order_by(BillingDeposit.created_at.asc()).first()
+                if dep:
+                    shortfall_to_cover = round(final_net - paid, 2)
+                    draw_down_deposit_for_charges(
+                        self.db,
+                        hospital_id=self.hospital_id,
+                        deposit_id=dep.id,
+                        allocations_plan=[{"charge_id": charge.id, "amount": shortfall_to_cover}],
+                        created_by_name=actor,
+                    )
+
+                from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+                assert_service_financially_cleared(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    source_type=BillingSourceType.pharmacy,
+                    source_id=sale.id,
+                    action_description="dispense pharmacy items",
+                    is_emergency_override=getattr(payload, "is_emergency_override", False),
+                    actor=self.user,
+                    emergency_reason=getattr(payload, "emergency_override_reason", None),
+                    admission_id=sale_admission_id,
+                    patient_id=payload.patient_id,
+                )
+        elif paid < final_net - 0.0001:
+            if not getattr(payload, "is_emergency_override", False):
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail=f"Retail pharmacy counter sales require full payment before dispensing. Shortfall: ₹{final_net - paid:.2f}",
+                )
+
+        # ── Stock Decrement (Only executed after financial clearance check passes) ──
+        for med_id, b_id, qty in stock_decrements:
+            apply_stock_change(
+                self.db,
+                hospital_id=self.hospital_id,
+                medicine_id=med_id,
+                batch_id=b_id,
+                quantity_delta=-qty,
+                transaction_type=StockTransactionType.sale,
+                reference_type="pharmacy_sale",
+                reference_id=sale.id,
+                notes=f"Sale {invoice_number}",
+                created_by_name=actor,
+            )
 
         # Transition prescription status (FLAW-004). When dispensing against a pharmacy
         # Rx request, the request-level recompute above already mirrored the clinical

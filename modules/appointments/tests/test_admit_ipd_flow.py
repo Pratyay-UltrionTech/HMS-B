@@ -63,6 +63,7 @@ def test_admit_ipd_action_success_and_side_effects(standalone_db: Session):
         phone="555-0100",
         email=f"admin_{uuid.uuid4().hex[:6]}@hospital.org",
         password_hash="hash",
+        facility_settings={"admission_financial_policy": {"advance_mode": "waived"}},
     )
     db.add(hosp)
     db.flush()

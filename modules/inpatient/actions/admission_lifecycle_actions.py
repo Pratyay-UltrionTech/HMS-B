@@ -49,6 +49,7 @@ def _link_appointment_compat(
 
     Requested → ``ipd_transfer_requested``; accepted → ``transferred_to_inpatient``.
     Runs inside the caller's transaction so the two states cannot diverge (§6).
+    Preserves completed, cancelled, and no-show appointments without mutating their status.
     """
     if source_appointment_id is None:
         return
@@ -64,6 +65,12 @@ def _link_appointment_compat(
     )
     if appt is None:
         return
+
+    # Never mutate completed or cancelled appointments into transferred status
+    if appt.status in (AppointmentStatus.completed, AppointmentStatus.cancelled, AppointmentStatus.no_show):
+        appt.admission_id = admission_id
+        return
+
     if admitted:
         appt.status = AppointmentStatus.transferred_to_inpatient
     else:
@@ -78,8 +85,9 @@ class EnsureAdmissionRequestAction:
     1. Lock/check existing open episode (requested/admitted/discharge_requested).
     2. Return it when present (no duplicate) — syncing the appointment mirror.
     3. Otherwise create ``Admission(status=requested)`` bedless.
-    4. Link the source appointment as compatibility state.
-    5. Audit + commit atomically; IntegrityError losers re-read the winner.
+    4. Link the source appointment as compatibility state without reopening completed ones.
+    5. Ensure IPD FinancialAccount exists immediately on request creation.
+    6. Audit + commit atomically; IntegrityError losers re-read the winner.
     """
 
     def __init__(self, db: Session) -> None:
@@ -94,6 +102,7 @@ class EnsureAdmissionRequestAction:
         doctor_id: UUID | None = None,
         notes: str | None = None,
         source_appointment_id: UUID | None = None,
+        ward_id: UUID | None = None,
         commit: bool = True,
     ) -> tuple[Admission, bool]:
         """Ensure a canonical admission request exists (idempotent).
@@ -102,6 +111,7 @@ class EnsureAdmissionRequestAction:
         (Transfer to Inpatient) can commit once together with its own audit
         row — single-commit semantics preserved either way.
         """
+        from modules.inpatient.services.inpatient_billing_service import InpatientBillingService
         from modules.inpatient.utils.admission_conflicts import (
             admission_conflict as _ensure_conflict,
         )
@@ -116,10 +126,15 @@ class EnsureAdmissionRequestAction:
 
             raise NotFoundError("Patient not found")
 
+        billing = InpatientBillingService(self.db)
+        actor_name = str(actor.get("name") or "System")
+
         existing = self.repo.get_open_admission(hospital_id, patient_id, for_update=True)
         if existing:
             if source_appointment_id and not existing.source_appointment_id:
                 existing.source_appointment_id = source_appointment_id
+            if ward_id and not existing.ward_id:
+                existing.ward_id = ward_id
             # Loser path also reconciles the appointment mirror so the
             # compatibility state can never diverge from the winner (§6).
             _link_appointment_compat(
@@ -128,6 +143,12 @@ class EnsureAdmissionRequestAction:
                 source_appointment_id or existing.source_appointment_id,
                 existing.id,
                 admitted=existing.status != AdmissionStatus.requested,
+            )
+            billing.ensure_financial_account(
+                hospital_id=hospital_id,
+                patient_id=patient.id,
+                admission_id=existing.id,
+                created_by_name=actor_name,
             )
             write_audit_log(
                 self.db,
@@ -150,8 +171,16 @@ class EnsureAdmissionRequestAction:
             notes=notes,
             source_appointment_id=source_appointment_id,
         )
+        if ward_id:
+            admission.ward_id = ward_id
         _link_appointment_compat(
             self.db, hospital_id, source_appointment_id, admission.id, admitted=False
+        )
+        billing.ensure_financial_account(
+            hospital_id=hospital_id,
+            patient_id=patient.id,
+            admission_id=admission.id,
+            created_by_name=actor_name,
         )
         write_audit_log(
             self.db,
@@ -179,6 +208,12 @@ class EnsureAdmissionRequestAction:
                     source_appointment_id or winner.source_appointment_id,
                     winner.id,
                     admitted=winner.status != AdmissionStatus.requested,
+                )
+                billing.ensure_financial_account(
+                    hospital_id=hospital_id,
+                    patient_id=patient.id,
+                    admission_id=winner.id,
+                    created_by_name=actor_name,
                 )
                 self.db.commit()
                 return winner, False
@@ -215,6 +250,8 @@ class AcceptAdmissionAction:
         bed_id: UUID | None = None,
         doctor_id: UUID | None = None,
         notes: str | None = None,
+        is_emergency_override: bool = False,
+        emergency_override_reason: str | None = None,
     ) -> AdmissionDetail:
         from modules.inpatient.actions.admission_actions import to_admission_detail
         from modules.inpatient.services.inpatient_billing_service import (
@@ -288,6 +325,78 @@ class AcceptAdmissionAction:
             if bed.ward_id != ward_id or bed.room_id != room_id:
                 raise ValidationError("Ward/Room does not match selected bed")
 
+            # ── Authoritative Backend Financial Clearance Check ─────────────
+            from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
+            from modules.billing.entities.financial_exception import FinancialClearanceException, FinancialExceptionStatus
+            from decimal import Decimal
+
+            now = datetime.now(timezone.utc)
+            if is_emergency_override:
+                from modules.billing.services.service_financial_clearance import validate_emergency_override_actor
+                actor_id, actor_name = validate_emergency_override_actor(
+                    actor, emergency_override_reason, service_type="admission_bed"
+                )
+                em_reason = (emergency_override_reason or "").strip()
+                if actor_id:
+                    em_exc = FinancialClearanceException(
+                        hospital_id=hospital_id,
+                        patient_id=admission.patient_id,
+                        admission_id=admission.id,
+                        service_type="admission_bed",
+                        action_type="bed_allocation",
+                        source_id=bed.id,
+                        is_emergency=True,
+                        reason_category="emergency_life_safety",
+                        reason=em_reason,
+                        status=FinancialExceptionStatus.consumed.value,
+                        is_consumed=True,
+                        consumed_at=now,
+                        requested_by_id=actor_id,
+                        requested_by_name=actor_name,
+                        approved_by_id=actor_id,
+                        approved_by_name=actor_name,
+                        approval_remarks="Auto-authorized under emergency admission protocol",
+                    )
+                    self.db.add(em_exc)
+                    self.db.flush()
+                    write_audit_log(
+                        self.db,
+                        hospital_id=hospital_id,
+                        actor=actor,
+                        action="emergency_override",
+                        entity_type="financial_clearance_exception",
+                        entity_id=em_exc.id,
+                        summary=f"Emergency financial override applied for bed {bed.bed_code}: {em_reason}",
+                    )
+            else:
+                fin_state = evaluate_bed_allocation_clearance(
+                    self.db, hospital_id, admission.id, ward_id=ward_id, bed_id=bed.id
+                )
+                if not fin_state.is_cleared:
+                    from fastapi import HTTPException
+                    raise HTTPException(
+                        status_code=402,
+                        detail={
+                            "message": f"Payment or deposit required before bed allocation. Shortfall: ₹{fin_state.shortfall:.2f}.",
+                            "status": fin_state.status,
+                            "required_advance": fin_state.required_advance,
+                            "admission_fee": fin_state.admission_fee,
+                            "bed_charge_per_day": fin_state.bed_charge_per_day,
+                            "paid_or_allocated_amount": fin_state.paid_or_allocated_amount,
+                            "available_deposit": fin_state.available_deposit,
+                            "shortfall": fin_state.shortfall,
+                            "reason": fin_state.reason,
+                            "ipd_account_id": str(fin_state.ipd_account_id) if fin_state.ipd_account_id else None,
+                        },
+                    )
+                if fin_state.active_exception_id:
+                    exc = self.db.query(FinancialClearanceException).filter(
+                        FinancialClearanceException.id == fin_state.active_exception_id
+                    ).first()
+                    if exc:
+                        exc.is_consumed = True
+                        exc.consumed_at = now
+
         now = datetime.now(timezone.utc)
         admission.status = AdmissionStatus.admitted
         admission.admitted_at = now
@@ -332,6 +441,7 @@ class AcceptAdmissionAction:
 
         # Appointment mirror: every pending request for this patient resolves
         # to transferred_to_inpatient inside the same transaction (spec §6).
+        # Completed appointments are strictly preserved.
         from modules.appointments.entities.appointment import Appointment, AppointmentStatus
 
         pending = (
@@ -356,7 +466,8 @@ class AcceptAdmissionAction:
                 .first()
             )
             if src:
-                src.status = AppointmentStatus.transferred_to_inpatient
+                if src.status != AppointmentStatus.completed:
+                    src.status = AppointmentStatus.transferred_to_inpatient
                 src.admission_id = admission.id
 
         billing = InpatientBillingService(self.db)

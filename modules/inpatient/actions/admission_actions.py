@@ -100,17 +100,18 @@ def to_admission_detail(a: Admission) -> AdmissionDetail:
             )
         )
 
+    # Requirement 22: OP Number belongs to OPD; only present if transferred from an OPD appointment.
     op_id = None
-    if getattr(a, "source_appointment_id", None):
-        appt = getattr(a, "source_appointment", None)
-        if appt is None and hasattr(a, "_sa_instance_state"):
-            from sqlalchemy.orm import object_session
-            sess = object_session(a)
-            if sess:
-                from modules.appointments.entities.appointment import Appointment
-                appt = sess.get(Appointment, a.source_appointment_id)
-        if appt:
-            op_id = getattr(appt, "op_id", None)
+    if getattr(a, "source_appointment", None):
+        op_id = a.source_appointment.op_id
+    elif getattr(a, "source_appointment_id", None):
+        from sqlalchemy.orm import object_session
+        from modules.appointments.entities.appointment import Appointment
+        s = object_session(a)
+        if s:
+            src_appt = s.query(Appointment).filter(Appointment.id == a.source_appointment_id).first()
+            if src_appt:
+                op_id = src_appt.op_id
 
     return AdmissionDetail(
         id=a.id,
@@ -415,6 +416,72 @@ class AllocateBedAction:
 
         from datetime import datetime as _dt
         from datetime import timezone as _tz
+        now = _dt.now(_tz.utc)
+
+        # ── Authoritative Backend Financial Clearance Check for First Bed Allocation ──
+        if admission.bed_id is None:
+            from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
+            from modules.billing.entities.financial_exception import FinancialClearanceException, FinancialExceptionStatus
+            from fastapi import HTTPException
+
+            is_em = getattr(payload, "is_emergency_override", False)
+            em_reason = getattr(payload, "emergency_override_reason", None)
+
+            if is_em:
+                from modules.billing.services.service_financial_clearance import validate_emergency_override_actor
+                actor_id, actor_name = validate_emergency_override_actor(
+                    actor, em_reason, service_type="admission_bed"
+                )
+                em_reason_text = (em_reason or "").strip()
+                if actor_id:
+                    em_exc = FinancialClearanceException(
+                        hospital_id=hospital_id,
+                        patient_id=admission.patient_id,
+                        admission_id=admission.id,
+                        service_type="admission_bed",
+                        action_type="bed_allocation",
+                        source_id=new_bed.id,
+                        is_emergency=True,
+                        reason_category="emergency_life_safety",
+                        reason=em_reason_text,
+                        status=FinancialExceptionStatus.consumed.value,
+                        is_consumed=True,
+                        consumed_at=now,
+                        requested_by_id=actor_id,
+                        requested_by_name=actor_name,
+                        approved_by_id=actor_id,
+                        approved_by_name=actor_name,
+                        approval_remarks="Auto-authorized under emergency admission protocol",
+                    )
+                    self.db.add(em_exc)
+                    self.db.flush()
+            else:
+                fin_state = evaluate_bed_allocation_clearance(
+                    self.db, hospital_id, admission.id, ward_id=payload.ward_id, bed_id=payload.bed_id
+                )
+                if not fin_state.is_cleared:
+                    raise HTTPException(
+                        status_code=402,
+                        detail={
+                            "message": f"Payment or deposit required before bed allocation. Shortfall: ₹{fin_state.shortfall:.2f}.",
+                            "status": fin_state.status,
+                            "required_advance": fin_state.required_advance,
+                            "admission_fee": fin_state.admission_fee,
+                            "bed_charge_per_day": fin_state.bed_charge_per_day,
+                            "paid_or_allocated_amount": fin_state.paid_or_allocated_amount,
+                            "available_deposit": fin_state.available_deposit,
+                            "shortfall": fin_state.shortfall,
+                            "reason": fin_state.reason,
+                            "ipd_account_id": str(fin_state.ipd_account_id) if fin_state.ipd_account_id else None,
+                        },
+                    )
+                if fin_state.active_exception_id:
+                    exc = self.db.query(FinancialClearanceException).filter(
+                        FinancialClearanceException.id == fin_state.active_exception_id
+                    ).first()
+                    if exc:
+                        exc.is_consumed = True
+                        exc.consumed_at = now
 
         old_bed = (
             self.db.query(Bed).filter(Bed.id == admission.bed_id).with_for_update().first()

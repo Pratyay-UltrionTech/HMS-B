@@ -60,6 +60,8 @@ class SpecimenCollectRequest(BaseModel):
     collected_by: str = Field(min_length=1, max_length=255)
     collected_at: datetime | None = None
     collection_remarks: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 # ── Catalogue ──────────────────────────────────────────────────────────────────
@@ -207,6 +209,8 @@ class LabOrderCreate(BaseModel):
     test_ids: list[UUID] = Field(default_factory=list)
     panel_ids: list[UUID] = Field(default_factory=list)
     clinical_notes: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
     @model_validator(mode="after")
     def require_tests_panels_or_request(self):
@@ -302,6 +306,8 @@ class SampleCollectRequest(BaseModel):
     collected_by: str = Field(min_length=1, max_length=255)
     sample_type: LabSampleType | None = None
     collection_remarks: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class ItemStatusUpdate(BaseModel):

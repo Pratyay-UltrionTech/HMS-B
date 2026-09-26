@@ -34,6 +34,7 @@ from modules.ot.contracts.ot_contracts import (
     OtDashboardResponse,
     OtNotesRequest,
     OtRescheduleRequest,
+    OtStartSurgeryRequest,
     OtSurgeryCreate,
     OtSurgeryResponse,
     OtSurgeryUpdate,
@@ -157,11 +158,12 @@ def reschedule_surgery(
 @router.post("/surgeries/{surgery_id}/start", response_model=OtSurgeryResponse, dependencies=[Depends(require_permission("ot", "edit"))])
 def start_surgery(
     surgery_id: UUID,
+    payload: OtStartSurgeryRequest | None = None,
     db: Session = Depends(get_transitional_sync_session),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> OtSurgeryResponse:
-    return StartSurgeryAction(db, hospital_id, user).execute(surgery_id)
+    return StartSurgeryAction(db, hospital_id, user).execute(surgery_id, payload)
 
 
 @router.post("/surgeries/{surgery_id}/complete", response_model=OtSurgeryResponse,

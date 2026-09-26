@@ -192,6 +192,8 @@ def test_allocate_bed_charges_admission_fee(
         bed_id=test_bed.id,
         ward_id=test_bed.ward_id,
         room_id=test_bed.room_id,
+        is_emergency_override=True,
+        emergency_override_reason="Clinical emergency placement",
     )
     updated = action.execute(hospital_id=hospital.id, payload=req, actor={"name": "Doctor"})
 
