@@ -20,8 +20,191 @@ from modules.billing.entities.financial_exception import (
     FinancialClearanceException,
     FinancialExceptionStatus,
 )
-from modules.inpatient.services.inpatient_billing_service import InpatientBillingService
+from modules.billing.services.financial_authorization import (
+    OverrideActor,
+    OverrideScope,
+    authorize_emergency_override,
+    authorize_exception_approval,
+    require_override_reason,
+    resolve_actor,
+)
 from shared.audit.service import write_audit_log
+
+ENTITY_TYPE = "financial_clearance_exception"
+
+
+def _money(value: Any) -> Decimal:
+    return Decimal(str(value or 0)).quantize(Decimal("0.01"))
+
+
+def exception_audit_details(exc: FinancialClearanceException, **extra: Any) -> dict[str, Any]:
+    """Audit / sync payload for an exception row (patient, admission, account, scope)."""
+    details: dict[str, Any] = {
+        "exception_id": str(exc.id) if exc.id else None,
+        "patient_id": str(exc.patient_id) if exc.patient_id else None,
+        "admission_id": str(exc.admission_id) if exc.admission_id else None,
+        "account_id": str(exc.financial_account_id) if exc.financial_account_id else None,
+        "service_type": exc.service_type,
+        "source_type": exc.service_type,
+        "action_type": exc.action_type,
+        "source_id": str(exc.source_id) if exc.source_id else None,
+        "is_emergency": bool(exc.is_emergency),
+        "status": exc.status,
+        "is_consumed": bool(exc.is_consumed),
+        "reason_category": exc.reason_category,
+        "reason": exc.reason,
+        "required_amount": float(exc.required_amount or 0),
+        "amount_covered": float(exc.amount_covered or 0),
+        "shortfall_amount": float(exc.shortfall_amount or 0),
+    }
+    details.update(extra)
+    return details
+
+
+def consume_exception(exc: FinancialClearanceException, now: datetime | None = None) -> None:
+    """Mark an approved exception as used; status and flag always move together."""
+    exc.is_consumed = True
+    exc.consumed_at = now or datetime.now(timezone.utc)
+    exc.status = FinancialExceptionStatus.consumed.value
+
+
+def _validate_scope_targets(db: Session, hospital_id: UUID, scope: OverrideScope) -> None:
+    """Admission / charge referenced by the scope must belong to this hospital and patient."""
+    if scope.admission_id:
+        from modules.inpatient.entities.admission import Admission
+
+        adm = (
+            db.query(Admission)
+            .filter(Admission.id == scope.admission_id, Admission.hospital_id == hospital_id)
+            .first()
+        )
+        if adm is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found.")
+        if scope.patient_id and adm.patient_id != scope.patient_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Admission does not belong to the selected patient.",
+            )
+    if scope.source_id and not scope.is_admission_scope:
+        from modules.billing.entities.billing_entities import BillingCharge
+
+        charge = (
+            db.query(BillingCharge)
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.source_type == scope.service_type,
+                BillingCharge.source_id == scope.source_id,
+            )
+            .order_by(BillingCharge.created_at.desc())
+            .first()
+        )
+        if charge is not None and scope.patient_id and charge.patient_id != scope.patient_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The referenced service does not belong to the selected patient.",
+            )
+
+
+def _resolve_account_id(
+    db: Session, hospital_id: UUID, scope: OverrideScope, actor_name: str
+) -> UUID | None:
+    if scope.admission_id and scope.patient_id:
+        from modules.inpatient.services.inpatient_billing_service import InpatientBillingService
+
+        acc = InpatientBillingService(db).ensure_financial_account(
+            hospital_id=hospital_id,
+            patient_id=scope.patient_id,
+            admission_id=scope.admission_id,
+            created_by_name=actor_name,
+        )
+        return acc.id if acc else None
+    if scope.source_id and not scope.is_admission_scope:
+        from modules.billing.entities.billing_entities import BillingCharge
+
+        charge = (
+            db.query(BillingCharge)
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.source_type == scope.service_type,
+                BillingCharge.source_id == scope.source_id,
+            )
+            .order_by(BillingCharge.created_at.desc())
+            .first()
+        )
+        return charge.account_id if charge else None
+    return None
+
+
+def record_emergency_override(
+    db: Session,
+    hospital_id: UUID,
+    actor: OverrideActor,
+    scope: OverrideScope,
+    reason: str,
+    *,
+    required_amount: float | Decimal = 0,
+    amount_covered: float | Decimal = 0,
+    consumed: bool,
+    financial_account_id: UUID | None = None,
+    approval_remarks: str | None = None,
+) -> FinancialClearanceException:
+    """Persist an authorized emergency override and stage its audit + sync event.
+
+    ``actor`` must come from ``authorize_emergency_override``. ``consumed=True`` for
+    inline overrides applied immediately; ``False`` for a standalone override that the
+    next matching gate (same source / admission) will consume. The caller commits.
+    """
+    if not scope.patient_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Emergency override requires a registered patient.",
+        )
+    reason_text = require_override_reason(reason)
+    account_id = financial_account_id or _resolve_account_id(db, hospital_id, scope, actor.name)
+    required = _money(required_amount)
+    covered = _money(amount_covered)
+    now = datetime.now(timezone.utc)
+
+    exc = FinancialClearanceException(
+        hospital_id=hospital_id,
+        patient_id=scope.patient_id,
+        admission_id=scope.admission_id,
+        financial_account_id=account_id,
+        service_type=scope.service_type,
+        action_type=scope.action_type,
+        source_id=scope.source_id,
+        is_emergency=True,
+        required_amount=required,
+        amount_covered=covered,
+        shortfall_amount=max(Decimal("0.00"), required - covered),
+        reason_category="emergency_life_safety",
+        reason=reason_text,
+        status=FinancialExceptionStatus.approved.value,
+        requested_by_id=actor.user_id,
+        requested_by_name=actor.name,
+        approved_by_id=actor.user_id,
+        approved_by_name=actor.name,
+        approved_at=now,
+        approval_remarks=approval_remarks
+        or f"Emergency override authorized via {actor.granted_by or 'emergency override permission'}",
+    )
+    if consumed:
+        consume_exception(exc, now)
+    db.add(exc)
+    db.flush()
+
+    scope_label = str(scope.source_id or scope.admission_id)
+    write_audit_log(
+        db,
+        hospital_id=hospital_id,
+        actor=actor.claims,
+        action="emergency_override",
+        entity_type=ENTITY_TYPE,
+        entity_id=exc.id,
+        summary=f"Emergency financial override for {scope.service_type} ({scope_label}) by {actor.name}: {reason_text}",
+        details=exception_audit_details(exc, **actor.audit_fields()),
+    )
+    return exc
 
 
 class FinancialExceptionService:
@@ -35,66 +218,53 @@ class FinancialExceptionService:
         actor: dict[str, Any],
     ) -> FinancialExceptionResponse:
         """Create a pending financial clearance exception. Requester cannot self-approve."""
-        actor_id_str = actor.get("id") or actor.get("sub") or actor.get("user_id")
-        if not actor_id_str:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User identifier missing from auth token.",
-            )
-        try:
-            actor_id = UUID(str(actor_id_str))
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid user ID in auth context.",
-            )
+        scope = OverrideScope(
+            service_type=payload.service_type,
+            patient_id=payload.patient_id,
+            source_id=payload.source_id,
+            admission_id=payload.admission_id,
+            action_type=payload.action_type,
+        )
+        scope.validate()
+        reason_text = require_override_reason(payload.reason, label="Financial exception reason")
+        requester = resolve_actor(self.db, self.hospital_id, actor)
+        _validate_scope_targets(self.db, self.hospital_id, scope)
+        account_id = _resolve_account_id(self.db, self.hospital_id, scope, requester.name)
 
-        actor_name = str(actor.get("name") or "Staff")
-
-        # Resolve financial account if admission_id is present
-        fin_account_id = None
-        if payload.admission_id:
-            billing_svc = InpatientBillingService(self.db)
-            acc = billing_svc.ensure_financial_account(
-                hospital_id=self.hospital_id,
-                patient_id=payload.patient_id,
-                admission_id=payload.admission_id,
-                created_by_name=actor_name,
-            )
-            fin_account_id = acc.id if acc else None
-
+        required = _money(payload.required_amount)
         exc = FinancialClearanceException(
             hospital_id=self.hospital_id,
             patient_id=payload.patient_id,
             admission_id=payload.admission_id,
-            financial_account_id=fin_account_id,
+            financial_account_id=account_id,
             service_type=payload.service_type,
             action_type=payload.action_type,
             source_id=payload.source_id,
             is_emergency=False,
-            required_amount=Decimal(str(payload.required_amount)),
+            required_amount=required,
             amount_covered=Decimal("0.00"),
-            shortfall_amount=Decimal(str(payload.required_amount)),
+            shortfall_amount=required,
             reason_category=payload.reason_category,
-            reason=payload.reason.strip(),
+            reason=reason_text,
             status=FinancialExceptionStatus.pending.value,
-            requested_by_id=actor_id,
-            requested_by_name=actor_name,
+            requested_by_id=requester.user_id,
+            requested_by_name=requester.name,
         )
         self.db.add(exc)
-        self.db.commit()
-        self.db.refresh(exc)
+        self.db.flush()
 
         write_audit_log(
             self.db,
             hospital_id=self.hospital_id,
-            actor=actor,
+            actor=requester.claims,
             action="create",
-            entity_type="financial_clearance_exception",
+            entity_type=ENTITY_TYPE,
             entity_id=exc.id,
-            summary=f"Requested financial exception for {payload.service_type}/{payload.action_type}: {payload.reason}",
+            summary=f"Requested financial exception for {payload.service_type}/{payload.action_type}: {reason_text}",
+            details=exception_audit_details(exc, **requester.audit_fields()),
         )
-
+        self.db.commit()
+        self.db.refresh(exc)
         return FinancialExceptionResponse.model_validate(exc)
 
     def decide_exception(
@@ -107,19 +277,7 @@ class FinancialExceptionService:
         Approve or reject a financial exception.
         Enforces separation of duties: requester cannot approve their own request!
         """
-        actor_id_str = actor.get("id") or actor.get("sub") or actor.get("user_id")
-        if not actor_id_str:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User identifier missing from auth token.",
-            )
-        try:
-            actor_id = UUID(str(actor_id_str))
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid user ID in auth context.",
-            )
+        approver = authorize_exception_approval(self.db, self.hospital_id, actor)
 
         exc = (
             self.db.query(FinancialClearanceException)
@@ -142,28 +300,33 @@ class FinancialExceptionService:
                 detail=f"Exception is already {exc.status} and cannot be modified.",
             )
 
-        # Enforce separation of duties
-        if payload.status == "approved" and exc.requested_by_id == actor_id:
+        if payload.status == "approved" and exc.requested_by_id == approver.user_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Separation of duties violation: the requester cannot approve their own financial exception.",
             )
 
-        now = datetime.now(timezone.utc)
         exc.status = payload.status
-        exc.approved_by_id = actor_id
-        exc.approved_by_name = str(actor.get("name") or "Authorized Approver")
-        exc.approved_at = now
+        exc.approved_by_id = approver.user_id
+        exc.approved_by_name = approver.name
+        exc.approved_at = datetime.now(timezone.utc)
         exc.approval_remarks = payload.approval_remarks
 
         write_audit_log(
             self.db,
             hospital_id=self.hospital_id,
-            actor=actor,
+            actor=approver.claims,
             action="update",
-            entity_type="financial_clearance_exception",
+            entity_type=ENTITY_TYPE,
             entity_id=exc.id,
-            summary=f"Financial exception {payload.status} by {exc.approved_by_name}: {payload.approval_remarks or ''}",
+            summary=f"Financial exception {payload.status} by {approver.name}: {payload.approval_remarks or ''}",
+            details=exception_audit_details(
+                exc,
+                decision=payload.status,
+                approval_remarks=payload.approval_remarks,
+                requested_by_id=str(exc.requested_by_id),
+                **approver.audit_fields(),
+            ),
         )
         self.db.commit()
         self.db.refresh(exc)
@@ -175,66 +338,33 @@ class FinancialExceptionService:
         actor: dict[str, Any],
     ) -> FinancialExceptionResponse:
         """
-        Record an emergency clinical financial override.
-        Immediately authorized without approval delay; does NOT forgive debt.
+        Record an authorized emergency financial override scoped to one source
+        (service_type + source_id) or one admission (bed / admission service types).
+        The next matching gate consumes it. Does NOT forgive debt.
         """
-        actor_id_str = actor.get("id") or actor.get("sub") or actor.get("user_id")
-        actor_id = None
-        if actor_id_str:
-            try:
-                actor_id = UUID(str(actor_id_str))
-            except (ValueError, TypeError):
-                actor_id = None
-
-        actor_name = str(actor.get("name") or "Emergency Clinician")
-
-        fin_account_id = None
-        if payload.admission_id:
-            billing_svc = InpatientBillingService(self.db)
-            acc = billing_svc.ensure_financial_account(
-                hospital_id=self.hospital_id,
-                patient_id=payload.patient_id,
-                admission_id=payload.admission_id,
-                created_by_name=actor_name,
-            )
-            fin_account_id = acc.id if acc else None
-
-        now = datetime.now(timezone.utc)
-        exc = FinancialClearanceException(
-            hospital_id=self.hospital_id,
-            patient_id=payload.patient_id,
-            admission_id=payload.admission_id,
-            financial_account_id=fin_account_id,
+        scope = OverrideScope(
             service_type=payload.service_type,
-            action_type=payload.action_type,
+            patient_id=payload.patient_id,
             source_id=payload.source_id,
-            is_emergency=True,
-            required_amount=Decimal(str(payload.required_amount)),
-            amount_covered=Decimal("0.00"),
-            shortfall_amount=Decimal(str(payload.required_amount)),
-            reason_category="emergency_life_safety",
-            reason=payload.reason.strip(),
-            status=FinancialExceptionStatus.approved.value,
-            requested_by_id=actor_id or UUID("00000000-0000-0000-0000-000000000000"),
-            requested_by_name=actor_name,
-            approved_by_id=actor_id,
-            approved_by_name=actor_name,
-            approved_at=now,
-            approval_remarks="Auto-authorized under emergency life-safety clinical override protocol",
+            admission_id=payload.admission_id,
+            action_type=payload.action_type,
         )
-        self.db.add(exc)
+        override_actor = authorize_emergency_override(
+            self.db, self.hospital_id, actor, scope=scope, reason=payload.reason
+        )
+        _validate_scope_targets(self.db, self.hospital_id, scope)
+
+        exc = record_emergency_override(
+            self.db,
+            self.hospital_id,
+            override_actor,
+            scope,
+            payload.reason,
+            required_amount=payload.required_amount,
+            consumed=False,
+        )
         self.db.commit()
         self.db.refresh(exc)
-
-        write_audit_log(
-            self.db,
-            hospital_id=self.hospital_id,
-            actor=actor,
-            action="emergency_override",
-            entity_type="financial_clearance_exception",
-            entity_id=exc.id,
-            summary=f"Emergency financial override recorded for {payload.service_type}/{payload.action_type}: {payload.reason}",
-        )
         return FinancialExceptionResponse.model_validate(exc)
 
     def list_exceptions(

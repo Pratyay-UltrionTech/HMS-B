@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from modules.laboratory.entities.lab_entities import (
@@ -263,17 +263,19 @@ class LaboratoryRepository:
     # ── Dashboard metrics ──────────────────────────────────────────────────────
     def get_dashboard_metrics(self) -> dict[str, Any]:
         today_start = datetime.combine(date.today(), time.min).replace(tzinfo=timezone.utc)
-        todays_orders = (
-            self.db.query(func.count(LabOrder.id))
-            .filter(LabOrder.hospital_id == self.hospital_id, LabOrder.ordered_at >= today_start)
-            .scalar()
-            or 0
-        )
-        status_counts = dict(
-            self.db.query(LabOrder.status, func.count(LabOrder.id))
+        order_row = (
+            self.db.query(
+                func.count(case((LabOrder.ordered_at >= today_start, 1))).label("todays_orders"),
+                func.count(case((LabOrder.status == LabOrderStatus.ordered, 1))).label("pending"),
+                func.count(case((LabOrder.status == LabOrderStatus.completed, 1))).label("completed"),
+                func.count(case((LabOrder.status == LabOrderStatus.cancelled, 1))).label("cancelled"),
+                func.count(case((LabOrder.status == LabOrderStatus.sample_collected, 1))).label("sample_collected"),
+                func.count(case((LabOrder.status == LabOrderStatus.in_progress, 1))).label("in_progress"),
+                func.count(case((LabOrder.order_source == LabOrderSource.doctor_prescribed, 1))).label("doctor_prescribed"),
+                func.count(case((LabOrder.order_source == LabOrderSource.self_requested, 1))).label("self_requested"),
+            )
             .filter(LabOrder.hospital_id == self.hospital_id)
-            .group_by(LabOrder.status)
-            .all()
+            .one()
         )
         panels_count = (
             self.db.query(func.count(LabTestPanel.id))
@@ -298,22 +300,16 @@ class LaboratoryRepository:
             .scalar()
             or 0
         )
-        source_counts = dict(
-            self.db.query(LabOrder.order_source, func.count(LabOrder.id))
-            .filter(LabOrder.hospital_id == self.hospital_id)
-            .group_by(LabOrder.order_source)
-            .all()
-        )
         return {
-            "todays_orders": int(todays_orders),
-            "pending": int(status_counts.get(LabOrderStatus.ordered, 0)),
-            "completed": int(status_counts.get(LabOrderStatus.completed, 0)),
-            "cancelled": int(status_counts.get(LabOrderStatus.cancelled, 0)),
-            "sample_collected": int(status_counts.get(LabOrderStatus.sample_collected, 0)),
-            "in_progress": int(status_counts.get(LabOrderStatus.in_progress, 0)),
+            "todays_orders": int(order_row.todays_orders or 0),
+            "pending": int(order_row.pending or 0),
+            "completed": int(order_row.completed or 0),
+            "cancelled": int(order_row.cancelled or 0),
+            "sample_collected": int(order_row.sample_collected or 0),
+            "in_progress": int(order_row.in_progress or 0),
             "panels_count": int(panels_count),
             "tests_count": int(tests_count),
             "pending_doctor_requests": int(pending_requests_count),
-            "doctor_prescribed_orders": int(source_counts.get(LabOrderSource.doctor_prescribed, 0)),
-            "self_requested_orders": int(source_counts.get(LabOrderSource.self_requested, 0)),
+            "doctor_prescribed_orders": int(order_row.doctor_prescribed or 0),
+            "self_requested_orders": int(order_row.self_requested or 0),
         }

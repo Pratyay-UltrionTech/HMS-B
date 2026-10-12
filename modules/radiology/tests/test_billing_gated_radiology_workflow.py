@@ -217,8 +217,18 @@ def test_billing_gated_radiology_full_lifecycle(rad_gated_client, rad_gated_db):
         or "payment" in str(err_detail).lower()
     )
 
-    # 5. Financial Clearance
-    charge.status = BillingChargeStatus.paid
+    # 5. Financial Clearance: real payment allocated to the request charge
+    from datetime import date
+
+    from modules.billing.entities.billing_entities import BillingPaymentMethod
+    from modules.billing.services.billing_service import create_payment
+
+    create_payment(
+        rad_gated_db, hospital_id=h_id, patient_id=patient.id, amount=float(charge.net_amount),
+        payment_date=date.today(), payment_method=BillingPaymentMethod.cash, notes=None,
+        received_by_name="Cashier",
+        allocations_plan=[{"charge_id": charge.id, "amount": float(charge.net_amount)}],
+    )
     rad_gated_db.commit()
 
     # Now pending queue has the released request
@@ -261,7 +271,7 @@ def test_billing_gated_radiology_full_lifecycle(rad_gated_client, rad_gated_db):
     assert patient_search_resp.status_code == 200
     assert any(row["id"] == order["id"] for row in patient_search_resp.json())
 
-    # 7. Zero Duplicate Charges: Existing charge re-pointed to order_id
+    # 7. Zero Duplicate Charges: the request keeps its single charge (never re-pointed)
     all_rad_charges = (
         rad_gated_db.query(BillingCharge)
         .filter(
@@ -272,8 +282,9 @@ def test_billing_gated_radiology_full_lifecycle(rad_gated_client, rad_gated_db):
         .all()
     )
     assert len(all_rad_charges) == 1
-    assert all_rad_charges[0].source_id == order_id
+    assert all_rad_charges[0].source_id == rad_req.id
     assert all_rad_charges[0].status == BillingChargeStatus.paid
+    assert order["is_financially_cleared"] is True
 
     # 8. Operational flow: Schedule -> Start -> Complete -> Upload Report
     sch_resp = rad_gated_client.post(

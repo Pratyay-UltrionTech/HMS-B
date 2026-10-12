@@ -57,6 +57,36 @@ def compute_net(
 
 # ── Financial Account (Episode) Operations ───────────────────────────────────
 
+def next_financial_account_number(db: Session, hospital_id: UUID) -> str:
+    """Generate sequential account number: ACC-YYYY-NNNNN (atomic)."""
+    year = date.today().year
+    counter_name = f"account_{year}"
+    from shared.database.sequences import (
+        counter_exists as _exists,
+        ensure_counter_at_least as _ensure_ctr,
+        next_sequence_value as _next_seq,
+    )
+    if not _exists(db, hospital_id, counter_name):
+        prefix = f"ACC-{year}-"
+        rows = (
+            db.query(FinancialAccount.account_number)
+            .filter(
+                FinancialAccount.hospital_id == hospital_id,
+                FinancialAccount.account_number.like(f"{prefix}%"),
+            )
+            .all()
+        )
+        max_seq = 0
+        for (num,) in rows:
+            try:
+                max_seq = max(max_seq, int(str(num).split("-")[-1]))
+            except (ValueError, IndexError):
+                continue
+        _ensure_ctr(db, hospital_id, counter_name, max_seq)
+    seq = _next_seq(db, hospital_id, counter_name)
+    return f"ACC-{year}-{seq:05d}"
+
+
 def get_or_create_financial_account(
     db: Session,
     *,
@@ -106,24 +136,7 @@ def get_or_create_financial_account(
         if existing:
             return existing
 
-    # Generate sequential account number: ACC-YYYY-NNNNN
-    year = date.today().year
-    prefix = f"ACC-{year}-"
-    rows = (
-        db.query(FinancialAccount.account_number)
-        .filter(
-            FinancialAccount.hospital_id == hospital_id,
-            FinancialAccount.account_number.like(f"{prefix}%"),
-        )
-        .all()
-    )
-    max_seq = 0
-    for (num,) in rows:
-        try:
-            max_seq = max(max_seq, int(str(num).split("-")[-1]))
-        except (ValueError, IndexError):
-            continue
-    account_number = f"{prefix}{max_seq + 1:05d}"
+    account_number = next_financial_account_number(db, hospital_id)
 
     account = FinancialAccount(
         hospital_id=hospital_id,
@@ -277,13 +290,24 @@ def cancel_charge_for_source(
     hospital_id: UUID,
     source_type: BillingSourceType,
     source_id: UUID,
+    *,
+    reason: str = "Source service cancelled",
+    actor: dict[str, Any] | None = None,
+    performed: bool = False,
 ) -> BillingCharge | None:
-    """Mark an active charge cancelled for a given source entity."""
-    row = find_charge_by_source(db, hospital_id, source_type, source_id)
-    if not row:
-        return None
-    row.status = BillingChargeStatus.cancelled
-    return row
+    """Compatibility wrapper around the canonical charge reversal service."""
+    from modules.billing.services.charge_reversal_service import cancel_charges_for_source
+
+    results = cancel_charges_for_source(
+        db,
+        hospital_id,
+        source_type,
+        source_id,
+        reason=reason,
+        actor=actor,
+        performed=performed,
+    )
+    return results[0].charge if results else None
 
 
 def bed_stay_days(admitted_at: datetime, discharged_at: datetime) -> int:
@@ -378,6 +402,25 @@ def ensure_bed_charge_for_admission(
         place = " / ".join(
             p for p in [ward_name or None, room_code or None, bed_code or None] if p
         ) or "Bed"
+        existing = find_charge_by_source(db, hospital_id, BillingSourceType.bed, admission_id)
+        if existing:
+            from modules.billing.services.service_charge_resolver import sync_service_charge_amount
+            charge = sync_service_charge_amount(
+                db,
+                hospital_id=hospital_id,
+                patient_id=patient_id,
+                source_type=BillingSourceType.bed,
+                source_id=admission_id,
+                charge_amount=amount,
+                description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
+                reason=f"Bed stay updated ({days} {day_label})",
+                created_by_name=created_by_name or "System",
+            )
+            if charge:
+                charge.quantity = float(days)
+                charge.unit_price = round(amount / days, 2) if days > 0 else 0.0
+                charge.notes = f"multi_segment; days={days}; {'; '.join(notes_parts)}"[:512]
+            return charge
         return ensure_charge(
             db,
             hospital_id=hospital_id,
@@ -400,6 +443,25 @@ def ensure_bed_charge_for_admission(
     place = " / ".join(
         p for p in [ward_name or None, room_code or None, bed_code or None] if p
     ) or "Bed"
+    existing = find_charge_by_source(db, hospital_id, BillingSourceType.bed, admission_id)
+    if existing:
+        from modules.billing.services.service_charge_resolver import sync_service_charge_amount
+        charge = sync_service_charge_amount(
+            db,
+            hospital_id=hospital_id,
+            patient_id=patient_id,
+            source_type=BillingSourceType.bed,
+            source_id=admission_id,
+            charge_amount=amount,
+            description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
+            reason=f"Bed stay updated ({days} {day_label})",
+            created_by_name=created_by_name or "System",
+        )
+        if charge:
+            charge.quantity = float(days)
+            charge.unit_price = float(bed_charge_per_day or 0)
+            charge.notes = f"days={days}; rate_per_day={float(bed_charge_per_day or 0)}"
+        return charge
     return ensure_charge(
         db,
         hospital_id=hospital_id,
@@ -415,18 +477,199 @@ def ensure_bed_charge_for_admission(
     )
 
 
-def _refresh_charge_status(charge: BillingCharge) -> None:
+MONEY_EPS = 0.005
+
+
+def charge_allocated_totals_bulk(db: Session, charge_ids: list[UUID]) -> dict[UUID, float]:
+    """Net money applied to multiple charges in a single grouped query."""
+    if not charge_ids:
+        return {}
+    db.flush()
+    rows = (
+        db.query(
+            BillingPaymentAllocation.charge_id,
+            func.coalesce(func.sum(BillingPaymentAllocation.allocated_amount), 0),
+        )
+        .filter(BillingPaymentAllocation.charge_id.in_(charge_ids))
+        .group_by(BillingPaymentAllocation.charge_id)
+        .all()
+    )
+    res = {cid: 0.0 for cid in charge_ids}
+    for cid, total in rows:
+        if cid:
+            res[cid] = round(float(total or 0), 2)
+    return res
+
+
+def charge_allocated_total(db: Session, charge_id: UUID) -> float:
+    """Net money applied to a charge: SUM of all allocation rows (reversals are negative)."""
+    db.flush()
+    total = (
+        db.query(func.coalesce(func.sum(BillingPaymentAllocation.allocated_amount), 0))
+        .filter(BillingPaymentAllocation.charge_id == charge_id)
+        .scalar()
+    )
+    return round(float(total or 0), 2)
+
+
+def recompute_charge_financials(
+    db: Session, charge: BillingCharge, allocated_total: float | None = None
+) -> BillingCharge:
+    """Single source of truth for ``amount_paid`` / settlement ``status`` of a charge.
+
+    ``amount_paid`` is the sum of the charge's allocation rows (payment + deposit
+    allocations, net of reversals). ``status`` is derived from it and can never
+    be set independently: paid when fully covered (or net <= 0), partially_paid
+    when some money is applied, pending otherwise. Cancelled charges keep their
+    status; their allocations must have been reversed by the reversal service.
+    If ``allocated_total`` is provided, it is used directly without issuing a query.
+    """
+    if allocated_total is not None:
+        allocated = max(0.0, round(float(allocated_total), 2))
+    else:
+        allocated = max(0.0, charge_allocated_total(db, charge.id))
+    net = round(float(charge.net_amount or 0), 2)
     if charge.status == BillingChargeStatus.cancelled:
-        return
-    paid = float(charge.amount_paid or 0)
-    net = float(charge.net_amount or 0)
-    if net <= 0 or paid >= net:
+        charge.amount_paid = allocated
+        return charge
+    if net <= 0:
+        # Zero/negative nets (full waivers, pharmacy returns) are settled by definition.
         charge.status = BillingChargeStatus.paid
-        charge.amount_paid = net
-    elif paid > 0:
+        charge.amount_paid = net if net < 0 else allocated
+    elif allocated >= net - MONEY_EPS:
+        charge.status = BillingChargeStatus.paid
+        charge.amount_paid = allocated
+    elif allocated > 0:
         charge.status = BillingChargeStatus.partially_paid
+        charge.amount_paid = allocated
     else:
         charge.status = BillingChargeStatus.pending
+        charge.amount_paid = 0.0
+    return charge
+
+
+def allocation_remaining(db: Session, allocation: BillingPaymentAllocation) -> float:
+    """Unreversed portion of an original (positive) allocation row."""
+    db.flush()
+    reversed_sum = (
+        db.query(func.coalesce(func.sum(BillingPaymentAllocation.allocated_amount), 0))
+        .filter(BillingPaymentAllocation.reversal_of_id == allocation.id)
+        .scalar()
+    )
+    return round(float(allocation.allocated_amount or 0) + float(reversed_sum or 0), 2)
+
+
+def allocations_remaining_bulk(
+    db: Session, allocations: list[BillingPaymentAllocation]
+) -> dict[UUID, float]:
+    """Bulk computation of remaining unreversed portions for a list of original allocations."""
+    if not allocations:
+        return {}
+    db.flush()
+    alloc_ids = [a.id for a in allocations]
+    reversals = (
+        db.query(
+            BillingPaymentAllocation.reversal_of_id,
+            func.coalesce(func.sum(BillingPaymentAllocation.allocated_amount), 0),
+        )
+        .filter(BillingPaymentAllocation.reversal_of_id.in_(alloc_ids))
+        .group_by(BillingPaymentAllocation.reversal_of_id)
+        .all()
+    )
+    rev_by_id = {row[0]: float(row[1]) for row in reversals}
+    return {
+        a.id: round(float(a.allocated_amount or 0) + rev_by_id.get(a.id, 0.0), 2)
+        for a in allocations
+    }
+
+
+def active_allocations_for_charge(
+    db: Session, charge_id: UUID
+) -> list[tuple[BillingPaymentAllocation, float]]:
+    """Original allocations on a charge that still hold money, newest first.
+
+    Returns ``(allocation, remaining_amount)`` pairs. Deterministic order: newest
+    ``created_at`` first; ties broken by larger amount first, then id.
+    """
+    rows = (
+        db.query(BillingPaymentAllocation)
+        .filter(
+            BillingPaymentAllocation.charge_id == charge_id,
+            BillingPaymentAllocation.reversal_of_id.is_(None),
+            BillingPaymentAllocation.allocated_amount > 0,
+        )
+        .all()
+    )
+    rem_map = allocations_remaining_bulk(db, rows)
+    out = [(a, rem_map.get(a.id, float(a.allocated_amount or 0))) for a in rows]
+    out = [(a, rem) for a, rem in out if rem > MONEY_EPS]
+    out.sort(key=lambda t: (t[0].created_at, float(t[0].allocated_amount), str(t[0].id)), reverse=True)
+    return out
+
+
+def reverse_allocation(
+    db: Session,
+    allocation: BillingPaymentAllocation,
+    amount: float,
+    *,
+    reason: str,
+    created_by_name: str,
+    refund_id: UUID | None = None,
+    credit_deposit_id: UUID | None = None,
+    precomputed_remaining: float | None = None,
+    flush: bool = True,
+) -> BillingPaymentAllocation:
+    """Append a negative allocation row reversing ``amount`` of ``allocation``.
+
+    History is never mutated. Deposit-funded money is returned to the source
+    deposit's ``available_amount``. Payment-funded money must be attributed to
+    either a refund (``refund_id``) or a cancellation credit deposit
+    (``credit_deposit_id``) so the payment's balances stay reconcilable.
+    Does not recompute the charge; callers do that once per affected charge.
+    """
+    amt = round(float(amount), 2)
+    if amt <= 0:
+        raise ValueError("Reversal amount must be greater than zero")
+    if allocation.reversal_of_id is not None or float(allocation.allocated_amount or 0) <= 0:
+        raise ValueError("Only original allocations can be reversed")
+    if precomputed_remaining is not None:
+        remaining = round(float(precomputed_remaining), 2)
+    else:
+        remaining = allocation_remaining(db, allocation)
+    if amt > remaining + MONEY_EPS:
+        raise ValueError(
+            f"Reversal ₹{amt:,.2f} exceeds the unreversed allocation balance ₹{remaining:,.2f}"
+        )
+    if allocation.payment_id is not None and refund_id is None and credit_deposit_id is None:
+        raise ValueError("Payment allocation reversal requires a refund or credit destination")
+
+    row = BillingPaymentAllocation(
+        hospital_id=allocation.hospital_id,
+        payment_id=allocation.payment_id,
+        deposit_id=allocation.deposit_id,
+        charge_id=allocation.charge_id,
+        allocated_amount=-amt,
+        reversal_of_id=allocation.id,
+        refund_id=refund_id,
+        credit_deposit_id=credit_deposit_id,
+        reversal_reason=(reason or "").strip()[:512] or None,
+        created_by_name=created_by_name or "System",
+    )
+    db.add(row)
+
+    if allocation.deposit_id is not None and allocation.payment_id is None:
+        deposit = (
+            db.query(BillingDeposit)
+            .filter(BillingDeposit.id == allocation.deposit_id)
+            .with_for_update()
+            .first()
+        )
+        if deposit is not None:
+            deposit.available_amount = round(float(deposit.available_amount or 0) + amt, 2)
+            refresh_deposit_status(db, deposit)
+    if flush:
+        db.flush()
+    return row
 
 
 # ── Payment & Selective Allocation ───────────────────────────────────────────
@@ -465,31 +708,43 @@ def allocate_payment_to_charges(
         query = query.filter(BillingCharge.account_id == account_id)
     
     charges = query.order_by(BillingCharge.created_at.asc()).with_for_update().all()
+    if not charges:
+        return 0.0
+
+    # Bulk load current allocation totals for all locked candidate charges in 1 query
+    allocated_totals = charge_allocated_totals_bulk(db, [c.id for c in charges])
     total_allocated = 0.0
 
     for charge in charges:
         if remaining <= 0:
             break
+        current_alloc = allocated_totals.get(charge.id, 0.0)
+        recompute_charge_financials(db, charge, allocated_total=current_alloc)
         due = round(float(charge.net_amount) - float(charge.amount_paid or 0), 2)
         if due <= 0:
-            _refresh_charge_status(charge)
             continue
         apply = min(due, remaining)
-        charge.amount_paid = round(float(charge.amount_paid or 0) + apply, 2)
         remaining = round(remaining - apply, 2)
         total_allocated = round(total_allocated + apply, 2)
-        _refresh_charge_status(charge)
 
-        # Record explicit allocation line
-        allocation = BillingPaymentAllocation(
-            hospital_id=hospital_id,
-            payment_id=payment_id,
-            deposit_id=deposit_id,
-            charge_id=charge.id,
-            allocated_amount=apply,
-            created_by_name=created_by_name,
+        db.add(
+            BillingPaymentAllocation(
+                hospital_id=hospital_id,
+                payment_id=payment_id,
+                deposit_id=deposit_id,
+                charge_id=charge.id,
+                allocated_amount=apply,
+                created_by_name=created_by_name,
+            )
         )
-        db.add(allocation)
+        current_alloc = round(current_alloc + apply, 2)
+        allocated_totals[charge.id] = current_alloc
+        recompute_charge_financials(db, charge, allocated_total=current_alloc)
+
+    if total_allocated > 0:
+        db.flush()
+        from modules.billing.services.invoice_service import refresh_invoice_paid_status
+        refresh_invoice_paid_status(db, hospital_id, patient_id)
 
     return total_allocated
 
@@ -515,24 +770,43 @@ def allocate_specific_charges(
         if dep_row and dep_row[0]:
             account_id = dep_row[0]
 
+    plan_cids = [item["charge_id"] for item in allocations_plan if item.get("charge_id")]
+    if not plan_cids:
+        return 0.0
+
+    # Bulk lock charges targeted in plan
+    locked_charges = (
+        db.query(BillingCharge)
+        .filter(
+            BillingCharge.id.in_(plan_cids),
+            BillingCharge.hospital_id == hospital_id,
+            BillingCharge.patient_id == patient_id,
+            BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
+        )
+        .with_for_update()
+        .all()
+    )
+    charge_by_id = {c.id: c for c in locked_charges}
+    allocated_totals = charge_allocated_totals_bulk(db, list(charge_by_id.keys()))
+
     total_allocated = 0.0
+    discounted_cids = [
+        item["charge_id"]
+        for item in allocations_plan
+        if item.get("charge_id") and (item.get("discount_amount") is not None or item.get("discount_percent") is not None)
+    ]
+    already_invoiced_set: set[UUID] = set()
+    if discounted_cids:
+        from modules.billing.services.invoice_service import charges_already_invoiced
+        already_invoiced_set = set(charges_already_invoiced(db, hospital_id, discounted_cids))
+
     for item in allocations_plan:
         cid = item["charge_id"]
         alloc_amt = round(float(item["amount"]), 2)
         if alloc_amt <= 0 and not (item.get("discount_amount") or item.get("discount_percent")):
             continue
 
-        charge = (
-            db.query(BillingCharge)
-            .filter(
-                BillingCharge.id == cid,
-                BillingCharge.hospital_id == hospital_id,
-                BillingCharge.patient_id == patient_id,
-                BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
-            )
-            .with_for_update()
-            .first()
-        )
+        charge = charge_by_id.get(cid)
         if not charge:
             continue
 
@@ -543,16 +817,11 @@ def allocate_specific_charges(
             )
 
         # If discount is specified at payment settlement, apply and recalculate net.
-        # Convention mirrors UpdateChargeAction: effective discount is
-        # max(amount, percent-derived) capped at the charge (see compute_net).
         disc_amt = item.get("discount_amount")
         disc_pct = item.get("discount_percent")
         disc_reason = item.get("discount_reason")
         if disc_amt is not None or disc_pct is not None:
-            from modules.billing.services.invoice_service import (
-                charges_already_invoiced,
-            )
-            if charges_already_invoiced(db, hospital_id, [cid]):
+            if cid in already_invoiced_set:
                 raise ValueError(
                     "Discount cannot be applied at settlement: charge "
                     f"{charge.description} is on an active invoice. "
@@ -575,24 +844,25 @@ def allocate_specific_charges(
             charge.discount_amount = disc
             charge.net_amount = net
 
+        current_alloc = allocated_totals.get(charge.id, 0.0)
+        recompute_charge_financials(db, charge, allocated_total=current_alloc)
         due = round(float(charge.net_amount) - float(charge.amount_paid or 0), 2)
         apply = min(due, alloc_amt)
         if apply > 0:
-            charge.amount_paid = round(float(charge.amount_paid or 0) + apply, 2)
             total_allocated = round(total_allocated + apply, 2)
-        
-        _refresh_charge_status(charge)
-
-        if apply > 0:
-            allocation = BillingPaymentAllocation(
-                hospital_id=hospital_id,
-                payment_id=payment_id,
-                deposit_id=deposit_id,
-                charge_id=charge.id,
-                allocated_amount=apply,
-                created_by_name=created_by_name,
+            db.add(
+                BillingPaymentAllocation(
+                    hospital_id=hospital_id,
+                    payment_id=payment_id,
+                    deposit_id=deposit_id,
+                    charge_id=charge.id,
+                    allocated_amount=apply,
+                    created_by_name=created_by_name,
+                )
             )
-            db.add(allocation)
+            current_alloc = round(current_alloc + apply, 2)
+            allocated_totals[charge.id] = current_alloc
+        recompute_charge_financials(db, charge, allocated_total=current_alloc)
 
     return total_allocated
 
@@ -696,12 +966,15 @@ def _max_existing_seq_for(db: Session, column, hospital_id: UUID, prefix: str) -
 def next_deposit_number(db: Session, hospital_id: UUID, year: int | None = None) -> str:
     """Generate sequential deposit voucher number: DEP-YYYY-NNNNN (atomic)."""
     from shared.database.sequences import (
+        counter_exists as _exists,
         ensure_counter_at_least as _ensure,
         next_deposit_number as _atomic_next_dep,
     )
     y = year or date.today().year
-    _ensure(db, hospital_id, f"deposit_{y}", _max_existing_seq_for(
-        db, BillingDeposit.deposit_number, hospital_id, f"DEP-{y}-"))
+    counter_name = f"deposit_{y}"
+    if not _exists(db, hospital_id, counter_name):
+        _ensure(db, hospital_id, counter_name, _max_existing_seq_for(
+            db, BillingDeposit.deposit_number, hospital_id, f"DEP-{y}-"))
     return _atomic_next_dep(db, hospital_id, year)
 
 
@@ -841,11 +1114,21 @@ def draw_down_deposit_for_charges(
         return 0.0
 
     if allocations_plan:
+        # Never allocate more than the deposit actually holds.
+        budget = round(avail, 2)
+        capped_plan: list[dict[str, Any]] = []
+        for item in allocations_plan:
+            amt = round(min(float(item.get("amount") or 0), budget), 2)
+            has_discount = bool(item.get("discount_amount") or item.get("discount_percent"))
+            if amt <= 0 and not has_discount:
+                continue
+            capped_plan.append({**item, "amount": max(0.0, amt)})
+            budget = round(budget - max(0.0, amt), 2)
         allocated = allocate_specific_charges(
             db,
             hospital_id,
             deposit.patient_id,
-            allocations_plan,
+            capped_plan,
             deposit_id=deposit.id,
             created_by_name=created_by_name,
             account_id=deposit.account_id,
@@ -863,11 +1146,295 @@ def draw_down_deposit_for_charges(
 
     new_avail = round(float(deposit.available_amount) - allocated, 2)
     deposit.available_amount = max(0.0, new_avail)
-    if deposit.available_amount <= 0:
-        deposit.status = DepositStatus.exhausted
-    else:
-        deposit.status = DepositStatus.partially_allocated
+    refresh_deposit_status(db, deposit)
     return allocated
+
+
+def draw_down_deposits_bulk_for_account(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    patient_id: UUID,
+    account_id: UUID | None,
+    created_by_name: str = "Discharge Settlement",
+) -> float:
+    """Bulk draw down available advance deposit funds across open charges.
+
+    Transactionally locks eligible deposits and pending charges once with
+    with_for_update(). Precomputes charge allocation totals in bulk and
+    performs drawdown allocations in memory without per-deposit query loops.
+    """
+    deposit_query = (
+        db.query(BillingDeposit)
+        .filter(
+            BillingDeposit.hospital_id == hospital_id,
+            BillingDeposit.patient_id == patient_id,
+            BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
+            BillingDeposit.available_amount > 0,
+        )
+    )
+    if account_id:
+        deposit_query = deposit_query.filter(
+            or_(
+                BillingDeposit.account_id == account_id,
+                BillingDeposit.account_id.is_(None),
+            )
+        )
+    deposits = (
+        deposit_query
+        .order_by(BillingDeposit.created_at.asc())
+        .with_for_update()
+        .all()
+    )
+    if not deposits:
+        return 0.0
+
+    charge_query = (
+        db.query(BillingCharge)
+        .filter(
+            BillingCharge.hospital_id == hospital_id,
+            BillingCharge.patient_id == patient_id,
+            BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
+        )
+    )
+    if account_id:
+        charge_query = charge_query.filter(BillingCharge.account_id == account_id)
+    charges = charge_query.order_by(BillingCharge.created_at.asc()).with_for_update().all()
+    if not charges:
+        return 0.0
+
+    # Bulk precompute already allocated amounts per charge
+    charge_ids = [c.id for c in charges]
+    alloc_map = charge_allocated_totals_bulk(db, charge_ids)
+    due_by_charge: dict[UUID, float] = {}
+    for c in charges:
+        paid = alloc_map.get(c.id, float(c.amount_paid or 0))
+        net = float(c.net_amount or 0)
+        due_by_charge[c.id] = max(0.0, round(net - paid, 2))
+
+    total_allocated = 0.0
+    touched_charges: set[UUID] = set()
+    charge_idx = 0
+    num_charges = len(charges)
+
+    for dep in deposits:
+        dep_avail = float(dep.available_amount or 0)
+        dep_used = 0.0
+        if dep_avail <= MONEY_EPS:
+            continue
+
+        while charge_idx < num_charges and dep_avail > MONEY_EPS:
+            c = charges[charge_idx]
+            c_due = due_by_charge[c.id]
+            if c_due <= MONEY_EPS:
+                charge_idx += 1
+                continue
+
+            take = round(min(dep_avail, c_due), 2)
+            if take <= 0:
+                charge_idx += 1
+                continue
+
+            row = BillingPaymentAllocation(
+                hospital_id=hospital_id,
+                payment_id=None,
+                deposit_id=dep.id,
+                charge_id=c.id,
+                allocated_amount=take,
+                created_by_name=created_by_name,
+            )
+            db.add(row)
+            touched_charges.add(c.id)
+
+            dep_avail = round(dep_avail - take, 2)
+            rem_due = round(c_due - take, 2)
+            due_by_charge[c.id] = rem_due
+            dep_used = round(dep_used + take, 2)
+            total_allocated = round(total_allocated + take, 2)
+
+            if rem_due <= MONEY_EPS:
+                charge_idx += 1
+
+        if dep_used > 0:
+            dep.available_amount = max(0.0, round(float(dep.available_amount) - dep_used, 2))
+            refresh_deposit_status(db, dep, is_applied=True)
+
+    db.flush()
+
+    if touched_charges:
+        alloc_totals = charge_allocated_totals_bulk(db, list(touched_charges))
+        for c in charges:
+            if c.id in touched_charges:
+                recompute_charge_financials(db, c, allocated_total=alloc_totals.get(c.id, 0.0))
+
+        from modules.billing.services.invoice_service import refresh_invoice_paid_status
+        refresh_invoice_paid_status(db, hospital_id, patient_id)
+
+    return total_allocated
+
+
+def refresh_deposit_status(
+    db: Session,
+    deposit: BillingDeposit,
+    *,
+    is_applied: bool | None = None,
+) -> BillingDeposit:
+    """Derive deposit status from its balance.
+
+    available: untouched; partially_allocated: partly consumed (allocations and/or
+    refunds); exhausted: nothing left and some of it is applied to charges;
+    refunded: nothing left and none of it is applied to charges.
+    """
+    avail = round(float(deposit.available_amount or 0), 2)
+    original = round(float(deposit.original_amount or 0), 2)
+    if avail >= original - MONEY_EPS:
+        deposit.status = DepositStatus.available
+    elif avail > MONEY_EPS:
+        deposit.status = DepositStatus.partially_allocated
+    elif is_applied is not None:
+        deposit.status = DepositStatus.exhausted if is_applied else DepositStatus.refunded
+    else:
+        db.flush()
+        applied = (
+            db.query(func.coalesce(func.sum(BillingPaymentAllocation.allocated_amount), 0))
+            .filter(
+                BillingPaymentAllocation.deposit_id == deposit.id,
+                BillingPaymentAllocation.payment_id.is_(None),
+            )
+            .scalar()
+        )
+        deposit.status = (
+            DepositStatus.exhausted if float(applied or 0) > MONEY_EPS else DepositStatus.refunded
+        )
+    return deposit
+
+
+def eligible_account_deposits(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    patient_id: UUID,
+    account_id: UUID | None,
+    for_update: bool = False,
+) -> list[BillingDeposit]:
+    """Deposits with balance that may fund charges of ``account_id``, oldest first.
+
+    Never crosses accounts: an account-scoped charge only draws deposits of that
+    same account; an unscoped charge only draws unscoped (patient-level) deposits.
+    """
+    q = db.query(BillingDeposit).filter(
+        BillingDeposit.hospital_id == hospital_id,
+        BillingDeposit.patient_id == patient_id,
+        BillingDeposit.available_amount > 0,
+        BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
+    )
+    if account_id is not None:
+        q = q.filter(BillingDeposit.account_id == account_id)
+    else:
+        q = q.filter(BillingDeposit.account_id.is_(None))
+    q = q.order_by(BillingDeposit.created_at.asc(), BillingDeposit.deposit_number.asc())
+    if for_update:
+        q = q.with_for_update()
+    return q.all()
+
+
+def draw_down_account_deposits_for_charge(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    charge: BillingCharge,
+    created_by_name: str = "Staff",
+    max_amount: float | None = None,
+) -> float:
+    """Cover a charge's outstanding balance from eligible deposits of its own account.
+
+    Draws from multiple deposits, oldest first, with explicit allocation rows.
+    Returns the total amount allocated.
+    """
+    if charge.status == BillingChargeStatus.cancelled:
+        return 0.0
+    recompute_charge_financials(db, charge)
+    outstanding = round(float(charge.net_amount or 0) - float(charge.amount_paid or 0), 2)
+    if max_amount is not None:
+        outstanding = min(outstanding, round(float(max_amount), 2))
+    if outstanding <= MONEY_EPS:
+        return 0.0
+
+    total = 0.0
+    for dep in eligible_account_deposits(
+        db,
+        hospital_id=hospital_id,
+        patient_id=charge.patient_id,
+        account_id=charge.account_id,
+        for_update=True,
+    ):
+        if outstanding <= MONEY_EPS:
+            break
+        take = min(outstanding, round(float(dep.available_amount or 0), 2))
+        if take <= 0:
+            continue
+        got = draw_down_deposit_for_charges(
+            db,
+            hospital_id=hospital_id,
+            deposit_id=dep.id,
+            allocations_plan=[{"charge_id": charge.id, "amount": take}],
+            created_by_name=created_by_name,
+        )
+        total = round(total + got, 2)
+        outstanding = round(outstanding - got, 2)
+    return total
+
+
+# ── Payment balances ────────────────────────────────────────────────────────
+
+def payment_balances(db: Session, payment: BillingPayment) -> dict[str, float]:
+    """Decompose a payment: amount = allocated + refunded + transferred_to_credit + unallocated.
+
+    - allocated: net money currently applied to charges (reversals subtracted)
+    - refunded: processed refund vouchers against this payment
+    - transferred_to_credit: money released from cancelled/re-priced charges into
+      a cancellation_credit deposit (that deposit is now the refundable balance)
+    """
+    db.flush()
+    allocated = (
+        db.query(func.coalesce(func.sum(BillingPaymentAllocation.allocated_amount), 0))
+        .filter(BillingPaymentAllocation.payment_id == payment.id)
+        .scalar()
+    )
+    transferred = (
+        db.query(func.coalesce(func.sum(BillingPaymentAllocation.allocated_amount), 0))
+        .filter(
+            BillingPaymentAllocation.payment_id == payment.id,
+            BillingPaymentAllocation.credit_deposit_id.isnot(None),
+        )
+        .scalar()
+    )
+    refunded = (
+        db.query(func.coalesce(func.sum(BillingRefund.amount), 0))
+        .filter(
+            BillingRefund.payment_id == payment.id,
+            BillingRefund.status == RefundStatus.processed,
+        )
+        .scalar()
+    )
+    amount = round(float(payment.amount or 0), 2)
+    allocated_f = round(float(allocated or 0), 2)
+    transferred_f = round(-float(transferred or 0), 2)
+    refunded_f = round(float(refunded or 0), 2)
+    unallocated = round(amount - allocated_f - refunded_f - transferred_f, 2)
+    return {
+        "amount": amount,
+        "allocated": allocated_f,
+        "refunded": refunded_f,
+        "transferred_to_credit": transferred_f,
+        "unallocated": max(0.0, unallocated),
+        "refundable": max(0.0, round(amount - refunded_f - transferred_f, 2)),
+    }
+
+
+def payment_unallocated_amount(db: Session, payment: BillingPayment) -> float:
+    """Tender on this payment not applied, refunded, or moved to credit."""
+    return payment_balances(db, payment)["unallocated"]
 
 
 # ── Refund System ────────────────────────────────────────────────────────────
@@ -875,12 +1442,15 @@ def draw_down_deposit_for_charges(
 def next_refund_number(db: Session, hospital_id: UUID, year: int | None = None) -> str:
     """Generate sequential refund voucher number: REF-YYYY-NNNNN (atomic)."""
     from shared.database.sequences import (
+        counter_exists as _exists,
         ensure_counter_at_least as _ensure,
         next_refund_number as _atomic_next_ref,
     )
     y = year or date.today().year
-    _ensure(db, hospital_id, f"refund_{y}", _max_existing_seq_for(
-        db, BillingRefund.refund_number, hospital_id, f"REF-{y}-"))
+    counter_name = f"refund_{y}"
+    if not _exists(db, hospital_id, counter_name):
+        _ensure(db, hospital_id, counter_name, _max_existing_seq_for(
+            db, BillingRefund.refund_number, hospital_id, f"REF-{y}-"))
     return _atomic_next_ref(db, hospital_id, year)
 
 
@@ -898,12 +1468,30 @@ def process_refund(
     account_id: UUID | None = None,
     approved_by_name: str = "Admin",
     processed_by_name: str = "Cashier",
+    charge_ids: list[UUID] | None = None,
 ) -> BillingRefund:
-    """Process validated refund voucher from payment or unused deposit."""
+    """Process a sourced refund voucher and reconcile the ledger.
+
+    Exactly one source is required:
+    - ``deposit_id``: refunds only the deposit's unallocated ``available_amount``.
+    - ``payment_id``: refunds up to the payment's refundable balance (amount minus
+      earlier refunds minus money already moved to a cancellation credit). The
+      refund is taken first from the payment's unallocated remainder, then by
+      reversing its allocations — restricted to ``charge_ids`` when given,
+      otherwise newest allocation first. Each reversal is a negative allocation
+      row linked to this refund; affected charges and invoices are re-derived,
+      so a refunded service is no longer financially cleared.
+    """
     ref_amt = round(float(amount), 2)
     if ref_amt <= 0:
         raise ValueError("Refund amount must be greater than zero")
+    if not payment_id and not deposit_id:
+        raise ValueError("A refund must reference the source payment_id or deposit_id")
+    if payment_id and deposit_id:
+        raise ValueError("A refund must reference exactly one source (payment_id or deposit_id), not both")
 
+    pay: BillingPayment | None = None
+    to_reverse = 0.0
     if deposit_id:
         deposit = (
             db.query(BillingDeposit)
@@ -917,15 +1505,15 @@ def process_refund(
         )
         if not deposit:
             raise ValueError("Target deposit not found")
-        if ref_amt > round(float(deposit.available_amount), 2):
-            raise ValueError(f"Refund amount exceeds available deposit balance (₹{deposit.available_amount:,.2f})")
-        
+        if ref_amt > round(float(deposit.available_amount), 2) + MONEY_EPS:
+            raise ValueError(
+                f"Refund amount exceeds available deposit balance (₹{float(deposit.available_amount):,.2f})"
+            )
         deposit.available_amount = round(float(deposit.available_amount) - ref_amt, 2)
-        if deposit.available_amount <= 0:
-            deposit.status = DepositStatus.refunded
-        else:
-            deposit.status = DepositStatus.partially_allocated
-    elif payment_id:
+        refresh_deposit_status(db, deposit)
+        if account_id is None:
+            account_id = deposit.account_id
+    else:
         pay = (
             db.query(BillingPayment)
             .filter(
@@ -938,19 +1526,16 @@ def process_refund(
         )
         if not pay:
             raise ValueError("Target payment not found")
-        # Check cumulative refunds against this payment
-        past_refunds = (
-            db.query(func.coalesce(func.sum(BillingRefund.amount), 0.0))
-            .filter(
-                BillingRefund.hospital_id == hospital_id,
-                BillingRefund.payment_id == payment_id,
-                BillingRefund.status == RefundStatus.processed,
+        balances = payment_balances(db, pay)
+        if ref_amt > balances["refundable"] + MONEY_EPS:
+            raise ValueError(
+                "Refund amount exceeds the payment's refundable balance "
+                f"(₹{balances['refundable']:,.2f}). Money already moved to a cancellation "
+                "credit must be refunded from that credit deposit."
             )
-            .scalar()
-            or 0.0
-        )
-        if ref_amt + past_refunds > float(pay.amount):
-            raise ValueError(f"Total refund cannot exceed payment amount (Remaining: ₹{float(pay.amount) - past_refunds:,.2f})")
+        to_reverse = round(max(0.0, ref_amt - balances["unallocated"]), 2)
+        if account_id is None:
+            account_id = pay.account_id
 
     refund_num = next_refund_number(db, hospital_id)
     refund = BillingRefund(
@@ -970,7 +1555,98 @@ def process_refund(
     )
     db.add(refund)
     db.flush()
+
+    if pay is not None and to_reverse > MONEY_EPS:
+        _reverse_payment_allocations_for_refund(
+            db,
+            pay,
+            to_reverse,
+            refund=refund,
+            charge_ids=charge_ids,
+            created_by_name=processed_by_name,
+        )
     return refund
+
+
+def _reverse_payment_allocations_for_refund(
+    db: Session,
+    pay: BillingPayment,
+    amount: float,
+    *,
+    refund: BillingRefund,
+    charge_ids: list[UUID] | None,
+    created_by_name: str,
+) -> list[BillingCharge]:
+    originals = (
+        db.query(BillingPaymentAllocation)
+        .filter(
+            BillingPaymentAllocation.payment_id == pay.id,
+            BillingPaymentAllocation.reversal_of_id.is_(None),
+            BillingPaymentAllocation.allocated_amount > 0,
+        )
+        .all()
+    )
+    if charge_ids:
+        wanted = {UUID(str(c)) for c in charge_ids}
+        originals = [a for a in originals if a.charge_id in wanted]
+    rem_map = allocations_remaining_bulk(db, originals)
+    candidates = [(a, rem_map.get(a.id, float(a.allocated_amount or 0))) for a in originals]
+    candidates = [(a, rem) for a, rem in candidates if rem > MONEY_EPS]
+    candidates.sort(key=lambda t: (t[0].created_at, float(t[0].allocated_amount), str(t[0].id)), reverse=True)
+
+    available = round(sum(rem for _, rem in candidates), 2)
+    if amount > available + MONEY_EPS:
+        raise ValueError(
+            f"Refund needs ₹{amount:,.2f} reversed from charge allocations but only "
+            f"₹{available:,.2f} is allocated{' to the selected charges' if charge_ids else ''}."
+        )
+
+    needed_charge_ids = list({a.charge_id for a, _ in candidates if a.charge_id is not None})
+    charges_by_id: dict[UUID, BillingCharge] = {}
+    if needed_charge_ids:
+        c_rows = (
+            db.query(BillingCharge)
+            .filter(
+                BillingCharge.hospital_id == pay.hospital_id,
+                BillingCharge.id.in_(needed_charge_ids),
+            )
+            .with_for_update()
+            .all()
+        )
+        charges_by_id = {c.id: c for c in c_rows}
+
+    remaining = round(amount, 2)
+    touched: dict[UUID, BillingCharge] = {}
+    for alloc, rem in candidates:
+        if remaining <= MONEY_EPS:
+            break
+        take = round(min(rem, remaining), 2)
+        reverse_allocation(
+            db,
+            alloc,
+            take,
+            reason=f"Refund {refund.refund_number}: {refund.reason}",
+            created_by_name=created_by_name,
+            refund_id=refund.id,
+            precomputed_remaining=rem,
+            flush=False,
+        )
+        remaining = round(remaining - take, 2)
+        charge = charges_by_id.get(alloc.charge_id)
+        if charge is not None:
+            touched[charge.id] = charge
+
+    db.flush()
+
+    if touched:
+        alloc_totals = charge_allocated_totals_bulk(db, list(touched.keys()))
+        for charge in touched.values():
+            recompute_charge_financials(db, charge, allocated_total=alloc_totals.get(charge.id, 0.0))
+
+        from modules.billing.services.invoice_service import refresh_invoice_paid_status
+
+        refresh_invoice_paid_status(db, pay.hospital_id, pay.patient_id)
+    return list(touched.values())
 
 
 # ── Patient Ledger Totals & Bank Statement Timeline ─────────────────────────
@@ -989,6 +1665,79 @@ def patient_ledger_totals(
     Compute aggregate charges, payments, active deposits, outstanding balance,
     and net patient balance (outstanding less available deposits).
     """
+    db.flush()
+    if charges is None and payments is None and deposits is None:
+        from sqlalchemy import case
+        chg_row = (
+            db.query(
+                func.coalesce(func.sum(BillingCharge.net_amount), 0).label("tot_net"),
+                func.coalesce(func.sum(BillingCharge.amount_paid), 0).label("tot_paid_alloc"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (BillingCharge.net_amount > BillingCharge.amount_paid, BillingCharge.net_amount - BillingCharge.amount_paid),
+                            else_=0.0,
+                        )
+                    ),
+                    0,
+                ).label("tot_out"),
+                func.count(BillingCharge.id).label("cnt"),
+            )
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.patient_id == patient_id,
+                BillingCharge.status != BillingChargeStatus.cancelled,
+                *( [BillingCharge.account_id == account_id] if account_id else [] ),
+            )
+            .first()
+        )
+        pay_row = (
+            db.query(
+                func.coalesce(func.sum(BillingPayment.amount), 0).label("tot_tender"),
+                func.count(BillingPayment.id).label("cnt"),
+            )
+            .filter(
+                BillingPayment.hospital_id == hospital_id,
+                BillingPayment.patient_id == patient_id,
+                *( [BillingPayment.account_id == account_id] if account_id else [] ),
+            )
+            .first()
+        )
+        dep_row = (
+            db.query(
+                func.coalesce(func.sum(BillingDeposit.available_amount), 0).label("tot_dep"),
+            )
+            .filter(
+                BillingDeposit.hospital_id == hospital_id,
+                BillingDeposit.patient_id == patient_id,
+                BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
+                *( [BillingDeposit.account_id == account_id] if account_id else [] ),
+            )
+            .first()
+        )
+        total_charges = round(float(chg_row.tot_net or 0), 2) if chg_row else 0.0
+        total_paid_allocations = round(float(chg_row.tot_paid_alloc or 0), 2) if chg_row else 0.0
+        outstanding = round(float(chg_row.tot_out or 0), 2) if chg_row else 0.0
+        charge_count = int(chg_row.cnt or 0) if chg_row else 0
+
+        total_paid_tender = round(float(pay_row.tot_tender or 0), 2) if pay_row else 0.0
+        payment_count = int(pay_row.cnt or 0) if pay_row else 0
+
+        total_deposits_avail = round(float(dep_row.tot_dep or 0), 2) if dep_row else 0.0
+
+        total_paid = total_paid_allocations if account_id else total_paid_tender
+        net_patient_balance = round(outstanding - total_deposits_avail, 2)
+
+        return {
+            "total_charges": total_charges,
+            "total_paid": total_paid,
+            "total_deposits_available": total_deposits_avail,
+            "outstanding": outstanding,
+            "net_patient_balance": net_patient_balance,
+            "charge_count": charge_count,
+            "payment_count": payment_count,
+        }
+
     if charges is None:
         q = db.query(BillingCharge).filter(
             BillingCharge.hospital_id == hospital_id,
@@ -1213,20 +1962,26 @@ def build_ledger_entries(
             "reference_number": p.reference_number,
         })
 
-    # 3. Deposits (Credits: patient advance payment)
+    # 3. Deposits (Credits: patient advance payment). A cancellation credit is money
+    # already credited through its source payment, so it is shown without re-crediting.
     for d in deposits:
         dt = (
             datetime.combine(d.deposit_date, datetime.min.time()).replace(tzinfo=timezone.utc)
             if d.deposit_date else d.created_at
         )
+        is_credit_reclass = d.deposit_type == "cancellation_credit"
         raw_items.append({
             "id": str(d.id),
             "entry_type": "deposit",
             "occurred_at": dt,
-            "description": f"Advance Deposit ({d.deposit_type.title()} · {d.deposit_number})",
+            "description": (
+                f"Cancellation Credit ({d.deposit_number}) — reclassified from payment"
+                if is_credit_reclass
+                else f"Advance Deposit ({d.deposit_type.title()} · {d.deposit_number})"
+            ),
             "source_type": None,
             "debit": 0.0,
-            "credit": float(d.original_amount),
+            "credit": 0.0 if is_credit_reclass else float(d.original_amount),
             "status": d.status.value,
             "ref_id": d.id,
             "reference_number": d.deposit_number,
@@ -1319,6 +2074,10 @@ def payment_to_dict(p: BillingPayment, patient: Patient | None = None) -> dict[s
             "deposit_id": a.deposit_id,
             "charge_id": a.charge_id,
             "allocated_amount": float(a.allocated_amount),
+            "reversal_of_id": a.reversal_of_id,
+            "refund_id": a.refund_id,
+            "credit_deposit_id": a.credit_deposit_id,
+            "reversal_reason": a.reversal_reason,
             "created_by_name": a.created_by_name,
             "created_at": a.created_at,
             "charge_description": a.charge.description if a.charge else None,

@@ -5,6 +5,7 @@ Business use-case actions for Radiology domain.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -15,12 +16,13 @@ from modules.appointments.services.appointment_lifecycle import (
     sync_appointment_after_clinical_change,
 )
 from modules.billing.entities.billing_entities import BillingSourceType
-from modules.billing.services.billing_service import (
-    cancel_charge_for_source,
-    ensure_charge,
-    find_charge_by_source,
+from modules.billing.services.episode_account_service import resolve_episode_account
+from modules.billing.services.service_charge_resolver import (
+    cancel_service_charges_or_400,
+    ensure_service_charge,
 )
 from modules.billing.services.service_financial_clearance import (
+    assert_order_financially_cleared,
     assert_service_financially_cleared,
 )
 from modules.inpatient.entities.admission import Admission
@@ -56,9 +58,12 @@ from modules.radiology.services.radiology_service import (
 from modules.radiology.services.rad_prescription_service import (
     apply_cancel_rad_prescription_request,
     assert_request_fulfillable,
+    ensure_rad_request_charge,
     get_prescription_request,
     is_rad_request_released,
+    recompute_rad_request_status,
     request_to_response_dict,
+    sync_rad_request_charge,
     sync_request_after_order_change,
 )
 from shared.audit import write_audit_log
@@ -66,6 +71,33 @@ from shared.audit import write_audit_log
 
 def _actor_name(user: dict[str, Any]) -> str:
     return str(user.get("name") or user.get("sub") or "Staff")
+
+
+def _gate_order(
+    db: Session,
+    hospital_id: UUID,
+    order: RadiologyOrder,
+    user: dict[str, Any],
+    action_description: str,
+    payload: Any | None = None,
+) -> None:
+    """Financial gate for every radiology execution step (schedule, start, attachment
+    upload, scan completion, first report). An emergency override is scoped to the order:
+    once used, it keeps unlocking that order's later steps."""
+    assert_order_financially_cleared(
+        db,
+        hospital_id,
+        BillingSourceType.radiology,
+        order,
+        user,
+        action_description=action_description,
+        is_emergency_override=bool(payload is not None and getattr(payload, "is_emergency_override", False)),
+        emergency_reason=getattr(payload, "emergency_override_reason", None) if payload is not None else None,
+    )
+
+
+def _is_report_finalized(order: RadiologyOrder) -> bool:
+    return bool(order.findings or order.impression)
 
 
 def _actor_role(user: dict[str, Any]) -> str:
@@ -303,9 +335,14 @@ class CreateOrdersAction:
                     detail="Doctor-prescribed orders cannot add or change scans; fulfill the prescription as written",
                 )
 
+            # Legacy requests (or ones whose charge was cancelled at the billing desk) get
+            # their canonical charge back before the clearance check.
+            ensure_rad_request_charge(self.db, rad_request, created_by_name=_actor_name(self.user))
+
             # Enforce financial clearance when accessioning doctor-prescribed radiology requests
-            is_em = bool(getattr(rad_request, "is_emergency", False) or getattr(payload, "is_emergency", False) or getattr(payload, "is_emergency_override", False))
-            em_reason = getattr(payload, "emergency_override_reason", None) or getattr(payload, "emergency_reason", None) or getattr(rad_request, "emergency_reason", None)
+            # A clinical priority flag (payload.is_emergency) never bypasses billing on its own.
+            is_em = bool(getattr(payload, "is_emergency_override", False))
+            em_reason = getattr(payload, "emergency_override_reason", None) or getattr(payload, "emergency_reason", None)
             assert_service_financially_cleared(
                 self.db,
                 self.hospital_id,
@@ -358,9 +395,15 @@ class CreateOrdersAction:
         actor_role = _actor_role(self.user)
         created_ids: list[UUID] = []
 
-        req_charge = None
-        if rad_request:
-            req_charge = find_charge_by_source(self.db, self.hospital_id, BillingSourceType.radiology, rad_request.id)
+        direct_account_id = None
+        if not rad_request:
+            direct_account_id = resolve_episode_account(
+                self.db,
+                self.hospital_id,
+                patient.id,
+                admission_id=admission_id,
+                created_by_name=actor_name,
+            ).account_id
 
         order_nos = iter(self.repo.next_order_no_batch(len(lines)))
         for scan_id, scan_code, scan_name, category, price in lines:
@@ -388,27 +431,10 @@ class CreateOrdersAction:
             self.db.flush()
             created_ids.append(order.id)
 
-            if req_charge and len(lines) == 1:
-                # Re-point single charge to this order so order.id owns the paid ledger charge
-                req_charge.source_id = order.id
-                req_charge.description = f"Radiology {order.order_no} — {scan_name}"
-            elif not rad_request:
-                rad_account_id = None
-                if admission_id:
-                    from modules.billing.entities.billing_entities import FinancialAccountType
-                    from modules.billing.services.billing_service import get_or_create_financial_account
-                    rad_acc = get_or_create_financial_account(
-                        self.db,
-                        hospital_id=self.hospital_id,
-                        patient_id=patient.id,
-                        account_type=FinancialAccountType.ipd,
-                        admission_id=admission_id,
-                        created_by_name=actor_name,
-                    )
-                    rad_account_id = rad_acc.id
-
-                # Target-native billing integration for direct orders
-                ensure_charge(
+            # Prescription orders are billed by the request's canonical charge (resolved
+            # via order.prescription_request_id); direct orders own a charge on order.id.
+            if not rad_request:
+                ensure_service_charge(
                     self.db,
                     hospital_id=self.hospital_id,
                     patient_id=patient.id,
@@ -416,7 +442,7 @@ class CreateOrdersAction:
                     source_id=order.id,
                     description=f"Radiology {order.order_no} — {scan_name}",
                     charge_amount=float(price or 0),
-                    account_id=rad_account_id,
+                    account_id=direct_account_id,
                     created_by_name=actor_name,
                 )
 
@@ -434,7 +460,8 @@ class CreateOrdersAction:
         if rad_request:
             for it in fulfill_items:
                 it.status = RadRequestItemStatus.ordered
-            rad_request.status = RadPrescriptionRequestStatus.partially_processed
+            self.db.flush()
+            recompute_rad_request_status(self.db, rad_request)
 
         self.db.commit()
 
@@ -448,6 +475,7 @@ class CreateOrdersAction:
 class ListRadPrescriptionRequestsAction:
     def __init__(self, db: Session, hospital_id: UUID) -> None:
         self.db = db
+        self.hospital_id = hospital_id
         self.repo = RadiologyRepository(db, hospital_id)
 
     def execute(
@@ -460,105 +488,68 @@ class ListRadPrescriptionRequestsAction:
         reqs = self.repo.list_prescription_requests(
             status=status, patient_id=patient_id, doctor_id=doctor_id
         )
+        if not reqs:
+            return []
 
         apply_release_filter = released_only is True
 
-        if not apply_release_filter:
-            # Return all requests including unpaid, with clearance & payment status populated
-            return [RadPrescriptionRequestResponse(**request_to_response_dict(r, self.db)) for r in reqs]
-
-        # Release filter is active.  Bulk-fetch clearance for all request IDs so that
-        # is_rad_request_released() does not issue one DB query per request.
-        # STAT requests are always released without a billing query.
         from modules.billing.entities.billing_entities import BillingSourceType
         from modules.billing.services.service_financial_clearance import (
             bulk_check_service_financial_clearance,
         )
+        from modules.billing.entities.financial_exception import (
+            FinancialClearanceException,
+            FinancialExceptionStatus,
+        )
 
-        stat_reqs: list = []
-        non_stat_reqs: list = []
-        for r in reqs:
-            is_stat = bool(getattr(r, "is_emergency", False))
-            if is_stat:
-                stat_reqs.append(r)  # always released; skip billing lookup
-            else:
-                non_stat_reqs.append(r)
-
-        # Single bulk query for all non-STAT requests
+        req_ids = [r.id for r in reqs]
         fin_states: dict = {}
-        if non_stat_reqs:
-            if non_stat_reqs[0].hospital_id:
-                fin_states = bulk_check_service_financial_clearance(
-                    self.db,
-                    non_stat_reqs[0].hospital_id,
-                    BillingSourceType.radiology,
-                    [r.id for r in non_stat_reqs],
+        if req_ids:
+            fin_states = bulk_check_service_financial_clearance(
+                self.db,
+                self.hospital_id,
+                BillingSourceType.radiology,
+                req_ids,
+            )
+
+        # Bulk fetch active approved unconsumed financial clearance exceptions
+        exc_set: set[UUID] = set()
+        if req_ids:
+            excs = (
+                self.db.query(FinancialClearanceException.source_id)
+                .filter(
+                    FinancialClearanceException.hospital_id == self.hospital_id,
+                    FinancialClearanceException.source_id.in_(req_ids),
+                    FinancialClearanceException.status == FinancialExceptionStatus.approved.value,
+                    FinancialClearanceException.is_consumed == False,
                 )
+                .all()
+            )
+            exc_set = {row[0] for row in excs}
 
-        # Filter non-STAT requests: only keep those whose charge is cleared
-        released_non_stat = [
-            r for r in non_stat_reqs
-            if fin_states.get(r.id) and fin_states[r.id].is_cleared
+        if apply_release_filter:
+            filtered_reqs = []
+            for r in reqs:
+                is_stat = bool(getattr(r, "is_emergency", False))
+                fin = fin_states.get(r.id)
+                is_fin_cleared = bool(fin and fin.is_cleared)
+                has_exc = r.id in exc_set
+                if is_stat or is_fin_cleared or has_exc:
+                    filtered_reqs.append(r)
+        else:
+            filtered_reqs = reqs
+
+        return [
+            RadPrescriptionRequestResponse(
+                **request_to_response_dict(
+                    r,
+                    db=None,
+                    financial_state=fin_states.get(r.id),
+                    exception_cleared=(r.id in exc_set),
+                )
+            )
+            for r in filtered_reqs
         ]
-
-        released = stat_reqs + released_non_stat
-
-        # Build responses — request_to_response_dict will call check_service_financial_clearance
-        # per request for the payment fields, but we pass the pre-fetched fin_states dict
-        # via a local wrapper to avoid re-querying.
-        from modules.radiology.services.rad_prescription_service import request_to_response_dict as _base_rtrd
-
-        def _build_response(r) -> dict:
-            is_stat = bool(getattr(r, "is_emergency", False))
-            if is_stat:
-                # For STAT, use normal single-request path (charge may or may not exist)
-                return _base_rtrd(r, self.db)
-            # Inject pre-fetched fin_state to avoid a second billing query per request
-            fin = fin_states.get(r.id)
-            if fin is None:
-                return _base_rtrd(r, self.db)
-            items = sorted(r.items or [], key=lambda i: (i.sort_order, str(i.id)))
-            return {
-                "id": r.id,
-                "hospital_id": r.hospital_id,
-                "prescription_id": r.prescription_id,
-                "patient_id": r.patient_id,
-                "doctor_id": r.doctor_id,
-                "appointment_id": r.appointment_id,
-                "status": r.status,
-                "prescribed_scan_ids": [str(sid) for sid in (r.prescribed_scan_ids or [])],
-                "clinical_notes": r.clinical_notes,
-                "cancel_reason": r.cancel_reason,
-                "created_at": r.created_at,
-                "updated_at": r.updated_at,
-                "patient_name": r.patient.name if r.patient else None,
-                "patient_uhid": r.patient.uhid if r.patient else None,
-                "doctor_name": r.doctor.name if r.doctor else None,
-                "scan_names": ", ".join(i.scan_code for i in (r.items or [])) or None,
-                "scan_count": len(items),
-                "pending_scan_count": len(
-                    [i for i in items if i.status == RadRequestItemStatus.pending]
-                ),
-                "appointment_label": None,
-                "is_financially_cleared": fin.is_cleared,
-                "payment_status": fin.status,
-                "outstanding_amount": fin.outstanding_amount,
-                "items": [
-                    {
-                        "id": i.id,
-                        "scan_id": i.scan_id,
-                        "scan_code": i.scan_code,
-                        "scan_name": i.scan_name,
-                        "category": i.category,
-                        "price": i.price,
-                        "sort_order": i.sort_order,
-                        "status": i.status,
-                    }
-                    for i in items
-                ],
-            }
-
-        return [RadPrescriptionRequestResponse(**_build_response(r)) for r in released]
 
 
 class GetRadPrescriptionRequestAction:
@@ -591,7 +582,14 @@ class CancelRadPrescriptionRequestAction:
         sync_appointment: bool = True,
     ) -> RadPrescriptionRequestResponse:
         req = apply_cancel_rad_prescription_request(self.db, request_id, self.hospital_id, reason)
-        cancel_charge_for_source(self.db, self.hospital_id, BillingSourceType.radiology, request_id)
+        cancel_service_charges_or_400(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.radiology,
+            request_id,
+            reason=reason or "Radiology prescription request cancelled",
+            actor=user,
+        )
         if commit:
             self.db.commit()
         if sync_appointment and req.appointment_id:
@@ -613,13 +611,34 @@ class MarkRadRequestItemUnavailableAction:
         item = next((i for i in (req.items or []) if i.id == item_id), None)
         if not item:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+        if item.status != RadRequestItemStatus.pending:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only pending scans can be marked unavailable",
+            )
         item.status = RadRequestItemStatus.unavailable
-
-        pending = [i for i in req.items if i.status == RadRequestItemStatus.pending]
-        if not pending:
-            req.status = RadPrescriptionRequestStatus.cancelled
+        self.db.flush()
+        if not [i for i in req.items if i.status in (RadRequestItemStatus.pending, RadRequestItemStatus.ordered)]:
             req.cancel_reason = "All requested scans marked unavailable"
+        recompute_rad_request_status(self.db, req)
+        # The request's single charge now bills only its remaining pending + ordered scans.
+        sync_rad_request_charge(
+            self.db,
+            req,
+            reason=f"Radiology scan {item.scan_code} marked unavailable",
+            actor=user,
+        )
 
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=user,
+            action="cancel_item",
+            entity_type="rad_prescription_request",
+            entity_id=request_id,
+            summary="Marked radiology request item unavailable",
+            details={"request_id": str(request_id), "item_id": str(item_id)},
+        )
         self.db.commit()
         if req.appointment_id:
             sync_appointment_after_clinical_change(self.db, self.hospital_id, req.appointment_id)
@@ -644,8 +663,20 @@ class CancelOrderAction:
                 detail="Completed orders cannot be cancelled",
             )
 
+        # A walk-in order's own charge is cancelled with it. An order fulfilling a
+        # prescription request owns no charge: the request's charge stays active and the
+        # scan returns to pending on the request so it can be re-accessioned.
+        if not order.prescription_request_id:
+            cancel_service_charges_or_400(
+                self.db,
+                self.hospital_id,
+                BillingSourceType.radiology,
+                order.id,
+                reason=f"Radiology order {order.order_no} cancelled",
+                actor=self.user,
+                performed=order.status == RadiologyOrderStatus.in_progress,
+            )
         order.status = RadiologyOrderStatus.cancelled
-        cancel_charge_for_source(self.db, self.hospital_id, BillingSourceType.radiology, order.id)
 
         write_audit_log(
             self.db,
@@ -681,23 +712,7 @@ class ScheduleOrderAction:
         if order.status in {RadiologyOrderStatus.cancelled, RadiologyOrderStatus.completed}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot schedule this order")
 
-        # Enforce financial clearance before scheduling scan
-        from modules.billing.entities.billing_entities import BillingSourceType
-        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-        is_em = bool(getattr(order, "is_emergency", False) or getattr(payload, "is_emergency_override", False))
-        em_reason = getattr(payload, "emergency_override_reason", None) or getattr(order, "emergency_reason", None)
-        assert_service_financially_cleared(
-            self.db,
-            self.hospital_id,
-            BillingSourceType.radiology,
-            order.id,
-            action_description="schedule scan",
-            is_emergency_override=is_em,
-            actor=self.user,
-            emergency_reason=em_reason,
-            admission_id=order.admission_id,
-            patient_id=order.patient_id,
-        )
+        _gate_order(self.db, self.hospital_id, order, self.user, "schedule scan", payload)
 
         order.scheduled_at = payload.scheduled_at
         order.machine = payload.machine.strip()
@@ -735,23 +750,7 @@ class StartScanAction:
                 detail="Order must be scheduled (or ordered) to start",
             )
 
-        # Enforce financial clearance before scan start
-        from modules.billing.entities.billing_entities import BillingSourceType
-        from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-        is_em = bool(getattr(order, "is_emergency", False) or (payload and getattr(payload, "is_emergency_override", False)))
-        em_reason = (payload and getattr(payload, "emergency_override_reason", None)) or getattr(order, "emergency_reason", None)
-        assert_service_financially_cleared(
-            self.db,
-            self.hospital_id,
-            BillingSourceType.radiology,
-            order.id,
-            action_description="start scan acquisition",
-            is_emergency_override=is_em,
-            actor=self.user,
-            emergency_reason=em_reason,
-            admission_id=order.admission_id,
-            patient_id=order.patient_id,
-        )
+        _gate_order(self.db, self.hospital_id, order, self.user, "start scan acquisition", payload)
 
         order.status = RadiologyOrderStatus.in_progress
         order.started_at = datetime.now(timezone.utc)
@@ -777,7 +776,7 @@ class CompleteScanAction:
         self.user = user
         self.repo = RadiologyRepository(db, hospital_id)
 
-    def execute(self, order_id: UUID) -> RadOrderResponse:
+    def execute(self, order_id: UUID, payload: Any | None = None) -> RadOrderResponse:
         order = self.repo.get_order(order_id)
         if not order:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
@@ -786,6 +785,7 @@ class CompleteScanAction:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Scan is not in progress",
             )
+        _gate_order(self.db, self.hospital_id, order, self.user, "complete scan", payload)
 
         order.status = RadiologyOrderStatus.completed
         order.completed_at = datetime.now(timezone.utc)
@@ -833,8 +833,14 @@ class UploadReportAction:
         if not payload.image_file_data and not order.image_file_data and not has_attachments:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scan image or attachment is required")
 
+        # A completed order already passed the gate (scan completion / first report);
+        # amending its report is not re-gated.
+        was_completed = order.status == RadiologyOrderStatus.completed
+        if not was_completed:
+            _gate_order(self.db, self.hospital_id, order, self.user, "upload radiology report", payload)
+
         # FLAW-009: Diagnostic immutability & amendment tracking
-        is_prior_completed = bool(order.findings or order.impression)
+        is_prior_completed = _is_report_finalized(order)
         if is_prior_completed:
             if not payload.amendment_reason or not payload.amendment_reason.strip():
                 raise HTTPException(
@@ -881,6 +887,8 @@ class UploadReportAction:
             summary=f"Radiology order {order.order_no} finalized with report",
             details={"order_id": str(order.id), "status": "completed", "patient_id": str(order.patient_id)},
         )
+        if not was_completed:
+            sync_request_after_order_change(self.db, order)
         self.db.commit()
 
         order = self.repo.get_order(order_id)
@@ -905,14 +913,55 @@ class AddAttachmentAction:
         file_name: str,
         mime_type: str,
         file_size: int,
-        storage_path: str,
+        storage_path: str | None = None,
         attachment_type: str = "scan_plate",
+        *,
+        file_bytes: bytes | None = None,
+        is_emergency_override: bool = False,
+        emergency_override_reason: str | None = None,
     ) -> RadAttachmentResponse:
+        """Attach an acquisition file. With ``file_bytes`` the file is written only after
+        the order passed its checks and financial gate (and removed if the commit fails)."""
         order = self.repo.get_order(order_id)
         if not order:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Radiology order not found")
         if order.status == RadiologyOrderStatus.cancelled:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is cancelled")
+        if _is_report_finalized(order):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot add attachments after the report has been finalized.",
+            )
+        if file_bytes is None and not storage_path:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Attachment file is required")
+
+        _gate_order(
+            self.db,
+            self.hospital_id,
+            order,
+            self.user,
+            "upload scan attachment",
+            SimpleNamespace(
+                is_emergency_override=is_emergency_override,
+                emergency_override_reason=emergency_override_reason,
+            ),
+        )
+
+        written_path = None
+        if file_bytes is not None:
+            import uuid as _uuid
+
+            from shared.storage.local_storage import save_attachment_file
+
+            written_path = save_attachment_file(
+                module="radiology",
+                hospital_id=self.hospital_id,
+                order_id=order.id,
+                file_id=_uuid.uuid4(),
+                file_name=file_name,
+                data=file_bytes,
+            )
+            storage_path = written_path
 
         att = RadiologyAttachment(
             hospital_id=self.hospital_id,
@@ -955,7 +1004,15 @@ class AddAttachmentAction:
                 details={"order_id": str(order.id), "status": "in_progress"},
             )
 
-        self.db.commit()
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            if written_path:
+                from shared.storage.local_storage import delete_attachment_file
+
+                delete_attachment_file(written_path)
+            raise
         self.db.refresh(att)
         return RadAttachmentResponse.model_validate(att)
 

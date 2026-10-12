@@ -96,6 +96,8 @@ class BillingChargeUpdate(BaseModel):
     discount_reason: str | None = None
     tax_amount: float | None = Field(default=None, ge=0)
     notes: str | None = None
+    # Settlement status is derived from allocations and cannot be edited; any
+    # value is rejected with 400 (use POST /charges/{id}/cancel to cancel).
     status: BillingChargeStatus | None = None
 
     @model_validator(mode="after")
@@ -169,7 +171,12 @@ class BillingPaymentAllocationResponse(BaseModel):
     payment_id: UUID | None = None
     deposit_id: UUID | None = None
     charge_id: UUID
+    # Negative for reversal rows (refund / cancellation / re-price release).
     allocated_amount: float
+    reversal_of_id: UUID | None = None
+    refund_id: UUID | None = None
+    credit_deposit_id: UUID | None = None
+    reversal_reason: str | None = None
     created_by_name: str = ""
     created_at: datetime
     charge_description: str | None = None
@@ -275,12 +282,15 @@ class BillingDepositResponse(BaseModel):
 class BillingRefundCreate(BaseModel):
     patient_id: UUID
     account_id: UUID | None = None
+    # Exactly one source is required (validated in the service → 400).
     payment_id: UUID | None = None
     deposit_id: UUID | None = None
     amount: float = Field(gt=0)
     refund_date: date | None = None
     refund_method: BillingPaymentMethod = BillingPaymentMethod.cash
     reason: str = Field(min_length=1, max_length=512)
+    # Payment refunds only: reverse allocations on these charges (default: newest first).
+    charge_ids: list[UUID] | None = None
 
 
 class BillingRefundResponse(BaseModel):
@@ -445,6 +455,16 @@ class PatientFinancialSummary(BaseModel):
     recent_entries: list[LedgerEntry] = []
 
 
+class PatientDuesResponse(BaseModel):
+    patient_id: UUID
+    patient_name: str | None = None
+    patient_uhid: str | None = None
+    outstanding: float = 0.0
+    total_deposits_available: float = 0.0
+    pending_charges: list[BillingChargeResponse] = []
+    modal_invoices: list[BillingInvoiceResponse] = []
+
+
 class BillingDashboardResponse(BaseModel):
     todays_charges: float
     todays_collections: float
@@ -457,7 +477,126 @@ class BillingDashboardResponse(BaseModel):
     outstanding_by_category: dict[str, float] = {}
     today_invoice_count: int = 0
     today_receipt_count: int = 0
-    total_invoiced: float = 0
-    total_collected: float = 0
     recent_charges: list[BillingChargeResponse] = []
     recent_payments: list[BillingPaymentResponse] = []
+
+
+# ── Canonical Insurance & Consolidated Statement Contracts ──────────────────
+
+class StatementHospitalInfo(BaseModel):
+    hospital_id: UUID
+    name: str
+    hospital_code: str
+    address: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    gstin: str | None = None
+    tax_identifier: str | None = None  # backward-compatible alias for gstin
+    registration_number: str | None = None
+
+
+class StatementPatientInfo(BaseModel):
+    patient_id: UUID
+    name: str
+    uhid: str  # MRN canonical identifier
+    gender: str | None = None
+    age: int | None = None
+    date_of_birth: date | None = None
+    mobile: str | None = None
+    emergency_contact: str | None = None
+    address: str | None = None
+
+
+class StatementScopeInfo(BaseModel):
+    scope: str = "entire_journey"  # "entire_journey" | "date_range" | "episode"
+    date_from: date | None = None
+    date_to: date | None = None
+    source_filter: str | None = None
+    account_number: str | None = None
+    total_episodes: int = 1
+
+
+class StatementItemizedCharge(BaseModel):
+    id: UUID
+    charge_date: datetime
+    source_type: str
+    source_id: UUID | None = None
+    description: str
+    quantity: float = 1.0
+    unit_price: float = 0.0
+    gross_amount: float = 0.0
+    discount_amount: float = 0.0
+    tax_amount: float = 0.0
+    net_amount: float = 0.0
+    amount_paid: float = 0.0
+    outstanding: float = 0.0
+    status: str
+    reference_number: str | None = None
+    account_id: UUID | None = None
+    account_number: str | None = None
+
+
+class StatementPayment(BaseModel):
+    id: UUID
+    payment_date: date
+    amount: float
+    payment_method: str
+    reference_number: str | None = None
+    receipt_number: str | None = None
+    receipt_id: UUID | None = None
+    received_by_name: str = ""
+    account_number: str | None = None
+
+
+class StatementDeposit(BaseModel):
+    id: UUID
+    deposit_number: str
+    deposit_date: date
+    deposit_type: str
+    payment_method: str
+    original_amount: float
+    available_amount: float
+    used_amount: float
+    status: str
+    reference_number: str | None = None
+
+
+class StatementRefund(BaseModel):
+    id: UUID
+    refund_number: str
+    refund_date: date
+    refund_method: str
+    amount: float
+    reason: str
+    status: str
+    reference_number: str | None = None
+
+
+class StatementFinancialSummary(BaseModel):
+    gross_charges: float
+    discount_total: float
+    tax_total: float
+    net_charges: float
+    total_paid: float
+    deposits_received: float
+    deposits_applied: float
+    deposits_available: float
+    total_refunds: float
+    outstanding: float
+    net_patient_balance: float
+
+
+class PatientBillingStatementResponse(BaseModel):
+    statement_id: str
+    generated_at: datetime
+    hospital: StatementHospitalInfo
+    patient: StatementPatientInfo
+    scope: StatementScopeInfo
+    charges: list[StatementItemizedCharge]
+    payments: list[StatementPayment]
+    receipts: list[BillingReceiptResponse]
+    invoices: list[BillingInvoiceResponse]
+    deposits: list[StatementDeposit]
+    refunds: list[StatementRefund]
+    summary: StatementFinancialSummary
+

@@ -13,9 +13,9 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import case, func
+from sqlalchemy import case, func, literal, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from modules.billing.contracts.billing_contracts import (
     BillingChargeCreate,
@@ -36,8 +36,18 @@ from modules.billing.contracts.billing_contracts import (
     FinancialAccountCreate,
     FinancialAccountResponse,
     LedgerEntry,
+    PatientBillingStatementResponse,
+    PatientDuesResponse,
     PatientFinancialSummary,
     PatientLedgerResponse,
+    StatementDeposit,
+    StatementFinancialSummary,
+    StatementHospitalInfo,
+    StatementItemizedCharge,
+    StatementPatientInfo,
+    StatementPayment,
+    StatementRefund,
+    StatementScopeInfo,
 )
 from modules.billing.db.billing_repository import BillingRepository
 from modules.billing.entities.billing_entities import (
@@ -76,9 +86,12 @@ from modules.billing.services.billing_service import (
     payment_to_dict,
     process_refund,
     refund_to_dict,
+    recompute_charge_financials,
 )
 from modules.billing.services.invoice_service import (
+    _resolve_encounter_details,
     create_invoice_from_charges,
+    deposit_receipt_html,
     invoice_html,
     invoice_to_dict,
     issue_receipt,
@@ -88,6 +101,11 @@ from modules.billing.services.invoice_service import (
     receipt_to_dict,
     refund_html,
     refresh_invoice_paid_status,
+)
+from modules.billing.services.charge_reversal_service import (
+    cancel_charge,
+    is_charge_service_performed,
+    reconcile_charge_after_reprice,
 )
 from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
@@ -323,6 +341,7 @@ def _payment_response_dtos(
     db: Session,
     payments: list[BillingPayment],
     patient: Patient | None = None,
+    receipts: list[BillingReceipt] | None = None,
 ) -> list[BillingPaymentResponse]:
     """
     Batch version of _payment_response_dto for list/dashboard responses.
@@ -331,20 +350,22 @@ def _payment_response_dtos(
     up to 200 extra round trips on the payments list, 5 more on the
     dashboard). This fetches all matching receipts in one query and maps
     them back, producing identical output to calling _payment_response_dto
-    in a loop.
+    in a loop. If receipts are already fetched by the caller (e.g. in patient
+    ledger), pass them directly to eliminate redundant round trips.
     """
     if not payments:
         return []
     payment_ids = [p.id for p in payments]
-    receipts = (
-        db.query(BillingReceipt)
-        .filter(
-            BillingReceipt.hospital_id == payments[0].hospital_id,
-            BillingReceipt.payment_id.in_(payment_ids),
-            BillingReceipt.status != BillingReceiptStatus.cancelled,
+    if receipts is None:
+        receipts = (
+            db.query(BillingReceipt)
+            .filter(
+                BillingReceipt.hospital_id == payments[0].hospital_id,
+                BillingReceipt.payment_id.in_(payment_ids),
+                BillingReceipt.status != BillingReceiptStatus.cancelled,
+            )
+            .all()
         )
-        .all()
-    )
     # Same tie-break as the per-payment query's .first(): first match wins if
     # more than one non-cancelled receipt somehow exists for a payment.
     receipt_by_payment_id: dict[UUID, BillingReceipt] = {}
@@ -450,51 +471,61 @@ class UpdateChargeAction:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Charge not found")
         if charge.status == BillingChargeStatus.cancelled:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot edit a cancelled charge")
+        if payload.status is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Charge status cannot be edited: paid / partially paid / pending are derived from "
+                    "recorded payments and deposit allocations. Record a payment to settle it, or use "
+                    "the cancel action to cancel it."
+                ),
+            )
 
-        # Check if already on a non-cancelled invoice
+        amount_fields_changed = (
+            payload.discount_amount is not None
+            or payload.discount_percent is not None
+            or payload.tax_amount is not None
+            or payload.quantity is not None
+            or payload.unit_price is not None
+        )
         from modules.billing.services.invoice_service import charges_already_invoiced
-        if charges_already_invoiced(self.db, self.repo.hospital_id, [charge.id]):
-            # If attempting to alter financial numbers on an invoiced charge, reject
-            if (
-                payload.discount_amount is not None
-                or payload.discount_percent is not None
-                or payload.tax_amount is not None
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Cannot modify financial amounts or discounts on an invoiced charge. Issue an adjustment or credit note.",
-                )
+        if amount_fields_changed and charges_already_invoiced(self.db, self.repo.hospital_id, [charge.id]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot modify financial amounts or discounts on an invoiced charge. Issue an adjustment or credit note.",
+            )
 
         if payload.description is not None:
             charge.description = payload.description.strip()[:512]
         if payload.notes is not None:
             charge.notes = payload.notes
 
+        old_net = float(charge.net_amount or 0)
         old_disc = float(charge.discount_amount or 0)
+        if payload.quantity is not None or payload.unit_price is not None:
+            qty = float(payload.quantity if payload.quantity is not None else charge.quantity or 1)
+            unit = float(payload.unit_price if payload.unit_price is not None else charge.unit_price or 0)
+            charge.quantity = qty
+            charge.unit_price = round(unit, 2)
+            charge.charge_amount = round(qty * unit, 2)
+        if payload.tax_amount is not None:
+            charge.tax_amount = round(float(payload.tax_amount), 2)
         disc_amt = payload.discount_amount if payload.discount_amount is not None else old_disc
         disc_pct = payload.discount_percent if payload.discount_percent is not None else charge.discount_percent
-        disc, net = compute_net(float(charge.charge_amount or 0), disc_amt, disc_pct)
+        disc, net = compute_net(
+            float(charge.charge_amount or 0), disc_amt, disc_pct, float(charge.tax_amount or 0)
+        )
         charge.discount_amount = disc
         charge.discount_percent = disc_pct
         if payload.discount_reason is not None:
             charge.discount_reason = payload.discount_reason.strip() or None
         charge.net_amount = net
 
-        if payload.status is not None:
-            charge.status = payload.status
-        else:
-            paid = float(charge.amount_paid or 0)
-            if net <= 0 or paid >= net:
-                charge.status = BillingChargeStatus.paid
-                charge.amount_paid = net
-            elif paid > 0:
-                charge.status = BillingChargeStatus.partially_paid
-            else:
-                charge.status = BillingChargeStatus.pending
+        released = reconcile_charge_after_reprice(
+            self.db, charge, reason=f"Charge re-priced from ₹{old_net:.2f} to ₹{net:.2f}", actor=user
+        )
 
-        self.db.commit()
-        self.db.refresh(charge)
-        audit_summary = f"Updated charge {charge.id} (Net: ₹{charge.net_amount:.2f})"
+        audit_summary = f"Updated charge {charge.id} (Net: ₹{float(charge.net_amount):.2f})"
         if disc > 0 and disc != old_disc:
             audit_summary += f" [Discount updated: ₹{disc:.2f}, Reason: {charge.discount_reason}]"
         write_audit_log(
@@ -505,8 +536,18 @@ class UpdateChargeAction:
             entity_type="billing_charge",
             entity_id=charge.id,
             summary=audit_summary,
+            details={
+                "patient_id": str(charge.patient_id),
+                "account_id": str(charge.account_id) if charge.account_id else None,
+                "old_net_amount": old_net,
+                "net_amount": float(charge.net_amount),
+                "status": charge.status.value,
+                "released_to_credit": released.amount_to_credit if released else 0.0,
+                "credit_deposit_id": str(released.credit_deposit_id) if released and released.credit_deposit_id else None,
+            },
         )
         self.db.commit()
+        self.db.refresh(charge)
         return BillingChargeResponse.model_validate(charge_to_dict(charge))
 
 
@@ -520,39 +561,16 @@ class CancelChargeAction:
         charge = self.repo.get_charge_by_id(charge_id)
         if not charge:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Charge not found")
-        
-        paid_amount = round(float(charge.amount_paid or 0.0), 2)
-        charge.status = BillingChargeStatus.cancelled
-        charge.amount_paid = 0.0
-        self.db.flush()
 
-        # If money was paid towards this charge, convert into an available advance deposit
-        if paid_amount > 0:
-            create_deposit(
-                self.db,
-                hospital_id=self.repo.hospital_id,
-                patient_id=charge.patient_id,
-                account_id=charge.account_id,
-                amount=paid_amount,
-                deposit_date=date.today(),
-                deposit_type="cancellation_credit",
-                payment_method=BillingPaymentMethod.other,
-                notes=f"Credit from cancelled charge {charge.description[:40]}",
-                received_by_name=_actor(user),
-            )
-
-        self.db.commit()
-        self.db.refresh(charge)
-        write_audit_log(
+        cancel_charge(
             self.db,
-            hospital_id=self.repo.hospital_id,
+            charge,
+            reason="Cancelled at billing desk",
             actor=user,
-            action="cancel",
-            entity_type="billing_charge",
-            entity_id=charge.id,
-            summary=f"Cancelled charge {charge.id} ({charge.description[:32]}). Credited paid amount ₹{paid_amount:.2f} as available patient deposit.",
+            performed=is_charge_service_performed(self.db, charge),
         )
         self.db.commit()
+        self.db.refresh(charge)
         return BillingChargeResponse.model_validate(charge_to_dict(charge))
 
 
@@ -628,6 +646,92 @@ class CreatePaymentAction:
             if existing:
                 return _payment_response_dto(self.db, existing, patient)
 
+        # Explicit charge settlements always retain an itemized bill. Reuse the
+        # one invoice that already contains every selected charge; otherwise
+        # snapshot precisely these selected charges before applying payment.
+        selected_charge_ids = list(dict.fromkeys(
+            item["charge_id"] for item in (allocations_plan or []) if item.get("charge_id")
+        ))
+        created_invoice_for_payment = False
+        if selected_charge_ids:
+            existing_lines = (
+                self.db.query(BillingInvoiceLine.charge_id, BillingInvoiceLine.invoice_id)
+                .join(BillingInvoice, BillingInvoice.id == BillingInvoiceLine.invoice_id)
+                .filter(
+                    BillingInvoice.hospital_id == self.repo.hospital_id,
+                    BillingInvoice.patient_id == payload.patient_id,
+                    BillingInvoiceLine.charge_id.in_(selected_charge_ids),
+                    BillingInvoice.status != BillingInvoiceStatus.cancelled,
+                ).all()
+            )
+            by_charge = {charge_id: invoice_id for charge_id, invoice_id in existing_lines}
+            invoice_ids = set(by_charge.values())
+            if len(invoice_ids) > 1 or (invoice_ids and len(by_charge) != len(selected_charge_ids)):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected charges belong to different bills. Collect payment against one invoice at a time.",
+                )
+            if invoice_ids:
+                effective_invoice_id = next(iter(invoice_ids))
+                if payload.linked_invoice_id and payload.linked_invoice_id != effective_invoice_id:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected charges do not belong to the linked invoice")
+            else:
+                if payload.linked_invoice_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Selected charges are not on the linked invoice.",
+                    )
+                try:
+                    # Apply per-line settlement concessions before taking the
+                    # immutable invoice snapshot, using the same calculation
+                    # as the allocator. The allocator fields are cleared after
+                    # snapshotting below to prevent a second application.
+                    charge_map = {c.id: c for c in self.db.query(BillingCharge).filter(
+                        BillingCharge.id.in_(selected_charge_ids),
+                        BillingCharge.hospital_id == self.repo.hospital_id,
+                        BillingCharge.patient_id == payload.patient_id,
+                    ).all()}
+                    for allocation in allocations_plan or []:
+                        charge = charge_map.get(allocation["charge_id"])
+                        if not charge:
+                            continue
+                        if allocation.get("discount_amount") is not None:
+                            charge.discount_amount = round(float(allocation["discount_amount"]), 2)
+                        if allocation.get("discount_percent") is not None:
+                            charge.discount_percent = round(float(allocation["discount_percent"]), 2)
+                        if allocation.get("discount_reason"):
+                            charge.discount_reason = allocation["discount_reason"]
+                        if allocation.get("discount_amount") is not None or allocation.get("discount_percent") is not None:
+                            disc, net = compute_net(
+                                float(charge.charge_amount or 0), float(charge.discount_amount or 0),
+                                charge.discount_percent, float(charge.tax_amount or 0),
+                            )
+                            charge.discount_amount, charge.net_amount = disc, net
+                            recompute_charge_financials(self.db, charge)
+                    inv = create_invoice_from_charges(
+                        self.db,
+                        hospital_id=self.repo.hospital_id,
+                        patient_id=payload.patient_id,
+                        charge_ids=selected_charge_ids,
+                        account_id=payload.account_id,
+                        created_by_name=_actor(user),
+                    )
+                    effective_invoice_id = inv.id
+                    created_invoice_for_payment = True
+                except ValueError as e:
+                    self.db.rollback()
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        if created_invoice_for_payment and allocations_plan:
+            # Settlement concessions were applied to charge snapshots before
+            # this invoice was created. Do not ask the allocator to apply them
+            # a second time after the charge has become invoiced.
+            for allocation in allocations_plan:
+                allocation["discount_amount"] = None
+                allocation["discount_percent"] = None
+                allocation["discount_reason"] = None
+        else:
+            effective_invoice_id = payload.linked_invoice_id
+
         try:
             pay = create_payment(
                 self.db,
@@ -648,11 +752,27 @@ class CreatePaymentAction:
             # Settlement-guard rejection (e.g. discount on an invoiced charge).
             self.db.rollback()
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        if not effective_invoice_id and pay.allocations:
+            allocated_charge_ids = [a.charge_id for a in pay.allocations if a.charge_id]
+            if allocated_charge_ids:
+                inv_lines = (
+                    self.db.query(BillingInvoiceLine.invoice_id)
+                    .join(BillingInvoice, BillingInvoice.id == BillingInvoiceLine.invoice_id)
+                    .filter(
+                        BillingInvoiceLine.charge_id.in_(allocated_charge_ids),
+                        BillingInvoice.status != BillingInvoiceStatus.cancelled,
+                    )
+                    .distinct()
+                    .all()
+                )
+                if len(inv_lines) == 1 and inv_lines[0][0]:
+                    effective_invoice_id = inv_lines[0][0]
+
         try:
             receipt = issue_receipt_for_payment(
                 self.db,
                 pay,
-                linked_invoice_id=payload.linked_invoice_id,
+                linked_invoice_id=effective_invoice_id,
                 reference_number=payload.reference_number,
             )
             refresh_invoice_paid_status(self.db, self.repo.hospital_id, payload.patient_id)
@@ -685,7 +805,7 @@ class CreatePaymentAction:
                 receipt = issue_receipt_for_payment(
                     self.db,
                     pay,
-                    linked_invoice_id=payload.linked_invoice_id,
+                    linked_invoice_id=effective_invoice_id,
                     reference_number=payload.reference_number,
                 )
                 refresh_invoice_paid_status(self.db, self.repo.hospital_id, payload.patient_id)
@@ -869,9 +989,44 @@ class PrintInvoiceAction:
         if not inv:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
         hospital = self.db.query(Hospital).filter(Hospital.id == self.repo.hospital_id).first()
-        patient = self.repo.get_patient(inv.patient_id)
-        out = patient_outstanding_for_invoice(self.db, self.repo.hospital_id, inv.patient_id)
-        return invoice_html(inv, hospital, patient, outstanding=out, auto_print=auto_print)
+        patient = inv.patient or self.repo.get_patient(inv.patient_id)
+        encounter = _resolve_encounter_details(self.db, getattr(inv, "account_id", None))
+        charge_ids = [line.charge_id for line in inv.lines if line.charge_id]
+        charges = self.db.query(BillingCharge).filter(BillingCharge.id.in_(charge_ids)).all() if charge_ids else []
+        amount_paid = min(float(inv.grand_total or 0), round(sum(float(c.amount_paid or 0) for c in charges), 2))
+        by_payment: dict[UUID, float] = {}
+        if charge_ids:
+            for payment_id, allocated in (
+                self.db.query(BillingPaymentAllocation.payment_id, func.sum(BillingPaymentAllocation.allocated_amount))
+                .filter(
+                    BillingPaymentAllocation.charge_id.in_(charge_ids),
+                    BillingPaymentAllocation.payment_id.isnot(None),
+                ).group_by(BillingPaymentAllocation.payment_id).all()
+            ):
+                if payment_id and float(allocated or 0) > 0:
+                    by_payment[payment_id] = float(allocated)
+        receipt_query = self.db.query(BillingReceipt).filter(
+            BillingReceipt.hospital_id == self.repo.hospital_id,
+            BillingReceipt.patient_id == inv.patient_id,
+            BillingReceipt.status != BillingReceiptStatus.cancelled,
+        )
+        receipt_filters = [BillingReceipt.linked_invoice_id == inv.id]
+        if by_payment:
+            receipt_filters.append(BillingReceipt.payment_id.in_(by_payment))
+        receipts = receipt_query.filter(or_(*receipt_filters)).all()
+        payment_rows = [
+            {
+                "amount": float(r.amount or 0),
+                "method": r.payment_method.value.replace("_", " ").title() if r.payment_method else "Payment",
+                "date": r.payment_date.strftime("%d/%m/%Y") if r.payment_date else "",
+                "receipt": r.receipt_number,
+            }
+            for r in receipts
+        ]
+        return invoice_html(
+            inv, hospital, patient, encounter=encounter, auto_print=auto_print,
+            settlement={"amount_paid": amount_paid, "payments": payment_rows},
+        )
 
 
 # ── Receipt Actions ─────────────────────────────────────────────────────────
@@ -998,8 +1153,39 @@ class PrintReceiptAction:
         if not r:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Receipt not found")
         hospital = self.db.query(Hospital).filter(Hospital.id == self.repo.hospital_id).first()
-        patient = self.repo.get_patient(r.patient_id)
-        return receipt_html(r, hospital, patient, auto_print=auto_print)
+        patient = r.patient or self.repo.get_patient(r.patient_id)
+        linked_inv = None
+        if r.linked_invoice_id:
+            linked_inv = self.db.query(BillingInvoice).filter(BillingInvoice.id == r.linked_invoice_id).first()
+        paid_against = []
+        if r.payment_id:
+            allocs = self.db.query(BillingPaymentAllocation).filter(
+                BillingPaymentAllocation.payment_id == r.payment_id
+            ).all()
+            reversed_amount = {}
+            for allocation in allocs:
+                if allocation.reversal_of_id:
+                    reversed_amount[allocation.reversal_of_id] = reversed_amount.get(allocation.reversal_of_id, 0) + float(allocation.allocated_amount or 0)
+            totals = {}
+            for allocation in allocs:
+                if allocation.reversal_of_id is None and float(allocation.allocated_amount or 0) > 0:
+                    remaining = round(float(allocation.allocated_amount) + reversed_amount.get(allocation.id, 0), 2)
+                    if remaining > 0:
+                        totals[allocation.charge_id] = totals.get(allocation.charge_id, 0) + remaining
+            charges = self.db.query(BillingCharge).filter(BillingCharge.id.in_(totals)).all() if totals else []
+            charge_objs = {c.id: c for c in charges}
+            paid_against = [
+                {
+                    "description": charge_objs[cid].description if cid in charge_objs else "Charge",
+                    "amount": amount,
+                    "source_type": charge_objs[cid].source_type.value if cid in charge_objs and charge_objs[cid].source_type else "",
+                }
+                for cid, amount in totals.items()
+            ]
+        return receipt_html(
+            r, hospital, patient, linked_invoice=linked_inv, auto_print=auto_print,
+            paid_against=paid_against,
+        )
 
 
 # ── Financial Account Actions ───────────────────────────────────────────────
@@ -1235,6 +1421,21 @@ class AllocateDepositAction:
         return BillingDepositResponse.model_validate(deposit_to_dict(deposit))
 
 
+class PrintDepositAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(self, deposit_id: UUID, auto_print: bool = True) -> str:
+        dep = self.repo.get_deposit_by_id(deposit_id)
+        if not dep:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deposit not found")
+        hospital = self.db.query(Hospital).filter(Hospital.id == self.repo.hospital_id).first()
+        patient = self.repo.get_patient(dep.patient_id)
+        encounter = _resolve_encounter_details(self.db, getattr(dep, "account_id", None))
+        return deposit_receipt_html(dep, hospital, patient, encounter=encounter, auto_print=auto_print)
+
+
 # ── Refund Actions ──────────────────────────────────────────────────────────
 
 class ListRefundsAction:
@@ -1280,13 +1481,22 @@ class CreateRefundAction:
                 account_id=payload.account_id,
                 approved_by_name=_actor(user),
                 processed_by_name=_actor(user),
+                charge_ids=payload.charge_ids,
             )
-            self.db.commit()
-            self.db.refresh(refund)
         except ValueError as e:
             self.db.rollback()
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
+        reversed_charge_ids = sorted({
+            str(row[0])
+            for row in self.db.query(BillingPaymentAllocation.charge_id)
+            .filter(BillingPaymentAllocation.refund_id == refund.id)
+            .all()
+        })
+        admission_id = None
+        if refund.account_id:
+            acc = self.db.query(FinancialAccount).filter(FinancialAccount.id == refund.account_id).first()
+            admission_id = acc.admission_id if acc else None
         write_audit_log(
             self.db,
             hospital_id=self.repo.hospital_id,
@@ -1294,9 +1504,19 @@ class CreateRefundAction:
             action="refund",
             entity_type="billing_refund",
             entity_id=refund.id,
-            summary=f"Refund voucher {refund.refund_number} (₹{refund.amount:.2f}) issued for {patient.name}: {refund.reason[:40]}",
+            summary=f"Refund voucher {refund.refund_number} (₹{float(refund.amount):.2f}) issued for {patient.name}: {refund.reason[:40]}",
+            details={
+                "patient_id": str(refund.patient_id),
+                "account_id": str(refund.account_id) if refund.account_id else None,
+                "admission_id": str(admission_id) if admission_id else None,
+                "payment_id": str(refund.payment_id) if refund.payment_id else None,
+                "deposit_id": str(refund.deposit_id) if refund.deposit_id else None,
+                "amount": float(refund.amount),
+                "reversed_charge_ids": reversed_charge_ids,
+            },
         )
         self.db.commit()
+        self.db.refresh(refund)
         return BillingRefundResponse.model_validate(refund_to_dict(refund, patient))
 
 
@@ -1321,80 +1541,943 @@ class GetPatientLedgerAction:
         self.db = db
         self.repo = BillingRepository(db, hospital_id)
 
-    def execute(self, patient_id: UUID) -> PatientLedgerResponse:
+    def execute(
+        self,
+        patient_id: UUID,
+        *,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        source_type: BillingSourceType | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> PatientLedgerResponse:
         patient = _get_patient_or_404(self.repo, patient_id)
-        # Fetch charges/payments once and share them across totals, the
-        # response's own charges/payments fields, and build_ledger_entries —
-        # this endpoint previously fetched each of those independently
-        # (1 query here in the caller + 2 inside patient_ledger_totals + 2
-        # inside build_ledger_entries = 5 queries over the same two tables).
-        # all_charges intentionally has NO status filter (unlike the old
-        # standalone query below) because build_ledger_entries needs
-        # cancelled charges too, to render them in the timeline; it filters
-        # them out itself. non_cancelled_charges recreates the old filtered
-        # set for totals and the response's `charges` field.
-        all_charges = (
+
+        # Base charges query with eager account loading
+        q_chg = (
             self.db.query(BillingCharge)
+            .options(joinedload(BillingCharge.account))
             .filter(
                 BillingCharge.hospital_id == self.repo.hospital_id,
                 BillingCharge.patient_id == patient_id,
             )
-            .order_by(BillingCharge.created_at.desc())
-            .all()
         )
+        if date_from:
+            q_chg = q_chg.filter(BillingCharge.created_at >= datetime.combine(date_from, time.min))
+        if date_to:
+            q_chg = q_chg.filter(BillingCharge.created_at <= datetime.combine(date_to, time.max))
+        if source_type:
+            q_chg = q_chg.filter(BillingCharge.source_type == source_type)
+        all_charges = q_chg.order_by(BillingCharge.created_at.desc()).all()
+
         non_cancelled_charges = [c for c in all_charges if c.status != BillingChargeStatus.cancelled]
-        payments = (
+
+        # Base payments query
+        q_pay = (
             self.db.query(BillingPayment)
             .filter(
                 BillingPayment.hospital_id == self.repo.hospital_id,
                 BillingPayment.patient_id == patient_id,
             )
-            .order_by(BillingPayment.created_at.desc())
-            .all()
         )
+        if date_from:
+            q_pay = q_pay.filter(BillingPayment.payment_date >= date_from)
+        if date_to:
+            q_pay = q_pay.filter(BillingPayment.payment_date <= date_to)
+        payments = q_pay.order_by(BillingPayment.created_at.desc()).all()
+
+        # Deposits query
+        q_dep = (
+            self.db.query(BillingDeposit)
+            .filter(
+                BillingDeposit.hospital_id == self.repo.hospital_id,
+                BillingDeposit.patient_id == patient_id,
+            )
+        )
+        if date_from:
+            q_dep = q_dep.filter(BillingDeposit.deposit_date >= date_from)
+        if date_to:
+            q_dep = q_dep.filter(BillingDeposit.deposit_date <= date_to)
+        deposits = q_dep.order_by(BillingDeposit.created_at.desc()).all()
+
+        # Refunds query
+        q_ref = (
+            self.db.query(BillingRefund)
+            .filter(
+                BillingRefund.hospital_id == self.repo.hospital_id,
+                BillingRefund.patient_id == patient_id,
+            )
+        )
+        if date_from:
+            q_ref = q_ref.filter(BillingRefund.refund_date >= date_from)
+        if date_to:
+            q_ref = q_ref.filter(BillingRefund.refund_date <= date_to)
+        refunds = q_ref.order_by(BillingRefund.created_at.desc()).all()
+
+        active_deposits = [
+            d for d in deposits
+            if d.status in (DepositStatus.available, DepositStatus.partially_allocated)
+        ]
         totals = patient_ledger_totals(
-            self.db, self.repo.hospital_id, patient_id, charges=non_cancelled_charges, payments=payments
+            self.db,
+            self.repo.hospital_id,
+            patient_id,
+            charges=non_cancelled_charges,
+            payments=payments,
+            deposits=active_deposits,
         )
         charges = non_cancelled_charges
-        invoices = (
+
+        # Invoices with lines eager loaded (no N+1)
+        q_inv = (
             self.db.query(BillingInvoice)
-            .options(joinedload(BillingInvoice.lines))
+            .options(selectinload(BillingInvoice.lines))
             .filter(
                 BillingInvoice.hospital_id == self.repo.hospital_id,
                 BillingInvoice.patient_id == patient_id,
                 BillingInvoice.status != BillingInvoiceStatus.cancelled,
             )
-            .order_by(BillingInvoice.created_at.desc())
-            .all()
         )
-        receipts = (
+        if date_from:
+            q_inv = q_inv.filter(BillingInvoice.invoice_date >= date_from)
+        if date_to:
+            q_inv = q_inv.filter(BillingInvoice.invoice_date <= date_to)
+        invoices = q_inv.order_by(BillingInvoice.created_at.desc()).all()
+
+        # Receipts query
+        q_rcp = (
             self.db.query(BillingReceipt)
             .filter(
                 BillingReceipt.hospital_id == self.repo.hospital_id,
                 BillingReceipt.patient_id == patient_id,
                 BillingReceipt.status != BillingReceiptStatus.cancelled,
             )
-            .order_by(BillingReceipt.created_at.desc())
-            .all()
         )
+        if date_from:
+            q_rcp = q_rcp.filter(BillingReceipt.payment_date >= date_from)
+        if date_to:
+            q_rcp = q_rcp.filter(BillingReceipt.payment_date <= date_to)
+        receipts = q_rcp.order_by(BillingReceipt.created_at.desc()).all()
+
         entries = build_ledger_entries(
-            self.db, self.repo.hospital_id, patient_id, charges=all_charges, payments=payments
+            self.db,
+            self.repo.hospital_id,
+            patient_id,
+            charges=all_charges,
+            payments=payments,
+            deposits=deposits,
+            refunds=refunds,
         )
+
+        # Pagination if requested
+        if limit is not None and limit > 0:
+            paginated_entries = entries[offset : offset + limit]
+            paginated_charges = charges[offset : offset + limit]
+        else:
+            paginated_entries = entries
+            paginated_charges = charges
+
         return PatientLedgerResponse(
             patient_id=patient_id,
             patient_name=patient.name,
             patient_uhid=patient.uhid,
             total_charges=totals["total_charges"],
             total_paid=totals["total_paid"],
+            total_deposits_available=totals.get("total_deposits_available", 0.0),
             outstanding=totals["outstanding"],
+            net_patient_balance=totals.get("net_patient_balance", 0.0),
             charge_count=totals["charge_count"],
             payment_count=totals["payment_count"],
-            charges=[BillingChargeResponse.model_validate(charge_to_dict(c, patient)) for c in charges],
-            payments=_payment_response_dtos(self.db, payments, patient),
+            charges=[BillingChargeResponse.model_validate(charge_to_dict(c, patient)) for c in paginated_charges],
+            payments=_payment_response_dtos(self.db, payments, patient, receipts=receipts),
+            deposits=[BillingDepositResponse.model_validate(deposit_to_dict(d, patient)) for d in deposits],
+            refunds=[BillingRefundResponse.model_validate(refund_to_dict(r, patient)) for r in refunds],
             invoices=[BillingInvoiceResponse.model_validate(invoice_to_dict(inv, patient)) for inv in invoices],
             receipts=[BillingReceiptResponse.model_validate(receipt_to_dict(r, patient)) for r in receipts],
-            entries=[LedgerEntry.model_validate(e) for e in entries],
+            entries=[LedgerEntry.model_validate(e) for e in paginated_entries],
         )
+
+
+class GetPatientStatementAction:
+    """Produces canonical, itemized consolidated billing statement for insurance and patient journey."""
+
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(
+        self,
+        patient_id: UUID,
+        *,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        source_type: BillingSourceType | None = None,
+        account_id: UUID | None = None,
+    ) -> PatientBillingStatementResponse:
+        from modules.tenancy.entities.hospital import Hospital
+
+        patient = _get_patient_or_404(self.repo, patient_id)
+        hospital = self.db.query(Hospital).filter(Hospital.id == self.repo.hospital_id).first()
+        if not hospital:
+            raise HTTPException(status_code=404, detail="Hospital not found")
+
+        # Hospital metadata (strictly authoritative from actual Hospital entity fields: name, address, phone, email, gstin)
+        real_gstin = hospital.gstin or None
+        hosp_info = StatementHospitalInfo(
+            hospital_id=hospital.id,
+            name=hospital.name,
+            hospital_code=hospital.hospital_id or f"HOSP-{str(hospital.id)[:6].upper()}",
+            address=hospital.address or None,
+            phone=hospital.phone or None,
+            email=hospital.email or None,
+            gstin=real_gstin,
+            tax_identifier=real_gstin,
+        )
+
+        # Patient metadata (UHID canonical identifier; MRN omitted to prevent fabrication)
+        pat_info = StatementPatientInfo(
+            patient_id=patient.id,
+            name=patient.name,
+            uhid=patient.uhid,
+            gender=patient.gender,
+            age=patient.age,
+            date_of_birth=patient.date_of_birth,
+            mobile=patient.mobile,
+            emergency_contact=patient.emergency_contact,
+            address=patient.address,
+        )
+
+        # Charges query (chronological, with account eager loading)
+        q_chg = (
+            self.db.query(BillingCharge)
+            .options(joinedload(BillingCharge.account))
+            .filter(
+                BillingCharge.hospital_id == self.repo.hospital_id,
+                BillingCharge.patient_id == patient_id,
+            )
+        )
+        if date_from:
+            q_chg = q_chg.filter(BillingCharge.created_at >= datetime.combine(date_from, time.min))
+        if date_to:
+            q_chg = q_chg.filter(BillingCharge.created_at <= datetime.combine(date_to, time.max))
+        if source_type:
+            q_chg = q_chg.filter(BillingCharge.source_type == source_type)
+        if account_id:
+            q_chg = q_chg.filter(BillingCharge.account_id == account_id)
+        all_charges = q_chg.order_by(BillingCharge.created_at.asc()).all()
+
+        non_cancelled_charges = [c for c in all_charges if c.status != BillingChargeStatus.cancelled]
+        is_scoped = bool(date_from or date_to or source_type or account_id)
+
+        scoped_charge_ids = [c.id for c in non_cancelled_charges]
+        pay_applied_map: dict[UUID, float] = {}
+        dep_applied_map: dict[UUID, float] = {}
+        refund_applied_map: dict[UUID, float] = {}
+
+        if is_scoped:
+            # Scoped statement: determine tender and settlements through explicit allocations
+            # Service charges define the scope. Payments, deposits, refunds, and invoices linked
+            # to these scoped charges are included even if settlement occurred outside the date filter.
+            scoped_allocs: list[BillingPaymentAllocation] = []
+            if scoped_charge_ids:
+                scoped_allocs = (
+                    self.db.query(BillingPaymentAllocation)
+                    .filter(
+                        BillingPaymentAllocation.hospital_id == self.repo.hospital_id,
+                        BillingPaymentAllocation.charge_id.in_(scoped_charge_ids),
+                    )
+                    .all()
+                )
+
+            for a in scoped_allocs:
+                if a.payment_id:
+                    pay_applied_map[a.payment_id] = round(
+                        pay_applied_map.get(a.payment_id, 0.0) + float(a.allocated_amount or 0.0), 2
+                    )
+                if a.deposit_id:
+                    dep_applied_map[a.deposit_id] = round(
+                        dep_applied_map.get(a.deposit_id, 0.0) + float(a.allocated_amount or 0.0), 2
+                    )
+                if a.refund_id and float(a.allocated_amount or 0.0) < 0:
+                    refund_applied_map[a.refund_id] = round(
+                        refund_applied_map.get(a.refund_id, 0.0) + abs(float(a.allocated_amount or 0.0)), 2
+                    )
+
+            # Payments: only those that applied money toward scoped charges
+            scoped_payment_ids = [pid for pid, amt in pay_applied_map.items() if amt > 0.009]
+            if scoped_payment_ids:
+                scoped_payments = (
+                    self.db.query(BillingPayment)
+                    .options(joinedload(BillingPayment.account))
+                    .filter(
+                        BillingPayment.hospital_id == self.repo.hospital_id,
+                        BillingPayment.id.in_(scoped_payment_ids),
+                    )
+                    .order_by(BillingPayment.payment_date.asc(), BillingPayment.created_at.asc())
+                    .all()
+                )
+            else:
+                scoped_payments = []
+            total_paid = round(sum(pay_applied_map.values()), 2)
+
+            # Receipts: only those linked to scoped payments
+            if scoped_payment_ids:
+                scoped_receipts = (
+                    self.db.query(BillingReceipt)
+                    .filter(
+                        BillingReceipt.hospital_id == self.repo.hospital_id,
+                        BillingReceipt.payment_id.in_(scoped_payment_ids),
+                        BillingReceipt.status != BillingReceiptStatus.cancelled,
+                    )
+                    .order_by(BillingReceipt.payment_date.asc(), BillingReceipt.created_at.asc())
+                    .all()
+                )
+            else:
+                scoped_receipts = []
+            rcpt_by_pay = {r.payment_id: r for r in scoped_receipts if r.payment_id}
+
+            # Deposits: only those drawn down toward scoped charges
+            scoped_deposit_ids = [did for did, amt in dep_applied_map.items() if amt > 0.009]
+            if scoped_deposit_ids:
+                scoped_deposits = (
+                    self.db.query(BillingDeposit)
+                    .filter(
+                        BillingDeposit.hospital_id == self.repo.hospital_id,
+                        BillingDeposit.id.in_(scoped_deposit_ids),
+                    )
+                    .order_by(BillingDeposit.deposit_date.asc(), BillingDeposit.created_at.asc())
+                    .all()
+                )
+            else:
+                scoped_deposits = []
+            deposits_applied = round(sum(dep_applied_map.values()), 2)
+            deposits_received = deposits_applied
+            deposits_available = 0.0
+
+            # Refunds: only those connected to reversals of allocations on scoped charges
+            scoped_refund_ids = list(refund_applied_map.keys())
+            if scoped_refund_ids:
+                scoped_refunds = (
+                    self.db.query(BillingRefund)
+                    .filter(
+                        BillingRefund.hospital_id == self.repo.hospital_id,
+                        BillingRefund.id.in_(scoped_refund_ids),
+                    )
+                    .order_by(BillingRefund.refund_date.asc(), BillingRefund.created_at.asc())
+                    .all()
+                )
+            else:
+                scoped_refunds = []
+            total_refunds = round(sum(refund_applied_map.values()), 2)
+
+            # Invoices: only invoices itemizing scoped charges
+            scoped_inv_lines = (
+                self.db.query(BillingInvoiceLine.invoice_id)
+                .filter(BillingInvoiceLine.charge_id.in_(scoped_charge_ids))
+                .all()
+            ) if scoped_charge_ids else []
+            scoped_inv_ids = {row[0] for row in scoped_inv_lines}
+            if scoped_inv_ids:
+                scoped_invoices = (
+                    self.db.query(BillingInvoice)
+                    .options(selectinload(BillingInvoice.lines))
+                    .filter(
+                        BillingInvoice.hospital_id == self.repo.hospital_id,
+                        BillingInvoice.id.in_(scoped_inv_ids),
+                        BillingInvoice.status != BillingInvoiceStatus.cancelled,
+                    )
+                    .order_by(BillingInvoice.invoice_date.asc(), BillingInvoice.created_at.asc())
+                    .all()
+                )
+            else:
+                scoped_invoices = []
+
+            gross_charges = round(sum(float(c.charge_amount or 0.0) for c in non_cancelled_charges), 2)
+            discount_total = round(sum(float(c.discount_amount or 0.0) for c in non_cancelled_charges), 2)
+            tax_total = round(sum(float(c.tax_amount or 0.0) for c in non_cancelled_charges), 2)
+            net_charges = round(sum(float(c.net_amount or 0.0) for c in non_cancelled_charges), 2)
+            outstanding = round(
+                sum(max(0.0, float(c.net_amount or 0.0) - float(c.amount_paid or 0.0)) for c in non_cancelled_charges), 2
+            )
+            net_patient_balance = outstanding
+        else:
+            # Entire journey: canonical reconciliation with patient_ledger_totals
+            payments = (
+                self.db.query(BillingPayment)
+                .options(joinedload(BillingPayment.account))
+                .filter(
+                    BillingPayment.hospital_id == self.repo.hospital_id,
+                    BillingPayment.patient_id == patient_id,
+                )
+                .order_by(BillingPayment.payment_date.asc(), BillingPayment.created_at.asc())
+                .all()
+            )
+            scoped_receipts = (
+                self.db.query(BillingReceipt)
+                .filter(
+                    BillingReceipt.hospital_id == self.repo.hospital_id,
+                    BillingReceipt.patient_id == patient_id,
+                    BillingReceipt.status != BillingReceiptStatus.cancelled,
+                )
+                .order_by(BillingReceipt.payment_date.asc(), BillingReceipt.created_at.asc())
+                .all()
+            )
+            rcpt_by_pay = {r.payment_id: r for r in scoped_receipts if r.payment_id}
+
+            scoped_invoices = (
+                self.db.query(BillingInvoice)
+                .options(selectinload(BillingInvoice.lines))
+                .filter(
+                    BillingInvoice.hospital_id == self.repo.hospital_id,
+                    BillingInvoice.patient_id == patient_id,
+                    BillingInvoice.status != BillingInvoiceStatus.cancelled,
+                )
+                .order_by(BillingInvoice.invoice_date.asc(), BillingInvoice.created_at.asc())
+                .all()
+            )
+
+            deposits = (
+                self.db.query(BillingDeposit)
+                .filter(
+                    BillingDeposit.hospital_id == self.repo.hospital_id,
+                    BillingDeposit.patient_id == patient_id,
+                )
+                .order_by(BillingDeposit.deposit_date.asc(), BillingDeposit.created_at.asc())
+                .all()
+            )
+
+            refunds = (
+                self.db.query(BillingRefund)
+                .filter(
+                    BillingRefund.hospital_id == self.repo.hospital_id,
+                    BillingRefund.patient_id == patient_id,
+                )
+                .order_by(BillingRefund.refund_date.asc(), BillingRefund.created_at.asc())
+                .all()
+            )
+
+            active_deposits = [
+                d for d in deposits
+                if d.status in (DepositStatus.available, DepositStatus.partially_allocated)
+            ]
+            totals = patient_ledger_totals(
+                self.db,
+                self.repo.hospital_id,
+                patient_id,
+                charges=non_cancelled_charges,
+                payments=payments,
+                deposits=active_deposits,
+                account_id=account_id,
+            )
+
+            scoped_payments = payments
+            scoped_deposits = deposits
+            scoped_refunds = refunds
+
+            gross_charges = round(sum(float(c.charge_amount or 0.0) for c in non_cancelled_charges), 2)
+            discount_total = round(sum(float(c.discount_amount or 0.0) for c in non_cancelled_charges), 2)
+            tax_total = round(sum(float(c.tax_amount or 0.0) for c in non_cancelled_charges), 2)
+            net_charges = totals["total_charges"]
+            total_paid = totals["total_paid"]
+            deposits_received = round(sum(float(d.original_amount or 0.0) for d in deposits), 2)
+            deposits_applied = round(sum(float(d.original_amount or 0.0) - float(d.available_amount or 0.0) for d in deposits), 2)
+            deposits_available = totals["total_deposits_available"]
+            total_refunds = round(sum(float(r.amount or 0.0) for r in refunds), 2)
+            outstanding = totals["outstanding"]
+            net_patient_balance = totals["net_patient_balance"]
+
+        # Scope
+        scope_str = "date_range" if (date_from or date_to) else ("episode" if account_id else "entire_journey")
+        scope_info = StatementScopeInfo(
+            scope=scope_str,
+            date_from=date_from,
+            date_to=date_to,
+            source_filter=source_type.value if source_type else None,
+            total_episodes=len(set(c.account_id for c in all_charges if c.account_id)) or 1,
+        )
+
+        # Build itemized charges list
+        itemized_charges: list[StatementItemizedCharge] = []
+        for c in all_charges:
+            out_item = max(0.0, float(c.net_amount or 0.0) - float(c.amount_paid or 0.0))
+            st_val = c.status.value if hasattr(c.status, "value") else str(c.status)
+            src_val = c.source_type.value if hasattr(c.source_type, "value") else str(c.source_type)
+            acct_no = c.account.account_number if getattr(c, "account", None) else None
+            itemized_charges.append(
+                StatementItemizedCharge(
+                    id=c.id,
+                    charge_date=c.created_at,
+                    source_type=src_val,
+                    source_id=c.source_id,
+                    description=c.description,
+                    quantity=float(c.quantity or 1.0),
+                    unit_price=float(c.unit_price or 0.0),
+                    gross_amount=float(c.charge_amount or 0.0),
+                    discount_amount=float(c.discount_amount or 0.0),
+                    tax_amount=float(c.tax_amount or 0.0),
+                    net_amount=float(c.net_amount or 0.0),
+                    amount_paid=float(c.amount_paid or 0.0),
+                    outstanding=round(out_item, 2),
+                    status=st_val,
+                    reference_number=str(c.source_id)[:8] if c.source_id else None,
+                    account_id=c.account_id,
+                    account_number=acct_no,
+                )
+            )
+
+        # Build payments list with linked receipts
+        stmt_payments: list[StatementPayment] = []
+        for p in scoped_payments:
+            rcpt = rcpt_by_pay.get(p.id)
+            meth_val = p.payment_method.value if hasattr(p.payment_method, "value") else str(p.payment_method)
+            acct_no = p.account.account_number if getattr(p, "account", None) else None
+            applied_amt = pay_applied_map.get(p.id, float(p.amount)) if is_scoped else float(p.amount)
+            stmt_payments.append(
+                StatementPayment(
+                    id=p.id,
+                    payment_date=p.payment_date,
+                    amount=applied_amt,
+                    payment_method=meth_val,
+                    reference_number=p.reference_number,
+                    receipt_number=rcpt.receipt_number if rcpt else None,
+                    receipt_id=rcpt.id if rcpt else None,
+                    received_by_name=p.received_by_name or "",
+                    account_number=acct_no,
+                )
+            )
+
+        # Build deposits list
+        stmt_deposits: list[StatementDeposit] = []
+        for d in scoped_deposits:
+            meth_val = d.payment_method.value if hasattr(d.payment_method, "value") else str(d.payment_method)
+            st_val = d.status.value if hasattr(d.status, "value") else str(d.status)
+            used = dep_applied_map.get(d.id, round(float(d.original_amount) - float(d.available_amount), 2)) if is_scoped else round(float(d.original_amount) - float(d.available_amount), 2)
+            orig = float(d.original_amount)
+            avail = 0.0 if is_scoped else float(d.available_amount)
+            stmt_deposits.append(
+                StatementDeposit(
+                    id=d.id,
+                    deposit_number=d.deposit_number,
+                    deposit_date=d.deposit_date,
+                    deposit_type=d.deposit_type,
+                    payment_method=meth_val,
+                    original_amount=orig,
+                    available_amount=avail,
+                    used_amount=used,
+                    status=st_val,
+                    reference_number=d.reference_number,
+                )
+            )
+
+        # Build refunds list
+        stmt_refunds: list[StatementRefund] = []
+        for r in scoped_refunds:
+            meth_val = r.refund_method.value if hasattr(r.refund_method, "value") else str(r.refund_method)
+            st_val = r.status.value if hasattr(r.status, "value") else str(r.status)
+            amt = refund_applied_map.get(r.id, float(r.amount)) if is_scoped else float(r.amount)
+            stmt_refunds.append(
+                StatementRefund(
+                    id=r.id,
+                    refund_number=r.refund_number,
+                    refund_date=r.refund_date,
+                    refund_method=meth_val,
+                    amount=amt,
+                    reason=r.reason,
+                    status=st_val,
+                    reference_number=r.reference_number if hasattr(r, "reference_number") else None,
+                )
+            )
+
+        summary = StatementFinancialSummary(
+            gross_charges=gross_charges,
+            discount_total=discount_total,
+            tax_total=tax_total,
+            net_charges=net_charges,
+            total_paid=total_paid,
+            deposits_received=deposits_received,
+            deposits_applied=deposits_applied,
+            deposits_available=deposits_available,
+            total_refunds=total_refunds,
+            outstanding=outstanding,
+            net_patient_balance=net_patient_balance,
+        )
+
+        stmt_id = f"STMT-{patient.uhid}-{date.today().strftime('%Y%m%d')}"
+
+        return PatientBillingStatementResponse(
+            statement_id=stmt_id,
+            generated_at=datetime.now(timezone.utc),
+            hospital=hosp_info,
+            patient=pat_info,
+            scope=scope_info,
+            charges=itemized_charges,
+            payments=stmt_payments,
+            receipts=[BillingReceiptResponse.model_validate(receipt_to_dict(r, patient)) for r in scoped_receipts],
+            invoices=[BillingInvoiceResponse.model_validate(invoice_to_dict(inv, patient)) for inv in scoped_invoices],
+            deposits=stmt_deposits,
+            refunds=stmt_refunds,
+            summary=summary,
+        )
+
+
+def _esc_stmt(val: Any) -> str:
+    import html as html_lib
+    return html_lib.escape(str(val)) if val is not None else ""
+
+
+def statement_html(statement: PatientBillingStatementResponse, auto_print: bool = True) -> str:
+    h = statement.hospital
+    p = statement.patient
+    s = statement.summary
+    scope = statement.scope
+
+    charges_rows = []
+    for c in statement.charges:
+        dt_str = c.charge_date.strftime("%d/%m/%Y") if c.charge_date else "—"
+        ref_text = f"<br/><span style='font-size:10px;color:#666;'>Ref: {_esc_stmt(c.reference_number)}</span>" if c.reference_number else ""
+        disc_text = f"₹{c.discount_amount:,.2f}" if c.discount_amount > 0 else "—"
+        tax_text = f"₹{c.tax_amount:,.2f}" if c.tax_amount > 0 else "—"
+        charges_rows.append(
+            f"<tr>"
+            f"<td style='white-space:nowrap;font-family:monospace;'>{dt_str}</td>"
+            f"<td style='text-transform:capitalize;'>{c.source_type.replace('_', ' ')}</td>"
+            f"<td><strong>{_esc_stmt(c.description)}</strong>{ref_text}</td>"
+            f"<td style='text-align:right;'>{c.quantity:g}</td>"
+            f"<td style='text-align:right;'>₹{c.unit_price:,.2f}</td>"
+            f"<td style='text-align:right;'>{disc_text}</td>"
+            f"<td style='text-align:right;'>{tax_text}</td>"
+            f"<td style='text-align:right;font-weight:bold;'>₹{c.net_amount:,.2f}</td>"
+            f"<td style='text-align:center;text-transform:uppercase;font-size:10px;'>{c.status}</td>"
+            f"</tr>"
+        )
+    charges_tbody = "".join(charges_rows) or "<tr><td colspan='9' style='text-align:center;padding:15px;'>No charges recorded</td></tr>"
+
+    invoices_rows = []
+    for inv in statement.invoices:
+        dt_str = inv.invoice_date.strftime("%d/%m/%Y") if inv.invoice_date else "—"
+        disc_text = f"₹{inv.discount_amount:,.2f}" if inv.discount_amount > 0 else "—"
+        tax_text = f"₹{inv.tax_amount:,.2f}" if inv.tax_amount > 0 else "—"
+        invoices_rows.append(
+            f"<tr>"
+            f"<td style='font-family:monospace;font-weight:bold;'>{inv.invoice_number}</td>"
+            f"<td>{dt_str}</td>"
+            f"<td style='text-align:right;'>₹{inv.subtotal:,.2f}</td>"
+            f"<td style='text-align:right;'>{disc_text}</td>"
+            f"<td style='text-align:right;'>{tax_text}</td>"
+            f"<td style='text-align:right;font-weight:bold;'>₹{inv.grand_total:,.2f}</td>"
+            f"<td style='text-align:center;text-transform:uppercase;font-size:10px;'>{inv.status}</td>"
+            f"</tr>"
+        )
+    invoices_tbody = "".join(invoices_rows) or "<tr><td colspan='7' style='text-align:center;padding:15px;'>No invoices issued</td></tr>"
+
+    payments_rows = []
+    for pay in statement.payments:
+        dt_str = pay.payment_date.strftime("%d/%m/%Y") if pay.payment_date else "—"
+        payments_rows.append(
+            f"<tr>"
+            f"<td style='font-family:monospace;'>{dt_str}</td>"
+            f"<td style='font-family:monospace;font-weight:bold;'>{pay.receipt_number or '—'}</td>"
+            f"<td style='text-transform:capitalize;'>{pay.payment_method.replace('_', ' ')}</td>"
+            f"<td>{pay.reference_number or '—'}</td>"
+            f"<td>{_esc_stmt(pay.received_by_name or 'Cashier')}</td>"
+            f"<td style='text-align:right;font-weight:bold;color:#166534;'>₹{pay.amount:,.2f}</td>"
+            f"</tr>"
+        )
+    payments_tbody = "".join(payments_rows) or "<tr><td colspan='6' style='text-align:center;padding:15px;'>No payments recorded</td></tr>"
+
+    deposits_section = ""
+    if statement.deposits:
+        dep_rows = []
+        for d in statement.deposits:
+            dt_str = d.deposit_date.strftime("%d/%m/%Y") if d.deposit_date else "—"
+            dep_rows.append(
+                f"<tr>"
+                f"<td style='font-family:monospace;'>{dt_str}</td>"
+                f"<td style='font-family:monospace;font-weight:bold;'>{d.deposit_number}</td>"
+                f"<td style='text-transform:capitalize;'>{d.deposit_type} · {d.payment_method}</td>"
+                f"<td style='text-align:right;'>₹{d.original_amount:,.2f}</td>"
+                f"<td style='text-align:right;'>₹{d.used_amount:,.2f}</td>"
+                f"<td style='text-align:right;font-weight:bold;color:#166534;'>₹{d.available_amount:,.2f}</td>"
+                f"<td style='text-align:center;text-transform:uppercase;font-size:10px;'>{d.status}</td>"
+                f"</tr>"
+            )
+        deposits_section = f"""
+        <div style="margin-top:20px;">
+          <h3 style="font-size:12px;text-transform:uppercase;margin:0 0 8px 0;letter-spacing:0.5px;">4. Advance Deposits &amp; Drawdowns</h3>
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Date</th><th>Deposit No</th><th>Type / Method</th>
+                <th style="text-align:right;">Original</th><th style="text-align:right;">Consumed</th>
+                <th style="text-align:right;">Available</th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody>{"".join(dep_rows)}</tbody>
+          </table>
+        </div>
+        """
+
+    refunds_section = ""
+    if statement.refunds:
+        ref_rows = []
+        for r in statement.refunds:
+            dt_str = r.refund_date.strftime("%d/%m/%Y") if r.refund_date else "—"
+            ref_rows.append(
+                f"<tr>"
+                f"<td style='font-family:monospace;'>{dt_str}</td>"
+                f"<td style='font-family:monospace;font-weight:bold;'>{r.refund_number}</td>"
+                f"<td style='text-transform:capitalize;'>{r.refund_method}</td>"
+                f"<td>{_esc_stmt(r.reason)}</td>"
+                f"<td style='text-align:center;text-transform:uppercase;font-size:10px;'>{r.status}</td>"
+                f"<td style='text-align:right;font-weight:bold;color:#991b1b;'>₹{r.amount:,.2f}</td>"
+                f"</tr>"
+            )
+        refunds_section = f"""
+        <div style="margin-top:20px;">
+          <h3 style="font-size:12px;text-transform:uppercase;margin:0 0 8px 0;letter-spacing:0.5px;">5. Refunds Processed</h3>
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Date</th><th>Refund No</th><th>Method</th><th>Reason</th><th>Status</th>
+                <th style="text-align:right;">Amount Refunded</th>
+              </tr>
+            </thead>
+            <tbody>{"".join(ref_rows)}</tbody>
+          </table>
+        </div>
+        """
+
+    gen_time_str = statement.generated_at.strftime("%d/%m/%Y %I:%M %p") if statement.generated_at else "—"
+    dob_str = p.date_of_birth.strftime("%d/%m/%Y") if p.date_of_birth else "—"
+    scope_str = scope.scope.replace("_", " ").title()
+    if scope.date_from:
+        d_from = scope.date_from.strftime("%d/%m/%Y")
+        d_to = scope.date_to.strftime("%d/%m/%Y") if scope.date_to else "Present"
+        scope_str += f" ({d_from} to {d_to})"
+
+    auto_script = "<script>window.onload = function() { window.print(); };</script>" if auto_print else ""
+
+    meta_parts = []
+    if h.phone:
+        meta_parts.append(f"Tel: {_esc_stmt(h.phone)}")
+    if h.email:
+        meta_parts.append(f"Email: {_esc_stmt(h.email)}")
+    gstin_val = h.gstin or h.tax_identifier
+    if gstin_val:
+        meta_parts.append(f"GSTIN: {_esc_stmt(gstin_val)}")
+    hosp_meta_line = " | ".join(meta_parts)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Billing Statement - {p.uhid} - {statement.statement_id}</title>
+  <style>
+    @page {{ size: A4 portrait; margin: 12mm; }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #111; margin: 0; padding: 12px; font-size: 11px; line-height: 1.4; background: #fff;
+    }}
+    .header-table {{ width: 100%; border-bottom: 2px solid #0f172a; padding-bottom: 10px; margin-bottom: 12px; }}
+    .header-table td {{ vertical-align: top; }}
+    .hosp-title {{ font-size: 18px; font-weight: 800; text-transform: uppercase; margin: 0; color: #0f172a; }}
+    .badge {{
+      display: inline-block; padding: 3px 8px; border: 1px solid #0f172a;
+      font-weight: 700; font-size: 10px; text-transform: uppercase; border-radius: 3px;
+    }}
+    .patient-box {{
+      width: 100%; border: 1px solid #cbd5e1; border-radius: 4px; padding: 10px;
+      margin-bottom: 14px; background: #f8fafc;
+    }}
+    .patient-table {{ width: 100%; border-collapse: collapse; }}
+    .patient-table td {{ padding: 3px 6px; font-size: 11px; }}
+    .patient-table .lbl {{ color: #64748b; font-weight: 600; text-transform: uppercase; font-size: 9px; }}
+    .data-table {{ width: 100%; border-collapse: collapse; margin-bottom: 14px; font-size: 10px; }}
+    .data-table th {{
+      background: #f1f5f9; border-top: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1;
+      padding: 5px 6px; text-align: left; font-weight: 700; text-transform: uppercase; font-size: 9px;
+    }}
+    .data-table td {{ padding: 5px 6px; border-bottom: 1px solid #e2e8f0; }}
+    .summary-box {{
+      width: 100%; border: 1px solid #cbd5e1; border-radius: 4px; padding: 12px; margin-top: 16px;
+      page-break-inside: avoid;
+    }}
+    .summary-table {{ width: 100%; border-collapse: collapse; }}
+    .summary-table td {{ padding: 4px 8px; font-size: 11px; }}
+    .summary-total {{ font-weight: 800; font-size: 12px; border-top: 2px solid #0f172a; border-bottom: 2px solid #0f172a; }}
+    .cert-box {{
+      margin-top: 24px; padding-top: 12px; border-top: 1px solid #e2e8f0; font-size: 9px; color: #64748b;
+      page-break-inside: avoid;
+    }}
+    @media print {{
+      body {{ padding: 0; }}
+      .no-print {{ display: none !important; }}
+    }}
+  </style>
+  {auto_script}
+</head>
+<body>
+  <div class="no-print" style="margin-bottom:12px;text-align:right;">
+    <button onclick="window.print()" style="padding:6px 14px;background:#0284c7;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer;">Print Document</button>
+  </div>
+
+  <table class="header-table">
+    <tr>
+      <td style="width:60%;">
+        <h1 class="hosp-title">{_esc_stmt(h.name)}</h1>
+        <div style="font-size:10px;color:#475569;margin-top:2px;">{_esc_stmt(h.address or '')}</div>
+        <div style="font-size:10px;color:#475569;">
+          {hosp_meta_line}
+        </div>
+      </td>
+      <td style="text-align:right;width:40%;">
+        <span class="badge">Consolidated Billing Statement</span>
+        <div style="font-family:monospace;font-weight:bold;font-size:11px;margin-top:4px;">Ref: {statement.statement_id}</div>
+        <div style="font-size:10px;color:#64748b;">Generated: {gen_time_str}</div>
+        <div style="font-size:10px;color:#64748b;">Scope: <strong>{scope_str}</strong></div>
+      </td>
+    </tr>
+  </table>
+
+  <div class="patient-box">
+    <table class="patient-table">
+      <tr>
+        <td style="width:25%;"><span class="lbl">Patient Name</span><br/><strong>{_esc_stmt(p.name)}</strong></td>
+        <td style="width:25%;"><span class="lbl">UHID</span><br/><strong style="font-family:monospace;">{_esc_stmt(p.uhid)}</strong></td>
+        <td style="width:25%;"><span class="lbl">Age / Gender</span><br/>{f"{p.age} Yrs" if p.age else "—"} / {_esc_stmt(p.gender or "—")}</td>
+        <td style="width:25%;"><span class="lbl">Contact Phone</span><br/>{_esc_stmt(p.mobile or "—")}</td>
+      </tr>
+      <tr>
+        <td><span class="lbl">Date of Birth</span><br/>{dob_str}</td>
+        <td><span class="lbl">Emergency Contact</span><br/>{_esc_stmt(p.emergency_contact or "—")}</td>
+        <td colspan="2"><span class="lbl">Residential Address</span><br/>{_esc_stmt(p.address or "—")}</td>
+      </tr>
+    </table>
+  </div>
+
+  <h3 style="font-size:12px;text-transform:uppercase;margin:0 0 6px 0;letter-spacing:0.5px;">1. Itemized Hospital Services &amp; Charges ({len(statement.charges)})</h3>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Date</th><th>Department</th><th>Service Description</th>
+        <th style="text-align:right;">Qty</th><th style="text-align:right;">Rate</th>
+        <th style="text-align:right;">Discount</th><th style="text-align:right;">Tax</th>
+        <th style="text-align:right;">Net Amount</th><th>Status</th>
+      </tr>
+    </thead>
+    <tbody>{charges_tbody}</tbody>
+  </table>
+
+  <h3 style="font-size:12px;text-transform:uppercase;margin:16px 0 6px 0;letter-spacing:0.5px;">2. Invoices Issued ({len(statement.invoices)})</h3>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Invoice Number</th><th>Invoice Date</th>
+        <th style="text-align:right;">Subtotal</th><th style="text-align:right;">Discount</th>
+        <th style="text-align:right;">Tax</th><th style="text-align:right;">Grand Total</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>{invoices_tbody}</tbody>
+  </table>
+
+  <h3 style="font-size:12px;text-transform:uppercase;margin:16px 0 6px 0;letter-spacing:0.5px;">3. Payments Received &amp; Receipts Issued ({len(statement.payments)})</h3>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Date</th><th>Receipt No</th><th>Payment Method</th><th>Reference No</th><th>Received By</th>
+        <th style="text-align:right;">Amount Settled</th>
+      </tr>
+    </thead>
+    <tbody>{payments_tbody}</tbody>
+  </table>
+
+  {deposits_section}
+  {refunds_section}
+
+  <div class="summary-box">
+    <div style="font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:8px;border-bottom:1px solid #cbd5e1;padding-bottom:4px;">
+      Financial Summary &amp; Ledger Reconciliation (Canonical Accounting)
+    </div>
+    <table class="summary-table">
+      <tr>
+        <td style="width:25%;color:#64748b;">Gross Billed Charges:</td>
+        <td style="width:25%;font-family:monospace;text-align:right;">₹{s.gross_charges:,.2f}</td>
+        <td style="width:25%;color:#64748b;">Total Payments Settled:</td>
+        <td style="width:25%;font-family:monospace;font-weight:bold;text-align:right;color:#166534;">₹{s.total_paid:,.2f}</td>
+      </tr>
+      <tr>
+        <td style="color:#64748b;">Less: Discounts:</td>
+        <td style="font-family:monospace;text-align:right;">- ₹{s.discount_total:,.2f}</td>
+        <td style="color:#64748b;">Advance Deposits Available:</td>
+        <td style="font-family:monospace;text-align:right;">₹{s.deposits_available:,.2f}</td>
+      </tr>
+      <tr>
+        <td style="color:#64748b;">Add: Applicable Taxes:</td>
+        <td style="font-family:monospace;text-align:right;">+ ₹{s.tax_total:,.2f}</td>
+        <td style="color:#64748b;">Total Refunds Processed:</td>
+        <td style="font-family:monospace;text-align:right;">₹{s.total_refunds:,.2f}</td>
+      </tr>
+      <tr class="summary-total">
+        <td>Net Canonical Charges:</td>
+        <td style="font-family:monospace;text-align:right;">₹{s.net_charges:,.2f}</td>
+        <td style="color:#991b1b;">Outstanding Balance:</td>
+        <td style="font-family:monospace;text-align:right;color:#991b1b;">₹{s.outstanding:,.2f}</td>
+      </tr>
+      <tr>
+        <td colspan="2"></td>
+        <td style="font-weight:700;padding-top:6px;">Net Patient Balance:</td>
+        <td style="font-family:monospace;font-weight:700;text-align:right;padding-top:6px;">₹{s.net_patient_balance:,.2f}</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="cert-box">
+    <table style="width:100%;">
+      <tr>
+        <td style="width:65%;vertical-align:bottom;">
+          <strong>Statement Certification</strong><br/>
+          This is an official consolidated billing statement generated from the hospital financial ledger.
+          Original invoice numbers, receipt numbers, and transaction records are preserved as canonical audit references
+          for insurance reimbursement and clinical accounting.
+        </td>
+        <td style="width:35%;text-align:center;vertical-align:bottom;">
+          <div style="border-top:1px dotted #000;padding-top:4px;margin-top:25px;">
+            <strong>Authorized Signatory</strong><br/>
+            Billing &amp; Financial Services
+          </div>
+        </td>
+      </tr>
+    </table>
+  </div>
+</body>
+</html>"""
+
+
+class PrintPatientStatementAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.hospital_id = hospital_id
+
+    def execute(
+        self,
+        patient_id: UUID,
+        *,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        source_type: BillingSourceType | None = None,
+        account_id: UUID | None = None,
+        auto_print: bool = True,
+    ) -> str:
+        statement = GetPatientStatementAction(self.db, self.hospital_id).execute(
+            patient_id=patient_id,
+            date_from=date_from,
+            date_to=date_to,
+            source_type=source_type,
+            account_id=account_id,
+        )
+        return statement_html(statement, auto_print=auto_print)
 
 
 class GetPatientSummaryAction:
@@ -1404,9 +2487,6 @@ class GetPatientSummaryAction:
 
     def execute(self, patient_id: UUID) -> PatientFinancialSummary:
         _get_patient_or_404(self.repo, patient_id)
-        # Same sharing as GetPatientLedgerAction above: one charges fetch and
-        # one payments fetch instead of 2 queries inside patient_ledger_totals
-        # plus 2 more inside build_ledger_entries.
         all_charges = (
             self.db.query(BillingCharge)
             .filter(
@@ -1424,11 +2504,42 @@ class GetPatientSummaryAction:
             )
             .all()
         )
+        deposits = (
+            self.db.query(BillingDeposit)
+            .filter(
+                BillingDeposit.hospital_id == self.repo.hospital_id,
+                BillingDeposit.patient_id == patient_id,
+            )
+            .all()
+        )
+        refunds = (
+            self.db.query(BillingRefund)
+            .filter(
+                BillingRefund.hospital_id == self.repo.hospital_id,
+                BillingRefund.patient_id == patient_id,
+            )
+            .all()
+        )
+        active_deposits = [
+            d for d in deposits
+            if d.status in (DepositStatus.available, DepositStatus.partially_allocated)
+        ]
         totals = patient_ledger_totals(
-            self.db, self.repo.hospital_id, patient_id, charges=non_cancelled_charges, payments=payments
+            self.db,
+            self.repo.hospital_id,
+            patient_id,
+            charges=non_cancelled_charges,
+            payments=payments,
+            deposits=active_deposits,
         )
         entries = build_ledger_entries(
-            self.db, self.repo.hospital_id, patient_id, charges=all_charges, payments=payments
+            self.db,
+            self.repo.hospital_id,
+            patient_id,
+            charges=all_charges,
+            payments=payments,
+            deposits=deposits,
+            refunds=refunds,
         )[:10]
         return PatientFinancialSummary(
             patient_id=patient_id,
@@ -1436,6 +2547,72 @@ class GetPatientSummaryAction:
             total_paid=totals["total_paid"],
             outstanding=totals["outstanding"],
             recent_entries=[LedgerEntry.model_validate(e) for e in entries],
+        )
+
+
+class GetPatientDuesAction:
+    """Lightweight dues query for the Record Payment modal.
+    
+    Returns only open (pending/partially_paid) charges, outstanding balance,
+    available advance deposits, and active invoices containing those charges.
+    Eliminates fetching historical receipts, payments, and timeline entries.
+    """
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(self, patient_id: UUID) -> PatientDuesResponse:
+        patient = _get_patient_or_404(self.repo, patient_id)
+        open_charges = (
+            self.db.query(BillingCharge)
+            .filter(
+                BillingCharge.hospital_id == self.repo.hospital_id,
+                BillingCharge.patient_id == patient_id,
+                BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
+            )
+            .order_by(BillingCharge.created_at.asc())
+            .all()
+        )
+        outstanding = round(
+            sum(max(0.0, float(c.net_amount or 0) - float(c.amount_paid or 0)) for c in open_charges),
+            2,
+        )
+        total_deposits_avail = float(
+            self.db.query(func.coalesce(func.sum(BillingDeposit.available_amount), 0.0))
+            .filter(
+                BillingDeposit.hospital_id == self.repo.hospital_id,
+                BillingDeposit.patient_id == patient_id,
+                BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
+            )
+            .scalar()
+            or 0.0
+        )
+
+        modal_invoices: list[BillingInvoice] = []
+        open_charge_ids = [c.id for c in open_charges]
+        if open_charge_ids:
+            modal_invoices = (
+                self.db.query(BillingInvoice)
+                .options(selectinload(BillingInvoice.lines))
+                .join(BillingInvoiceLine, BillingInvoiceLine.invoice_id == BillingInvoice.id)
+                .filter(
+                    BillingInvoice.hospital_id == self.repo.hospital_id,
+                    BillingInvoice.patient_id == patient_id,
+                    BillingInvoice.status != BillingInvoiceStatus.cancelled,
+                    BillingInvoiceLine.charge_id.in_(open_charge_ids),
+                )
+                .distinct()
+                .all()
+            )
+
+        return PatientDuesResponse(
+            patient_id=patient_id,
+            patient_name=patient.name,
+            patient_uhid=patient.uhid,
+            outstanding=outstanding,
+            total_deposits_available=round(total_deposits_avail, 2),
+            pending_charges=[BillingChargeResponse.model_validate(charge_to_dict(c, patient)) for c in open_charges],
+            modal_invoices=[BillingInvoiceResponse.model_validate(invoice_to_dict(inv, patient)) for inv in modal_invoices],
         )
 
 
@@ -1450,19 +2627,18 @@ class GetBillingDashboardAction:
         today_end = datetime.combine(date.today(), time.max).replace(tzinfo=timezone.utc)
         today = date.today()
 
-        # All 5 of these scan billing_charges for this hospital_id — collapsed
-        # into one conditional-aggregation query (was 5 separate round trips).
-        # outstanding_by_cat below stays a separate GROUP BY query: combining a
-        # scalar-aggregate query with a grouped one needs a window function or
-        # UNION, which isn't worth the added complexity for one extra round
-        # trip that's already a single efficient query on its own (see the
-        # revised optimization plan, "be careful with query consolidation").
+        # Consolidate Charges, Payments, Invoices, and Receipts metrics into a single
+        # set-based database round trip (collapses 4 separate round trips into 1).
+        # This preserves strict tenant isolation (hid), identical financial definitions,
+        # and exact date boundaries.
         is_today = (BillingCharge.created_at >= today_start) & (BillingCharge.created_at <= today_end)
         not_cancelled = BillingCharge.status != BillingChargeStatus.cancelled
-        charge_row = (
-            self.db.query(
-                func.coalesce(func.sum(case((is_today & not_cancelled, BillingCharge.net_amount), else_=0.0)), 0.0),
-                func.coalesce(func.sum(case((not_cancelled, BillingCharge.net_amount), else_=0.0)), 0.0),
+
+        sq_charges = (
+            select(
+                literal(1).label("join_key"),
+                func.coalesce(func.sum(case((is_today & not_cancelled, BillingCharge.net_amount), else_=0.0)), 0.0).label("todays_charges"),
+                func.coalesce(func.sum(case((not_cancelled, BillingCharge.net_amount), else_=0.0)), 0.0).label("total_charges"),
                 func.coalesce(
                     func.sum(
                         case(
@@ -1476,13 +2652,13 @@ class GetBillingDashboardAction:
                         )
                     ),
                     0,
-                ),
+                ).label("pending_count"),
                 func.coalesce(
                     func.sum(
                         case((is_today & not_cancelled & (BillingCharge.source_type == BillingSourceType.ot), BillingCharge.net_amount), else_=0.0)
                     ),
                     0.0,
-                ),
+                ).label("todays_ot"),
                 func.coalesce(
                     func.sum(
                         case(
@@ -1496,16 +2672,15 @@ class GetBillingDashboardAction:
                         )
                     ),
                     0.0,
-                ),
+                ).label("todays_ipd"),
             )
-            .filter(BillingCharge.hospital_id == hid)
-            .one()
+            .where(BillingCharge.hospital_id == hid)
+            .subquery()
         )
-        todays_charges, total_charges, pending_count, todays_ot, todays_ipd = charge_row
 
-        # todays_collections + total_paid both scan billing_payments — 1 query.
-        payment_row = (
-            self.db.query(
+        sq_payments = (
+            select(
+                literal(1).label("join_key"),
                 func.coalesce(
                     func.sum(
                         case(
@@ -1517,13 +2692,76 @@ class GetBillingDashboardAction:
                         )
                     ),
                     0.0,
-                ),
-                func.coalesce(func.sum(BillingPayment.amount), 0.0),
+                ).label("todays_collections"),
+                func.coalesce(func.sum(BillingPayment.amount), 0.0).label("total_paid"),
             )
-            .filter(BillingPayment.hospital_id == hid)
-            .one()
+            .where(BillingPayment.hospital_id == hid)
+            .subquery()
         )
-        todays_collections, total_paid = payment_row
+
+        sq_invoices = (
+            select(
+                literal(1).label("join_key"),
+                func.coalesce(
+                    func.sum(case((BillingInvoice.invoice_date == today, 1), else_=0)), 0
+                ).label("today_inv_count"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (BillingInvoice.status != BillingInvoiceStatus.cancelled, BillingInvoice.grand_total),
+                            else_=0.0,
+                        )
+                    ),
+                    0.0,
+                ).label("total_inv"),
+            )
+            .where(BillingInvoice.hospital_id == hid)
+            .subquery()
+        )
+
+        sq_receipts = (
+            select(
+                literal(1).label("join_key"),
+                func.coalesce(func.count(BillingReceipt.id), 0).label("today_rcpt_count"),
+            )
+            .where(BillingReceipt.hospital_id == hid, BillingReceipt.payment_date == today)
+            .subquery()
+        )
+
+        comb_metrics_stmt = (
+            select(
+                sq_charges.c.todays_charges,
+                sq_charges.c.total_charges,
+                sq_charges.c.pending_count,
+                sq_charges.c.todays_ot,
+                sq_charges.c.todays_ipd,
+                sq_payments.c.todays_collections,
+                sq_payments.c.total_paid,
+                sq_invoices.c.today_inv_count,
+                sq_invoices.c.total_inv,
+                sq_receipts.c.today_rcpt_count,
+            )
+            .select_from(
+                sq_charges
+                .join(sq_payments, sq_charges.c.join_key == sq_payments.c.join_key)
+                .join(sq_invoices, sq_charges.c.join_key == sq_invoices.c.join_key)
+                .join(sq_receipts, sq_charges.c.join_key == sq_receipts.c.join_key)
+            )
+        )
+
+        metrics_row = self.db.execute(comb_metrics_stmt).one()
+        (
+            todays_charges,
+            total_charges,
+            pending_count,
+            todays_ot,
+            todays_ipd,
+            todays_collections,
+            total_paid,
+            today_inv_count,
+            total_inv,
+            today_rcpt_count,
+        ) = metrics_row
         outstanding_total = round(max(0.0, float(total_charges) - float(total_paid)), 2)
 
         # Outstanding by category
@@ -1541,37 +2779,9 @@ class GetBillingDashboardAction:
             for r in cat_rows
         }
 
-        # today_inv_count + total_inv both scan billing_invoices — 1 query.
-        invoice_row = (
-            self.db.query(
-                func.coalesce(
-                    func.sum(case((BillingInvoice.invoice_date == today, 1), else_=0)), 0
-                ),
-                func.coalesce(
-                    func.sum(
-                        case(
-                            (BillingInvoice.status != BillingInvoiceStatus.cancelled, BillingInvoice.grand_total),
-                            else_=0.0,
-                        )
-                    ),
-                    0.0,
-                ),
-            )
-            .filter(BillingInvoice.hospital_id == hid)
-            .one()
-        )
-        today_inv_count, total_inv = invoice_row
-
-        today_rcpt_count = (
-            self.db.query(func.count(BillingReceipt.id))
-            .filter(BillingReceipt.hospital_id == hid, BillingReceipt.payment_date == today)
-            .scalar()
-            or 0
-        )
-
         recent_charges = (
             self.db.query(BillingCharge)
-            .options(joinedload(BillingCharge.patient))
+            .options(joinedload(BillingCharge.patient), joinedload(BillingCharge.account))
             .filter(BillingCharge.hospital_id == hid, BillingCharge.status != BillingChargeStatus.cancelled)
             .order_by(BillingCharge.created_at.desc())
             .limit(5)
@@ -1579,7 +2789,10 @@ class GetBillingDashboardAction:
         )
         recent_payments = (
             self.db.query(BillingPayment)
-            .options(joinedload(BillingPayment.patient))
+            .options(
+                joinedload(BillingPayment.patient),
+                joinedload(BillingPayment.allocations).joinedload(BillingPaymentAllocation.charge),
+            )
             .filter(BillingPayment.hospital_id == hid)
             .order_by(BillingPayment.created_at.desc())
             .limit(5)

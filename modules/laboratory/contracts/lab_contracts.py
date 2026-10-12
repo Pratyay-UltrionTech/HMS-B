@@ -312,6 +312,8 @@ class SampleCollectRequest(BaseModel):
 
 class ItemStatusUpdate(BaseModel):
     status: LabItemStatus
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class LabResultInput(BaseModel):
@@ -334,6 +336,8 @@ class LabReportSaveRequest(BaseModel):
     results: list[LabResultInput] = Field(min_length=1)
     mark_completed: bool = True
     amendment_reason: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class LabDashboardResponse(BaseModel):

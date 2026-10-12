@@ -81,6 +81,7 @@ def apply_cancel_lab_prescription_request(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Completed prescription requests cannot be cancelled",
         )
+    assert_lab_request_cancellable(db, req)
     req.status = LabPrescriptionRequestStatus.cancelled
     req.cancel_reason = reason.strip() if reason else "Cancelled by staff"
     for item in req.items or []:
@@ -190,6 +191,125 @@ def sync_request_after_order_change(db: Session, order: LabOrder) -> None:
         req.status = LabPrescriptionRequestStatus.partially_processed
 
 
+# ── Canonical request charge ─────────────────────────────────────────────────
+# A prescription request owns exactly one charge (source_id = request.id), billing
+# its pending + ordered items. Orders created from the request resolve that charge
+# through ``service_charge_resolver``; the key is never re-pointed.
+
+BILLABLE_REQUEST_ITEM_STATUSES = frozenset({LabRequestItemStatus.pending, LabRequestItemStatus.ordered})
+
+
+def lab_request_billable_items(req: LabPrescriptionRequest) -> list[LabPrescriptionRequestItem]:
+    return [i for i in (req.items or []) if i.status in BILLABLE_REQUEST_ITEM_STATUSES]
+
+
+def lab_request_billable_total(req: LabPrescriptionRequest) -> float:
+    # Panel prices are not applied: a panel bills the sum of its member test prices.
+    return round(sum(float(i.price or 0.0) for i in lab_request_billable_items(req)), 2)
+
+
+def lab_request_charge_description(req: LabPrescriptionRequest) -> str:
+    names = [i.test_name for i in lab_request_billable_items(req) if i.test_name]
+    return f"Lab Investigation — {', '.join(names)}"[:512]
+
+
+def lab_request_account_id(db: Session, req: LabPrescriptionRequest, created_by_name: str = "Prescription Order") -> UUID | None:
+    from modules.billing.services.episode_account_service import resolve_episode_account
+
+    return resolve_episode_account(
+        db,
+        req.hospital_id,
+        req.patient_id,
+        admission_id=req.admission_id,
+        created_by_name=created_by_name,
+    ).account_id
+
+
+def ensure_lab_request_charge(db: Session, req: LabPrescriptionRequest, *, created_by_name: str = "Prescription Order"):
+    """Create the request's canonical charge if it has no active one (create-only)."""
+    from modules.billing.entities.billing_entities import BillingSourceType
+    from modules.billing.services.service_charge_resolver import (
+        ensure_service_charge,
+        resolve_active_service_charge,
+    )
+
+    existing = resolve_active_service_charge(db, req.hospital_id, BillingSourceType.laboratory, req.id)
+    if existing is not None:
+        return existing
+    total = lab_request_billable_total(req)
+    if total <= 0 and not lab_request_billable_items(req):
+        return None
+    return ensure_service_charge(
+        db,
+        hospital_id=req.hospital_id,
+        patient_id=req.patient_id,
+        source_type=BillingSourceType.laboratory,
+        source_id=req.id,
+        description=lab_request_charge_description(req),
+        charge_amount=total,
+        account_id=lab_request_account_id(db, req, created_by_name),
+        created_by_name=created_by_name,
+    )
+
+
+def sync_lab_request_charge(
+    db: Session,
+    req: LabPrescriptionRequest,
+    *,
+    reason: str,
+    actor: dict | None = None,
+    created_by_name: str = "Prescription Order",
+):
+    """Re-price the request's single canonical charge to its billable items (create it
+    if missing, cancel it canonically when nothing billable remains)."""
+    from modules.billing.entities.billing_entities import BillingSourceType
+    from modules.billing.services.service_charge_resolver import sync_service_charge_amount
+
+    db.flush()
+    db.refresh(req, attribute_names=["items"])
+    return sync_service_charge_amount(
+        db,
+        hospital_id=req.hospital_id,
+        patient_id=req.patient_id,
+        source_type=BillingSourceType.laboratory,
+        source_id=req.id,
+        charge_amount=lab_request_billable_total(req),
+        description=lab_request_charge_description(req),
+        reason=reason,
+        actor=actor,
+        account_id=lab_request_account_id(db, req, created_by_name),
+        created_by_name=created_by_name,
+    )
+
+
+def lab_request_live_order(db: Session, req: LabPrescriptionRequest) -> LabOrder | None:
+    """A non-cancelled (open or completed) order fulfilling this request, if any."""
+    return (
+        db.query(LabOrder)
+        .filter(
+            LabOrder.hospital_id == req.hospital_id,
+            LabOrder.prescription_request_id == req.id,
+            LabOrder.status != LabOrderStatus.cancelled,
+        )
+        .order_by(LabOrder.ordered_at.desc())
+        .first()
+    )
+
+
+def assert_lab_request_cancellable(db: Session, req: LabPrescriptionRequest) -> None:
+    """A request whose order is still live can't be cancelled as a whole: its charge
+    also bills that order. Cancel the order first (the request returns to pending)."""
+    live = lab_request_live_order(db, req)
+    if live is not None and req.status != LabPrescriptionRequestStatus.cancelled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Lab request is being fulfilled by order {live.order_no} ({live.status.value}). "
+                "Cancel the order first, or mark individual pending tests unavailable."
+            ),
+        )
+
+
 def is_lab_request_released(db: Session, req: LabPrescriptionRequest) -> bool:
     """Check if a LabPrescriptionRequest is operationally released to the lab queue."""
     if req.status == LabPrescriptionRequestStatus.cancelled:
@@ -211,35 +331,47 @@ def is_lab_request_released(db: Session, req: LabPrescriptionRequest) -> bool:
     return bool(exc)
 
 
-def request_to_response_dict(req: LabPrescriptionRequest, db: Session | None = None) -> dict[str, Any]:
+def request_to_response_dict(
+    req: LabPrescriptionRequest,
+    db: Session | None = None,
+    financial_state: Any | None = None,
+    exception_cleared: bool | None = None,
+) -> dict[str, Any]:
     items = sorted(req.items or [], key=lambda i: (i.sort_order, str(i.id)))
     panels = request_panel_names(req)
     payment_status = "pending"
     is_financially_cleared = False
     outstanding_amount = 0.0
 
-    target_db = db or (req._sa_instance_state.session if hasattr(req, "_sa_instance_state") else None)
-    if target_db:
-        try:
-            from modules.billing.entities.billing_entities import BillingSourceType
-            from modules.billing.services.service_financial_clearance import check_service_financial_clearance
-            fin = check_service_financial_clearance(target_db, req.hospital_id, BillingSourceType.laboratory, req.id)
-            payment_status = fin.status
-            is_em = bool(getattr(req, "is_emergency", False))
-            is_financially_cleared = fin.is_cleared or is_em
-            if not is_financially_cleared:
-                from modules.billing.entities.financial_exception import FinancialClearanceException, FinancialExceptionStatus
-                exc = target_db.query(FinancialClearanceException).filter(
-                    FinancialClearanceException.hospital_id == req.hospital_id,
-                    FinancialClearanceException.source_id == req.id,
-                    FinancialClearanceException.status == FinancialExceptionStatus.approved.value,
-                    FinancialClearanceException.is_consumed == False,
-                ).first()
-                if exc:
-                    is_financially_cleared = True
-            outstanding_amount = fin.outstanding_amount
-        except Exception:
-            pass
+    if financial_state is not None:
+        payment_status = getattr(financial_state, "status", "pending")
+        is_em = bool(getattr(req, "is_emergency", False))
+        is_fin_cleared = bool(getattr(financial_state, "is_cleared", False))
+        is_financially_cleared = is_fin_cleared or is_em or bool(exception_cleared)
+        outstanding_amount = float(getattr(financial_state, "outstanding_amount", 0.0) or 0.0)
+    else:
+        target_db = db or (req._sa_instance_state.session if hasattr(req, "_sa_instance_state") else None)
+        if target_db:
+            try:
+                from modules.billing.entities.billing_entities import BillingSourceType
+                from modules.billing.services.service_financial_clearance import check_service_financial_clearance
+                fin = check_service_financial_clearance(target_db, req.hospital_id, BillingSourceType.laboratory, req.id)
+                payment_status = fin.status
+                is_em = bool(getattr(req, "is_emergency", False))
+                is_financially_cleared = fin.is_cleared or is_em
+                if not is_financially_cleared:
+                    from modules.billing.entities.financial_exception import FinancialClearanceException, FinancialExceptionStatus
+                    exc = target_db.query(FinancialClearanceException).filter(
+                        FinancialClearanceException.hospital_id == req.hospital_id,
+                        FinancialClearanceException.source_id == req.id,
+                        FinancialClearanceException.status == FinancialExceptionStatus.approved.value,
+                        FinancialClearanceException.is_consumed == False,
+                    ).first()
+                    if exc:
+                        is_financially_cleared = True
+                outstanding_amount = fin.outstanding_amount
+            except Exception:
+                pass
 
     return {
         "id": req.id,
@@ -294,6 +426,110 @@ def request_to_response_dict(req: LabPrescriptionRequest, db: Session | None = N
     }
 
 
+def _new_lab_request(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    prescription_id: UUID,
+    patient_id: UUID,
+    doctor_id: UUID,
+    appointment_id: UUID | None,
+    admission_id: UUID | None,
+    tests_resolved: list,
+    test_ids: list[UUID],
+    panel_ids: list[UUID],
+    clinical_notes: str | None,
+) -> LabPrescriptionRequest:
+    lab_req = LabPrescriptionRequest(
+        hospital_id=hospital_id,
+        prescription_id=prescription_id,
+        patient_id=patient_id,
+        doctor_id=doctor_id,
+        appointment_id=appointment_id,
+        admission_id=admission_id,
+        status=LabPrescriptionRequestStatus.pending,
+        prescribed_test_ids=[str(tid) for tid in test_ids],
+        prescribed_panel_ids=[str(pid) for pid in panel_ids],
+        clinical_notes=clinical_notes,
+    )
+    db.add(lab_req)
+    db.flush()
+    for idx, r in enumerate(tests_resolved):
+        t = r.test
+        db.add(
+            LabPrescriptionRequestItem(
+                hospital_id=hospital_id,
+                request_id=lab_req.id,
+                test_id=t.id,
+                panel_id=r.panel.id if r.panel else None,
+                panel_name=r.panel.panel_name if r.panel else None,
+                test_code=t.test_code,
+                test_name=t.test_name,
+                department=t.department,
+                price=t.price,
+                sort_order=idx,
+                status=LabRequestItemStatus.pending,
+            )
+        )
+    db.flush()
+    db.refresh(lab_req, attribute_names=["items"])
+    ensure_lab_request_charge(db, lab_req)
+    return lab_req
+
+
+def _new_rad_request(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    prescription_id: UUID,
+    patient_id: UUID,
+    doctor_id: UUID,
+    appointment_id: UUID | None,
+    admission_id: UUID | None,
+    scans_resolved: list,
+    clinical_notes: str | None,
+):
+    from modules.radiology.entities.radiology_entities import (
+        RadPrescriptionRequest,
+        RadPrescriptionRequestItem,
+        RadPrescriptionRequestStatus,
+        RadRequestItemStatus,
+    )
+    from modules.radiology.services.rad_prescription_service import ensure_rad_request_charge
+
+    rad_req = RadPrescriptionRequest(
+        hospital_id=hospital_id,
+        prescription_id=prescription_id,
+        patient_id=patient_id,
+        doctor_id=doctor_id,
+        appointment_id=appointment_id,
+        admission_id=admission_id,
+        status=RadPrescriptionRequestStatus.pending,
+        prescribed_scan_ids=[str(s.id) for s in scans_resolved],
+        clinical_notes=clinical_notes,
+    )
+    db.add(rad_req)
+    db.flush()
+    for idx, s in enumerate(scans_resolved):
+        db.add(
+            RadPrescriptionRequestItem(
+                hospital_id=hospital_id,
+                request_id=rad_req.id,
+                scan_id=s.id,
+                scan_code=s.scan_code,
+                scan_name=s.scan_name,
+                category=s.category,
+                price=s.price,
+                sort_order=idx,
+                status=RadRequestItemStatus.pending,
+            )
+        )
+    db.flush()
+    db.refresh(rad_req, attribute_names=["items"])
+    ensure_rad_request_charge(db, rad_req)
+    return rad_req
+
+
 def create_investigation_requests_for_prescription(
     db: Session,
     *,
@@ -309,12 +545,20 @@ def create_investigation_requests_for_prescription(
     clinical_notes: str | None = None,
 ) -> tuple[LabPrescriptionRequest | None, Any | None]:
     """
-    Create lab investigation request (and order) when doctor prescribes tests.
-    Also handles radiology scan order creation when scan_ids are present.
-    Creates corresponding BillingCharge records so investigations enter billing queue immediately.
+    Create lab / radiology investigation requests when a doctor prescribes tests.
+
+    Each request gets its single canonical BillingCharge (source_id = request.id) so the
+    investigation enters the billing queue immediately. Work belonging to an admission
+    (explicit ``admission_id``, or an appointment transferred into one) is linked to the
+    admission and billed on its IPD FinancialAccount.
     """
-    from modules.billing.entities.billing_entities import BillingSourceType
-    from modules.billing.services.billing_service import ensure_charge
+    from modules.billing.services.episode_account_service import resolve_episode_admission_id
+
+    episode_admission_id = None
+    if test_ids or panel_ids or scan_ids:
+        episode_admission_id = resolve_episode_admission_id(
+            db, hospital_id, patient_id, admission_id=admission_id, appointment_id=appointment_id
+        )
 
     lab_req = None
     if test_ids or panel_ids:
@@ -322,138 +566,36 @@ def create_investigation_requests_for_prescription(
             db, hospital_id, test_ids, panel_ids, require_non_empty=False
         )
         if tests_resolved:
-            lab_req = LabPrescriptionRequest(
+            lab_req = _new_lab_request(
+                db,
                 hospital_id=hospital_id,
                 prescription_id=prescription_id,
                 patient_id=patient_id,
                 doctor_id=doctor_id,
                 appointment_id=appointment_id,
-                admission_id=admission_id,
-                status=LabPrescriptionRequestStatus.pending,
-                prescribed_test_ids=[str(tid) for tid in (test_ids or [])],
-                prescribed_panel_ids=[str(pid) for pid in (panel_ids or [])],
+                admission_id=episode_admission_id,
+                tests_resolved=tests_resolved,
+                test_ids=list(test_ids or []),
+                panel_ids=list(panel_ids or []),
                 clinical_notes=clinical_notes,
-            )
-            db.add(lab_req)
-            db.flush()
-
-            for idx, r in enumerate(tests_resolved):
-                t = r.test
-                item = LabPrescriptionRequestItem(
-                    hospital_id=hospital_id,
-                    request_id=lab_req.id,
-                    test_id=t.id,
-                    panel_id=r.panel.id if r.panel else None,
-                    panel_name=r.panel.panel_name if r.panel else None,
-                    test_code=t.test_code,
-                    test_name=t.test_name,
-                    department=t.department,
-                    price=t.price,
-                    sort_order=idx,
-                    status=LabRequestItemStatus.pending,
-                )
-                db.add(item)
-            db.flush()
-
-            # Auto-create BillingCharge so billing receives investigation immediately
-            lab_total = round(sum(float(r.test.price or 0.0) for r in tests_resolved), 2)
-            desc_names = [r.test.test_name for r in tests_resolved]
-            inv_account_id = None
-            if admission_id:
-                from modules.billing.entities.billing_entities import FinancialAccountType
-                from modules.billing.services.billing_service import get_or_create_financial_account
-                inv_acc = get_or_create_financial_account(
-                    db,
-                    hospital_id=hospital_id,
-                    patient_id=patient_id,
-                    account_type=FinancialAccountType.ipd,
-                    admission_id=admission_id,
-                    created_by_name="Prescription Order",
-                )
-                inv_account_id = inv_acc.id
-
-            ensure_charge(
-                db,
-                hospital_id=hospital_id,
-                patient_id=patient_id,
-                source_type=BillingSourceType.laboratory,
-                source_id=lab_req.id,
-                description=f"Lab Investigation — {', '.join(desc_names)}"[:512],
-                charge_amount=lab_total,
-                account_id=inv_account_id,
-                created_by_name="Prescription Order",
             )
 
     rad_req = None
     if scan_ids:
-        from modules.radiology.entities.radiology_entities import (
-            RadPrescriptionRequest,
-            RadPrescriptionRequestItem,
-            RadPrescriptionRequestStatus,
-            RadRequestItemStatus,
-        )
-        from modules.radiology.services.rad_prescription_service import (
-            resolve_rad_selection,
-        )
+        from modules.radiology.services.rad_prescription_service import resolve_rad_selection
 
         scans_resolved = resolve_rad_selection(db, hospital_id, scan_ids)
         if scans_resolved:
-            rad_req = RadPrescriptionRequest(
+            rad_req = _new_rad_request(
+                db,
                 hospital_id=hospital_id,
                 prescription_id=prescription_id,
                 patient_id=patient_id,
                 doctor_id=doctor_id,
                 appointment_id=appointment_id,
-                admission_id=admission_id,
-                status=RadPrescriptionRequestStatus.pending,
-                prescribed_scan_ids=[str(sid) for sid in (scan_ids or [])],
+                admission_id=episode_admission_id,
+                scans_resolved=scans_resolved,
                 clinical_notes=clinical_notes,
-            )
-            db.add(rad_req)
-            db.flush()
-
-            for idx, s in enumerate(scans_resolved):
-                item = RadPrescriptionRequestItem(
-                    hospital_id=hospital_id,
-                    request_id=rad_req.id,
-                    scan_id=s.id,
-                    scan_code=s.scan_code,
-                    scan_name=s.scan_name,
-                    category=s.category,
-                    price=s.price,
-                    sort_order=idx,
-                    status=RadRequestItemStatus.pending,
-                )
-                db.add(item)
-            db.flush()
-
-            # Auto-create BillingCharge for radiology
-            rad_total = round(sum(float(s.price or 0.0) for s in scans_resolved), 2)
-            scan_names = [s.scan_name for s in scans_resolved]
-            rad_inv_account_id = None
-            if admission_id:
-                from modules.billing.entities.billing_entities import FinancialAccountType
-                from modules.billing.services.billing_service import get_or_create_financial_account
-                rad_inv_acc = get_or_create_financial_account(
-                    db,
-                    hospital_id=hospital_id,
-                    patient_id=patient_id,
-                    account_type=FinancialAccountType.ipd,
-                    admission_id=admission_id,
-                    created_by_name="Prescription Order",
-                )
-                rad_inv_account_id = rad_inv_acc.id
-
-            ensure_charge(
-                db,
-                hospital_id=hospital_id,
-                patient_id=patient_id,
-                source_type=BillingSourceType.radiology,
-                source_id=rad_req.id,
-                description=f"Radiology Investigation — {', '.join(scan_names)}"[:512],
-                charge_amount=rad_total,
-                account_id=rad_inv_account_id,
-                created_by_name="Prescription Order",
             )
 
     return lab_req, rad_req
@@ -539,48 +681,292 @@ def prescription_investigation_names(
     return lab_names, rad_names
 
 
+def _parse_uuid_list(values) -> list[UUID]:
+    out: list[UUID] = []
+    for v in values or []:
+        try:
+            out.append(UUID(str(v)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def get_prescription_investigation_ids(
     db: Session, rx_id: UUID
 ) -> tuple[list[UUID], list[UUID], list[UUID]]:
-    """Retrieve the current test_ids, panel_ids, and scan_ids for a prescription."""
+    """Current test_ids, panel_ids and scan_ids across every live request of a prescription
+    (an edit can add a supplementary request next to one that is already in the lab)."""
+    from modules.radiology.entities.radiology_entities import (
+        RadPrescriptionRequest,
+        RadPrescriptionRequestStatus,
+    )
+
     test_ids: list[UUID] = []
     panel_ids: list[UUID] = []
     scan_ids: list[UUID] = []
 
-    lab_req = (
+    lab_reqs = (
         db.query(LabPrescriptionRequest)
-        .filter(LabPrescriptionRequest.prescription_id == rx_id)
-        .first()
-    )
-    if lab_req:
-        for tid_str in (lab_req.prescribed_test_ids or []):
-            try:
-                test_ids.append(UUID(str(tid_str)))
-            except Exception:
-                pass
-        for pid_str in (lab_req.prescribed_panel_ids or []):
-            try:
-                panel_ids.append(UUID(str(pid_str)))
-            except Exception:
-                pass
-
-    try:
-        from modules.radiology.entities.radiology_entities import RadPrescriptionRequest
-        rad_req = (
-            db.query(RadPrescriptionRequest)
-            .filter(RadPrescriptionRequest.prescription_id == rx_id)
-            .first()
+        .filter(
+            LabPrescriptionRequest.prescription_id == rx_id,
+            LabPrescriptionRequest.status != LabPrescriptionRequestStatus.cancelled,
         )
-        if rad_req:
-            for sid_str in (rad_req.prescribed_scan_ids or []):
-                try:
-                    scan_ids.append(UUID(str(sid_str)))
-                except Exception:
-                    pass
-    except Exception:
-        pass
+        .order_by(LabPrescriptionRequest.created_at.asc())
+        .all()
+    )
+    for req in lab_reqs:
+        for tid in _parse_uuid_list(req.prescribed_test_ids):
+            if tid not in test_ids:
+                test_ids.append(tid)
+        for pid in _parse_uuid_list(req.prescribed_panel_ids):
+            if pid not in panel_ids:
+                panel_ids.append(pid)
+
+    rad_reqs = (
+        db.query(RadPrescriptionRequest)
+        .filter(
+            RadPrescriptionRequest.prescription_id == rx_id,
+            RadPrescriptionRequest.status != RadPrescriptionRequestStatus.cancelled,
+        )
+        .order_by(RadPrescriptionRequest.created_at.asc())
+        .all()
+    )
+    for req in rad_reqs:
+        for sid in _parse_uuid_list(req.prescribed_scan_ids):
+            if sid not in scan_ids:
+                scan_ids.append(sid)
 
     return test_ids, panel_ids, scan_ids
+
+
+def _refresh_lab_prescribed_ids(req: LabPrescriptionRequest) -> None:
+    items = [i for i in (req.items or []) if i.status != LabRequestItemStatus.cancelled]
+    req.prescribed_test_ids = list(dict.fromkeys(str(i.test_id) for i in items if i.panel_id is None))
+    req.prescribed_panel_ids = list(dict.fromkeys(str(i.panel_id) for i in items if i.panel_id is not None))
+
+
+def _update_lab_requests_for_prescription(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    doctor_id: UUID,
+    patient_id: UUID,
+    appointment_id: UUID | None,
+    admission_id: UUID | None,
+    prescription_id: UUID,
+    test_ids: list[UUID],
+    panel_ids: list[UUID],
+    clinical_notes: str | None,
+    actor: dict | None,
+) -> None:
+    reqs = (
+        db.query(LabPrescriptionRequest)
+        .options(joinedload(LabPrescriptionRequest.items))
+        .filter(
+            LabPrescriptionRequest.hospital_id == hospital_id,
+            LabPrescriptionRequest.prescription_id == prescription_id,
+            LabPrescriptionRequest.status != LabPrescriptionRequestStatus.cancelled,
+        )
+        .order_by(LabPrescriptionRequest.created_at.asc())
+        .all()
+    )
+    tests_resolved = resolve_lab_selection(db, hospital_id, test_ids, panel_ids, require_non_empty=False)
+    target = {(r.test.id, r.panel.id if r.panel else None): r for r in tests_resolved}
+
+    touched: dict[UUID, LabPrescriptionRequest] = {}
+    existing_keys: set[tuple] = set()
+    for req in reqs:
+        for item in list(req.items or []):
+            key = (item.test_id, item.panel_id)
+            if item.status == LabRequestItemStatus.cancelled:
+                continue
+            if key in target:
+                existing_keys.add(key)
+                continue
+            # Removed by the doctor: only not-yet-accessioned work is withdrawn; tests
+            # already in the lab (ordered) keep their order and remain billed.
+            if item.status == LabRequestItemStatus.pending:
+                req.items.remove(item)
+                touched[req.id] = req
+
+    additions = [(key, r) for key, r in target.items() if key not in existing_keys]
+    if additions:
+        host = next(
+            (
+                r
+                for r in reqs
+                if r.status == LabPrescriptionRequestStatus.pending and lab_request_live_order(db, r) is None
+            ),
+            None,
+        )
+        if host is not None:
+            start = len(host.items or [])
+            for idx, (_key, r) in enumerate(additions):
+                t = r.test
+                host.items.append(
+                    LabPrescriptionRequestItem(
+                        hospital_id=hospital_id,
+                        request_id=host.id,
+                        test_id=t.id,
+                        panel_id=r.panel.id if r.panel else None,
+                        panel_name=r.panel.panel_name if r.panel else None,
+                        test_code=t.test_code,
+                        test_name=t.test_name,
+                        department=t.department,
+                        price=t.price,
+                        sort_order=start + idx,
+                        status=LabRequestItemStatus.pending,
+                    )
+                )
+            touched[host.id] = host
+        else:
+            # Every existing request is already in the lab: bill the added tests on a
+            # supplementary request so paid, in-flight orders keep their clearance.
+            from modules.billing.services.episode_account_service import resolve_episode_admission_id
+
+            added = [r for _key, r in additions]
+            _new_lab_request(
+                db,
+                hospital_id=hospital_id,
+                prescription_id=prescription_id,
+                patient_id=patient_id,
+                doctor_id=doctor_id,
+                appointment_id=appointment_id,
+                admission_id=resolve_episode_admission_id(
+                    db, hospital_id, patient_id, admission_id=admission_id, appointment_id=appointment_id
+                ),
+                tests_resolved=added,
+                test_ids=list(dict.fromkeys(r.test.id for r in added if r.panel is None)),
+                panel_ids=list(dict.fromkeys(r.panel.id for r in added if r.panel is not None)),
+                clinical_notes=clinical_notes,
+            )
+
+    for req in touched.values():
+        if clinical_notes is not None:
+            req.clinical_notes = clinical_notes
+        db.flush()
+        _refresh_lab_prescribed_ids(req)
+        if not lab_request_billable_items(req):
+            req.status = LabPrescriptionRequestStatus.cancelled
+            req.cancel_reason = "All tests removed from prescription"
+        sync_lab_request_charge(
+            db,
+            req,
+            reason="Prescription edited: lab investigations changed",
+            actor=actor,
+        )
+
+
+def _update_rad_requests_for_prescription(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    doctor_id: UUID,
+    patient_id: UUID,
+    appointment_id: UUID | None,
+    admission_id: UUID | None,
+    prescription_id: UUID,
+    scan_ids: list[UUID],
+    clinical_notes: str | None,
+    actor: dict | None,
+) -> None:
+    from modules.radiology.entities.radiology_entities import (
+        RadPrescriptionRequest,
+        RadPrescriptionRequestItem,
+        RadPrescriptionRequestStatus,
+        RadRequestItemStatus,
+    )
+    from modules.radiology.services.rad_prescription_service import (
+        rad_request_live_orders,
+        resolve_rad_selection,
+        sync_rad_request_charge,
+    )
+
+    reqs = (
+        db.query(RadPrescriptionRequest)
+        .options(joinedload(RadPrescriptionRequest.items))
+        .filter(
+            RadPrescriptionRequest.hospital_id == hospital_id,
+            RadPrescriptionRequest.prescription_id == prescription_id,
+            RadPrescriptionRequest.status != RadPrescriptionRequestStatus.cancelled,
+        )
+        .order_by(RadPrescriptionRequest.created_at.asc())
+        .all()
+    )
+    target = {s.id: s for s in resolve_rad_selection(db, hospital_id, scan_ids)}
+
+    touched: dict[UUID, Any] = {}
+    existing: set[UUID] = set()
+    for req in reqs:
+        for item in list(req.items or []):
+            if item.status == RadRequestItemStatus.cancelled:
+                continue
+            if item.scan_id in target:
+                existing.add(item.scan_id)
+                continue
+            if item.status == RadRequestItemStatus.pending:
+                req.items.remove(item)
+                touched[req.id] = req
+
+    additions = [s for sid, s in target.items() if sid not in existing]
+    if additions:
+        host = next(
+            (
+                r
+                for r in reqs
+                if r.status == RadPrescriptionRequestStatus.pending and not rad_request_live_orders(db, r)
+            ),
+            None,
+        )
+        if host is not None:
+            start = len(host.items or [])
+            for idx, s in enumerate(additions):
+                host.items.append(
+                    RadPrescriptionRequestItem(
+                        hospital_id=hospital_id,
+                        request_id=host.id,
+                        scan_id=s.id,
+                        scan_code=s.scan_code,
+                        scan_name=s.scan_name,
+                        category=s.category,
+                        price=s.price,
+                        sort_order=start + idx,
+                        status=RadRequestItemStatus.pending,
+                    )
+                )
+            touched[host.id] = host
+        else:
+            from modules.billing.services.episode_account_service import resolve_episode_admission_id
+
+            _new_rad_request(
+                db,
+                hospital_id=hospital_id,
+                prescription_id=prescription_id,
+                patient_id=patient_id,
+                doctor_id=doctor_id,
+                appointment_id=appointment_id,
+                admission_id=resolve_episode_admission_id(
+                    db, hospital_id, patient_id, admission_id=admission_id, appointment_id=appointment_id
+                ),
+                scans_resolved=additions,
+                clinical_notes=clinical_notes,
+            )
+
+    for req in touched.values():
+        if clinical_notes is not None:
+            req.clinical_notes = clinical_notes
+        db.flush()
+        remaining = [i for i in (req.items or []) if i.status != RadRequestItemStatus.cancelled]
+        req.prescribed_scan_ids = list(dict.fromkeys(str(i.scan_id) for i in remaining))
+        if not [i for i in remaining if i.status in (RadRequestItemStatus.pending, RadRequestItemStatus.ordered)]:
+            req.status = RadPrescriptionRequestStatus.cancelled
+            req.cancel_reason = "All scans removed from prescription"
+        sync_rad_request_charge(
+            db,
+            req,
+            reason="Prescription edited: radiology investigations changed",
+            actor=actor,
+        )
 
 
 def update_investigation_requests_for_prescription(
@@ -591,227 +977,48 @@ def update_investigation_requests_for_prescription(
     patient_id: UUID,
     appointment_id: UUID | None,
     prescription_id: UUID,
+    admission_id: UUID | None = None,
     test_ids: list[UUID] | None = None,
     panel_ids: list[UUID] | None = None,
     scan_ids: list[UUID] | None = None,
     clinical_notes: str | None = None,
+    actor: dict | None = None,
 ) -> None:
     """
-    Synchronize prescription investigations upon prescription edit.
-    - If an investigation item was already accessioned into a departmental LabOrder or RadiologyOrder,
-      it MUST NOT be deleted or modified; the departmental order and billing charge remain untouched.
-    - If a pending request item is removed by the doctor, it is safely removed/cancelled.
-    - If new investigations are added, pending request items are created.
+    Synchronize prescription investigations upon prescription edit (``None`` = untouched).
+
+    - Tests/scans already accessioned into a departmental order are never deleted; their
+      order and charge stay as they are.
+    - Pending items the doctor removed are withdrawn and the request's canonical charge is
+      re-priced (a reduction on a paid charge becomes a traceable credit).
+    - Additions join a not-yet-accessioned pending request (re-priced), otherwise a new
+      supplementary request with its own charge. New charges follow the prescription's
+      episode: admission work is billed on the IPD account.
     """
-    lab_req = (
-        db.query(LabPrescriptionRequest)
-        .options(joinedload(LabPrescriptionRequest.items))
-        .filter(LabPrescriptionRequest.prescription_id == prescription_id)
-        .first()
-    )
-
     if test_ids is not None or panel_ids is not None:
-        target_tids = test_ids if test_ids is not None else []
-        target_pids = panel_ids if panel_ids is not None else []
-        tests_resolved = resolve_lab_selection(
-            db, hospital_id, target_tids, target_pids, require_non_empty=False
+        _update_lab_requests_for_prescription(
+            db,
+            hospital_id=hospital_id,
+            doctor_id=doctor_id,
+            patient_id=patient_id,
+            appointment_id=appointment_id,
+            admission_id=admission_id,
+            prescription_id=prescription_id,
+            test_ids=list(test_ids or []),
+            panel_ids=list(panel_ids or []),
+            clinical_notes=clinical_notes,
+            actor=actor,
         )
-
-        if not lab_req and (target_tids or target_pids):
-            create_investigation_requests_for_prescription(
-                db,
-                hospital_id=hospital_id,
-                doctor_id=doctor_id,
-                patient_id=patient_id,
-                appointment_id=appointment_id,
-                prescription_id=prescription_id,
-                test_ids=target_tids,
-                panel_ids=target_pids,
-                clinical_notes=clinical_notes,
-            )
-        elif lab_req:
-            lab_req.prescribed_test_ids = [str(tid) for tid in target_tids]
-            lab_req.prescribed_panel_ids = [str(pid) for pid in target_pids]
-            if clinical_notes is not None:
-                lab_req.clinical_notes = clinical_notes
-
-            # Map resolved target tests: (test_id, panel_id)
-            target_tuples = {(r.test.id, r.panel.id if r.panel else None): r for r in tests_resolved}
-
-            existing_items = lab_req.items or []
-            # Keep track of which existing items match target
-            for item in existing_items:
-                key = (item.test_id, item.panel_id)
-                if key in target_tuples:
-                    # Item stays
-                    pass
-                else:
-                    # Item removed from prescription
-                    # RULE: If item is pending, cancel/remove it.
-                    # If already ordered (departmental order exists), DO NOT delete or cancel order!
-                    if item.status == LabRequestItemStatus.pending:
-                        db.delete(item)
-
-            # Add any newly added tests
-            existing_keys = {(i.test_id, i.panel_id) for i in existing_items}
-            idx_start = len(existing_items)
-            for idx, ((tid, pid), r) in enumerate(target_tuples.items()):
-                if (tid, pid) not in existing_keys:
-                    t = r.test
-                    new_item = LabPrescriptionRequestItem(
-                        hospital_id=hospital_id,
-                        request_id=lab_req.id,
-                        test_id=t.id,
-                        panel_id=r.panel.id if r.panel else None,
-                        panel_name=r.panel.panel_name if r.panel else None,
-                        test_code=t.test_code,
-                        test_name=t.test_name,
-                        department=t.department,
-                        price=t.price,
-                        sort_order=idx_start + idx,
-                        status=LabRequestItemStatus.pending,
-                    )
-                    db.add(new_item)
-
-            db.flush()
-
-            # Synchronize billing charge with updated lab items
-            from modules.billing.entities.billing_entities import BillingChargeStatus, BillingSourceType
-            from modules.billing.services.billing_service import ensure_charge, find_charge_by_source
-
-            current_items = db.query(LabPrescriptionRequestItem).filter(LabPrescriptionRequestItem.request_id == lab_req.id).all()
-            charge = find_charge_by_source(db, hospital_id, BillingSourceType.laboratory, lab_req.id)
-            if not current_items:
-                if charge:
-                    charge.status = BillingChargeStatus.cancelled
-            else:
-                new_total = round(sum(float(it.price or 0.0) for it in current_items), 2)
-                desc_names = [it.test_name for it in current_items if it.test_name]
-                if charge:
-                    charge.charge_amount = new_total
-                    charge.description = f"Lab Investigation — {', '.join(desc_names)}"[:512]
-                    net = max(0.0, round(new_total - float(charge.discount_amount or 0.0) + float(charge.tax_amount or 0.0), 2))
-                    charge.net_amount = net
-                    paid = float(charge.amount_paid or 0.0)
-                    if net <= 0.0 or paid >= net > 0.0:
-                        charge.status = BillingChargeStatus.paid
-                    elif paid > 0.0:
-                        charge.status = BillingChargeStatus.partially_paid
-                    else:
-                        charge.status = BillingChargeStatus.pending
-                else:
-                    ensure_charge(
-                        db,
-                        hospital_id=hospital_id,
-                        patient_id=patient_id,
-                        source_type=BillingSourceType.laboratory,
-                        source_id=lab_req.id,
-                        description=f"Lab Investigation — {', '.join(desc_names)}"[:512],
-                        charge_amount=new_total,
-                        created_by_name="Prescription Order",
-                    )
-
-    # Handle Radiology Investigations
     if scan_ids is not None:
-        try:
-            from modules.radiology.entities.radiology_entities import (
-                RadPrescriptionRequest,
-                RadPrescriptionRequestItem,
-                RadPrescriptionRequestStatus,
-                RadRequestItemStatus,
-            )
-            from modules.radiology.services.rad_prescription_service import resolve_rad_selection
-
-            rad_req = (
-                db.query(RadPrescriptionRequest)
-                .options(joinedload(RadPrescriptionRequest.items))
-                .filter(RadPrescriptionRequest.prescription_id == prescription_id)
-                .first()
-            )
-
-            target_sids = scan_ids
-            scans_resolved = resolve_rad_selection(db, hospital_id, target_sids)
-
-            if not rad_req and target_sids:
-                create_investigation_requests_for_prescription(
-                    db,
-                    hospital_id=hospital_id,
-                    doctor_id=doctor_id,
-                    patient_id=patient_id,
-                    appointment_id=appointment_id,
-                    prescription_id=prescription_id,
-                    scan_ids=target_sids,
-                    clinical_notes=clinical_notes,
-                )
-            elif rad_req:
-                rad_req.prescribed_scan_ids = [str(sid) for sid in target_sids]
-                if clinical_notes is not None:
-                    rad_req.clinical_notes = clinical_notes
-
-                target_scan_ids = {s.id: s for s in scans_resolved}
-                existing_items = rad_req.items or []
-
-                for item in existing_items:
-                    if item.scan_id in target_scan_ids:
-                        pass
-                    else:
-                        if item.status == RadRequestItemStatus.pending:
-                            db.delete(item)
-
-                existing_sids = {i.scan_id for i in existing_items}
-                idx_start = len(existing_items)
-                for idx, (sid, s) in enumerate(target_scan_ids.items()):
-                    if sid not in existing_sids:
-                        new_item = RadPrescriptionRequestItem(
-                            hospital_id=hospital_id,
-                            request_id=rad_req.id,
-                            scan_id=s.id,
-                            scan_code=s.scan_code,
-                            scan_name=s.scan_name,
-                            category=s.category,
-                            price=s.price,
-                            sort_order=idx_start + idx,
-                            status=RadRequestItemStatus.pending,
-                        )
-                        db.add(new_item)
-
-                db.flush()
-
-                # Synchronize billing charge with updated radiology items
-                from modules.billing.entities.billing_entities import BillingChargeStatus, BillingSourceType
-                from modules.billing.services.billing_service import ensure_charge, find_charge_by_source
-
-                current_rad_items = db.query(RadPrescriptionRequestItem).filter(RadPrescriptionRequestItem.request_id == rad_req.id).all()
-                rad_charge = find_charge_by_source(db, hospital_id, BillingSourceType.radiology, rad_req.id)
-                if not current_rad_items:
-                    if rad_charge:
-                        rad_charge.status = BillingChargeStatus.cancelled
-                else:
-                    new_rad_total = round(sum(float(it.price or 0.0) for it in current_rad_items), 2)
-                    desc_scans = [it.scan_name for it in current_rad_items if it.scan_name]
-                    if rad_charge:
-                        rad_charge.charge_amount = new_rad_total
-                        rad_charge.description = f"Radiology Investigation — {', '.join(desc_scans)}"[:512]
-                        net = max(0.0, round(new_rad_total - float(rad_charge.discount_amount or 0.0) + float(rad_charge.tax_amount or 0.0), 2))
-                        rad_charge.net_amount = net
-                        paid = float(rad_charge.amount_paid or 0.0)
-                        if net <= 0.0 or paid >= net > 0.0:
-                            rad_charge.status = BillingChargeStatus.paid
-                        elif paid > 0.0:
-                            rad_charge.status = BillingChargeStatus.partially_paid
-                        else:
-                            rad_charge.status = BillingChargeStatus.pending
-                    else:
-                        ensure_charge(
-                            db,
-                            hospital_id=hospital_id,
-                            patient_id=patient_id,
-                            source_type=BillingSourceType.radiology,
-                            source_id=rad_req.id,
-                            description=f"Radiology Investigation — {', '.join(desc_scans)}"[:512],
-                            charge_amount=new_rad_total,
-                            created_by_name="Prescription Order",
-                        )
-        except Exception:
-            pass
-
+        _update_rad_requests_for_prescription(
+            db,
+            hospital_id=hospital_id,
+            doctor_id=doctor_id,
+            patient_id=patient_id,
+            appointment_id=appointment_id,
+            admission_id=admission_id,
+            prescription_id=prescription_id,
+            scan_ids=list(scan_ids),
+            clinical_notes=clinical_notes,
+            actor=actor,
+        )

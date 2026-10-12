@@ -41,14 +41,15 @@ class DrugInteractionRepository:
             .all()
         )
 
-    def find_interaction(self, drug_1: str, drug_2: str) -> DrugInteractionRule | None:
+    def find_interaction(
+        self, drug_1: str, drug_2: str, rules: list[DrugInteractionRule] | None = None
+    ) -> DrugInteractionRule | None:
         """Find active rule for drug pair in either direction (A-B or B-A)."""
         d1 = drug_1.strip().lower()
         d2 = drug_2.strip().lower()
 
-        # Fetch active rules for hospital and match substrings or exact
-        rules = self.list_active_rules()
-        for r in rules:
+        active_rules = rules if rules is not None else self.list_active_rules()
+        for r in active_rules:
             ra = r.drug_a.strip().lower()
             rb = r.drug_b.strip().lower()
             if (ra in d1 or d1 in ra) and (rb in d2 or d2 in rb):

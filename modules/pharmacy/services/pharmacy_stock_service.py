@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from typing import Any
+import uuid
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -78,6 +79,152 @@ def refresh_medicine_inventory(db: Session, hospital_id: UUID, medicine_id: UUID
     return inv
 
 
+def refresh_medicine_inventories_bulk(
+    db: Session, hospital_id: UUID, medicine_ids: list[UUID]
+) -> None:
+    """Bulk recomputation of inventory summaries from active batches across multiple medicines."""
+    if not medicine_ids:
+        return
+    unique_ids = list(dict.fromkeys(medicine_ids))
+    all_batches = (
+        db.query(MedicineBatch)
+        .filter(
+            MedicineBatch.hospital_id == hospital_id,
+            MedicineBatch.medicine_id.in_(unique_ids),
+            MedicineBatch.is_active.is_(True),
+        )
+        .all()
+    )
+    batches_by_med: dict[UUID, list[MedicineBatch]] = {}
+    for b in all_batches:
+        batches_by_med.setdefault(b.medicine_id, []).append(b)
+
+    existing_invs = (
+        db.query(MedicineInventory)
+        .filter(
+            MedicineInventory.hospital_id == hospital_id,
+            MedicineInventory.medicine_id.in_(unique_ids),
+        )
+        .all()
+    )
+    inv_by_med = {inv.medicine_id: inv for inv in existing_invs}
+
+    for mid in unique_ids:
+        rows = batches_by_med.get(mid, [])
+        current = sum(max(0.0, float(b.available_quantity or 0)) for b in rows)
+        active_batches = [b for b in rows if float(b.available_quantity or 0) > 0]
+        nearest = min((b.expiry_date for b in active_batches), default=None) if active_batches else None
+
+        inv = inv_by_med.get(mid)
+        if not inv:
+            inv = MedicineInventory(
+                hospital_id=hospital_id,
+                medicine_id=mid,
+                current_stock=0,
+                reserved_stock=0,
+                available_stock=0,
+                batch_count=0,
+            )
+            db.add(inv)
+            inv_by_med[mid] = inv
+
+        inv.current_stock = round(current, 2)
+        inv.reserved_stock = round(float(inv.reserved_stock or 0), 2)
+        inv.available_stock = round(max(0.0, inv.current_stock - inv.reserved_stock), 2)
+        inv.nearest_expiry = nearest
+        inv.batch_count = len(active_batches)
+        inv.updated_at = datetime.now(timezone.utc)
+
+
+def apply_stock_changes_bulk(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    changes: list[dict[str, Any]],
+    preloaded_batches: dict[UUID, MedicineBatch] | None = None,
+    auto_refresh: bool = True,
+) -> list[StockTransaction]:
+    """
+    Apply multiple signed quantity changes to batches in bulk with row locking,
+    writing StockTransactions in a single pass without per-item flushes.
+    """
+    if not changes:
+        return []
+
+    batch_map: dict[UUID, MedicineBatch] = dict(preloaded_batches) if preloaded_batches else {}
+    missing_batch_ids = [
+        c["batch_id"] for c in changes
+        if c.get("batch_id") and c["batch_id"] not in batch_map
+    ]
+
+    if missing_batch_ids:
+        batches = (
+            db.query(MedicineBatch)
+            .filter(
+                MedicineBatch.id.in_(list(dict.fromkeys(missing_batch_ids))),
+                MedicineBatch.hospital_id == hospital_id,
+            )
+            .with_for_update()
+            .all()
+        )
+        for b in batches:
+            batch_map[b.id] = b
+
+    txns: list[StockTransaction] = []
+    med_ids: list[UUID] = []
+    today = date.today()
+
+    for item in changes:
+        batch_id = item["batch_id"]
+        med_id = item["medicine_id"]
+        quantity_delta = float(item["quantity_delta"])
+        allow_expired = item.get("allow_expired", False)
+
+        batch = batch_map.get(batch_id)
+        if not batch or batch.medicine_id != med_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Medicine batch not found")
+
+        if quantity_delta < 0 and not allow_expired and batch.expiry_date < today:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot sell/issue expired batch {batch.batch_number} (expired {batch.expiry_date})",
+            )
+
+        before = float(batch.available_quantity or 0)
+        after = round(before + quantity_delta, 2)
+        if after < -0.0001:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient stock on batch {batch.batch_number} (available {before})",
+            )
+        after = max(0.0, after)
+        batch.available_quantity = after
+
+        txn = StockTransaction(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            medicine_id=med_id,
+            batch_id=batch_id,
+            transaction_type=item["transaction_type"],
+            quantity=round(quantity_delta, 2),
+            quantity_before=before,
+            quantity_after=after,
+            reference_type=item.get("reference_type"),
+            reference_id=item.get("reference_id"),
+            notes=item.get("notes"),
+            created_by_name=item.get("created_by_name") or "System",
+        )
+        txns.append(txn)
+        med_ids.append(med_id)
+
+    db.add_all(txns)
+
+    if auto_refresh and med_ids:
+        refresh_medicine_inventories_bulk(db, hospital_id, list(dict.fromkeys(med_ids)))
+
+    return txns
+
+
 def apply_stock_change(
     db: Session,
     *,
@@ -91,57 +238,104 @@ def apply_stock_change(
     notes: str | None = None,
     created_by_name: str = "",
     allow_expired: bool = False,
+    auto_refresh: bool = True,
 ) -> StockTransaction:
     """
-    Apply signed quantity change to a batch and write StockTransaction.
-    quantity_delta > 0 increases stock; < 0 decreases.
+    Apply signed quantity change to a single batch and write StockTransaction.
+    Preserves immediate flush and return semantics for single-item callers.
     """
-    batch = (
+    txns = apply_stock_changes_bulk(
+        db,
+        hospital_id=hospital_id,
+        changes=[
+            {
+                "medicine_id": medicine_id,
+                "batch_id": batch_id,
+                "quantity_delta": quantity_delta,
+                "transaction_type": transaction_type,
+                "reference_type": reference_type,
+                "reference_id": reference_id,
+                "notes": notes,
+                "created_by_name": created_by_name,
+                "allow_expired": allow_expired,
+            }
+        ],
+        auto_refresh=auto_refresh,
+    )
+    db.flush()
+    return txns[0]
+
+
+def allocate_fifo_bulk(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    requests: list[tuple[UUID, float]],
+    medicine_names: dict[UUID, str] | None = None,
+) -> list[list[tuple[MedicineBatch, float]]]:
+    """
+    Allocate batches across multiple medicines or requests using FIFO (earliest expiry first).
+    Loads and locks matching active batches in a single bulk query.
+    Returns a list of allocations (list of (MedicineBatch, allocated_qty)) corresponding 1:1 with requests.
+    """
+    if not requests:
+        return []
+    today = date.today()
+    med_ids = list(dict.fromkeys(m for m, _ in requests))
+
+    batches = (
         db.query(MedicineBatch)
         .filter(
-            MedicineBatch.id == batch_id,
             MedicineBatch.hospital_id == hospital_id,
-            MedicineBatch.medicine_id == medicine_id,
+            MedicineBatch.medicine_id.in_(med_ids),
+            MedicineBatch.is_active.is_(True),
+            MedicineBatch.available_quantity > 0,
+            MedicineBatch.expiry_date >= today,
         )
+        .order_by(MedicineBatch.expiry_date.asc(), MedicineBatch.created_at.asc())
         .with_for_update()
-        .first()
+        .all()
     )
-    if not batch:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Medicine batch not found")
 
-    if quantity_delta < 0 and not allow_expired and batch.expiry_date < date.today():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot sell/issue expired batch {batch.batch_number} (expired {batch.expiry_date})",
-        )
+    batches_by_med: dict[UUID, list[MedicineBatch]] = {}
+    for b in batches:
+        batches_by_med.setdefault(b.medicine_id, []).append(b)
 
-    before = float(batch.available_quantity or 0)
-    after = round(before + float(quantity_delta), 2)
-    if after < -0.0001:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient stock on batch {batch.batch_number} (available {before})",
-        )
-    after = max(0.0, after)
-    batch.available_quantity = after
+    batch_available: dict[UUID, float] = {b.id: float(b.available_quantity) for b in batches}
+    per_request_allocations: list[list[tuple[MedicineBatch, float]]] = []
 
-    txn = StockTransaction(
-        hospital_id=hospital_id,
-        medicine_id=medicine_id,
-        batch_id=batch_id,
-        transaction_type=transaction_type,
-        quantity=round(float(quantity_delta), 2),
-        quantity_before=before,
-        quantity_after=after,
-        reference_type=reference_type,
-        reference_id=reference_id,
-        notes=notes,
-        created_by_name=created_by_name or "System",
-    )
-    db.add(txn)
-    db.flush()
-    refresh_medicine_inventory(db, hospital_id, medicine_id)
-    return txn
+    for med_id, requested_qty in requests:
+        if requested_qty <= 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Quantity must be positive")
+
+        med_batches = batches_by_med.get(med_id, [])
+        remaining = float(requested_qty)
+        med_allocs: list[tuple[MedicineBatch, float]] = []
+
+        for b in med_batches:
+            if remaining <= 0:
+                break
+            avail = batch_available.get(b.id, 0.0)
+            if avail <= 0:
+                continue
+            take = min(avail, remaining)
+            if take > 0:
+                med_allocs.append((b, take))
+                batch_available[b.id] = round(avail - take, 2)
+                remaining = round(remaining - take, 2)
+
+        if remaining > 0.0001:
+            name = (medicine_names or {}).get(med_id)
+            if not name:
+                med = db.query(Medicine.medicine_name).filter(Medicine.id == med_id).first()
+                name = med[0] if med else str(med_id)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient non-expired stock for {name} (short by {remaining})",
+            )
+        per_request_allocations.append(med_allocs)
+
+    return per_request_allocations
 
 
 def allocate_fifo(
@@ -152,40 +346,8 @@ def allocate_fifo(
     quantity: float,
 ) -> list[tuple[MedicineBatch, float]]:
     """Return list of (batch, qty) using earliest expiry first. Raises if insufficient non-expired stock."""
-    if quantity <= 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Quantity must be positive")
-
-    today = date.today()
-    batches = (
-        db.query(MedicineBatch)
-        .filter(
-            MedicineBatch.hospital_id == hospital_id,
-            MedicineBatch.medicine_id == medicine_id,
-            MedicineBatch.is_active.is_(True),
-            MedicineBatch.available_quantity > 0,
-            MedicineBatch.expiry_date >= today,
-        )
-        .order_by(MedicineBatch.expiry_date.asc(), MedicineBatch.created_at.asc())
-        .with_for_update()
-        .all()
-    )
-    remaining = float(quantity)
-    allocations: list[tuple[MedicineBatch, float]] = []
-    for batch in batches:
-        if remaining <= 0:
-            break
-        take = min(float(batch.available_quantity), remaining)
-        if take > 0:
-            allocations.append((batch, take))
-            remaining = round(remaining - take, 2)
-    if remaining > 0.0001:
-        med = db.query(Medicine).filter(Medicine.id == medicine_id).first()
-        name = med.medicine_name if med else str(medicine_id)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient non-expired stock for {name} (short by {remaining})",
-        )
-    return allocations
+    result = allocate_fifo_bulk(db, hospital_id=hospital_id, requests=[(medicine_id, quantity)])
+    return result[0] if result else []
 
 
 def inventory_status(inv: MedicineInventory | None, medicine: Medicine, today: date | None = None) -> str:
@@ -207,19 +369,28 @@ def inventory_status(inv: MedicineInventory | None, medicine: Medicine, today: d
 def next_doc_number(db: Session, hospital_id: UUID, model: Any, field_name: str, prefix: str) -> str:
     y = date.today().year
     full_prefix = f"{prefix}-{y}-"
-    col = getattr(model, field_name)
-    rows = (
-        db.query(col)
-        .filter(model.hospital_id == hospital_id, col.like(f"{full_prefix}%"))
-        .all()
+    counter_name = f"{prefix.lower()}_{y}"
+    from shared.database.sequences import (
+        counter_exists as _exists,
+        ensure_counter_at_least as _ensure,
+        next_sequence_value as _next_seq,
     )
-    max_seq = 0
-    for (num,) in rows:
-        try:
-            max_seq = max(max_seq, int(str(num).split("-")[-1]))
-        except (ValueError, IndexError):
-            continue
-    return f"{full_prefix}{max_seq + 1:05d}"
+    if not _exists(db, hospital_id, counter_name):
+        col = getattr(model, field_name)
+        rows = (
+            db.query(col)
+            .filter(model.hospital_id == hospital_id, col.like(f"{full_prefix}%"))
+            .all()
+        )
+        max_seq = 0
+        for (num,) in rows:
+            try:
+                max_seq = max(max_seq, int(str(num).split("-")[-1]))
+            except (ValueError, IndexError):
+                continue
+        _ensure(db, hospital_id, counter_name, max_seq)
+    seq = _next_seq(db, hospital_id, counter_name)
+    return f"{full_prefix}{seq:05d}"
 
 
 def medicine_stock_total(db: Session, hospital_id: UUID, medicine_id: UUID) -> float:

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from io import BytesIO
 from typing import Any
-import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -50,6 +49,7 @@ from modules.radiology.contracts.radiology_contracts import (
     RadScanResponse,
     RadScanUpdate,
     RadScheduleRequest,
+    RadCompleteScanRequest,
     RadStartScanRequest,
 )
 from modules.radiology.db.radiology_repository import RadiologyRepository
@@ -267,11 +267,12 @@ def start_scan(
     dependencies=[Depends(require_permission("radiology", "edit"))])
 def complete_scan(
     order_id: UUID,
+    payload: RadCompleteScanRequest | None = None,
     db: Session = Depends(get_transitional_sync_session),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> RadOrderResponse:
-    return CompleteScanAction(db, hospital_id, user).execute(order_id)
+    return CompleteScanAction(db, hospital_id, user).execute(order_id, payload)
 
 
 @router.post("/orders/{order_id}/report", response_model=RadOrderResponse, dependencies=[Depends(require_permission("radiology", "release"))])
@@ -374,24 +375,17 @@ def upload_order_attachment(
             detail="File size exceeds the 15MB attachment limit.",
         )
 
-    from shared.storage.local_storage import save_attachment_file
-    storage_path = save_attachment_file(
-        module="radiology",
-        hospital_id=hospital_id,
-        order_id=order_id,
-        file_id=uuid.uuid4(),
-        file_name=original_name,
-        data=file_bytes,
-    )
-
+    # The action writes the file only after the order passed its financial gate.
     action = AddAttachmentAction(db, hospital_id, user)
     return action.execute(
         order_id=order_id,
         file_name=original_name,
         mime_type=mime_type,
         file_size=file_size,
-        storage_path=storage_path,
         attachment_type=payload.attachment_type,
+        file_bytes=file_bytes,
+        is_emergency_override=payload.is_emergency_override,
+        emergency_override_reason=payload.emergency_override_reason,
     )
 
 

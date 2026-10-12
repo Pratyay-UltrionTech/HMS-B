@@ -108,9 +108,10 @@ class CheckDrugInteractionsAction:
         highest_sev_enum: InteractionSeverity | None = None
 
         seen_pairs: set[tuple[str, str]] = set()
+        active_rules = self.repo.list_active_rules()
 
         for med1, med2 in itertools.combinations(medicines, 2):
-            rule = self.repo.find_interaction(med1, med2)
+            rule = self.repo.find_interaction(med1, med2, rules=active_rules)
             if rule:
                 pair_key = tuple(sorted([rule.drug_a.lower(), rule.drug_b.lower()]))
                 if pair_key in seen_pairs:

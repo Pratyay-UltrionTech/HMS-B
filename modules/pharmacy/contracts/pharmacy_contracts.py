@@ -313,7 +313,9 @@ class SaleCreate(BaseModel):
     sale_date: date | None = None
     discount_amount: float = 0.0
     payment_method: str = "cash"
-    amount_paid: float | None = None
+    # Cash actually tendered at the counter. Omitted/0 means nothing was collected:
+    # the sale must then be covered by same-account deposits or it is refused (402).
+    amount_paid: float | None = Field(default=None, ge=0)
     notes: str | None = None
     is_emergency_override: bool = False
     emergency_override_reason: str | None = None

@@ -36,6 +36,7 @@ from modules.pharmacy.entities.pharmacy_entities import (
 )
 from shared.auth.jwt import create_access_token
 from tests.conftest import db_session, doctor, hospital
+from modules.doctors.entities.doctor import HospitalUser, StaffRole
 
 
 @pytest.fixture(scope="function")
@@ -56,16 +57,39 @@ def client(interaction_app: FastAPI) -> TestClient:
 
 
 @pytest.fixture(scope="function")
-def staff_headers(hospital: Hospital) -> dict[str, str]:
+def staff_headers(db_session: Session, hospital: Hospital) -> dict[str, str]:
+    role_id = uuid.uuid4()
+    sr = StaffRole(
+        id=role_id,
+        hospital_id=hospital.id,
+        name=f"Pharmacist-{uuid.uuid4().hex[:6]}",
+        is_active=True,
+    )
+    db_session.add(sr)
+    db_session.flush()
+
+    user_id = uuid.uuid4()
+    u = HospitalUser(
+        id=user_id,
+        hospital_id=hospital.id,
+        role_id=role_id,
+        name="Anil Sharma",
+        phone="555-0199",
+        email=f"pharmacist.{uuid.uuid4().hex[:6]}@hospital.test",
+        password_hash="dummy_hash_for_test",
+        is_active=True,
+    )
+    db_session.add(u)
+    db_session.commit()
     token = create_access_token(
         data={
-            "sub": "pharmacist.anil@hospital.test",
+            "sub": u.email,
             "name": "Anil Sharma",
-            "email": "pharmacist.anil@hospital.test",
+            "email": u.email,
             "role": "hospital_staff",
             "staff_role_name": "pharmacist",
             "hospital_uuid": str(hospital.id),
-            "user_id": str(uuid.uuid4()),
+            "user_id": str(user_id),
         }
     )
     return {

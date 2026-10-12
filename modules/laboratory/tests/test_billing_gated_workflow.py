@@ -233,8 +233,17 @@ def test_billing_gated_lab_workflow_full_lifecycle(lab_gated_client, lab_gated_d
     )
     assert order_count == 0
 
-    # 5. Financial Clearance (e.g. Patient pays at billing counter)
-    charge.status = BillingChargeStatus.paid
+    # 5. Financial Clearance: patient pays at the billing counter (real payment allocation)
+    from datetime import date
+
+    from modules.billing.entities.billing_entities import BillingPaymentMethod
+    from modules.billing.services.billing_service import create_payment
+
+    create_payment(
+        lab_gated_db, hospital_id=h_id, patient_id=patient.id, amount=350.0, payment_date=date.today(),
+        payment_method=BillingPaymentMethod.cash, notes=None, received_by_name="Cashier",
+        allocations_plan=[{"charge_id": charge.id, "amount": 350.0}],
+    )
     lab_gated_db.commit()
 
     # Now actionable queue includes the request
@@ -282,7 +291,8 @@ def test_billing_gated_lab_workflow_full_lifecycle(lab_gated_client, lab_gated_d
     assert patient_search_resp.status_code == 200
     assert any(row["id"] == order_data["id"] for row in patient_search_resp.json())
 
-    # 7. Zero Duplicate Charges: Ensure the charge was re-pointed to order.id
+    # 7. Zero Duplicate Charges: the request keeps its single charge (stable key, never
+    # re-pointed); the order resolves it through prescription_request_id.
     all_lab_charges = (
         lab_gated_db.query(BillingCharge)
         .filter(
@@ -294,8 +304,11 @@ def test_billing_gated_lab_workflow_full_lifecycle(lab_gated_client, lab_gated_d
     )
     # Exactly ONE charge for this patient's CBC!
     assert len(all_lab_charges) == 1
-    assert all_lab_charges[0].source_id == order_id
+    assert all_lab_charges[0].source_id == lab_req.id
     assert all_lab_charges[0].status == BillingChargeStatus.paid
+    assert order_data["payment_status"] == "paid"
+    assert order_data["net_amount"] == 350.0
+    assert order_data["amount_paid"] == 350.0
 
     # 8. Downstream operational actions proceed smoothly
     collect_resp = lab_gated_client.post(
@@ -311,7 +324,8 @@ def test_billing_gated_lab_workflow_full_lifecycle(lab_gated_client, lab_gated_d
 
 
 def test_billing_gated_stat_emergency_bypass(lab_gated_client, lab_gated_db):
-    """Emergency / STAT doctor orders must bypass financial clearance."""
+    """A "STAT" note never clears a request; only a structured, authorized emergency
+    override does."""
     h_id = lab_gated_client.test_hospital_id
     user_id = lab_gated_client.test_user_id
 
@@ -356,10 +370,10 @@ def test_billing_gated_stat_emergency_bypass(lab_gated_client, lab_gated_db):
     )
     lab_gated_db.commit()
 
-    # STAT request appears in actionable queue even before payment
+    # Release is derived from canonical clearance only: STAT text alone is not cleared.
     dash_resp = lab_gated_client.get("/api/laboratory/dashboard")
     assert dash_resp.status_code == 200
-    assert dash_resp.json()["pending_doctor_requests"] == 1
+    assert dash_resp.json()["pending_doctor_requests"] == 0
 
     # Accession with only "STAT" text in notes without structured override MUST fail (Requirement 9)
     accession_stat = lab_gated_client.post(
@@ -458,3 +472,60 @@ def test_prescription_request_cancel_cancels_billing_charge(lab_gated_client, la
     # Verify billing charge is now cancelled
     lab_gated_db.refresh(charge)
     assert charge.status == BillingChargeStatus.cancelled
+
+
+def test_all_items_unavailable_cancels_paid_charge_into_credit(lab_gated_client, lab_gated_db):
+    """When every requested test is unavailable the (paid) charge is cancelled canonically."""
+    from datetime import date
+
+    from modules.billing.entities.billing_entities import BillingDeposit, BillingPaymentMethod
+    from modules.billing.services.billing_service import create_payment
+
+    h_id = lab_gated_client.test_hospital_id
+    patient = Patient(
+        id=uuid4(), hospital_id=h_id, uhid="UHID-LAB-UNAV-01", name="Kavya Rao",
+        mobile="9876500004", age=30, gender="female",
+    )
+    lab_gated_db.add(patient)
+    test = LabTestCatalog(
+        id=uuid4(), hospital_id=h_id, test_code="TSH", test_name="Thyroid Stimulating Hormone",
+        department="Biochemistry", price=450.0, sample_type=LabSampleType.blood, tat_hours=6, is_active=True,
+    )
+    lab_gated_db.add(test)
+    lab_gated_db.commit()
+
+    lab_req, _ = create_investigation_requests_for_prescription(
+        db=lab_gated_db, hospital_id=h_id, prescription_id=uuid4(), patient_id=patient.id,
+        doctor_id=lab_gated_client.test_user_id, appointment_id=None,
+        test_ids=[test.id], panel_ids=[], scan_ids=[], clinical_notes=None,
+    )
+    lab_gated_db.commit()
+    charge = (
+        lab_gated_db.query(BillingCharge)
+        .filter(BillingCharge.source_id == lab_req.id, BillingCharge.source_type == BillingSourceType.laboratory)
+        .one()
+    )
+    create_payment(
+        lab_gated_db, hospital_id=h_id, patient_id=patient.id, amount=450.0, payment_date=date.today(),
+        payment_method=BillingPaymentMethod.cash, notes=None, received_by_name="Cashier",
+        allocations_plan=[{"charge_id": charge.id, "amount": 450.0}],
+    )
+    lab_gated_db.commit()
+    lab_gated_db.refresh(charge)
+    assert charge.status == BillingChargeStatus.paid
+
+    item_id = lab_req.items[0].id
+    resp = lab_gated_client.post(f"/api/laboratory/prescription-requests/{lab_req.id}/items/{item_id}/unavailable")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "cancelled"
+
+    lab_gated_db.expire_all()
+    charge = lab_gated_db.get(BillingCharge, charge.id)
+    assert charge.status == BillingChargeStatus.cancelled
+    assert float(charge.amount_paid) == 0.0
+    credits = (
+        lab_gated_db.query(BillingDeposit)
+        .filter(BillingDeposit.patient_id == patient.id, BillingDeposit.deposit_type == "cancellation_credit")
+        .all()
+    )
+    assert len(credits) == 1 and float(credits[0].available_amount) == 450.0

@@ -14,7 +14,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from modules.billing.entities.billing_entities import (
     BillingCharge,
@@ -31,81 +31,11 @@ from modules.billing.contracts.policy_contracts import (
 )
 
 
-def validate_emergency_override_actor(
-    actor: dict[str, Any] | None,
-    reason: str | None,
-    service_type: str = "general",
-) -> tuple[UUID | None, str]:
-    """
-    Validate that an emergency override is accompanied by a mandatory reason
-    and that the actor is authorized (admin, physician/doctor/surgeon, clinical supervisor,
-    or explicit override permission). Raises 400 or 403 on invalid invocation.
-    """
-    if not reason or not reason.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Emergency override reason is mandatory when executing an emergency financial override.",
-        )
-
-    actor_dict = actor or {}
-    role = str(actor_dict.get("role") or "").lower()
-    staff_role = str(actor_dict.get("staff_role_name") or "").lower()
-    permissions = actor_dict.get("permissions") or []
-
-    is_admin = role in {"super_admin", "hospital_admin"}
-    actor_name_lower = str(actor_dict.get("name") or "").lower()
-    is_doctor = (
-        role in {"doctor", "physician", "surgeon"}
-        or "doctor" in staff_role
-        or "physician" in staff_role
-        or "surgeon" in staff_role
-        or actor_dict.get("is_doctor") is True
-        or "doctor" in actor_name_lower
-        or actor_name_lower.startswith("dr.")
-        or actor_name_lower.startswith("dr ")
-    )
-    is_clinical_lead = (
-        "supervisor" in staff_role
-        or "in-charge" in staff_role
-        or "charge" in staff_role
-        or "head" in staff_role
-        or role in {"nurse_supervisor", "clinical_supervisor"}
-    )
-    has_explicit_perm = any(
-        p in permissions
-        for p in [
-            "billing:approve",
-            "all_ipd:approve",
-            "emergency:administer",
-            "emergency:create",
-            "emergency:edit",
-            "doctors:edit",
-        ]
-    )
-
-    if not (is_admin or is_doctor or is_clinical_lead or has_explicit_perm):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Forbidden: Actor '{actor_dict.get('name') or actor_dict.get('sub')}' with role '{staff_role or role}' is not authorized to grant emergency financial overrides.",
-        )
-
-    actor_id = None
-    actor_id_str = actor_dict.get("id") or actor_dict.get("sub") or actor_dict.get("user_id")
-    if actor_id_str:
-        try:
-            actor_id = UUID(str(actor_id_str))
-        except (ValueError, TypeError):
-            actor_id = None
-
-    actor_name = str(actor_dict.get("name") or "Authorized Emergency Clinician")
-    return actor_id, actor_name
-
-
 def get_admission_financial_policy(db: Session, hospital_id: UUID) -> AdmissionFinancialPolicy:
     from modules.tenancy.entities.hospital import Hospital
     hosp = db.query(Hospital).filter(Hospital.id == hospital_id).first()
     if not hosp:
-        raise HTTPException(status_code=404, detail="Hospital not found")
+        return AdmissionFinancialPolicy()
     settings = hosp.facility_settings or {}
     stored = settings.get("admission_financial_policy") or settings.get("admission_advance_policy") or {}
     return AdmissionFinancialPolicy(
@@ -129,15 +59,14 @@ def set_admission_financial_policy(
     if not hosp:
         raise HTTPException(status_code=404, detail="Hospital not found")
     settings = dict(hosp.facility_settings or {})
-    current = dict(settings.get("admission_financial_policy") or settings.get("admission_advance_policy") or {})
+    previous = dict(settings.get("admission_financial_policy") or settings.get("admission_advance_policy") or {})
+    current = dict(previous)
 
     update_dict = payload.model_dump(exclude_unset=True)
     current.update(update_dict)
     settings["admission_financial_policy"] = current
     settings["admission_advance_policy"] = current
     hosp.facility_settings = settings
-    db.commit()
-    db.refresh(hosp)
 
     from shared.audit.service import write_audit_log
     write_audit_log(
@@ -148,7 +77,10 @@ def set_admission_financial_policy(
         entity_type="admission_financial_policy",
         entity_id=hospital_id,
         summary=f"Updated admission financial policy: mode={current.get('advance_mode')}, min={current.get('minimum_advance_amount')}",
+        details={"previous": previous, "updated": current, "changed_fields": sorted(update_dict.keys())},
     )
+    db.commit()
+    db.refresh(hosp)
     return get_admission_financial_policy(db, hospital_id)
 
 
@@ -190,172 +122,28 @@ def check_service_financial_clearance(
 ) -> ServiceFinancialState:
     """
     Evaluate the authoritative financial clearance state of a specific service.
-    
+
+    The charge is found through the stable service ↔ charge resolver
+    (``service_charge_resolver.resolve_service_charge``): an order id and its
+    prescription request id resolve to the same canonical charge, and an active charge
+    always wins over a cancelled one.
+
     Rules:
-    - If no active non-cancelled charge exists:
-        treated as unbilled / not cleared.
-    - If charge is cancelled:
-        not cleared, service cancelled.
-    - If net_amount <= 0.0 or charge.status == BillingChargeStatus.paid:
-        cleared (e.g. 0-cost, 100% discount, or fully paid).
-    - If charge.status == BillingChargeStatus.partially_paid:
-        NOT automatically cleared; requires full settlement unless net <= amount_paid.
-    - If charge.status == BillingChargeStatus.pending:
-        NOT cleared.
+    - No charge: unbilled / not cleared.
+    - Cancelled charge (and no active one): not cleared, service cancelled.
+    - net_amount <= 0, status paid, or amount_paid covers net: cleared.
+    - Partially paid or pending: NOT cleared.
     """
-    charge = (
-        db.query(BillingCharge)
-        .filter(
-            BillingCharge.hospital_id == hospital_id,
-            BillingCharge.source_type == source_type,
-            BillingCharge.source_id == source_id,
-        )
-        .order_by(BillingCharge.created_at.desc())
-        .first()
-    )
+    from modules.billing.services.service_charge_resolver import resolve_service_charge
 
-    if not charge:
-        # Fallback cross-link resolution between orders and prescription requests
-        try:
-            if source_type == BillingSourceType.laboratory:
-                from modules.laboratory.entities.lab_entities import LabOrder, LabPrescriptionRequest
-                # If source_id is LabOrder, check linked prescription request
-                order = db.query(LabOrder).filter(LabOrder.id == source_id, LabOrder.hospital_id == hospital_id).first()
-                if order and order.prescription_request_id:
-                    charge = (
-                        db.query(BillingCharge)
-                        .filter(
-                            BillingCharge.hospital_id == hospital_id,
-                            BillingCharge.source_type == source_type,
-                            BillingCharge.source_id == order.prescription_request_id,
-                        )
-                        .order_by(BillingCharge.created_at.desc())
-                        .first()
-                    )
-                elif not order:
-                    # If source_id is LabPrescriptionRequest, check linked LabOrder (either via req.lab_order_id or LabOrder.prescription_request_id)
-                    req = db.query(LabPrescriptionRequest).filter(LabPrescriptionRequest.id == source_id, LabPrescriptionRequest.hospital_id == hospital_id).first()
-                    linked_lab_order_id = req.lab_order_id if req else None
-                    if not linked_lab_order_id:
-                        lab_o = db.query(LabOrder).filter(LabOrder.prescription_request_id == source_id, LabOrder.hospital_id == hospital_id).first()
-                        if lab_o:
-                            linked_lab_order_id = lab_o.id
-                    if linked_lab_order_id:
-                        charge = (
-                            db.query(BillingCharge)
-                            .filter(
-                                BillingCharge.hospital_id == hospital_id,
-                                BillingCharge.source_type == source_type,
-                                BillingCharge.source_id == linked_lab_order_id,
-                            )
-                            .order_by(BillingCharge.created_at.desc())
-                            .first()
-                        )
-            elif source_type == BillingSourceType.radiology:
-                from modules.radiology.entities.radiology_entities import RadiologyOrder, RadPrescriptionRequest
-                # If source_id is RadiologyOrder, check linked prescription request
-                rad_order = db.query(RadiologyOrder).filter(RadiologyOrder.id == source_id, RadiologyOrder.hospital_id == hospital_id).first()
-                if rad_order and rad_order.prescription_request_id:
-                    charge = (
-                        db.query(BillingCharge)
-                        .filter(
-                            BillingCharge.hospital_id == hospital_id,
-                            BillingCharge.source_type == source_type,
-                            BillingCharge.source_id == rad_order.prescription_request_id,
-                        )
-                        .order_by(BillingCharge.created_at.desc())
-                        .first()
-                    )
-                elif not rad_order:
-                    # If source_id is RadPrescriptionRequest, check any created RadiologyOrder
-                    rad_o = db.query(RadiologyOrder).filter(RadiologyOrder.prescription_request_id == source_id, RadiologyOrder.hospital_id == hospital_id).first()
-                    if rad_o:
-                        charge = (
-                            db.query(BillingCharge)
-                            .filter(
-                                BillingCharge.hospital_id == hospital_id,
-                                BillingCharge.source_type == source_type,
-                                BillingCharge.source_id == rad_o.id,
-                            )
-                            .order_by(BillingCharge.created_at.desc())
-                            .first()
-                        )
-        except Exception:
-            pass
-
-    if not charge:
-        return ServiceFinancialState(
-            charge_exists=False,
-            charge_id=None,
-            status="unbilled",
-            net_amount=0.0,
-            amount_paid=0.0,
-            outstanding_amount=0.0,
-            is_cleared=False,
-            reason="No billing charge found for this service order.",
-        )
-
-    if charge.status == BillingChargeStatus.cancelled:
-        return ServiceFinancialState(
-            charge_exists=True,
-            charge_id=charge.id,
-            status="cancelled",
-            net_amount=float(charge.net_amount or 0.0),
-            amount_paid=float(charge.amount_paid or 0.0),
-            outstanding_amount=0.0,
-            is_cleared=False,
-            reason="The billing charge for this service is cancelled.",
-        )
-
-    net = round(float(charge.net_amount or 0.0), 2)
-    paid = round(float(charge.amount_paid or 0.0), 2)
-    outstanding = max(0.0, round(net - paid, 2))
-
-    # Fully cleared if net is 0 (or negative) or status is paid or paid covers net
-    if net <= 0.0 or charge.status == BillingChargeStatus.paid or paid >= net > 0.0:
-        return ServiceFinancialState(
-            charge_exists=True,
-            charge_id=charge.id,
-            status="paid",
-            net_amount=net,
-            amount_paid=paid,
-            outstanding_amount=0.0,
-            is_cleared=True,
-            reason="Service is financially cleared.",
-        )
-
-    if charge.status == BillingChargeStatus.partially_paid or paid > 0.0:
-        return ServiceFinancialState(
-            charge_exists=True,
-            charge_id=charge.id,
-            status="partially_paid",
-            net_amount=net,
-            amount_paid=paid,
-            outstanding_amount=outstanding,
-            is_cleared=False,
-            reason=f"Service is partially paid. Outstanding amount: ₹{outstanding:.2f}.",
-        )
-
-    return ServiceFinancialState(
-        charge_exists=True,
-        charge_id=charge.id,
-        status="pending",
-        net_amount=net,
-        amount_paid=paid,
-        outstanding_amount=outstanding,
-        is_cleared=False,
-        reason=f"Payment pending. Outstanding amount: ₹{outstanding:.2f}.",
-    )
+    return _state_from_charge(resolve_service_charge(db, hospital_id, source_type, source_id))
 
 
 def _state_from_charge(charge: BillingCharge | None) -> ServiceFinancialState:
-    """
-    Convert a single BillingCharge ORM row (or None) into a ServiceFinancialState.
+    """Convert a single BillingCharge ORM row (or None) into a ServiceFinancialState.
 
-    Encapsulates the clearance business rules so they are applied identically by
-    both check_service_financial_clearance() and bulk_check_service_financial_clearance().
-    This function must remain in exact parity with the logic in
-    check_service_financial_clearance() — any rule change must be applied to both.
+    Shared by check_service_financial_clearance() and bulk_check_service_financial_clearance()
+    so both apply identical clearance rules.
     """
     if charge is None:
         return ServiceFinancialState(
@@ -427,217 +215,396 @@ def bulk_check_service_financial_clearance(
     source_type: BillingSourceType,
     source_ids: list[UUID],
 ) -> dict[UUID, ServiceFinancialState]:
-    """
-    Bulk-evaluate financial clearance for a list of source_ids in a minimal number
-    of DB round-trips (2–4 queries total regardless of list length).
+    """Bulk ``check_service_financial_clearance`` in a constant number of queries.
 
-    Returns a mapping of source_id -> ServiceFinancialState for every supplied ID.
-    IDs with no direct charge are resolved via cross-link fallback (prescription
-    request ↔ radiology order) using additional bulk queries — never per-item
-    queries.  IDs that remain unresolved are returned as "unbilled" / not cleared.
-
-    All clearance business rules are identical to check_service_financial_clearance().
-    The 'latest applicable charge' (ORDER BY created_at DESC) semantics are
-    preserved: for each source_id, only the most-recently created charge is used.
-
-    The existing single-item check_service_financial_clearance() is unchanged.
+    Returns a mapping of source_id -> ServiceFinancialState for every supplied ID,
+    resolved through the same stable service ↔ charge resolver as the single check.
     """
     if not source_ids:
         return {}
+    from modules.billing.services.service_charge_resolver import resolve_service_charges
 
-    id_list = list(source_ids)
+    charges = resolve_service_charges(db, hospital_id, source_type, list(source_ids))
+    return {sid: _state_from_charge(charges.get(sid)) for sid in source_ids}
 
-    # ── Step 1: Fetch latest charge per source_id in one bulk query ───────────
-    # Fetch all matching charges, then keep only the most-recent per source_id
-    # in Python.  This is equivalent to DISTINCT ON (source_id) ORDER BY
-    # source_id, created_at DESC and preserves the "latest charge" semantics.
-    all_charges = (
-        db.query(BillingCharge)
-        .filter(
-            BillingCharge.hospital_id == hospital_id,
-            BillingCharge.source_type == source_type,
-            BillingCharge.source_id.in_(id_list),
-        )
-        .order_by(BillingCharge.source_id, BillingCharge.created_at.desc())
-        .all()
+
+def _parse_admission_policy_from_settings(settings: dict | None) -> AdmissionFinancialPolicy:
+    stored = (settings or {}).get("admission_financial_policy") or (settings or {}).get("admission_advance_policy") or {}
+    return AdmissionFinancialPolicy(
+        financial_gate_enabled=stored.get("financial_gate_enabled", stored.get("enabled", True)),
+        advance_mode=stored.get("advance_mode", "mandatory"),
+        minimum_advance_amount=float(stored.get("minimum_advance_amount", stored.get("fixed_minimum_amount", 0.0)) or 0.0),
+        include_admission_fee=stored.get("include_admission_fee", True),
+        include_first_day_bed_tariff=stored.get("include_first_day_bed_tariff", True),
+        emergency_bypass_allowed=stored.get("emergency_bypass_allowed", True),
     )
 
-    # Keep only the first (latest) charge seen per source_id
-    charges_by_source: dict[UUID, BillingCharge] = {}
-    for charge in all_charges:
-        if charge.source_id not in charges_by_source:
-            charges_by_source[charge.source_id] = charge
 
-    # ── Step 2: Identify source_ids without a direct charge ───────────────────
-    missing_ids = [sid for sid in id_list if sid not in charges_by_source]
+def bulk_evaluate_bed_allocation_clearance(
+    db: Session,
+    hospital_id: UUID,
+    admission_ids: list[UUID],
+    ward_overrides: dict[UUID, UUID | None] | None = None,
+    bed_overrides: dict[UUID, UUID | None] | None = None,
+) -> dict[UUID, BedAllocationClearanceState]:
+    """Bulk evaluate authoritative financial readiness for IPD bed allocation.
 
-    # ── Step 3: Bulk cross-link fallback resolution ────────────────────────────
-    # For laboratory & radiology: a source_id may be either an Order.id (whose charge
-    # was recorded against its prescription_request_id) or a
-    # PrescriptionRequest.id (whose charge was recorded against a linked
-    # Order.id). We resolve all missing IDs in bulk queries:
-    # one for Order/Request rows and one for BillingCharge on counterparts.
-    if missing_ids and source_type == BillingSourceType.laboratory:
-        try:
-            from modules.laboratory.entities.lab_entities import LabOrder, LabPrescriptionRequest
-            from sqlalchemy import or_ as sa_or
+    Executes in a constant number of bounded queries (~4-5 queries total) regardless
+    of how many admissions N are evaluated:
+      1. Bulk load admissions with joined patient, ward, room, and bed relationships.
+      2. Bulk load hospital facility settings for admission policy.
+      3. Bulk load existing open IPD FinancialAccounts for these admissions.
+      4. Single combined set-based aggregation query computing episode + lifetime
+         charges, payments, and deposits per patient and per admission account.
+      5. Bulk load active FinancialClearanceExceptions for all admissions.
+    """
+    if not admission_ids:
+        return {}
 
-            # Fetch all lab orders whose .id OR .prescription_request_id appears in missing_ids
-            linked_orders = (
-                db.query(LabOrder)
-                .filter(
-                    LabOrder.hospital_id == hospital_id,
-                    sa_or(
-                        LabOrder.id.in_(missing_ids),
-                        LabOrder.prescription_request_id.in_(missing_ids),
-                    ),
-                )
-                .all()
-            )
+    from sqlalchemy import case, func, or_
+    from modules.beds.entities.bed import Bed, Ward, WardType
+    from modules.billing.entities.billing_entities import (
+        BillingCharge,
+        BillingChargeStatus,
+        BillingDeposit,
+        BillingPayment,
+        DepositStatus,
+        FinancialAccount,
+        FinancialAccountType,
+        FinancialAccountStatus,
+    )
+    from modules.inpatient.entities.admission import Admission
+    from modules.tenancy.entities.hospital import Hospital
 
-            orders_by_id: dict[UUID, LabOrder] = {o.id: o for o in linked_orders}
-            orders_by_req: dict[UUID, LabOrder] = {}
-            for o in linked_orders:
-                if o.prescription_request_id and o.prescription_request_id not in orders_by_req:
-                    orders_by_req[o.prescription_request_id] = o
+    ward_overrides = ward_overrides or {}
+    bed_overrides = bed_overrides or {}
 
-            # For remaining missing IDs that weren't resolved as LabOrder.id,
-            # query LabPrescriptionRequest to find their linked lab_order_id
-            still_unresolved = [sid for sid in missing_ids if sid not in orders_by_id and sid not in orders_by_req]
-            reqs_by_id: dict[UUID, LabPrescriptionRequest] = {}
-            if still_unresolved:
-                linked_reqs = (
-                    db.query(LabPrescriptionRequest)
-                    .filter(
-                        LabPrescriptionRequest.hospital_id == hospital_id,
-                        LabPrescriptionRequest.id.in_(still_unresolved),
-                    )
-                    .all()
-                )
-                reqs_by_id = {r.id: r for r in linked_reqs}
+    # Query 1: Bulk load admissions with relationships
+    admissions = (
+        db.query(Admission)
+        .options(
+            joinedload(Admission.patient),
+            joinedload(Admission.ward),
+            joinedload(Admission.bed),
+        )
+        .filter(Admission.id.in_(admission_ids), Admission.hospital_id == hospital_id)
+        .all()
+    )
+    admission_map = {a.id: a for a in admissions}
 
-            missing_to_counterpart: dict[UUID, UUID] = {}
-            counterpart_ids: list[UUID] = []
-            for sid in missing_ids:
-                counterpart: UUID | None = None
-                if sid in orders_by_id:
-                    # sid is a LabOrder.id — look up charge by its prescription_request_id
-                    req_id = orders_by_id[sid].prescription_request_id
-                    if req_id:
-                        counterpart = req_id
-                elif sid in orders_by_req:
-                    # sid is a LabPrescriptionRequest.id — look up charge by the order's id
-                    counterpart = orders_by_req[sid].id
-                elif sid in reqs_by_id:
-                    # sid is a LabPrescriptionRequest.id without a matching LabOrder from query 1
-                    ord_id = reqs_by_id[sid].lab_order_id
-                    if ord_id:
-                        counterpart = ord_id
+    # Query 2: Policy & default ward if needed
+    hosp = db.query(Hospital).filter(Hospital.id == hospital_id).first()
+    policy = _parse_admission_policy_from_settings(hosp.facility_settings if hosp else {})
 
-                if counterpart:
-                    missing_to_counterpart[sid] = counterpart
-                    counterpart_ids.append(counterpart)
+    default_ward = None
+    if policy.financial_gate_enabled and policy.advance_mode == "mandatory":
+        default_ward = (
+            db.query(Ward)
+            .filter(Ward.hospital_id == hospital_id, Ward.is_active == True)
+            .order_by((Ward.ward_type == WardType.general).desc(), Ward.admission_fee.asc())
+            .first()
+        )
 
-            if counterpart_ids:
-                fallback_charges = (
-                    db.query(BillingCharge)
-                    .filter(
-                        BillingCharge.hospital_id == hospital_id,
-                        BillingCharge.source_type == source_type,
-                        BillingCharge.source_id.in_(counterpart_ids),
-                    )
-                    .order_by(BillingCharge.source_id, BillingCharge.created_at.desc())
-                    .all()
-                )
-                fallback_by_counterpart: dict[UUID, BillingCharge] = {}
-                for charge in fallback_charges:
-                    if charge.source_id not in fallback_by_counterpart:
-                        fallback_by_counterpart[charge.source_id] = charge
+    # Resolve target ward per admission
+    extra_bed_ids = {
+        bed_overrides[aid]
+        for aid in admission_ids
+        if bed_overrides.get(aid) and not ward_overrides.get(aid)
+    } - {None}
+    extra_beds = {}
+    if extra_bed_ids:
+        extra_beds = {
+            b.id: b
+            for b in db.query(Bed).filter(Bed.id.in_(extra_bed_ids), Bed.hospital_id == hospital_id).all()
+        }
 
-                for sid, counterpart in missing_to_counterpart.items():
-                    if counterpart in fallback_by_counterpart:
-                        charges_by_source[sid] = fallback_by_counterpart[counterpart]
+    extra_ward_ids = set()
+    for aid in admission_ids:
+        w_override = ward_overrides.get(aid)
+        if w_override:
+            extra_ward_ids.add(w_override)
+        elif bed_overrides.get(aid) and bed_overrides[aid] in extra_beds:
+            b_obj = extra_beds[bed_overrides[aid]]
+            if b_obj.ward_id:
+                extra_ward_ids.add(b_obj.ward_id)
 
-        except Exception:
-            pass
+    extra_wards = {}
+    if extra_ward_ids:
+        extra_wards = {
+            w.id: w
+            for w in db.query(Ward).filter(Ward.id.in_(extra_ward_ids), Ward.hospital_id == hospital_id).all()
+        }
 
-    elif missing_ids and source_type == BillingSourceType.radiology:
-        try:
-            from modules.radiology.entities.radiology_entities import RadiologyOrder
-            from sqlalchemy import or_ as sa_or
-
-            # Fetch all radiology orders whose .id OR .prescription_request_id
-            # appears in missing_ids — covers both cross-link directions at once.
-            linked_orders = (
-                db.query(RadiologyOrder)
-                .filter(
-                    RadiologyOrder.hospital_id == hospital_id,
-                    sa_or(
-                        RadiologyOrder.id.in_(missing_ids),
-                        RadiologyOrder.prescription_request_id.in_(missing_ids),
-                    ),
-                )
-                .all()
-            )
-
-            # Index for O(1) lookup in both directions
-            orders_by_id: dict[UUID, RadiologyOrder] = {o.id: o for o in linked_orders}
-            # Keep first order per prescription_request_id (consistent with the
-            # original single-item fallback which uses .first())
-            orders_by_req: dict[UUID, RadiologyOrder] = {}
-            for o in linked_orders:
-                if o.prescription_request_id and o.prescription_request_id not in orders_by_req:
-                    orders_by_req[o.prescription_request_id] = o
-
-            # Map each missing source_id to its counterpart charge-lookup ID
-            missing_to_counterpart: dict[UUID, UUID] = {}
-            counterpart_ids: list[UUID] = []
-            for sid in missing_ids:
-                counterpart: UUID | None = None
-                if sid in orders_by_id:
-                    # sid is a RadiologyOrder.id — look up charge by its prescription_request_id
-                    req_id = orders_by_id[sid].prescription_request_id
-                    if req_id:
-                        counterpart = req_id
-                elif sid in orders_by_req:
-                    # sid is a RadPrescriptionRequest.id — look up charge by the order's id
-                    counterpart = orders_by_req[sid].id
-
-                if counterpart:
-                    missing_to_counterpart[sid] = counterpart
-                    counterpart_ids.append(counterpart)
-
-            # One bulk charge query for all resolved counterpart IDs
-            if counterpart_ids:
-                fallback_charges = (
-                    db.query(BillingCharge)
-                    .filter(
-                        BillingCharge.hospital_id == hospital_id,
-                        BillingCharge.source_type == source_type,
-                        BillingCharge.source_id.in_(counterpart_ids),
-                    )
-                    .order_by(BillingCharge.source_id, BillingCharge.created_at.desc())
-                    .all()
-                )
-                fallback_by_counterpart: dict[UUID, BillingCharge] = {}
-                for charge in fallback_charges:
-                    if charge.source_id not in fallback_by_counterpart:
-                        fallback_by_counterpart[charge.source_id] = charge
-
-                # Map resolved charges back to original source_ids
-                for sid, counterpart in missing_to_counterpart.items():
-                    if counterpart in fallback_by_counterpart:
-                        charges_by_source[sid] = fallback_by_counterpart[counterpart]
-
-        except Exception:
-            # Fallback resolution failed — missing IDs stay missing (unbilled / not cleared)
-            pass
-
-    # ── Step 4: Build and return result map ────────────────────────────────────
-    return {
-        sid: _state_from_charge(charges_by_source.get(sid))
-        for sid in id_list
+    # Query 3: Bulk load open IPD accounts for these admissions (read path - no write locks!)
+    existing_accounts = (
+        db.query(FinancialAccount)
+        .filter(
+            FinancialAccount.hospital_id == hospital_id,
+            FinancialAccount.admission_id.in_(admission_ids),
+            FinancialAccount.account_type == FinancialAccountType.ipd,
+            FinancialAccount.status == FinancialAccountStatus.open,
+        )
+        .all()
+    )
+    acc_by_admission: dict[UUID, FinancialAccount] = {
+        acc.admission_id: acc for acc in existing_accounts if acc.admission_id
     }
+
+    patient_ids = list({a.patient_id for a in admissions if a.patient_id})
+    all_account_ids = [acc.id for acc in existing_accounts]
+
+    # Query 4: Set-based aggregation for charges, payments, and deposits
+    # 4a. Charges aggregation: group by patient_id
+    charge_aggs = {}
+    if patient_ids:
+        c_rows = (
+            db.query(
+                BillingCharge.patient_id,
+                func.coalesce(func.sum(BillingCharge.net_amount), 0.0).label("lifetime_charges"),
+                func.coalesce(func.sum(BillingCharge.amount_paid), 0.0).label("lifetime_paid"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                BillingCharge.account_id.in_(all_account_ids) if all_account_ids else False,
+                                BillingCharge.amount_paid,
+                            ),
+                            else_=0.0,
+                        )
+                    ),
+                    0.0,
+                ).label("episode_paid"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                BillingCharge.account_id.in_(all_account_ids) if all_account_ids else False,
+                                case(
+                                    (BillingCharge.net_amount > BillingCharge.amount_paid, BillingCharge.net_amount - BillingCharge.amount_paid),
+                                    else_=0.0,
+                                ),
+                            ),
+                            else_=0.0,
+                        )
+                    ),
+                    0.0,
+                ).label("episode_outstanding"),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (BillingCharge.net_amount > BillingCharge.amount_paid, BillingCharge.net_amount - BillingCharge.amount_paid),
+                            else_=0.0,
+                        )
+                    ),
+                    0.0,
+                ).label("lifetime_outstanding"),
+            )
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.patient_id.in_(patient_ids),
+                BillingCharge.status != BillingChargeStatus.cancelled,
+            )
+            .group_by(BillingCharge.patient_id)
+            .all()
+        )
+        charge_aggs = {r[0]: r for r in c_rows}
+
+    # Per-account charges aggregation (if multiple admissions belong to same patient)
+    acc_charge_aggs = {}
+    if all_account_ids:
+        ac_rows = (
+            db.query(
+                BillingCharge.account_id,
+                func.coalesce(func.sum(BillingCharge.amount_paid), 0.0),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (BillingCharge.net_amount > BillingCharge.amount_paid, BillingCharge.net_amount - BillingCharge.amount_paid),
+                            else_=0.0,
+                        )
+                    ),
+                    0.0,
+                ),
+            )
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.account_id.in_(all_account_ids),
+                BillingCharge.status != BillingChargeStatus.cancelled,
+            )
+            .group_by(BillingCharge.account_id)
+            .all()
+        )
+        acc_charge_aggs = {r[0]: (float(r[1]), float(r[2])) for r in ac_rows}
+
+    # 4b. Deposits aggregation per admission and per account
+    dep_aggs: dict[UUID, float] = {}
+    if admission_ids:
+        d_rows = (
+            db.query(
+                BillingDeposit.admission_id,
+                func.coalesce(func.sum(BillingDeposit.available_amount), 0.0),
+            )
+            .filter(
+                BillingDeposit.hospital_id == hospital_id,
+                BillingDeposit.admission_id.in_(admission_ids),
+                BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
+            )
+            .group_by(BillingDeposit.admission_id)
+            .all()
+        )
+        dep_aggs = {r[0]: float(r[1]) for r in d_rows if r[0]}
+
+    # Query 5: Active exceptions for all target admissions
+    exceptions = (
+        db.query(FinancialClearanceException)
+        .filter(
+            FinancialClearanceException.hospital_id == hospital_id,
+            FinancialClearanceException.admission_id.in_(admission_ids),
+            FinancialClearanceException.service_type.in_(["admission_bed", "ipd_bed_allocation", "bed_allocation", "admission"]),
+            FinancialClearanceException.is_consumed == False,
+        )
+        .order_by(FinancialClearanceException.created_at.desc())
+        .all()
+    )
+    exc_by_admission: dict[UUID, FinancialClearanceException] = {}
+    for exc in exceptions:
+        if exc.admission_id and exc.admission_id not in exc_by_admission:
+            exc_by_admission[exc.admission_id] = exc
+
+    # Construct clearance state for each admission
+    results: dict[UUID, BedAllocationClearanceState] = {}
+    for aid in admission_ids:
+        adm = admission_map.get(aid)
+        if not adm:
+            continue
+
+        resolved_ward = None
+        w_id = ward_overrides.get(aid)
+        if w_id and w_id in extra_wards:
+            resolved_ward = extra_wards[w_id]
+        elif bed_overrides.get(aid) and bed_overrides[aid] in extra_beds:
+            b_obj = extra_beds[bed_overrides[aid]]
+            if b_obj.ward_id and b_obj.ward_id in extra_wards:
+                resolved_ward = extra_wards[b_obj.ward_id]
+        if not resolved_ward and adm.ward:
+            resolved_ward = adm.ward
+
+        is_prov = False
+        if not resolved_ward and policy.financial_gate_enabled and policy.advance_mode == "mandatory":
+            resolved_ward = default_ward
+            is_prov = True
+
+        admission_fee = float(getattr(resolved_ward, "admission_fee", 0.0) or 0.0) if resolved_ward else 0.0
+        bed_charge_per_day = float(getattr(resolved_ward, "bed_charge_per_day", 0.0) or 0.0) if resolved_ward else 0.0
+
+        if not policy.financial_gate_enabled or policy.advance_mode in ("waived", "optional"):
+            required_advance = 0.0
+        else:
+            fee = admission_fee if policy.include_admission_fee else 0.0
+            tariff = bed_charge_per_day if policy.include_first_day_bed_tariff else 0.0
+            base_advance = round(fee + tariff, 2)
+            required_advance = max(base_advance, policy.minimum_advance_amount) if policy.minimum_advance_amount > 0 else base_advance
+
+        acc = acc_by_admission.get(aid)
+        ipd_acc_id = acc.id if acc else None
+
+        if ipd_acc_id and ipd_acc_id in acc_charge_aggs:
+            paid = round(acc_charge_aggs[ipd_acc_id][0], 2)
+            current_ipd_outstanding = round(acc_charge_aggs[ipd_acc_id][1], 2)
+        else:
+            paid = 0.0
+            current_ipd_outstanding = 0.0
+
+        deposit = round(dep_aggs.get(aid, 0.0), 2)
+
+        c_row = charge_aggs.get(adm.patient_id)
+        lifetime_outstanding = round(float(c_row[5] if c_row else 0.0), 2)
+        historical_balance = max(0.0, round(lifetime_outstanding - current_ipd_outstanding, 2))
+
+        total_cov = round(paid + deposit, 2)
+        shortfall = max(0.0, round(required_advance - total_cov, 2))
+
+        active_exc = exc_by_admission.get(aid)
+        if active_exc and active_exc.status == FinancialExceptionStatus.approved.value:
+            status_str = "emergency_override" if active_exc.is_emergency else "exception_approved"
+            reason_str = (
+                f"Emergency clinical override active: {active_exc.reason}"
+                if active_exc.is_emergency
+                else f"Approved financial exception ({active_exc.reason_category}): {active_exc.reason}"
+            )
+            results[aid] = BedAllocationClearanceState(
+                is_cleared=True,
+                status=status_str,
+                required_advance=required_advance,
+                admission_fee=admission_fee,
+                bed_charge_per_day=bed_charge_per_day,
+                paid_or_allocated_amount=paid,
+                available_deposit=deposit,
+                shortfall=shortfall,
+                ipd_account_id=ipd_acc_id,
+                current_ipd_outstanding=current_ipd_outstanding,
+                historical_patient_balance=historical_balance,
+                active_exception_id=active_exc.id,
+                active_exception_status=active_exc.status,
+                reason=reason_str,
+            )
+        elif active_exc and active_exc.status == FinancialExceptionStatus.pending.value:
+            results[aid] = BedAllocationClearanceState(
+                is_cleared=False,
+                status="exception_pending",
+                required_advance=required_advance,
+                admission_fee=admission_fee,
+                bed_charge_per_day=bed_charge_per_day,
+                paid_or_allocated_amount=paid,
+                available_deposit=deposit,
+                shortfall=shortfall,
+                ipd_account_id=ipd_acc_id,
+                current_ipd_outstanding=current_ipd_outstanding,
+                historical_patient_balance=historical_balance,
+                active_exception_id=active_exc.id,
+                active_exception_status=active_exc.status,
+                reason=f"Financial exception request pending review ({active_exc.reason_category}). Shortfall: ₹{shortfall:.2f}",
+            )
+        elif shortfall <= 0.0:
+            results[aid] = BedAllocationClearanceState(
+                is_cleared=True,
+                status="financially_cleared",
+                required_advance=required_advance,
+                admission_fee=admission_fee,
+                bed_charge_per_day=bed_charge_per_day,
+                paid_or_allocated_amount=paid,
+                available_deposit=deposit,
+                shortfall=0.0,
+                ipd_account_id=ipd_acc_id,
+                current_ipd_outstanding=current_ipd_outstanding,
+                historical_patient_balance=historical_balance,
+                active_exception_id=None,
+                active_exception_status=None,
+                reason="Financially cleared for standard ward admission (pending bed allocation)." if is_prov else "Financially cleared for bed allocation.",
+            )
+        else:
+            results[aid] = BedAllocationClearanceState(
+                is_cleared=False,
+                status="payment_required",
+                required_advance=required_advance,
+                admission_fee=admission_fee,
+                bed_charge_per_day=bed_charge_per_day,
+                paid_or_allocated_amount=paid,
+                available_deposit=deposit,
+                shortfall=shortfall,
+                ipd_account_id=ipd_acc_id,
+                current_ipd_outstanding=current_ipd_outstanding,
+                historical_patient_balance=historical_balance,
+                active_exception_id=None,
+                active_exception_status=None,
+                reason=(
+                    f"Payment or deposit of ₹{shortfall:.2f} required (estimated for standard ward). Final amount adjusts upon specific bed allocation."
+                    if is_prov
+                    else f"Payment or deposit of ₹{shortfall:.2f} required for admission advance."
+                ),
+            )
+
+    return results
 
 
 def evaluate_bed_allocation_clearance(
@@ -647,195 +614,214 @@ def evaluate_bed_allocation_clearance(
     ward_id: UUID | None = None,
     bed_id: UUID | None = None,
 ) -> BedAllocationClearanceState:
-    """
-    Evaluate authoritative financial readiness for IPD bed allocation.
-    Evaluates strictly against the current requested IPD episode's advance requirement
-    (admission fee + selected bed/ward tariff, or configured hospital minimum),
-    accounting for allocated payments and available deposits.
-    Separates historical patient balance (informational only) without hard-blocking.
-    Respects approved FinancialClearanceExceptions.
-    """
-    from modules.beds.entities.bed import Bed, Ward
-    from modules.billing.services.billing_service import patient_ledger_totals
-    from modules.inpatient.entities.admission import Admission
-    from modules.inpatient.services.inpatient_billing_service import InpatientBillingService
-    from modules.tenancy.entities.hospital import Hospital
+    """Evaluate authoritative financial readiness for IPD bed allocation.
 
-    admission = (
-        db.query(Admission)
-        .filter(Admission.id == admission_id, Admission.hospital_id == hospital_id)
-        .first()
+    Uses bulk evaluation architecture behind the scenes to execute in a constant,
+    bounded number of set-based queries (~4 queries) without N+1 or write-locking.
+    """
+    res = bulk_evaluate_bed_allocation_clearance(
+        db,
+        hospital_id,
+        [admission_id],
+        ward_overrides={admission_id: ward_id} if ward_id else None,
+        bed_overrides={admission_id: bed_id} if bed_id else None,
     )
-    if not admission:
+    if admission_id not in res:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Admission not found for financial clearance evaluation.",
         )
+    return res[admission_id]
 
-    # Resolve target ward & bed
-    resolved_ward_id = ward_id
-    if not resolved_ward_id and bed_id:
-        target_bed = db.query(Bed).filter(Bed.id == bed_id, Bed.hospital_id == hospital_id).first()
-        if target_bed:
-            resolved_ward_id = target_bed.ward_id
-    if not resolved_ward_id and admission.ward_id:
-        resolved_ward_id = admission.ward_id
 
-    ward = None
-    if resolved_ward_id:
-        ward = db.query(Ward).filter(Ward.id == resolved_ward_id, Ward.hospital_id == hospital_id).first()
+def enforce_bed_allocation_clearance(
+    db: Session,
+    hospital_id: UUID,
+    admission: Any,
+    *,
+    ward_id: UUID | None,
+    bed_id: UUID | None,
+    actor: dict[str, Any] | None,
+    is_emergency_override: bool = False,
+    emergency_override_reason: str | None = None,
+) -> BedAllocationClearanceState:
+    """Gate a first bed allocation for ``admission`` (402 when not financially cleared).
 
-    # Read hospital admission advance policy
-    policy = get_admission_financial_policy(db, hospital_id)
+    A cleared state consumes the admission's approved exception, if any. When not
+    cleared, an explicit emergency override is authorized through the canonical helper
+    (permission + reason + ``emergency_bypass_allowed`` policy) and persisted as a
+    consumed admission-scoped override with audit + sync. The caller commits.
+    """
+    from dataclasses import replace
 
-    is_provisional_ward = False
-    if not ward and policy.financial_gate_enabled and policy.advance_mode == "mandatory":
-        from modules.beds.entities.bed import WardType
-        default_ward = (
-            db.query(Ward)
-            .filter(Ward.hospital_id == hospital_id, Ward.is_active == True)
-            .order_by((Ward.ward_type == WardType.general).desc(), Ward.admission_fee.asc())
-            .first()
+    from modules.billing.services.financial_exception_service import (
+        ENTITY_TYPE,
+        consume_exception,
+        exception_audit_details,
+        record_emergency_override,
+    )
+    from shared.audit.service import write_audit_log
+
+    fin_state = evaluate_bed_allocation_clearance(db, hospital_id, admission.id, ward_id=ward_id, bed_id=bed_id)
+    if fin_state.is_cleared:
+        if fin_state.active_exception_id:
+            exc = (
+                db.query(FinancialClearanceException)
+                .filter(
+                    FinancialClearanceException.id == fin_state.active_exception_id,
+                    FinancialClearanceException.hospital_id == hospital_id,
+                )
+                .first()
+            )
+            if exc is not None:
+                consume_exception(exc)
+                db.flush()
+                write_audit_log(
+                    db,
+                    hospital_id=hospital_id,
+                    actor=actor or {"sub": "system", "name": "System", "role": "system"},
+                    action="consume",
+                    entity_type=ENTITY_TYPE,
+                    entity_id=exc.id,
+                    summary=f"Financial exception consumed for bed allocation (admission {admission.id})",
+                    details=exception_audit_details(exc, consumed_for_bed_id=str(bed_id) if bed_id else None),
+                )
+        return fin_state
+
+    if not is_emergency_override:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "message": f"Payment or deposit required before bed allocation. Shortfall: ₹{fin_state.shortfall:.2f}.",
+                "status": fin_state.status,
+                "required_advance": fin_state.required_advance,
+                "admission_fee": fin_state.admission_fee,
+                "bed_charge_per_day": fin_state.bed_charge_per_day,
+                "paid_or_allocated_amount": fin_state.paid_or_allocated_amount,
+                "available_deposit": fin_state.available_deposit,
+                "shortfall": fin_state.shortfall,
+                "reason": fin_state.reason,
+                "ipd_account_id": str(fin_state.ipd_account_id) if fin_state.ipd_account_id else None,
+            },
         )
-        if default_ward:
-            ward = default_ward
-            is_provisional_ward = True
 
-    admission_fee = float(getattr(ward, "admission_fee", 0.0) or 0.0) if ward else 0.0
-    bed_charge_per_day = float(getattr(ward, "bed_charge_per_day", 0.0) or 0.0) if ward else 0.0
-
-    if not policy.financial_gate_enabled or policy.advance_mode == "waived":
-        required_advance = 0.0
-    elif policy.advance_mode == "optional":
-        required_advance = 0.0
-    else:
-        # Mandatory advance
-        fee = admission_fee if policy.include_admission_fee else 0.0
-        tariff = bed_charge_per_day if policy.include_first_day_bed_tariff else 0.0
-        base_advance = round(fee + tariff, 2)
-        required_advance = max(base_advance, policy.minimum_advance_amount) if policy.minimum_advance_amount > 0 else base_advance
-
-    # Ensure IPD financial account exists
-    billing_svc = InpatientBillingService(db)
-    acc = billing_svc.ensure_financial_account(
-        hospital_id=hospital_id,
-        patient_id=admission.patient_id,
-        admission_id=admission.id,
-        created_by_name="System",
-    )
-    ipd_account_id = acc.id if acc else None
-
-    # Compute episode-specific ledger totals
-    ledger = billing_svc.get_ledger_totals(
-        hospital_id, admission.patient_id, admission_id=admission.id
-    )
-    paid = round(float(ledger.get("total_paid", 0.0) or ledger.get("total_payments", 0.0) or 0.0), 2)
-    deposit = round(
-        float(ledger.get("deposits_available", 0.0) or ledger.get("total_deposits_available", 0.0) or 0.0),
-        2,
-    )
-    current_ipd_outstanding = round(float(ledger.get("outstanding", 0.0) or 0.0), 2)
-
-    # Compute historical patient balance (all episodes minus current IPD account)
-    lifetime_ledger = patient_ledger_totals(db, hospital_id, admission.patient_id, account_id=None)
-    lifetime_outstanding = round(float(lifetime_ledger.get("outstanding", 0.0) or 0.0), 2)
-    historical_patient_balance = max(0.0, round(lifetime_outstanding - current_ipd_outstanding, 2))
-
-    total_coverage = round(paid + deposit, 2)
-    shortfall = max(0.0, round(required_advance - total_coverage, 2))
-
-    # Check for active FinancialClearanceException for this admission
-    active_exc = (
-        db.query(FinancialClearanceException)
-        .filter(
-            FinancialClearanceException.hospital_id == hospital_id,
-            FinancialClearanceException.admission_id == admission.id,
-            FinancialClearanceException.service_type.in_(["admission_bed", "ipd_bed_allocation", "bed_allocation", "admission"]),
-            FinancialClearanceException.is_consumed == False,
-        )
-        .order_by(FinancialClearanceException.created_at.desc())
-        .first()
+    from modules.billing.services.financial_authorization import (
+        OverrideScope,
+        authorize_emergency_override,
     )
 
-    if active_exc and active_exc.status == FinancialExceptionStatus.approved.value:
-        status_str = "emergency_override" if active_exc.is_emergency else "exception_approved"
-        reason_str = (
-            f"Emergency clinical override active: {active_exc.reason}"
-            if active_exc.is_emergency
-            else f"Approved financial exception ({active_exc.reason_category}): {active_exc.reason}"
-        )
-        return BedAllocationClearanceState(
-            is_cleared=True,
-            status=status_str,
-            required_advance=required_advance,
-            admission_fee=admission_fee,
-            bed_charge_per_day=bed_charge_per_day,
-            paid_or_allocated_amount=paid,
-            available_deposit=deposit,
-            shortfall=shortfall,
-            ipd_account_id=ipd_account_id,
-            current_ipd_outstanding=current_ipd_outstanding,
-            historical_patient_balance=historical_patient_balance,
-            active_exception_id=active_exc.id,
-            active_exception_status=active_exc.status,
-            reason=reason_str,
-        )
+    scope = OverrideScope.admission(admission.id, patient_id=admission.patient_id, source_id=bed_id)
+    override_actor = authorize_emergency_override(
+        db, hospital_id, actor, scope=scope, reason=emergency_override_reason
+    )
+    em_exc = record_emergency_override(
+        db,
+        hospital_id,
+        override_actor,
+        scope,
+        emergency_override_reason or "",
+        required_amount=fin_state.required_advance,
+        amount_covered=round(fin_state.paid_or_allocated_amount + fin_state.available_deposit, 2),
+        consumed=True,
+        financial_account_id=fin_state.ipd_account_id,
+    )
+    return replace(
+        fin_state,
+        is_cleared=True,
+        status="emergency_override",
+        active_exception_id=em_exc.id,
+        active_exception_status=em_exc.status,
+        reason=f"Emergency clinical override active: {em_exc.reason}",
+    )
 
-    if active_exc and active_exc.status == FinancialExceptionStatus.pending.value:
-        return BedAllocationClearanceState(
-            is_cleared=False,
-            status="exception_pending",
-            required_advance=required_advance,
-            admission_fee=admission_fee,
-            bed_charge_per_day=bed_charge_per_day,
-            paid_or_allocated_amount=paid,
-            available_deposit=deposit,
-            shortfall=shortfall,
-            ipd_account_id=ipd_account_id,
-            current_ipd_outstanding=current_ipd_outstanding,
-            historical_patient_balance=historical_patient_balance,
-            active_exception_id=active_exc.id,
-            active_exception_status=active_exc.status,
-            reason=f"Financial exception request pending review ({active_exc.reason_category}). Shortfall: ₹{shortfall:.2f}",
-        )
 
-    if shortfall <= 0.0:
-        return BedAllocationClearanceState(
-            is_cleared=True,
-            status="financially_cleared",
-            required_advance=required_advance,
-            admission_fee=admission_fee,
-            bed_charge_per_day=bed_charge_per_day,
-            paid_or_allocated_amount=paid,
-            available_deposit=deposit,
-            shortfall=0.0,
-            ipd_account_id=ipd_account_id,
-            current_ipd_outstanding=current_ipd_outstanding,
-            historical_patient_balance=historical_patient_balance,
-            active_exception_id=None,
-            active_exception_status=None,
-            reason="Financially cleared for standard ward admission (pending bed allocation)." if is_provisional_ward else "Financially cleared for bed allocation.",
-        )
+def _linked_source_ids(
+    db: Session, hospital_id: UUID, source_type: BillingSourceType, source_id: UUID
+) -> list[UUID]:
+    """The source plus its lab/radiology order ↔ prescription-request counterpart."""
+    ids: list[UUID] = [source_id]
+    rows: list[Any] = []
+    if source_type == BillingSourceType.laboratory:
+        from modules.laboratory.entities.lab_entities import LabOrder
 
-    return BedAllocationClearanceState(
-        is_cleared=False,
-        status="payment_required",
-        required_advance=required_advance,
-        admission_fee=admission_fee,
-        bed_charge_per_day=bed_charge_per_day,
-        paid_or_allocated_amount=paid,
-        available_deposit=deposit,
-        shortfall=shortfall,
-        ipd_account_id=ipd_account_id,
-        current_ipd_outstanding=current_ipd_outstanding,
-        historical_patient_balance=historical_patient_balance,
-        active_exception_id=None,
-        active_exception_status=None,
-        reason=(
-            f"Payment or deposit of ₹{shortfall:.2f} required (estimated for standard ward). Final amount adjusts upon specific bed allocation."
-            if is_provisional_ward
-            else f"Payment or deposit of ₹{shortfall:.2f} required for admission advance."
+        rows = (
+            db.query(LabOrder.id, LabOrder.prescription_request_id)
+            .filter(
+                LabOrder.hospital_id == hospital_id,
+                (LabOrder.id == source_id) | (LabOrder.prescription_request_id == source_id),
+            )
+            .all()
+        )
+    elif source_type == BillingSourceType.radiology:
+        from modules.radiology.entities.radiology_entities import RadiologyOrder
+
+        rows = (
+            db.query(RadiologyOrder.id, RadiologyOrder.prescription_request_id)
+            .filter(
+                RadiologyOrder.hospital_id == hospital_id,
+                (RadiologyOrder.id == source_id) | (RadiologyOrder.prescription_request_id == source_id),
+            )
+            .all()
+        )
+    for order_id, request_id in rows:
+        for candidate in (order_id, request_id):
+            if candidate and candidate not in ids:
+                ids.append(candidate)
+    return ids
+
+
+def _service_scope_ids(
+    db: Session, hospital_id: UUID, source_type: BillingSourceType, source_id: UUID
+) -> list[UUID]:
+    """Ids whose exception authorizes every step of this service: the source itself
+    plus, for an order created from a prescription request, that request (the canonical
+    billable service). Sibling orders of the same request are never included."""
+    from modules.billing.services.service_charge_resolver import service_charge_key
+
+    key = service_charge_key(db, hospital_id, source_type, source_id)
+    ids = [source_id]
+    if key.canonical_source_id not in ids:
+        ids.append(key.canonical_source_id)
+    return ids
+
+
+def _find_order_scoped_exception(
+    db: Session,
+    hospital_id: UUID,
+    source_type: BillingSourceType,
+    source_id: UUID,
+    patient_id: UUID | None,
+) -> FinancialClearanceException | None:
+    """An approved exception / emergency override already used by an earlier step of
+    the same service (status ``consumed``) keeps authorizing its later steps."""
+    q = db.query(FinancialClearanceException).filter(
+        FinancialClearanceException.hospital_id == hospital_id,
+        FinancialClearanceException.service_type == source_type.value,
+        FinancialClearanceException.is_consumed == True,
+        FinancialClearanceException.status == FinancialExceptionStatus.consumed.value,
+        FinancialClearanceException.source_id.in_(
+            _service_scope_ids(db, hospital_id, source_type, source_id)
         ),
+    )
+    if patient_id:
+        q = q.filter(FinancialClearanceException.patient_id == patient_id)
+    return q.order_by(FinancialClearanceException.created_at.desc()).first()
+
+
+def _exception_cleared_state(state: ServiceFinancialState, exc: FinancialClearanceException) -> ServiceFinancialState:
+    if exc.is_emergency:
+        reason = f"Emergency clinical override active: {exc.reason}"
+    else:
+        reason = f"Approved financial exception ({exc.reason_category}): {exc.reason}"
+    return ServiceFinancialState(
+        charge_exists=state.charge_exists,
+        charge_id=state.charge_id,
+        status=state.status,
+        net_amount=state.net_amount,
+        amount_paid=state.amount_paid,
+        outstanding_amount=state.outstanding_amount,
+        is_cleared=True,
+        reason=reason,
     )
 
 
@@ -850,18 +836,39 @@ def assert_service_financially_cleared(
     emergency_reason: str | None = None,
     admission_id: UUID | None = None,
     patient_id: UUID | None = None,
+    exception_scope: str = "step",
 ) -> ServiceFinancialState:
     """
     Assert that the service charge is financially cleared.
     Raises HTTPException 402 PAYMENT_REQUIRED (or 400 if cancelled) if blocked.
-    If an approved FinancialClearanceException exists, allows service to proceed.
-    If is_emergency_override is True, structured emergency exception is recorded and care proceeds immediately.
+    If an approved FinancialClearanceException scoped to this exact source exists, it is
+    consumed and the service proceeds.
+    If is_emergency_override is True, the actor is authorized through
+    ``financial_authorization.authorize_emergency_override`` (403 when not permitted,
+    400 without reason) and a consumed emergency override record + audit are staged.
+
+    ``exception_scope="order"`` (Lab / Radiology): an exception or override already
+    consumed by an earlier step of the same service (the order, or the prescription
+    request it fulfils) keeps authorizing every later step, so staff never re-override
+    each step of one order. ``"step"`` keeps per-step consumption (OT, pharmacy, ...).
     """
     state = check_service_financial_clearance(db, hospital_id, source_type, source_id)
     if state.is_cleared:
         return state
 
-    # 1. Check for approved FinancialClearanceException strictly scoped to service_type & patient
+    if state.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot {action_description}: billing charge is cancelled.",
+        )
+
+    if exception_scope == "order":
+        prior = _find_order_scoped_exception(db, hospital_id, source_type, source_id, patient_id)
+        if prior is not None:
+            return _exception_cleared_state(state, prior)
+
+    # 1. Approved exception scoped to this source (or its linked order / request).
+    #    Rows with a NULL source_id never match: they would unlock every source of the type.
     exc_q = (
         db.query(FinancialClearanceException)
         .filter(
@@ -869,15 +876,13 @@ def assert_service_financially_cleared(
             FinancialClearanceException.status == FinancialExceptionStatus.approved.value,
             FinancialClearanceException.is_consumed == False,
             FinancialClearanceException.service_type == source_type.value,
+            FinancialClearanceException.source_id.in_(
+                _linked_source_ids(db, hospital_id, source_type, source_id)
+            ),
         )
     )
     if patient_id:
         exc_q = exc_q.filter(FinancialClearanceException.patient_id == patient_id)
-    if source_id:
-        exc_q = exc_q.filter(
-            (FinancialClearanceException.source_id == source_id)
-            | (FinancialClearanceException.source_id.is_(None))
-        )
     if admission_id:
         exc_q = exc_q.filter(
             (FinancialClearanceException.admission_id == admission_id)
@@ -886,13 +891,25 @@ def assert_service_financially_cleared(
 
     approved_exc = exc_q.order_by(FinancialClearanceException.created_at.desc()).first()
     if approved_exc:
-        # Mark exception consumed to prevent unauthorized replay
-        from datetime import datetime as _dt
-        from datetime import timezone as _tz
-        approved_exc.is_consumed = True
-        approved_exc.consumed_at = _dt.now(_tz.utc)
-        approved_exc.status = FinancialExceptionStatus.consumed.value
+        from modules.billing.services.financial_exception_service import (
+            ENTITY_TYPE,
+            consume_exception,
+            exception_audit_details,
+        )
+        from shared.audit.service import write_audit_log
+
+        consume_exception(approved_exc)
         db.flush()
+        write_audit_log(
+            db,
+            hospital_id=hospital_id,
+            actor=actor or {"sub": "system", "name": "System", "role": "system"},
+            action="consume",
+            entity_type=ENTITY_TYPE,
+            entity_id=approved_exc.id,
+            summary=f"Financial exception consumed to {action_description} ({source_type.value} {source_id})",
+            details=exception_audit_details(approved_exc, consumed_for_source_id=str(source_id)),
+        )
 
         return ServiceFinancialState(
             charge_exists=state.charge_exists,
@@ -905,61 +922,35 @@ def assert_service_financially_cleared(
             reason=f"Approved financial exception ({approved_exc.reason_category}): {approved_exc.reason}",
         )
 
-    # 2. Structured emergency override
+    # 2. Authorized, recorded emergency override
     if is_emergency_override:
-        actor_id, actor_name = validate_emergency_override_actor(
-            actor, emergency_reason, service_type=source_type.value
+        from modules.billing.services.financial_authorization import (
+            OverrideScope,
+            authorize_emergency_override,
         )
-        reason_text = (emergency_reason or "").strip()
+        from modules.billing.services.financial_exception_service import record_emergency_override
 
-        # If patient_id is not given, derive from charge
-        target_patient_id = patient_id
-        if not target_patient_id and state.charge_id:
-            chg = db.query(BillingCharge).filter(BillingCharge.id == state.charge_id).first()
-            if chg:
-                target_patient_id = chg.patient_id
-
-        if target_patient_id and actor_id:
-            try:
-                from datetime import datetime as _dt
-                from datetime import timezone as _tz
-                now = _dt.now(_tz.utc)
-                em_exc = FinancialClearanceException(
-                    hospital_id=hospital_id,
-                    patient_id=target_patient_id,
-                    admission_id=admission_id,
-                    service_type=source_type.value,
-                    action_type="emergency_execution",
-                    source_id=source_id,
-                    is_emergency=True,
-                    required_amount=Decimal(str(state.net_amount)),
-                    amount_covered=Decimal(str(state.amount_paid)),
-                    shortfall_amount=Decimal(str(state.outstanding_amount)),
-                    reason_category="emergency_life_safety",
-                    reason=reason_text,
-                    status=FinancialExceptionStatus.consumed.value,
-                    is_consumed=True,
-                    consumed_at=now,
-                    requested_by_id=actor_id,
-                    requested_by_name=actor_name,
-                    approved_by_id=actor_id,
-                    approved_by_name=actor_name,
-                    approval_remarks="Auto-authorized under emergency life-safety override protocol",
-                )
-                db.add(em_exc)
-                db.flush()
-                from shared.audit.service import write_audit_log
-                write_audit_log(
-                    db,
-                    hospital_id=hospital_id,
-                    actor=actor or {"id": str(actor_id), "name": actor_name},
-                    action="emergency_override",
-                    entity_type="financial_clearance_exception",
-                    entity_id=em_exc.id,
-                    summary=f"Emergency financial override applied for {source_type.value} ({source_id}): {reason_text}",
-                )
-            except Exception:
-                pass
+        charge = db.query(BillingCharge).filter(BillingCharge.id == state.charge_id).first() if state.charge_id else None
+        scope = OverrideScope.service(
+            source_type.value,
+            source_id,
+            patient_id=patient_id or (charge.patient_id if charge else None),
+            admission_id=admission_id,
+        )
+        override_actor = authorize_emergency_override(
+            db, hospital_id, actor, scope=scope, reason=emergency_reason
+        )
+        em_exc = record_emergency_override(
+            db,
+            hospital_id,
+            override_actor,
+            scope,
+            emergency_reason or "",
+            required_amount=state.net_amount,
+            amount_covered=state.amount_paid,
+            consumed=True,
+            financial_account_id=charge.account_id if charge else None,
+        )
 
         return ServiceFinancialState(
             charge_exists=state.charge_exists,
@@ -969,23 +960,54 @@ def assert_service_financially_cleared(
             amount_paid=state.amount_paid,
             outstanding_amount=state.outstanding_amount,
             is_cleared=True,
-            reason=f"Emergency clinical override active: {reason_text}",
-        )
-
-    if state.status == "cancelled":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot {action_description}: billing charge is cancelled.",
+            reason=f"Emergency clinical override active: {em_exc.reason}",
         )
 
     raise HTTPException(
         status_code=status.HTTP_402_PAYMENT_REQUIRED,
         detail={
+            "code": "FINANCIAL_CLEARANCE_REQUIRED",
             "message": f"Payment required to {action_description}.",
+            "service_type": source_type.value,
+            "source_id": str(source_id),
+            "charge_id": str(state.charge_id) if state.charge_id else None,
             "status": state.status,
             "net_amount": state.net_amount,
             "amount_paid": state.amount_paid,
             "outstanding_amount": state.outstanding_amount,
             "reason": state.reason,
         },
+    )
+
+
+def assert_order_financially_cleared(
+    db: Session,
+    hospital_id: UUID,
+    source_type: BillingSourceType,
+    order: Any,
+    actor: dict[str, Any] | None,
+    *,
+    action_description: str,
+    is_emergency_override: bool = False,
+    emergency_reason: str | None = None,
+) -> ServiceFinancialState:
+    """Canonical gate for executing a step of a Lab / Radiology order.
+
+    Uses the order's resolved charge (request charge for prescription-originated
+    orders), 402 with the structured clearance body when not cleared, and order-scoped
+    exceptions: an exception / emergency override used by any earlier step of the same
+    order (or of the prescription request it fulfils) authorizes every later step.
+    """
+    return assert_service_financially_cleared(
+        db,
+        hospital_id,
+        source_type,
+        order.id,
+        action_description=action_description,
+        is_emergency_override=is_emergency_override,
+        actor=actor,
+        emergency_reason=emergency_reason,
+        admission_id=getattr(order, "admission_id", None),
+        patient_id=getattr(order, "patient_id", None),
+        exception_scope="order",
     )

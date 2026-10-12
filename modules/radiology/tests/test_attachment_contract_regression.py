@@ -67,6 +67,23 @@ def _make_client(role="hospital_admin"):
     db.add(order)
     db.commit()
 
+    # Attachment upload is a gated execution step: the order's charge is paid first.
+    from datetime import date
+
+    from modules.billing.entities.billing_entities import BillingPaymentMethod, BillingSourceType
+    from modules.billing.services.billing_service import create_payment, ensure_charge
+
+    charge = ensure_charge(
+        db, hospital_id=h_id, patient_id=patient.id, source_type=BillingSourceType.radiology,
+        source_id=order.id, description="Radiology RADREG01", charge_amount=400.0, created_by_name="Admin",
+    )
+    create_payment(
+        db, hospital_id=h_id, patient_id=patient.id, amount=400.0, payment_date=date.today(),
+        payment_method=BillingPaymentMethod.cash, notes=None, received_by_name="Cashier",
+        allocations_plan=[{"charge_id": charge.id, "amount": 400.0}],
+    )
+    db.commit()
+
     app = FastAPI()
     app.include_router(rad_router)
     user_dict = {"sub": str(uuid.uuid4()), "name": "Admin", "role": role,

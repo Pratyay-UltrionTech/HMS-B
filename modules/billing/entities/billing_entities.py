@@ -217,6 +217,23 @@ class BillingCharge(Base):
     __table_args__ = (
         Index("ix_billing_charges_hospital_created", "hospital_id", "created_at"),
         Index("ix_billing_charges_account", "hospital_id", "account_id"),
+        # One active charge per diagnostic service key (see service_charge_resolver).
+        # Created on existing databases by scripts/add_diagnostic_charge_unique_index.py.
+        Index(
+            "uq_billing_charges_active_diagnostic_source",
+            "hospital_id",
+            "source_type",
+            "source_id",
+            unique=True,
+            postgresql_where=text(
+                "source_id IS NOT NULL AND status <> 'cancelled' "
+                "AND source_type IN ('laboratory', 'radiology')"
+            ),
+            sqlite_where=text(
+                "source_id IS NOT NULL AND status <> 'cancelled' "
+                "AND source_type IN ('laboratory', 'radiology')"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -325,6 +342,13 @@ class BillingPaymentAllocation(Base):
     """
     Explicit, auditable allocation of tender (from payment or deposit) to a charge.
     Enables selective payment and partial item settlement.
+
+    Append-only ledger semantics: an allocation is never edited or deleted.
+    A reversal is a new row with a negative ``allocated_amount`` pointing at the
+    original via ``reversal_of_id`` and carrying the same payment/deposit/charge.
+    The money applied to a charge is therefore ``SUM(allocated_amount)`` over all
+    of its rows. ``refund_id`` marks a reversal caused by a refund voucher;
+    ``credit_deposit_id`` marks money moved into a ``cancellation_credit`` deposit.
     """
 
     __tablename__ = "billing_payment_allocations"
@@ -332,6 +356,7 @@ class BillingPaymentAllocation(Base):
         Index("ix_allocations_charge", "charge_id"),
         Index("ix_allocations_payment", "payment_id"),
         Index("ix_allocations_deposit", "deposit_id"),
+        Index("ix_allocations_reversal_of", "reversal_of_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -350,13 +375,25 @@ class BillingPaymentAllocation(Base):
         UUID(as_uuid=True), ForeignKey("billing_charges.id", ondelete="CASCADE"), nullable=False, index=True
     )
     allocated_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    reversal_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_payment_allocations.id", ondelete="SET NULL"), nullable=True
+    )
+    refund_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_refunds.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    credit_deposit_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_deposits.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    reversal_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     payment: Mapped["BillingPayment | None"] = relationship("BillingPayment", back_populates="allocations")
-    deposit: Mapped["BillingDeposit | None"] = relationship("BillingDeposit", back_populates="allocations")
+    deposit: Mapped["BillingDeposit | None"] = relationship(
+        "BillingDeposit", back_populates="allocations", foreign_keys=[deposit_id]
+    )
     charge: Mapped["BillingCharge"] = relationship("BillingCharge", back_populates="allocations")
 
 
@@ -416,7 +453,9 @@ class BillingDeposit(Base):
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
     account: Mapped["FinancialAccount | None"] = relationship("FinancialAccount", back_populates="deposits")
     allocations: Mapped[list["BillingPaymentAllocation"]] = relationship(
-        "BillingPaymentAllocation", back_populates="deposit"
+        "BillingPaymentAllocation",
+        back_populates="deposit",
+        foreign_keys="BillingPaymentAllocation.deposit_id",
     )
     refunds: Mapped[list["BillingRefund"]] = relationship(
         "BillingRefund", back_populates="deposit"
@@ -620,6 +659,11 @@ class BillingReceipt(Base):
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])
+
+    @property
+    def receipt_date(self) -> date:
+        """Receipt chronology date (matches collection settlement payment_date)."""
+        return self.payment_date
 
 
 # ── Consultation Pricing ─────────────────────────────────────────────────────

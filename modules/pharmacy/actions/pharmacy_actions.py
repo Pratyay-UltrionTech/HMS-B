@@ -7,21 +7,25 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from modules.billing.entities.billing_entities import (
+    BillingChargeStatus,
     BillingPaymentMethod,
     BillingSourceType,
 )
 from modules.billing.services.billing_service import (
-    cancel_charge_for_source,
     create_payment,
+    draw_down_account_deposits_for_charge,
     ensure_charge,
+    recompute_charge_financials,
 )
+from modules.billing.services.charge_reversal_service import cancel_source_charges_or_400
 from modules.pharmacy.contracts.pharmacy_contracts import (
     AdjustmentCreate,
     AdjustmentResponse,
@@ -73,15 +77,19 @@ from modules.pharmacy.entities.pharmacy_entities import (
     PharmacySupplier,
     PurchasePaymentStatus,
     StockAdjustment,
+    StockTransaction,
     StockTransactionType,
 )
 from modules.pharmacy.services.pharmacy_stock_service import (
     actor_name,
     allocate_fifo,
+    allocate_fifo_bulk,
     apply_stock_change,
+    apply_stock_changes_bulk,
     inventory_status,
     line_amounts,
     next_doc_number,
+    refresh_medicine_inventories_bulk,
     refresh_medicine_inventory,
 )
 from shared.audit import write_audit_log
@@ -622,9 +630,17 @@ class PharmacyActions:
         total_gst = 0.0
         total_net = 0.0
 
+        medicine_ids = list({it.medicine_id for it in payload.items})
+        meds = (
+            self.db.query(Medicine)
+            .filter(Medicine.hospital_id == self.hospital_id, Medicine.id.in_(medicine_ids))
+            .all()
+        )
+        med_by_id = {m.id: m for m in meds}
+
         line_computations = []
         for it in payload.items:
-            med = self.repo.get_medicine_by_id(it.medicine_id, self.hospital_id)
+            med = med_by_id.get(it.medicine_id)
             if not med:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Medicine {it.medicine_id} not found")
 
@@ -642,6 +658,7 @@ class PharmacyActions:
             line_computations.append((it, med, gross, disc, gst, net))
 
         purchase = PharmacyPurchase(
+            id=uuid4(),
             hospital_id=self.hospital_id,
             supplier_id=payload.supplier_id,
             invoice_number=inv_num,
@@ -656,38 +673,137 @@ class PharmacyActions:
             created_by_name=actor_name(self.user),
         )
         self.db.add(purchase)
-        self.db.flush()
+
+        # Bulk pre-fetch existing batches
+        batch_numbers = list({it.batch_number.strip() for it in payload.items})
+        existing_batches = (
+            self.db.query(MedicineBatch)
+            .filter(
+                MedicineBatch.hospital_id == self.hospital_id,
+                MedicineBatch.medicine_id.in_(medicine_ids),
+                MedicineBatch.batch_number.in_(batch_numbers),
+            )
+            .with_for_update()
+            .all()
+        )
+        batch_map: dict[tuple[UUID, str], MedicineBatch] = {
+            (b.medicine_id, b.batch_number): b for b in existing_batches
+        }
+
+        # Helper to instantiate a clean MedicineBatch model from canonical spec
+        def _build_batch_entity(spec: dict[str, Any]) -> MedicineBatch:
+            return MedicineBatch(
+                hospital_id=self.hospital_id,
+                medicine_id=spec["medicine_id"],
+                supplier_id=spec["supplier_id"],
+                batch_number=spec["batch_number"],
+                manufacture_date=spec["manufacture_date"],
+                expiry_date=spec["expiry_date"],
+                purchase_price=spec["purchase_price"],
+                selling_price=spec["selling_price"],
+                mrp=spec["mrp"],
+                initial_quantity=spec["total_incoming"],
+                available_quantity=0.0,
+                is_active=True,
+            )
+
+        # Deduplicate requested unique batch keys across purchase lines
+        missing_batch_specs: dict[tuple[UUID, str], dict[str, Any]] = {}
+        for it, med, gross, disc, gst, net in line_computations:
+            batch_num = it.batch_number.strip()
+            key = (it.medicine_id, batch_num)
+            total_incoming = it.quantity + it.free_quantity
+
+            if key in batch_map:
+                continue
+
+            if key in missing_batch_specs:
+                spec = missing_batch_specs[key]
+                # Validate immutable metadata compatibility
+                if spec["expiry_date"] != it.expiry_date:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Incompatible metadata for batch '{batch_num}': conflicting expiry dates within same purchase",
+                    )
+                if it.manufacture_date and spec["manufacture_date"] and spec["manufacture_date"] != it.manufacture_date:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Incompatible metadata for batch '{batch_num}': conflicting manufacture dates within same purchase",
+                    )
+                spec["total_incoming"] = round(spec["total_incoming"] + total_incoming, 2)
+            else:
+                missing_batch_specs[key] = {
+                    "medicine_id": it.medicine_id,
+                    "supplier_id": payload.supplier_id,
+                    "batch_number": batch_num,
+                    "manufacture_date": it.manufacture_date,
+                    "expiry_date": it.expiry_date,
+                    "purchase_price": it.purchase_price,
+                    "selling_price": it.selling_price,
+                    "mrp": it.mrp,
+                    "total_incoming": total_incoming,
+                }
+
+        # Create missing unique batches safely
+        if missing_batch_specs:
+            # Fast path: attempt bulk insert within a savepoint (O(1) queries when no collision)
+            staged_batches = {k: _build_batch_entity(spec) for k, spec in missing_batch_specs.items()}
+            try:
+                with self.db.begin_nested():
+                    for b in staged_batches.values():
+                        self.db.add(b)
+                    self.db.flush()
+                batch_map.update(staged_batches)
+            except IntegrityError:
+                # Collision race detected: outer savepoint rolled back cleanly.
+                # Handle each missing unique key independently to guarantee that
+                # non-conflicting batches are recreated and never disappear.
+                for key, spec in missing_batch_specs.items():
+                    # 1. Check if a concurrent transaction won the insert for this key
+                    winner = (
+                        self.db.query(MedicineBatch)
+                        .filter(
+                            MedicineBatch.hospital_id == self.hospital_id,
+                            MedicineBatch.medicine_id == spec["medicine_id"],
+                            MedicineBatch.batch_number == spec["batch_number"],
+                        )
+                        .with_for_update()
+                        .first()
+                    )
+                    if winner:
+                        batch_map[key] = winner
+                    else:
+                        # 2. Key did NOT collide: instantiate fresh model and insert in its own savepoint
+                        try:
+                            with self.db.begin_nested():
+                                fresh_b = _build_batch_entity(spec)
+                                self.db.add(fresh_b)
+                                self.db.flush()
+                            batch_map[key] = fresh_b
+                        except IntegrityError:
+                            # Concurrent transaction inserted in the interim: lock winner
+                            w = (
+                                self.db.query(MedicineBatch)
+                                .filter(
+                                    MedicineBatch.hospital_id == self.hospital_id,
+                                    MedicineBatch.medicine_id == spec["medicine_id"],
+                                    MedicineBatch.batch_number == spec["batch_number"],
+                                )
+                                .with_for_update()
+                                .one()
+                            )
+                            batch_map[key] = w
+
+        # Strict invariant verification: every requested key must exist in batch_map
+        for it in payload.items:
+            req_key = (it.medicine_id, it.batch_number.strip())
+            assert req_key in batch_map, f"Invariant violation: batch key {req_key} missing from batch_map"
 
         actor = actor_name(self.user)
         for it, med, gross, disc, gst, net in line_computations:
             batch_num = it.batch_number.strip()
-            batch = (
-                self.db.query(MedicineBatch)
-                .filter(
-                    MedicineBatch.hospital_id == self.hospital_id,
-                    MedicineBatch.medicine_id == it.medicine_id,
-                    MedicineBatch.batch_number == batch_num,
-                )
-                .first()
-            )
+            batch = batch_map[(it.medicine_id, batch_num)]
             total_incoming = it.quantity + it.free_quantity
-            if not batch:
-                batch = MedicineBatch(
-                    hospital_id=self.hospital_id,
-                    medicine_id=it.medicine_id,
-                    supplier_id=payload.supplier_id,
-                    batch_number=batch_num,
-                    manufacture_date=it.manufacture_date,
-                    expiry_date=it.expiry_date,
-                    purchase_price=it.purchase_price,
-                    selling_price=it.selling_price,
-                    mrp=it.mrp,
-                    initial_quantity=total_incoming,
-                    available_quantity=0.0,
-                    is_active=True,
-                )
-                self.db.add(batch)
-                self.db.flush()
 
             p_item = PharmacyPurchaseItem(
                 hospital_id=self.hospital_id,
@@ -710,19 +826,27 @@ class PharmacyActions:
             )
             self.db.add(p_item)
 
-            apply_stock_change(
-                self.db,
+            before = float(batch.available_quantity or 0)
+            after = round(before + float(total_incoming), 2)
+            batch.available_quantity = after
+
+            txn = StockTransaction(
                 hospital_id=self.hospital_id,
                 medicine_id=it.medicine_id,
                 batch_id=batch.id,
-                quantity_delta=total_incoming,
                 transaction_type=StockTransactionType.purchase,
+                quantity=round(float(total_incoming), 2),
+                quantity_before=before,
+                quantity_after=after,
                 reference_type="pharmacy_purchase",
                 reference_id=purchase.id,
                 notes=f"Purchase {inv_num}",
                 created_by_name=actor,
-                allow_expired=True,
             )
+            self.db.add(txn)
+
+        self.db.flush()
+        refresh_medicine_inventories_bulk(self.db, self.hospital_id, medicine_ids)
 
         write_audit_log(
             self.db,
@@ -774,6 +898,61 @@ class PharmacyActions:
         except Exception:
             self.db.rollback()
             raise
+
+    @staticmethod
+    def _apply_sale_payment_status(sale: PharmacySale, paid: float, net: float) -> None:
+        if paid >= net - 0.0001:
+            sale.payment_status = PharmacyPaymentStatus.paid
+        elif paid > 0:
+            sale.payment_status = PharmacyPaymentStatus.partial
+        else:
+            sale.payment_status = PharmacyPaymentStatus.unpaid
+
+    def _authorize_walk_in_override(
+        self, sale: PharmacySale, payload: SaleCreate, paid: float, net: float
+    ) -> None:
+        """Emergency dispensing to an unregistered walk-in.
+
+        Authorized through the canonical helper like every other override. There is no
+        patient record to hang a FinancialClearanceException on, so the override is
+        persisted as an attributable audit entry on the sale.
+        """
+        from modules.billing.services.financial_authorization import (
+            OverrideScope,
+            authorize_emergency_override,
+        )
+
+        scope = OverrideScope.service(BillingSourceType.pharmacy.value, sale.id, action_type="dispense")
+        override_actor = authorize_emergency_override(
+            self.db,
+            self.hospital_id,
+            self.user,
+            scope=scope,
+            reason=getattr(payload, "emergency_override_reason", None),
+        )
+        reason = (payload.emergency_override_reason or "").strip()
+        write_audit_log(
+            self.db,
+            hospital_id=self.hospital_id,
+            actor=override_actor.claims,
+            action="emergency_override",
+            entity_type="pharmacy_sale",
+            entity_id=sale.id,
+            summary=f"Emergency walk-in dispensing override for sale {sale.invoice_number} by {override_actor.name}: {reason}",
+            details={
+                "sale_id": str(sale.id),
+                "patient_id": None,
+                "service_type": BillingSourceType.pharmacy.value,
+                "source_type": BillingSourceType.pharmacy.value,
+                "source_id": str(sale.id),
+                "customer_name": sale.customer_name,
+                "net_amount": round(net, 2),
+                "amount_paid": round(paid, 2),
+                "shortfall_amount": round(max(0.0, net - paid), 2),
+                "reason": reason,
+                **override_actor.audit_fields(),
+            },
+        )
 
     def _create_sale_internal(self, payload: SaleCreate) -> SaleResponse:
         actor = actor_name(self.user)
@@ -851,33 +1030,8 @@ class PharmacyActions:
 
         invoice_number = next_doc_number(self.db, self.hospital_id, PharmacySale, "invoice_number", "SAL")
 
+        sale_id = uuid4()
         sale_admission_id = payload.admission_id or (rx_request.admission_id if rx_request else None) or (rx_obj.admission_id if rx_obj else None)
-
-        sale = PharmacySale(
-            hospital_id=self.hospital_id,
-            invoice_number=invoice_number,
-            sale_type=payload.sale_type,
-            status=PharmacySaleStatus.completed,
-            customer_name=payload.customer_name.strip(),
-            customer_phone=payload.customer_phone.strip(),
-            patient_id=payload.patient_id,
-            admission_id=sale_admission_id,
-            prescription_id=payload.prescription_id,
-            pharmacy_rx_request_id=payload.pharmacy_rx_request_id,
-            doctor_name=payload.doctor_name.strip() if payload.doctor_name else None,
-            sale_date=today,
-            subtotal=0.0,
-            discount_amount=payload.discount_amount,
-            gst_amount=0.0,
-            net_amount=0.0,
-            amount_paid=payload.amount_paid if payload.amount_paid is not None else 0.0,
-            payment_status=PharmacyPaymentStatus.paid,
-            payment_method=payload.payment_method,
-            notes=payload.notes.strip() if payload.notes else None,
-            created_by_name=actor,
-        )
-        self.db.add(sale)
-        self.db.flush()
 
         total_subtotal = 0.0
         total_gst = 0.0
@@ -885,14 +1039,52 @@ class PharmacyActions:
         warnings: list[str] = []
         stock_decrements: list[tuple[UUID, UUID, float]] = []
 
-        for it in payload.items:
-            med = self.repo.get_medicine_by_id(it.medicine_id, self.hospital_id)
+        med_ids = list(dict.fromkeys(it.medicine_id for it in payload.items))
+        meds = (
+            self.db.query(Medicine)
+            .filter(Medicine.id.in_(med_ids), Medicine.hospital_id == self.hospital_id)
+            .all()
+        )
+        med_by_id = {m.id: m for m in meds}
+
+        batch_ids = [it.batch_id for it in payload.items if it.batch_id]
+        batch_by_id: dict[UUID, MedicineBatch] = {}
+        if batch_ids:
+            batches = (
+                self.db.query(MedicineBatch)
+                .filter(
+                    MedicineBatch.id.in_(list(dict.fromkeys(batch_ids))),
+                    MedicineBatch.hospital_id == self.hospital_id,
+                )
+                .with_for_update()
+                .all()
+            )
+            batch_by_id = {b.id: b for b in batches}
+
+        fifo_item_indices = [idx for idx, it in enumerate(payload.items) if not it.batch_id]
+        fifo_requests = [(payload.items[idx].medicine_id, payload.items[idx].quantity) for idx in fifo_item_indices]
+        fifo_alloc_map: dict[int, list[tuple[MedicineBatch, float]]] = {}
+        if fifo_requests:
+            alloc_results = allocate_fifo_bulk(
+                self.db,
+                hospital_id=self.hospital_id,
+                requests=fifo_requests,
+                medicine_names={m.id: m.medicine_name for m in meds},
+            )
+            for idx, alloc in zip(fifo_item_indices, alloc_results):
+                fifo_alloc_map[idx] = alloc
+                for b, _ in alloc:
+                    batch_by_id[b.id] = b
+
+        sale_items: list[PharmacySaleItem] = []
+        for item_idx, it in enumerate(payload.items):
+            med = med_by_id.get(it.medicine_id)
             if not med:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Medicine {it.medicine_id} not found")
 
             allocations: list[tuple[MedicineBatch, float]] = []
             if it.batch_id:
-                batch = self.repo.get_batch_by_id(it.batch_id, self.hospital_id)
+                batch = batch_by_id.get(it.batch_id)
                 if not batch or batch.medicine_id != it.medicine_id:
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
                 if batch.available_quantity < it.quantity:
@@ -907,12 +1099,12 @@ class PharmacyActions:
                     )
                 allocations = [(batch, it.quantity)]
             else:
-                allocations = allocate_fifo(
-                    self.db,
-                    hospital_id=self.hospital_id,
-                    medicine_id=it.medicine_id,
-                    quantity=it.quantity,
-                )
+                allocations = fifo_alloc_map.get(item_idx, [])
+                if not allocations:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Insufficient non-expired stock for {med.medicine_name}",
+                    )
 
             for b, qty in allocations:
                 unit_pr = float(it.unit_price if it.unit_price is not None else b.selling_price or med.selling_price)
@@ -925,8 +1117,9 @@ class PharmacyActions:
                     warnings.append(f"{med.medicine_name} batch {b.batch_number} expires in {(b.expiry_date - today).days} days")
 
                 sale_item = PharmacySaleItem(
+                    id=uuid4(),
                     hospital_id=self.hospital_id,
-                    sale_id=sale.id,
+                    sale_id=sale_id,
                     medicine_id=it.medicine_id,
                     batch_id=b.id,
                     batch_number=b.batch_number,
@@ -938,7 +1131,7 @@ class PharmacyActions:
                     gst_amount=gst,
                     net_amount=net,
                 )
-                self.db.add(sale_item)
+                sale_items.append(sale_item)
                 stock_decrements.append((it.medicine_id, b.id, qty))
 
             if rx_request:
@@ -962,19 +1155,36 @@ class PharmacyActions:
                     rx_obj.status = "issued"
 
         final_net = max(0.0, round(total_net - payload.discount_amount, 2))
-        sale.subtotal = round(total_subtotal, 2)
-        sale.gst_amount = round(total_gst, 2)
-        sale.net_amount = final_net
-        if payload.amount_paid is None:
-            sale.amount_paid = final_net
+        tendered = round(float(payload.amount_paid or 0), 2)
+        paid = min(tendered, final_net)
 
-        paid = float(sale.amount_paid or 0)
-        if paid >= final_net - 0.0001:
-            sale.payment_status = PharmacyPaymentStatus.paid
-        elif paid > 0:
-            sale.payment_status = PharmacyPaymentStatus.partial
-        else:
-            sale.payment_status = PharmacyPaymentStatus.unpaid
+        sale = PharmacySale(
+            id=sale_id,
+            hospital_id=self.hospital_id,
+            invoice_number=invoice_number,
+            sale_type=payload.sale_type,
+            status=PharmacySaleStatus.completed,
+            customer_name=payload.customer_name.strip(),
+            customer_phone=payload.customer_phone.strip(),
+            patient_id=payload.patient_id,
+            admission_id=sale_admission_id,
+            prescription_id=payload.prescription_id,
+            pharmacy_rx_request_id=payload.pharmacy_rx_request_id,
+            doctor_name=payload.doctor_name.strip() if payload.doctor_name else None,
+            sale_date=today,
+            subtotal=round(total_subtotal, 2),
+            discount_amount=payload.discount_amount,
+            gst_amount=round(total_gst, 2),
+            net_amount=final_net,
+            amount_paid=paid,
+            payment_status=PharmacyPaymentStatus.paid,
+            payment_method=payload.payment_method,
+            notes=payload.notes.strip() if payload.notes else None,
+            created_by_name=actor,
+        )
+        self._apply_sale_payment_status(sale, paid, final_net)
+        self.db.add(sale)
+        self.db.add_all(sale_items)
 
         # Integrate with target Billing domain if registered patient
         if payload.patient_id:
@@ -1005,9 +1215,10 @@ class PharmacyActions:
             )
             sale.billing_charge_id = charge.id
 
-            # If payment was collected at pharmacy POS counter, mirror to central billing as paid
+            # Real money collected at the pharmacy counter is recorded as a billing payment.
             if paid > 0:
-                method_val = payload.payment_method.value if getattr(payload, "payment_method", None) else "cash"
+                raw_method = getattr(payload, "payment_method", None) or "cash"
+                method_val = str(getattr(raw_method, "value", raw_method))
                 try:
                     pay_method = BillingPaymentMethod(method_val)
                 except ValueError:
@@ -1027,32 +1238,15 @@ class PharmacyActions:
                     allocations_plan=[{"charge_id": charge.id, "amount": min(paid, float(charge.net_amount))}],
                 )
 
-            # Check clearance if not fully paid at counter
-            if paid < final_net - 0.0001:
-                from modules.billing.entities.billing_entities import BillingDeposit
-                from modules.billing.services.billing_service import draw_down_deposit_for_charges
-                dep_q = (
-                    self.db.query(BillingDeposit)
-                    .filter(
-                        BillingDeposit.hospital_id == self.hospital_id,
-                        BillingDeposit.patient_id == payload.patient_id,
-                        BillingDeposit.available_amount > 0,
-                    )
+            recompute_charge_financials(self.db, charge)
+            if charge.status != BillingChargeStatus.paid:
+                # Cover the remainder from this account's own deposits (oldest first).
+                draw_down_account_deposits_for_charge(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    charge=charge,
+                    created_by_name=actor,
                 )
-                if account_id:
-                    dep_q = dep_q.filter(
-                        (BillingDeposit.account_id == account_id) | (BillingDeposit.account_id.is_(None))
-                    )
-                dep = dep_q.order_by(BillingDeposit.created_at.asc()).first()
-                if dep:
-                    shortfall_to_cover = round(final_net - paid, 2)
-                    draw_down_deposit_for_charges(
-                        self.db,
-                        hospital_id=self.hospital_id,
-                        deposit_id=dep.id,
-                        allocations_plan=[{"charge_id": charge.id, "amount": shortfall_to_cover}],
-                        created_by_name=actor,
-                    )
 
                 from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
                 assert_service_financially_cleared(
@@ -1067,27 +1261,44 @@ class PharmacyActions:
                     admission_id=sale_admission_id,
                     patient_id=payload.patient_id,
                 )
+
+            # Sale payment status mirrors the ledger (payments + deposit allocations).
+            recompute_charge_financials(self.db, charge)
+            sale.amount_paid = round(float(charge.amount_paid or 0), 2)
+            self._apply_sale_payment_status(sale, sale.amount_paid, final_net)
         elif paid < final_net - 0.0001:
             if not getattr(payload, "is_emergency_override", False):
                 raise HTTPException(
                     status_code=status.HTTP_402_PAYMENT_REQUIRED,
                     detail=f"Retail pharmacy counter sales require full payment before dispensing. Shortfall: ₹{final_net - paid:.2f}",
                 )
+            self._authorize_walk_in_override(sale, payload, paid, final_net)
 
         # ── Stock Decrement (Only executed after financial clearance check passes) ──
-        for med_id, b_id, qty in stock_decrements:
-            apply_stock_change(
-                self.db,
-                hospital_id=self.hospital_id,
-                medicine_id=med_id,
-                batch_id=b_id,
-                quantity_delta=-qty,
-                transaction_type=StockTransactionType.sale,
-                reference_type="pharmacy_sale",
-                reference_id=sale.id,
-                notes=f"Sale {invoice_number}",
-                created_by_name=actor,
-            )
+        bulk_changes = [
+            {
+                "medicine_id": med_id,
+                "batch_id": b_id,
+                "quantity_delta": -qty,
+                "transaction_type": StockTransactionType.sale,
+                "reference_type": "pharmacy_sale",
+                "reference_id": sale.id,
+                "notes": f"Sale {invoice_number}",
+                "created_by_name": actor,
+            }
+            for med_id, b_id, qty in stock_decrements
+        ]
+        apply_stock_changes_bulk(
+            self.db,
+            hospital_id=self.hospital_id,
+            changes=bulk_changes,
+            preloaded_batches=batch_by_id,
+            auto_refresh=False,
+        )
+
+        unique_med_ids = list(dict.fromkeys(med_id for med_id, _, _ in stock_decrements))
+        if unique_med_ids:
+            refresh_medicine_inventories_bulk(self.db, self.hospital_id, unique_med_ids)
 
         # Transition prescription status (FLAW-004). When dispensing against a pharmacy
         # Rx request, the request-level recompute above already mirrored the clinical
@@ -1117,28 +1328,45 @@ class PharmacyActions:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Sale already cancelled")
 
         actor = actor_name(self.user)
+        cancel_changes = []
         for it in sale.items or []:
             refundable = float(it.quantity or 0) - float(it.returned_quantity or 0)
             if refundable <= 0:
                 continue
-            apply_stock_change(
-                self.db,
-                hospital_id=self.hospital_id,
-                medicine_id=it.medicine_id,
-                batch_id=it.batch_id,
-                quantity_delta=refundable,
-                transaction_type=StockTransactionType.return_in,
-                reference_type="pharmacy_sale_cancel",
-                reference_id=sale.id,
-                notes=f"Cancel {sale.invoice_number}",
-                created_by_name=actor,
-                allow_expired=True,
+            cancel_changes.append(
+                {
+                    "medicine_id": it.medicine_id,
+                    "batch_id": it.batch_id,
+                    "quantity_delta": refundable,
+                    "transaction_type": StockTransactionType.return_in,
+                    "reference_type": "pharmacy_sale_cancel",
+                    "reference_id": sale.id,
+                    "notes": f"Cancel {sale.invoice_number}",
+                    "created_by_name": actor,
+                    "allow_expired": True,
+                }
             )
             it.returned_quantity = float(it.quantity or 0)
 
+        if cancel_changes:
+            apply_stock_changes_bulk(
+                self.db,
+                hospital_id=self.hospital_id,
+                changes=cancel_changes,
+                auto_refresh=True,
+            )
+
         sale.status = PharmacySaleStatus.cancelled
-        if sale.billing_charge_id or sale.patient_id:
-            cancel_charge_for_source(self.db, self.hospital_id, BillingSourceType.pharmacy, sale.id)
+        # All dispensed stock was returned above, so the service is no longer "performed".
+        cancel_source_charges_or_400(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.pharmacy,
+            sale.id,
+            reason=f"Pharmacy sale {sale.invoice_number} cancelled",
+            actor=self.user,
+            performed=False,
+        )
 
         write_audit_log(
             self.db,

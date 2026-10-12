@@ -136,6 +136,11 @@ class RadStartScanRequest(BaseModel):
     emergency_override_reason: str | None = None
 
 
+class RadCompleteScanRequest(BaseModel):
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
+
+
 class RadReportRequest(BaseModel):
     findings: str = Field(min_length=1)
     impression: str = Field(min_length=1)
@@ -146,6 +151,8 @@ class RadReportRequest(BaseModel):
     image_file_name: str | None = None
     image_file_data: str | None = None
     amendment_reason: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class RadAttachmentResponse(BaseModel):
@@ -169,6 +176,8 @@ class RadAttachmentUploadRequest(BaseModel):
     file_data_base64: str | None = Field(default=None, min_length=1)  # legacy frontend alias
     mime_type: str = Field(default="application/octet-stream", max_length=128)
     attachment_type: str = Field(default="scan_plate", max_length=64)
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
     @model_validator(mode="after")
     def coalesce_file_data(self):

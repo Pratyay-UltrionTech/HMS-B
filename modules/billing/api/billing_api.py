@@ -30,7 +30,9 @@ from modules.billing.actions.billing_actions import (
     CreateRefundAction,
     GetBillingDashboardAction,
     GetInvoiceAction,
+    GetPatientDuesAction,
     GetPatientLedgerAction,
+    GetPatientStatementAction,
     GetPatientSummaryAction,
     GetReceiptAction,
     ListChargesAction,
@@ -40,7 +42,9 @@ from modules.billing.actions.billing_actions import (
     ListPaymentsAction,
     ListReceiptsAction,
     ListRefundsAction,
+    PrintDepositAction,
     PrintInvoiceAction,
+    PrintPatientStatementAction,
     PrintReceiptAction,
     PrintRefundAction,
     UpdateChargeAction,
@@ -63,6 +67,8 @@ from modules.billing.contracts.billing_contracts import (
     BillingRefundResponse,
     FinancialAccountCreate,
     FinancialAccountResponse,
+    PatientBillingStatementResponse,
+    PatientDuesResponse,
     PatientFinancialSummary,
     PatientLedgerResponse,
 )
@@ -86,7 +92,12 @@ from modules.billing.entities.billing_entities import (
     FinancialAccountType,
     RefundStatus,
 )
-from shared.auth.dependencies import get_hospital_context, require_hospital_user, require_permission
+from shared.auth.dependencies import (
+    get_hospital_context,
+    require_any_permission,
+    require_hospital_user,
+    require_permission,
+)
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
@@ -216,7 +227,7 @@ def list_invoices(
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[BillingInvoiceResponse]:
     return ListInvoicesAction(db, hospital_id).execute(
@@ -234,7 +245,7 @@ def list_invoices(
 def get_invoice(
     invoice_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> BillingInvoiceResponse:
     return GetInvoiceAction(db, hospital_id).execute(invoice_id)
@@ -265,7 +276,7 @@ def print_invoice(
     invoice_id: UUID,
     download: bool = Query(default=False),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> StreamingResponse:
     html = PrintInvoiceAction(db, hospital_id).execute(invoice_id, auto_print=not download)
@@ -276,7 +287,7 @@ def print_invoice(
 def download_invoice_pdf(
     invoice_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> StreamingResponse:
     html = PrintInvoiceAction(db, hospital_id).execute(invoice_id, auto_print=False)
@@ -293,7 +304,7 @@ def list_receipts(
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[BillingReceiptResponse]:
     return ListReceiptsAction(db, hospital_id).execute(
@@ -305,7 +316,7 @@ def list_receipts(
 def get_receipt(
     receipt_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> BillingReceiptResponse:
     return GetReceiptAction(db, hospital_id).execute(receipt_id)
@@ -336,7 +347,7 @@ def print_receipt(
     receipt_id: UUID,
     download: bool = Query(default=False),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> StreamingResponse:
     html = PrintReceiptAction(db, hospital_id).execute(receipt_id, auto_print=not download)
@@ -347,33 +358,98 @@ def print_receipt(
 def download_receipt_pdf(
     receipt_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> StreamingResponse:
     html = PrintReceiptAction(db, hospital_id).execute(receipt_id, auto_print=False)
     return _html_response(html, f"{receipt_id}.html", download=True)
 
 
-# ── Patient Ledger & Summary ────────────────────────────────────────────────
+# ── Patient Ledger, Statement & Summary ─────────────────────────────────────
 
 @router.get("/patients/{patient_id}/ledger", response_model=PatientLedgerResponse)
 def get_patient_ledger(
     patient_id: UUID,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    source_type: BillingSourceType | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PatientLedgerResponse:
-    return GetPatientLedgerAction(db, hospital_id).execute(patient_id)
+    return GetPatientLedgerAction(db, hospital_id).execute(
+        patient_id=patient_id,
+        date_from=date_from,
+        date_to=date_to,
+        source_type=source_type,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/patients/{patient_id}/statement", response_model=PatientBillingStatementResponse)
+def get_patient_statement(
+    patient_id: UUID,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    source_type: BillingSourceType | None = Query(default=None),
+    account_id: UUID | None = Query(default=None),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_any_permission([("billing", "view"), ("insurance", "view")])),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> PatientBillingStatementResponse:
+    return GetPatientStatementAction(db, hospital_id).execute(
+        patient_id=patient_id,
+        date_from=date_from,
+        date_to=date_to,
+        source_type=source_type,
+        account_id=account_id,
+    )
+
+
+@router.get("/patients/{patient_id}/statement/print")
+def print_patient_statement(
+    patient_id: UUID,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    source_type: BillingSourceType | None = Query(default=None),
+    account_id: UUID | None = Query(default=None),
+    download: bool = Query(default=False),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_any_permission([("billing", "view"), ("insurance", "view")])),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> StreamingResponse:
+    html = PrintPatientStatementAction(db, hospital_id).execute(
+        patient_id=patient_id,
+        date_from=date_from,
+        date_to=date_to,
+        source_type=source_type,
+        account_id=account_id,
+        auto_print=not download,
+    )
+    return _html_response(html, f"statement_{patient_id}.html", download)
 
 
 @router.get("/patients/{patient_id}/summary", response_model=PatientFinancialSummary)
 def get_patient_financial_summary(
     patient_id: UUID,
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> PatientFinancialSummary:
     return GetPatientSummaryAction(db, hospital_id).execute(patient_id)
+
+
+@router.get("/patients/{patient_id}/dues", response_model=PatientDuesResponse)
+def get_patient_dues(
+    patient_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_permission("billing", "view")),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> PatientDuesResponse:
+    return GetPatientDuesAction(db, hospital_id).execute(patient_id)
 
 
 # ── Financial Accounts ──────────────────────────────────────────────────────
@@ -463,6 +539,18 @@ def allocate_deposit(
     return AllocateDepositAction(db, hospital_id).execute(deposit_id, payload, user)
 
 
+@router.get("/deposits/{deposit_id}/print", response_class=StreamingResponse)
+def print_deposit_receipt(
+    deposit_id: UUID,
+    download: bool = Query(default=False),
+    db: Session = Depends(get_transitional_sync_session),
+    _: dict = Depends(require_permission("billing", "view")),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> StreamingResponse:
+    html = PrintDepositAction(db, hospital_id).execute(deposit_id, auto_print=not download)
+    return _html_response(html, f"deposit_{deposit_id}.html", download=download)
+
+
 # ── Refunds ─────────────────────────────────────────────────────────────────
 
 @router.get("/refunds", response_model=list[BillingRefundResponse])
@@ -474,7 +562,7 @@ def list_refunds(
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[BillingRefundResponse]:
     return ListRefundsAction(db, hospital_id).execute(
@@ -497,7 +585,7 @@ def print_refund_voucher(
     refund_id: UUID,
     download: bool = Query(default=False),
     db: Session = Depends(get_transitional_sync_session),
-    _: dict = Depends(require_hospital_user),
+    _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> StreamingResponse:
     html = PrintRefundAction(db, hospital_id).execute(refund_id, auto_print=not download)
@@ -649,13 +737,29 @@ def list_pending_admission_advances(
     """List requested IPD admissions awaiting admission advance deposit for billing/cashier staff."""
     from modules.inpatient.db.admissions_repository import AdmissionsRepository
     from modules.inpatient.actions.admission_actions import to_admission_detail
-    from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
+    from modules.billing.services.service_financial_clearance import bulk_evaluate_bed_allocation_clearance
 
     rows = AdmissionsRepository(db).list_admission_requests(hospital_id)
+    if not rows:
+        return []
+
+    admission_ids = [a.id for a in rows]
+    ward_overrides = {a.id: a.ward_id for a in rows}
+    bed_overrides = {a.id: a.bed_id for a in rows}
+    clearance_map = bulk_evaluate_bed_allocation_clearance(
+        db,
+        hospital_id,
+        admission_ids,
+        ward_overrides=ward_overrides,
+        bed_overrides=bed_overrides,
+    )
+
     results: list[dict[str, Any]] = []
     for a in rows:
         d = to_admission_detail(a)
-        fin = evaluate_bed_allocation_clearance(db, hospital_id, a.id, ward_id=a.ward_id, bed_id=a.bed_id)
+        fin = clearance_map.get(a.id)
+        if not fin:
+            continue
         results.append({
             "id": str(a.id),
             "admission_id": str(a.id),
