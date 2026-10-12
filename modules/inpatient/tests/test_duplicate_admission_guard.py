@@ -382,7 +382,7 @@ def test_open_admissions_endpoint_returns_row_or_null(sdb):
     from shared.auth.jwt import create_access_token
     from shared.exceptions.handlers import register_exception_handlers
 
-    hid, _, _, pat, _, _, _ = _seed(sdb)
+    hid, _, docs, pat, _, _, _ = _seed(sdb)
     app = FastAPI()
     register_exception_handlers(app)
     app.include_router(beds_router, prefix="/api")
@@ -391,6 +391,7 @@ def test_open_admissions_endpoint_returns_row_or_null(sdb):
     token = create_access_token({
         "sub": "admin@hospital.com", "name": "Admin",
         "role": "hospital_admin", "hospital_uuid": str(hid),
+        "user_id": str(docs.id),
     })
     headers = {"Authorization": f"Bearer {token}"}
 

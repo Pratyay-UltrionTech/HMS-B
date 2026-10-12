@@ -83,6 +83,12 @@ from shared.exceptions.base import ValidationError
 from tests.conftest import db_session, hospital  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def disable_advance_policy_for_care_team_tests(hospital: Hospital, db_session: Session):
+    hospital.facility_settings = {"admission_advance_policy": {"enabled": False}}
+    db_session.commit()
+
+
 def _make_hospital_user(db: Session, hospital_id: UUID, role_name: str, name: str) -> HospitalUser:
     role = StaffRole(id=uuid4(), hospital_id=hospital_id, name=f"{role_name}-{uuid4().hex[:6]}")
     db.add(role)

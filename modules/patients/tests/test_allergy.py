@@ -45,17 +45,54 @@ def client(allergy_app: FastAPI) -> TestClient:
     return TestClient(allergy_app)
 
 
+from modules.doctors.entities.doctor import HospitalUser, RolePermission, StaffRole
+
+
 @pytest.fixture(scope="function")
-def staff_headers(hospital: Hospital) -> dict[str, str]:
+def staff_headers(db_session: Session, hospital: Hospital) -> dict[str, str]:
+    role_id = uuid.uuid4()
+    sr = StaffRole(
+        id=role_id,
+        hospital_id=hospital.id,
+        name=f"Admin-{uuid.uuid4().hex[:6]}",
+        is_active=True,
+    )
+    db_session.add(sr)
+
+    perm = RolePermission(
+        id=uuid.uuid4(),
+        hospital_id=hospital.id,
+        role_id=role_id,
+        module_key="registration",
+        can_view=True,
+        can_edit=True,
+        can_create=True,
+    )
+    db_session.add(perm)
+    db_session.flush()
+
+    user_id = uuid.uuid4()
+    u = HospitalUser(
+        id=user_id,
+        hospital_id=hospital.id,
+        role_id=role_id,
+        name="Dr. Sharma",
+        phone="555-0188",
+        email=f"doctor.{uuid.uuid4().hex[:6]}@hospital.test",
+        password_hash="dummy_hash_for_test",
+        is_active=True,
+    )
+    db_session.add(u)
+    db_session.commit()
     token = create_access_token(
         data={
-            "sub": "doctor.sharma@hospital.test",
+            "sub": u.email,
             "name": "Dr. Sharma",
-            "email": "doctor.sharma@hospital.test",
+            "email": u.email,
             "role": "hospital_admin",
             "staff_role_name": "doctor",
             "hospital_uuid": str(hospital.id),
-            "user_id": str(uuid.uuid4()),
+            "user_id": str(user_id),
         }
     )
     return {

@@ -16,7 +16,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Hospital, HospitalUser as LegacyHospitalUser, Patient, StaffRole
 from infrastructure.postgres.base import Base as TargetBase
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.clinical_decision.api.clinical_decision_api import router as clinical_decision_router
@@ -24,14 +23,22 @@ from modules.appointments.entities.appointment import Appointment
 from modules.appointments.entities.enums import AppointmentStatus
 from modules.clinical_records.entities.clinical_record import Prescription
 from modules.doctors.entities.doctor import HospitalUser
+from modules.doctors.entities.doctor import HospitalUser as LegacyHospitalUser
 from modules.inpatient.entities.admission import Admission
 from modules.laboratory.entities.lab_entities import LabOrder, LabOrderItem, LabTestCatalog, LabSampleType
+from modules.patients.entities.patient import Patient
 from modules.patients.entities.patient import Patient as TargetPatient
 from modules.pharmacy.entities.pharmacy_entities import Medicine
 from modules.radiology.entities.radiology_entities import RadiologyOrder, RadiologyScanCatalog
+from modules.tenancy.entities.hospital import Hospital
 from modules.tenancy.entities.hospital import Hospital as TargetHospital
 from shared.auth.jwt import create_access_token
 from tests.conftest import db_session, hospital, hospital_b, patient, patient_b, doctor
+
+
+CLINICAL_DECISION_PERMS = {
+    "clinical_decision": {"can_view": True, "can_edit": True, "can_create": True},
+}
 
 
 @pytest.fixture(scope="function")
@@ -60,6 +67,7 @@ def doctor_auth(hospital: Hospital, doctor: LegacyHospitalUser) -> dict[str, str
         "role": "hospital_staff",
         "hospital_uuid": str(hospital.id),
         "user_id": str(doctor.id),
+        "permissions": CLINICAL_DECISION_PERMS,
     })
     return {"Authorization": f"Bearer {token}"}
 
@@ -72,6 +80,7 @@ def staff_auth_b(hospital_b: Hospital) -> dict[str, str]:
         "role": "hospital_staff",
         "hospital_uuid": str(hospital_b.id),
         "user_id": str(uuid4()),
+        "permissions": CLINICAL_DECISION_PERMS,
     })
     return {"Authorization": f"Bearer {token}"}
 

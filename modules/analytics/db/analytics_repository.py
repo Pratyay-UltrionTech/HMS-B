@@ -102,6 +102,17 @@ class AnalyticsRepository:
         Replaces pulling every patient row platform-wide into Python just to
         bucket by month — this aggregates in the database instead.
         """
+        # Check dialect for SQLite test engine vs PostgreSQL production
+        bind = self.db.get_bind() if hasattr(self.db, "get_bind") else getattr(self.db, "bind", None)
+        if bind and bind.dialect.name == "sqlite":
+            bucket = func.strftime("%Y-%m", _patients.c.created_at)
+            stmt = (
+                select(bucket.label("bucket"), func.count(_patients.c.id))
+                .where(_patients.c.created_at >= since)
+                .group_by(bucket)
+            )
+            return {str(row[0]): int(row[1]) for row in self.db.execute(stmt).all() if row[0]}
+
         # Truncate in UTC explicitly — date_trunc on a timestamptz otherwise
         # uses the DB session's timezone, which could shift month boundaries.
         bucket = func.date_trunc("month", func.timezone("UTC", _patients.c.created_at))

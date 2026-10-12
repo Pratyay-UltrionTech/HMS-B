@@ -125,7 +125,24 @@ def test_lab_order_and_specimen_events_published_on_commit(sync_test_env):
     assert len(specimen_events) > 0
     assert specimen_events[0]["details"]["order_id"] == str(order.id)
 
-    # 2. Collect Specimen
+    # 2. Pay the walk-in order's charge (specimen collection is financially gated)
+    from datetime import date
+
+    from modules.billing.entities.billing_entities import BillingPaymentMethod, BillingSourceType
+    from modules.billing.services.billing_service import create_payment
+    from modules.billing.services.service_charge_resolver import resolve_active_service_charge
+
+    charge = resolve_active_service_charge(session, h_id, BillingSourceType.laboratory, order.id)
+    assert charge is not None
+    create_payment(
+        session, hospital_id=h_id, patient_id=patient.id, amount=float(charge.net_amount),
+        payment_date=date.today(), payment_method=BillingPaymentMethod.cash, notes=None,
+        received_by_name="Cashier",
+        allocations_plan=[{"charge_id": charge.id, "amount": float(charge.net_amount)}],
+    )
+    session.commit()
+
+    # 3. Collect Specimen
     history_before_collect = list(sync_broker._history.get(hid_str, []))
     specimen = order.specimens[0]
     collect_in = SpecimenCollectRequest(

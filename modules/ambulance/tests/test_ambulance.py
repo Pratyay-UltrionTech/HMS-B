@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Hospital
+from modules.tenancy.entities.hospital import Hospital
 from infrastructure.postgres.base import Base
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.ambulance.api.ambulance_api import router as ambulance_router
@@ -44,7 +44,7 @@ def staff_auth(hospital: Hospital) -> dict[str, str]:
     token = create_access_token({
         "sub": "dispatcher@hospital.com",
         "name": "Dispatcher Joe",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital.id),
         "user_id": str(uuid4()),
     })
@@ -56,7 +56,7 @@ def staff_auth_b(hospital_b: Hospital) -> dict[str, str]:
     token = create_access_token({
         "sub": "dispatcher2@hospitalb.com",
         "name": "Dispatcher B",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital_b.id),
         "user_id": str(uuid4()),
     })

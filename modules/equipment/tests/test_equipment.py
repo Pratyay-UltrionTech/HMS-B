@@ -71,9 +71,9 @@ def equip_client(equip_db):
         "id": str(uuid4()),
         "sub": "equip_admin@example.com",
         "email": "equip_admin@example.com",
-        "role": "admin",
+        "role": "hospital_admin",
         "name": "Equipment Admin",
-        "hospital_id": str(hospital_id),
+        "hospital_uuid": str(hospital_id),
     }
 
     def override_session():

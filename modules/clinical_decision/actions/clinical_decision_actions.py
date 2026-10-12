@@ -46,14 +46,7 @@ from modules.clinical_decision.entities.clinical_decision_entities import (
     MedicationReconciliationItem,
     MedicationReconciliationStatus,
 )
-from modules.laboratory.entities.lab_entities import (
-    LabItemStatus,
-    LabOrder,
-    LabOrderItem,
-    LabOrderSource,
-    LabOrderStatus,
-    LabTestCatalog,
-)
+from modules.laboratory.entities.lab_entities import LabOrderSource
 from modules.patients.entities.patient import Patient
 from modules.radiology.entities.radiology_entities import (
     RadiologyOrder,
@@ -481,54 +474,46 @@ class ClinicalDecisionActions:
         now = datetime.now(timezone.utc)
         actor_id = self.actor.get("user_id") or self.actor.get("id")
         doctor_uuid = UUID(str(actor_id)) if actor_id else None
+        actor_name = str(self.actor.get("email") or self.actor.get("username") or "System")
+        order_notes = f"Order Set: {order_set.name}. {payload.clinical_notes or ''}".strip()
 
-        # Reuses existing LabOrder engine (Correction #3)
-        if lab_items:
-            lab_order_no = f"LO-{uuid.uuid4().hex[:8].upper()}"
-            actor_name = str(self.actor.get("email") or self.actor.get("username") or "System")
-            lab_order = LabOrder(
-                hospital_id=self.hospital_id,
-                order_no=lab_order_no,
-                patient_id=patient.id,
-                doctor_id=doctor_uuid,
+        # Order-set diagnostics bill like walk-in orders (charge on order.id); work for
+        # an admission is linked to it and billed on its IPD account.
+        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.episode_account_service import resolve_episode_account
+        from modules.billing.services.service_charge_resolver import ensure_service_charge
+
+        episode = resolve_episode_account(
+            self.db,
+            self.hospital_id,
+            patient.id,
+            admission_id=payload.admission_id,
+            created_by_name=actor_name,
+        )
+
+        # Same engine as the lab desk: items, specimens and the charge in one place.
+        lab_test_ids = list(dict.fromkeys(li.lab_test_catalog_id for li in lab_items if li.lab_test_catalog_id))
+        if lab_test_ids:
+            from modules.doctors.entities.doctor import HospitalUser
+            from modules.laboratory.actions.laboratory_actions import CreateLabOrderAction
+
+            doctor = (
+                self.db.query(HospitalUser)
+                .filter(HospitalUser.id == doctor_uuid, HospitalUser.hospital_id == self.hospital_id)
+                .first()
+                if doctor_uuid
+                else None
+            )
+            lab_order = CreateLabOrderAction(self.db, self.hospital_id).build_order(
+                patient=patient,
+                doctor=doctor,
+                user=self.actor,
+                test_ids=lab_test_ids,
+                admission_id=episode.admission_id,
+                clinical_notes=order_notes,
                 order_source=LabOrderSource.doctor_prescribed,
-                ordered_by_name=actor_name,
-                ordered_by_role="doctor" if doctor_uuid else "system",
-                status=LabOrderStatus.ordered,
-                clinical_notes=f"Order Set: {order_set.name}. {payload.clinical_notes or ''}",
-                ordered_at=now,
             )
-            self.db.add(lab_order)
-            self.db.flush()
             created_lab_order_id = lab_order.id
-
-            lab_catalog_ids = {li.lab_test_catalog_id for li in lab_items if li.lab_test_catalog_id}
-            lab_catalog_map = (
-                {
-                    c.id: c
-                    for c in self.db.query(LabTestCatalog).filter(
-                        LabTestCatalog.id.in_(lab_catalog_ids),
-                        LabTestCatalog.hospital_id == self.hospital_id,
-                    ).all()
-                }
-                if lab_catalog_ids
-                else {}
-            )
-            for li in lab_items:
-                if li.lab_test_catalog_id:
-                    cat_test = lab_catalog_map.get(li.lab_test_catalog_id)
-                    lo_item = LabOrderItem(
-                        hospital_id=self.hospital_id,
-                        order_id=lab_order.id,
-                        test_id=li.lab_test_catalog_id,
-                        test_code=cat_test.test_code if cat_test else "UNKNOWN",
-                        test_name=cat_test.test_name if cat_test else li.instructions or "Lab Test",
-                        department=cat_test.department if cat_test else "General",
-                        price=cat_test.price if cat_test else 0.0,
-                        status=LabItemStatus.pending,
-                        created_at=now,
-                    )
-                    self.db.add(lo_item)
 
         # Reuses existing RadiologyOrder engine (Correction #3)
         rad_catalog_ids = {ri.radiology_scan_catalog_id for ri in rad_items if ri.radiology_scan_catalog_id}
@@ -547,11 +532,11 @@ class ClinicalDecisionActions:
             if ri.radiology_scan_catalog_id:
                 scan = rad_catalog_map.get(ri.radiology_scan_catalog_id)
                 rad_order_no = f"RO-{uuid.uuid4().hex[:8].upper()}"
-                actor_name = str(self.actor.get("email") or self.actor.get("username") or "System")
                 rad_order = RadiologyOrder(
                     hospital_id=self.hospital_id,
                     order_no=rad_order_no,
                     patient_id=patient.id,
+                    admission_id=episode.admission_id,
                     scan_id=ri.radiology_scan_catalog_id,
                     scan_code=scan.scan_code if scan else "UNKNOWN",
                     scan_name=scan.scan_name if scan else "Radiology Scan",
@@ -561,17 +546,14 @@ class ClinicalDecisionActions:
                     ordered_by_role="doctor" if doctor_uuid else "system",
                     doctor_id=doctor_uuid,
                     status=RadiologyOrderStatus.ordered,
-                    clinical_notes=f"Order Set: {order_set.name}. {payload.clinical_notes or ''}",
+                    clinical_notes=order_notes,
                     scheduled_at=now,
                 )
                 self.db.add(rad_order)
                 self.db.flush()
                 created_rad_ids.append(rad_order.id)
 
-                # Ensure billing charge exists for billable radiology order
-                from modules.billing.entities.billing_entities import BillingSourceType
-                from modules.billing.services.billing_service import ensure_charge
-                ensure_charge(
+                ensure_service_charge(
                     self.db,
                     hospital_id=self.hospital_id,
                     patient_id=patient.id,
@@ -579,6 +561,7 @@ class ClinicalDecisionActions:
                     source_id=rad_order.id,
                     description=f"Radiology {rad_order.order_no} — {rad_order.scan_name}",
                     charge_amount=float(rad_order.price or 0.0),
+                    account_id=episode.account_id,
                     created_by_name=actor_name,
                 )
 

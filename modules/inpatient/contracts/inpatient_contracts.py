@@ -152,6 +152,8 @@ class AdmitRequest(BaseModel):
     requested_advance: float | None = None
     department_id: UUID | None = None
     department_name: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class AllocateRequest(BaseModel):
@@ -295,6 +297,8 @@ class AdmitPatientRequest(BaseModel):
     requested_advance: float | None = None
     department_id: UUID | None = None
     department_name: str | None = None
+    is_emergency_override: bool = False
+    emergency_override_reason: str | None = None
 
 
 class AdmissionRequestCreate(BaseModel):

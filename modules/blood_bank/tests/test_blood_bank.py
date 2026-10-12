@@ -18,7 +18,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Hospital, HospitalUser as LegacyHospitalUser, Patient, StaffRole
+from modules.tenancy.entities.hospital import Hospital
+from modules.doctors.entities.doctor import HospitalUser as LegacyHospitalUser, StaffRole
+from modules.patients.entities.patient import Patient
 from infrastructure.postgres.base import Base as TargetBase
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.appointments.entities.appointment import Appointment
@@ -45,6 +47,8 @@ from tests.conftest import db_session, hospital, hospital_b, patient, patient_b,
 def blood_bank_app(db_session: Session) -> FastAPI:
     TargetBase.metadata.create_all(bind=db_session.bind)
     test_app = FastAPI(title="Blood Bank Test App")
+    from shared.exceptions.handlers import register_exception_handlers
+    register_exception_handlers(test_app)
     test_app.include_router(blood_bank_router, prefix="/api")
 
     def _override_db():
@@ -64,7 +68,7 @@ def blood_bank_auth(hospital: Hospital, doctor: LegacyHospitalUser) -> dict[str,
     token = create_access_token({
         "sub": "bb_tech@hospital.com",
         "name": "Blood Bank Tech",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital.id),
         "user_id": str(doctor.id),
     })
@@ -76,7 +80,7 @@ def blood_bank_auth_b(hospital_b: Hospital, doctor: LegacyHospitalUser) -> dict[
     token = create_access_token({
         "sub": "bb_tech_b@hospitalb.com",
         "name": "Hospital B Tech",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital_b.id),
         "user_id": str(doctor.id),
     })

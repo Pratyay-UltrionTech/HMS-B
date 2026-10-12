@@ -7,6 +7,7 @@ Kept strictly under 500 lines.
 
 from __future__ import annotations
 
+import logging
 from io import BytesIO
 from typing import Any
 from uuid import UUID
@@ -41,6 +42,8 @@ from modules.patients.entities.patient import Patient
 from modules.vitals.entities.vital_reading import VitalReading
 from shared.audit.service import write_audit_log
 
+logger = logging.getLogger(__name__)
+
 
 def to_prescription_response(
     p: Prescription,
@@ -59,7 +62,7 @@ def to_prescription_response(
             )
             test_ids, panel_ids, scan_ids = get_prescription_investigation_ids(target_db, p.id)
         except Exception:
-            pass
+            logger.exception("Could not load investigations for prescription %s", p.id)
 
     return PrescriptionResponse(
         id=p.id,
@@ -106,7 +109,7 @@ def to_record_response(r: MedicalRecord) -> MedicalRecordResponse:
         title=r.title,
         notes=r.notes,
         file_name=r.file_name,
-        has_file=bool(r.file_data),
+        has_file=bool(getattr(r, "has_file", False)),
         created_at=r.created_at,
         patient_name=r.patient.name if r.patient else None,
         doctor_name=r.doctor.name if r.doctor else None,
@@ -175,8 +178,13 @@ class CreatePrescriptionAction:
         # Feature 16 & 17 Clinical Safety Validation: Allergy alerts & Drug Interactions
         med_list = [m.strip() for m in payload.medicines.replace(";", ",").replace("\n", ",").split(",") if m.strip()]
         allergy_checker = CheckPatientAllergyAlertAction(self.db, hospital_id)
+        preloaded_allergies = allergy_checker.repo.list_active_allergies(payload.patient_id) if med_list else []
         for med in med_list:
-            warning = allergy_checker.execute(payload.patient_id, CheckAllergyAlertRequest(medicine_name=med))
+            warning = allergy_checker.execute(
+                payload.patient_id,
+                CheckAllergyAlertRequest(medicine_name=med),
+                active_allergies=preloaded_allergies,
+            )
             if warning.has_conflict and warning.requires_clinical_override:
                 if not payload.override_confirmed:
                     raise HTTPException(
@@ -240,27 +248,25 @@ class CreatePrescriptionAction:
         self.db.add(rx)
         self.db.flush()
 
-        # Link lab / radiology orders if requested via legacy helper
+        # Investigations are part of the prescription transaction: an invalid test/scan
+        # selection fails the whole request instead of silently dropping the orders.
         if payload.test_ids or payload.panel_ids or payload.scan_ids:
-            try:
-                from modules.laboratory.services.lab_prescription_service import (
-                    create_investigation_requests_for_prescription,
-                )
-                create_investigation_requests_for_prescription(
-                    self.db,
-                    hospital_id=hospital_id,
-                    doctor_id=doctor_id,
-                    patient_id=payload.patient_id,
-                    appointment_id=payload.appointment_id,
-                    prescription_id=rx.id,
-                    admission_id=payload.admission_id,
-                    test_ids=payload.test_ids,
-                    panel_ids=payload.panel_ids,
-                    scan_ids=payload.scan_ids,
-                    clinical_notes=f"Ordered with prescription · {rx.diagnosis[:120]}",
-                )
-            except Exception:
-                pass
+            from modules.laboratory.services.lab_prescription_service import (
+                create_investigation_requests_for_prescription,
+            )
+            create_investigation_requests_for_prescription(
+                self.db,
+                hospital_id=hospital_id,
+                doctor_id=doctor_id,
+                patient_id=payload.patient_id,
+                appointment_id=payload.appointment_id,
+                prescription_id=rx.id,
+                admission_id=payload.admission_id,
+                test_ids=payload.test_ids,
+                panel_ids=payload.panel_ids,
+                scan_ids=payload.scan_ids,
+                clinical_notes=f"Ordered with prescription · {rx.diagnosis[:120]}",
+            )
 
         write_audit_log(
             self.db,
@@ -349,23 +355,23 @@ class UpdatePrescriptionAction:
             rx.status = payload.status
 
         if payload.test_ids is not None or payload.panel_ids is not None or payload.scan_ids is not None:
-            try:
-                from modules.laboratory.services.lab_prescription_service import (
-                    update_investigation_requests_for_prescription,
-                )
-                update_investigation_requests_for_prescription(
-                    self.db,
-                    hospital_id=hospital_id,
-                    doctor_id=doctor_id,
-                    patient_id=rx.patient_id,
-                    appointment_id=rx.appointment_id,
-                    prescription_id=rx.id,
-                    test_ids=payload.test_ids,
-                    panel_ids=payload.panel_ids,
-                    scan_ids=payload.scan_ids,
-                )
-            except Exception:
-                pass
+            from modules.laboratory.services.lab_prescription_service import (
+                update_investigation_requests_for_prescription,
+            )
+            update_investigation_requests_for_prescription(
+                self.db,
+                hospital_id=hospital_id,
+                doctor_id=doctor_id,
+                patient_id=rx.patient_id,
+                appointment_id=rx.appointment_id,
+                admission_id=getattr(rx, "admission_id", None) or payload.admission_id,
+                prescription_id=rx.id,
+                test_ids=payload.test_ids,
+                panel_ids=payload.panel_ids,
+                scan_ids=payload.scan_ids,
+                clinical_notes=f"Ordered with prescription · {rx.diagnosis[:120]}" if rx.diagnosis else None,
+                actor=actor,
+            )
 
         write_audit_log(
             self.db,
@@ -465,7 +471,7 @@ class StreamPrescriptionPdfAction:
             )
             lab_names, rad_names = prescription_investigation_names(self.db, rx)
         except Exception:
-            pass
+            logger.exception("Could not load investigation names for prescription %s", rx.id)
 
         html = PrescriptionHtmlService.render(
             rx,

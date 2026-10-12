@@ -84,6 +84,13 @@ from modules.tenancy.entities.hospital import Hospital
 from shared.exceptions.base import ConflictError, ValidationError
 from tests.conftest import db_session, hospital  # noqa: F401  (fixtures)
 
+
+@pytest.fixture(autouse=True)
+def disable_advance_policy_for_remediation_tests(hospital: Hospital, db_session: Session):
+    hospital.facility_settings = {"admission_advance_policy": {"enabled": False}}
+    db_session.commit()
+
+
 ACTOR = {"name": "Test Runner", "role": "hospital_admin"}
 
 

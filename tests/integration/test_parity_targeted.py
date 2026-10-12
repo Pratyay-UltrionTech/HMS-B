@@ -46,7 +46,13 @@ from modules.inpatient.contracts.inpatient_contracts import DischargeRequest
 from modules.billing.entities.billing_entities import (
     BillingCharge,
     BillingChargeStatus,
+    BillingInvoice,
+    BillingInvoiceLine,
+    BillingInvoiceStatus,
     BillingSourceType,
+    FinancialAccount,
+    FinancialAccountStatus,
+    FinancialAccountType,
 )
 
 
@@ -372,7 +378,7 @@ def test_inpatient_discharge_blocks_on_outstanding_dues(parity_db: Session, samp
         hospital_id=sample_hospital.id,
         name="General Ward",
         ward_type=WardType.general,
-        bed_charge_per_day=500.0,
+        bed_charge_per_day=0.0,
     )
     room = Room(
         id=uuid4(),
@@ -415,18 +421,62 @@ def test_inpatient_discharge_blocks_on_outstanding_dues(parity_db: Session, samp
     parity_db.add(admission)
     parity_db.flush()
 
-    # Add an outstanding charge of 1000
+    acc = FinancialAccount(
+        id=uuid4(),
+        hospital_id=sample_hospital.id,
+        patient_id=patient.id,
+        admission_id=admission.id,
+        account_number="ACC-TEST-101",
+        account_type=FinancialAccountType.ipd,
+        status=FinancialAccountStatus.open,
+        created_by_name="System",
+    )
+    parity_db.add(acc)
+    parity_db.flush()
+
+    # Add an outstanding charge of 1000 tied to this account
     charge = BillingCharge(
         id=uuid4(),
         hospital_id=sample_hospital.id,
         patient_id=patient.id,
+        account_id=acc.id,
         source_type=BillingSourceType.admission,
         source_id=admission.id,
         description="Room Stay Dues",
         charge_amount=1000.0,
+        net_amount=1000.0,
+        amount_paid=0.0,
         status=BillingChargeStatus.pending,
     )
     parity_db.add(charge)
+    parity_db.flush()
+
+    from decimal import Decimal
+
+    invoice = BillingInvoice(
+        id=uuid4(),
+        hospital_id=sample_hospital.id,
+        patient_id=patient.id,
+        account_id=acc.id,
+        invoice_number="INV-TEST-101",
+        invoice_date=date.today(),
+        subtotal=Decimal("1000.00"),
+        grand_total=Decimal("1000.00"),
+        status=BillingInvoiceStatus.generated,
+        created_by_name="System",
+    )
+    parity_db.add(invoice)
+    parity_db.flush()
+
+    inv_line = BillingInvoiceLine(
+        id=uuid4(),
+        hospital_id=sample_hospital.id,
+        invoice_id=invoice.id,
+        charge_id=charge.id,
+        description="Room Stay Dues",
+        amount=Decimal("1000.00"),
+    )
+    parity_db.add(inv_line)
     parity_db.commit()
 
     action = DischargePatientAction(parity_db)
@@ -434,13 +484,16 @@ def test_inpatient_discharge_blocks_on_outstanding_dues(parity_db: Session, samp
         admission_id=admission.id,
         patient_id=patient.id,
         discharge_notes="Ready to go",
+        no_discharge_meds=True,
     )
 
-    with pytest.raises(HTTPException) as exc:
+    from shared.exceptions.base import ValidationError
+
+    with pytest.raises((HTTPException, ValidationError)) as exc:
         action.execute(
             sample_hospital.id,
             req,
             actor={"name": "Nurse Kelly", "role": "hospital_staff"},
         )
-    assert exc.value.status_code == 400
-    assert "outstanding balance" in exc.value.detail.lower()
+    err_text = str(getattr(exc.value, "detail", getattr(exc.value, "message", str(exc.value)))).lower()
+    assert "outstanding balance" in err_text

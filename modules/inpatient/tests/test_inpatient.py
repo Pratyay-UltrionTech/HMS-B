@@ -34,6 +34,12 @@ from shared.auth.jwt import create_access_token
 from tests.conftest import db_session, hospital
 
 
+@pytest.fixture(autouse=True)
+def disable_advance_policy_for_inpatient_tests(hospital: Hospital, db_session: Session):
+    hospital.facility_settings = {"admission_advance_policy": {"enabled": False}}
+    db_session.commit()
+
+
 @pytest.fixture(scope="function")
 def inpatient_app(db_session: Session) -> FastAPI:
     """Isolated test app mounting inpatient routes across /beds, /registration, and /ipd."""

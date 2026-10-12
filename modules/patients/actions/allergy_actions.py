@@ -121,8 +121,14 @@ class CheckPatientAllergyAlertAction:
     def __init__(self, db: Session, hospital_id: UUID) -> None:
         self.repo = AllergyRepository(db, hospital_id)
 
-    def execute(self, patient_id: UUID, payload: CheckAllergyAlertRequest) -> AllergyAlertWarning:
-        active_allergies = self.repo.list_active_allergies(patient_id)
+    def execute(
+        self,
+        patient_id: UUID,
+        payload: CheckAllergyAlertRequest,
+        active_allergies: list[PatientAllergy] | None = None,
+    ) -> AllergyAlertWarning:
+        if active_allergies is None:
+            active_allergies = self.repo.list_active_allergies(patient_id)
         if not active_allergies:
             return AllergyAlertWarning(has_conflict=False)
 

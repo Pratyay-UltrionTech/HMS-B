@@ -51,6 +51,35 @@ from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
 
 
+EMERGENCY_APPROVER_PERMS = {"emergency": {"can_view": True, "can_approve": True}}
+BILLING_APPROVER_PERMS = {"billing": {"can_view": True, "can_approve": True}}
+
+
+def _staff_user(db_session: Session, hospital: Hospital, name: str) -> HospitalUser:
+    user = HospitalUser(
+        id=uuid.uuid4(),
+        hospital_id=hospital.id,
+        role_id=uuid.uuid4(),
+        name=name,
+        phone="555-0110",
+        email=f"{uuid.uuid4().hex[:8]}@apollocity.com",
+        password_hash="dummy_hash_for_test",
+    )
+    db_session.add(user)
+    db_session.commit()
+    return user
+
+
+def _claims(user: HospitalUser, hospital: Hospital, permissions: dict | None = None) -> dict:
+    return {
+        "user_id": str(user.id),
+        "name": user.name,
+        "role": "hospital_staff",
+        "hospital_uuid": str(hospital.id),
+        "permissions": permissions or {},
+    }
+
+
 @pytest.fixture
 def test_setup(db_session: Session, hospital: Hospital, doctor: HospitalUser, patient: Patient):
     ward = Ward(
@@ -267,11 +296,9 @@ def test_financial_exception_workflow_and_separation_of_duties(db_session: Sessi
     room = test_setup["room"]
     bed = test_setup["bed"]
 
-    nurse_id = uuid.uuid4()
-    nurse_user = {"id": str(nurse_id), "name": "Staff Nurse Priya", "role": "nurse"}
-
-    approver_id = uuid.uuid4()
-    approver_user = {"id": str(approver_id), "name": "Finance Head Mehta", "role": "billing_manager"}
+    # The requester also holds billing:approve so separation of duties is what blocks self-approval.
+    nurse_user = _claims(_staff_user(db_session, h, "Staff Nurse Priya"), h, BILLING_APPROVER_PERMS)
+    approver_user = _claims(_staff_user(db_session, h, "Finance Head Mehta"), h, BILLING_APPROVER_PERMS)
 
     actor = {"user_id": str(doc.id), "name": "Dr. House"}
     adm, created = EnsureAdmissionRequestAction(db_session).execute(
@@ -339,7 +366,7 @@ def test_emergency_financial_override_instant_continuation(db_session: Session, 
     room = test_setup["room"]
     bed = test_setup["bed"]
 
-    actor = {"user_id": str(doc.id), "name": "Dr. House"}
+    actor = _claims(doc, h, EMERGENCY_APPROVER_PERMS)
     adm, created = EnsureAdmissionRequestAction(db_session).execute(
         hospital_id=h.id,
         patient_id=pat.id,
@@ -444,7 +471,7 @@ def test_stat_string_does_not_bypass_laboratory_payment_gate(db_session: Session
     h = test_setup["hospital"]
     doc = test_setup["doctor"]
     pat = test_setup["patient"]
-    actor = {"id": str(doc.id), "name": doc.name, "role": "hospital_staff", "hospital_uuid": str(h.id)}
+    actor = _claims(doc, h, EMERGENCY_APPROVER_PERMS)
 
     order = LabOrder(
         id=uuid.uuid4(),
@@ -524,7 +551,7 @@ def test_stat_string_does_not_bypass_radiology_payment_gate(db_session: Session,
     h = test_setup["hospital"]
     doc = test_setup["doctor"]
     pat = test_setup["patient"]
-    actor = {"id": str(doc.id), "name": doc.name, "role": "hospital_staff", "hospital_uuid": str(h.id)}
+    actor = _claims(doc, h, EMERGENCY_APPROVER_PERMS)
 
     order = RadiologyOrder(
         id=uuid.uuid4(),
@@ -643,7 +670,7 @@ def test_diagnostic_report_viewing_and_finalization_not_blocked_after_service(db
     pat = test_setup["patient"]
     actor = {"id": str(doc.id), "name": doc.name, "role": "doctor", "hospital_uuid": str(h.id)}
 
-    # ── 1. Laboratory: Collected sample allows result entry, sign-off and HTML viewing even if charge is unpaid ──
+    # ── 1. Laboratory: result entry needs clearance; once signed off, report viewing is never billing-gated ──
     lab_order = LabOrder(
         id=uuid.uuid4(),
         hospital_id=h.id,
@@ -696,7 +723,6 @@ def test_diagnostic_report_viewing_and_finalization_not_blocked_after_service(db
     db_session.add(lab_charge)
     db_session.commit()
 
-    # Clinical result entry and sign-off MUST NOT be blocked by the unpaid billing charge!
     save_payload = LabReportSaveRequest(
         results=[
             LabResultInput(
@@ -710,6 +736,22 @@ def test_diagnostic_report_viewing_and_finalization_not_blocked_after_service(db
         ],
         mark_completed=True,
     )
+    # Result entry is an execution step: gated while the charge is unpaid.
+    from fastapi import HTTPException
+    from modules.billing.entities.billing_entities import BillingPaymentMethod
+    from modules.billing.services.billing_service import create_payment
+
+    with pytest.raises(HTTPException) as exc:
+        SaveLabResultsAction(db_session, h.id).execute(lab_order.id, save_payload, actor)
+    assert exc.value.status_code == 402
+    db_session.rollback()
+
+    create_payment(
+        db_session, hospital_id=h.id, patient_id=pat.id, amount=450.0, payment_date=datetime.now(timezone.utc).date(),
+        payment_method=BillingPaymentMethod.cash, notes=None, received_by_name="Cashier",
+        allocations_plan=[{"charge_id": lab_charge.id, "amount": 450.0}],
+    )
+    db_session.commit()
     saved_order = SaveLabResultsAction(db_session, h.id).execute(lab_order.id, save_payload, actor)
     assert saved_order.status == LabOrderStatus.completed
 
@@ -902,56 +944,55 @@ def test_unpaid_diagnostic_orders_remain_visible_in_queues(db_session: Session, 
 
 def test_emergency_override_validation_and_permissions(db_session: Session, test_setup: dict):
     from fastapi import HTTPException
-    from modules.billing.services.service_financial_clearance import (
-        assert_service_financially_cleared,
-        validate_emergency_override_actor,
+    from modules.billing.services.financial_authorization import (
+        OverrideScope,
+        authorize_emergency_override,
     )
 
     h = test_setup["hospital"]
     doc = test_setup["doctor"]
     pat = test_setup["patient"]
+    scope = OverrideScope.service("laboratory", uuid.uuid4(), patient_id=pat.id)
 
     # 1. Blank or whitespace reason MUST fail with HTTP 400
     with pytest.raises(HTTPException) as exc_400:
-        validate_emergency_override_actor(
-            actor={"id": str(doc.id), "name": doc.name, "role": "doctor"},
-            reason="   ",
-            service_type="laboratory",
+        authorize_emergency_override(
+            db_session, h.id, _claims(doc, h, EMERGENCY_APPROVER_PERMS), scope=scope, reason="   "
         )
     assert exc_400.value.status_code == 400
     assert "mandatory" in exc_400.value.detail.lower()
 
     # 2. Unauthorized actor (e.g. receptionist / desk clerk) MUST fail with HTTP 403
+    receptionist = _staff_user(db_session, h, "Front Desk Receptionist")
     unauthorized_actor = {
-        "id": str(uuid.uuid4()),
-        "name": "Front Desk Receptionist",
-        "role": "receptionist",
+        **_claims(receptionist, h, {"registration": {"can_view": True, "can_edit": True}}),
         "staff_role_name": "Front Desk Clerk",
-        "permissions": [],
     }
     with pytest.raises(HTTPException) as exc_403:
-        validate_emergency_override_actor(
-            actor=unauthorized_actor,
+        authorize_emergency_override(
+            db_session, h.id, unauthorized_actor, scope=scope,
             reason="Patient looks very sick, need immediate test",
-            service_type="laboratory",
         )
     assert exc_403.value.status_code == 403
     assert "not authorized" in exc_403.value.detail.lower()
 
-    # 3. Authorized doctor with valid reason passes validation and returns actor details
-    authorized_actor = {
-        "id": str(doc.id),
-        "name": doc.name,
-        "role": "doctor",
-        "staff_role_name": "Consultant Physician",
-    }
-    actor_id, actor_name = validate_emergency_override_actor(
-        actor=authorized_actor,
+    # 3. "Dr." name / doctor-ish role label without the permission is NOT enough
+    with pytest.raises(HTTPException) as exc_name:
+        authorize_emergency_override(
+            db_session, h.id,
+            {**_claims(doc, h), "role": "hospital_staff", "staff_role_name": "Consultant Physician"},
+            scope=scope, reason="Acute septic shock; lactate clearance monitoring",
+        )
+    assert exc_name.value.status_code == 403
+
+    # 4. Actor holding emergency:approve with a valid reason is authorized
+    override_actor = authorize_emergency_override(
+        db_session, h.id, _claims(doc, h, EMERGENCY_APPROVER_PERMS), scope=scope,
         reason="Acute septic shock; lactate clearance monitoring",
-        service_type="laboratory",
     )
-    assert actor_id == doc.id
-    assert actor_name == doc.name
+    assert override_actor.user_id == doc.id
+    assert override_actor.name == doc.name
+    assert override_actor.granted_by == "emergency:approve"
 
 
 # ===========================================================================
@@ -976,15 +1017,17 @@ def test_financial_exception_cross_scope_and_consumption(db_session: Session, te
     doc = test_setup["doctor"]
     pat = test_setup["patient"]
 
-    requester = {"user_id": str(uuid.uuid4()), "name": "Nurse Jane", "role": "hospital_staff"}
-    approver = {"user_id": str(uuid.uuid4()), "name": "CFO Robert", "role": "hospital_admin"}
+    requester = _claims(_staff_user(db_session, h, "Nurse Jane"), h)
+    approver = _claims(_staff_user(db_session, h, "CFO Robert"), h, BILLING_APPROVER_PERMS)
+    bed_source_id = uuid.uuid4()
 
-    # 1. Create and approve an exception specifically scoped to bed allocation
+    # 1. Create and approve an exception specifically scoped to one bed source
     svc = FinancialExceptionService(db_session, h.id)
     req = FinancialExceptionRequest(
         patient_id=pat.id,
         service_type="bed",
         action_type="bed_allocation",
+        source_id=bed_source_id,
         reason_category="administrative_approval",
         reason="Patient has approved corporate coverage arriving tomorrow morning",
         required_amount=2500.0,
@@ -1029,13 +1072,25 @@ def test_financial_exception_cross_scope_and_consumption(db_session: Session, te
         )
     assert exc_scope.value.status_code == 402
 
-    # 3. Use the exception for its legitimate scope: bed
+    # 2b. A different bed source of the same type is NOT covered
+    with pytest.raises(HTTPException) as exc_other_source:
+        assert_service_financially_cleared(
+            db_session,
+            hospital_id=h.id,
+            source_type=BillingSourceType.bed,
+            source_id=uuid.uuid4(),
+            action_description="allocate another bed",
+            patient_id=pat.id,
+        )
+    assert exc_other_source.value.status_code == 402
+
+    # 3. Use the exception for its legitimate scope: this bed source
     # This should succeed and consume the exception
     assert_service_financially_cleared(
         db_session,
         hospital_id=h.id,
         source_type=BillingSourceType.bed,
-        source_id=uuid.uuid4(),
+        source_id=bed_source_id,
         action_description="allocate inpatient bed",
         patient_id=pat.id,
     )
@@ -1056,7 +1111,7 @@ def test_financial_exception_cross_scope_and_consumption(db_session: Session, te
             db_session,
             hospital_id=h.id,
             source_type=BillingSourceType.bed,
-            source_id=uuid.uuid4(),
+            source_id=bed_source_id,
             action_description="allocate second bed",
             patient_id=pat.id,
         )

@@ -65,7 +65,7 @@ def dms_db():
 
 
 @pytest.fixture
-def dms_client(dms_db):
+def dms_client(dms_db, monkeypatch):
     app = FastAPI()
     app.include_router(dms_router, prefix="/api")
 
@@ -86,10 +86,17 @@ def dms_client(dms_db):
         "id": str(uuid4()),
         "sub": "records_clerk",
         "name": "Sarah Miller",
-        "role": "records_clerk",
+        "role": "hospital_admin",
         "staff_role_name": "Medical Records Clerk",
         "hospital_id": str(test_hospital_id),
+        "hospital_uuid": str(test_hospital_id),
     }
+
+    test_factory = sessionmaker(bind=dms_db.get_bind(), autocommit=False, autoflush=False)
+    monkeypatch.setattr(
+        "infrastructure.postgres.session.get_transitional_sync_session_factory",
+        lambda: test_factory,
+    )
 
     app.dependency_overrides[get_transitional_sync_session] = lambda: dms_db
     app.dependency_overrides[get_hospital_context] = lambda: test_hospital_id

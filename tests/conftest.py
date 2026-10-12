@@ -45,6 +45,7 @@ from infrastructure.postgres.session import get_transitional_sync_session as get
 from infrastructure.postgres.engine import get_transitional_sync_engine
 
 # Import module entities to register all ORM models in Base.metadata
+import modules.auth.entities
 import modules.tenancy.entities.hospital
 import modules.doctors.entities.doctor
 import modules.patients.entities.patient
@@ -66,8 +67,11 @@ import modules.blood_bank.entities.blood_bank_entities
 import modules.ambulance.entities.ambulance_entities
 import modules.equipment.entities.equipment_entities
 import modules.inventory.entities.inventory_entities
+import modules.procurement.entities.procurement_entities
 import modules.patients.entities.allergy
 import modules.pharmacy.entities.drug_interaction_entities
+import modules.clinical_decision.entities.clinical_decision_entities
+import modules.emergency.entities.emergency_entities
 import shared.audit.entities.audit_log
 import shared.database.sequences
 
@@ -166,6 +170,7 @@ def hospital(db_session: Session) -> Hospital:
         phone="555-0100",
         email="admin@apollocity.com",
         password_hash="dummy_hash_for_test",
+        auth_model="legacy_organization",
     )
     db_session.add(h)
     db_session.commit()
@@ -184,6 +189,7 @@ def hospital_b(db_session: Session) -> Hospital:
         phone="555-0200",
         email="admin@fortisreg.com",
         password_hash="dummy_hash_for_test",
+        auth_model="legacy_organization",
     )
     db_session.add(h)
     db_session.commit()
@@ -275,7 +281,8 @@ def patient_b(db_session: Session, hospital_b: Hospital) -> Patient:
 
 @pytest.fixture(scope="function")
 def appointment_factory(db_session: Session, hospital: Hospital, doctor: HospitalUser, patient: Patient):
-    """Factory fixture to create appointments with arbitrary status, date, and time."""
+    _counter = 0
+
     def _create(
         status: AppointmentStatus = AppointmentStatus.scheduled,
         appointment_date: date | None = None,
@@ -287,6 +294,12 @@ def appointment_factory(db_session: Session, hospital: Hospital, doctor: Hospita
         custom_doctor: HospitalUser | None = None,
         custom_patient: Patient | None = None,
     ) -> Appointment:
+        nonlocal _counter
+        if appointment_time is None:
+            minute = (30 + _counter * 5) % 60
+            hour = 9 + ((30 + _counter * 5) // 60)
+            appointment_time = time(hour, minute)
+            _counter += 1
         appt = Appointment(
             id=uuid.uuid4(),
             hospital_id=(custom_hospital or hospital).id,
@@ -354,6 +367,10 @@ def auth_headers(hospital: Hospital) -> dict[str, str]:
             "appointment": {"can_view": True, "can_edit": True, "can_create": True, "can_cancel": True},
             "registration": {"can_view": True, "can_edit": True},
             "doctors": {"can_view": True, "can_edit": True},
+            "vitals": {"can_view": True, "can_edit": True, "can_create": True, "can_delete": True},
+            "cssd": {"can_view": True, "can_edit": True, "can_create": True, "can_delete": True},
+            "equipment": {"can_view": True, "can_edit": True, "can_create": True, "can_delete": True},
+            "masters": {"can_view": True, "can_edit": True, "can_create": True, "can_delete": True},
         },
     })
     return {"Authorization": f"Bearer {token}"}
@@ -371,6 +388,10 @@ def auth_headers_b(hospital_b: Hospital) -> dict[str, str]:
             "appointment": {"can_view": True, "can_edit": True, "can_create": True, "can_cancel": True},
             "registration": {"can_view": True, "can_edit": True},
             "doctors": {"can_view": True, "can_edit": True},
+            "vitals": {"can_view": True, "can_edit": True, "can_create": True, "can_delete": True},
+            "cssd": {"can_view": True, "can_edit": True, "can_create": True, "can_delete": True},
+            "equipment": {"can_view": True, "can_edit": True, "can_create": True, "can_delete": True},
+            "masters": {"can_view": True, "can_edit": True, "can_create": True, "can_delete": True},
         },
     })
     return {"Authorization": f"Bearer {token}"}

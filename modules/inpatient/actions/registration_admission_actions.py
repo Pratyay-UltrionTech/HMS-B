@@ -117,6 +117,20 @@ class RegistrationAdmitAction:
             admission_id=admission.id,
             created_by_name=actor_name,
         )
+
+        # ── Authoritative Backend Financial Clearance Check for Bed Allocation ──
+        from modules.billing.services.service_financial_clearance import enforce_bed_allocation_clearance
+        enforce_bed_allocation_clearance(
+            self.db,
+            hospital_id,
+            admission,
+            ward_id=payload.ward_id,
+            bed_id=payload.bed_id,
+            actor=actor,
+            is_emergency_override=bool(getattr(payload, "is_emergency_override", False)),
+            emergency_override_reason=getattr(payload, "emergency_override_reason", None),
+        )
+
         self.billing_svc.ensure_admission_charge(
             hospital_id=hospital_id,
             patient_id=patient.id,
@@ -304,7 +318,9 @@ class RegistrationDischargeAction:
         )
         from modules.billing.services.billing_service import (
             draw_down_deposit_for_charges,
+            draw_down_deposits_bulk_for_account,
             allocate_payment_to_charges,
+            payment_unallocated_amount,
         )
         from sqlalchemy import or_
 
@@ -333,12 +349,13 @@ class RegistrationDischargeAction:
                     "Final billing required: A generated final invoice must exist for the admission account before discharge."
                 )
 
-            # Avoid Stale Final Bills: Check if any charges were posted after invoice generation
+            # Avoid Stale Final Bills: Check if any active billable charges were posted after invoice generation
             stale_charges = (
                 self.db.query(BillingCharge)
                 .filter(
                     BillingCharge.hospital_id == hospital_id,
                     BillingCharge.account_id == acc.id,
+                    BillingCharge.status != BillingChargeStatus.cancelled,
                     BillingCharge.created_at > latest_invoice.created_at,
                 )
                 .all()
@@ -357,11 +374,7 @@ class RegistrationDischargeAction:
                 .all()
             )
             for pay in acc_payments:
-                alloc_sum = sum(
-                    float(a.allocated_amount or 0)
-                    for a in self.db.query(BillingPaymentAllocation).filter(BillingPaymentAllocation.payment_id == pay.id).all()
-                )
-                unalloc_tender = round(float(pay.amount or 0) - alloc_sum, 2)
+                unalloc_tender = payment_unallocated_amount(self.db, pay)
                 if unalloc_tender > 0:
                     allocate_payment_to_charges(
                         self.db,
@@ -373,41 +386,14 @@ class RegistrationDischargeAction:
                         account_id=acc.id,
                     )
 
-            available_deposits = (
-                self.db.query(BillingDeposit)
-                .filter(
-                    BillingDeposit.hospital_id == hospital_id,
-                    or_(
-                        BillingDeposit.admission_id == admission.id,
-                        BillingDeposit.account_id == acc.id,
-                    ),
-                    BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
-                    BillingDeposit.available_amount > 0,
-                )
-                .order_by(BillingDeposit.created_at.asc())
-                .with_for_update()
-                .all()
+            # Safely draw down available deposits belonging to this admission/account in bulk
+            draw_down_deposits_bulk_for_account(
+                self.db,
+                hospital_id=hospital_id,
+                patient_id=admission.patient_id,
+                account_id=acc.id if acc else None,
+                created_by_name=actor.get("name") or "Registration Discharge",
             )
-            for dep in available_deposits:
-                open_charges_due = sum(
-                    max(0.0, float(c.net_amount or 0) - float(c.amount_paid or 0))
-                    for c in self.db.query(BillingCharge)
-                    .filter(
-                        BillingCharge.hospital_id == hospital_id,
-                        BillingCharge.account_id == acc.id,
-                        BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
-                    )
-                    .all()
-                )
-                if open_charges_due <= 0.009:
-                    break
-                draw_down_deposit_for_charges(
-                    self.db,
-                    hospital_id=hospital_id,
-                    deposit_id=dep.id,
-                    max_amount=open_charges_due,
-                    created_by_name=actor.get("name") or "Registration Discharge",
-                )
 
         fin = self.billing_svc.get_ledger_totals(hospital_id, admission.patient_id, admission_id=admission.id)
         outstanding = float(fin.get("outstanding") or 0)
@@ -481,6 +467,13 @@ class RegistrationDischargeAction:
             entity_id=str(admission.patient_id),
             summary="Patient discharged via registration",
         )
+        # Close FinancialAccount and refresh invoice status at successful discharge
+        if acc:
+            from modules.billing.entities.billing_entities import FinancialAccountStatus
+            from modules.billing.services.invoice_service import refresh_invoice_paid_status
+            acc.status = FinancialAccountStatus.closed
+            refresh_invoice_paid_status(self.db, hospital_id, admission.patient_id)
+
         self.db.commit()
         return DischargeResponse(
             id=admission.id,

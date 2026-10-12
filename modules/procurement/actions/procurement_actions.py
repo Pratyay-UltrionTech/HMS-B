@@ -14,9 +14,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from typing import Any
+import uuid
 from uuid import UUID
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from modules.inventory.actions.inventory_actions import InventoryActions
@@ -369,6 +371,13 @@ class ProcurementActions:
         return _po_to_response(row)
 
     def create_po(self, payload: PurchaseOrderCreate) -> PurchaseOrderResponse:
+        try:
+            return self._create_po_internal(payload)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def _create_po_internal(self, payload: PurchaseOrderCreate) -> PurchaseOrderResponse:
         supplier = self.repo.get_supplier(payload.supplier_id, self.hospital_id)
         if not supplier:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Supplier not found")
@@ -390,8 +399,10 @@ class ProcurementActions:
         self.db.add(row)
         self.db.flush()
 
+        item_ids = [item_payload.consumable_item_id for item_payload in payload.items]
+        items_map = self.repo.get_consumable_items_bulk(item_ids, self.hospital_id)
         for item_payload in payload.items:
-            item = self.repo.get_consumable_item(item_payload.consumable_item_id, self.hospital_id)
+            item = items_map.get(item_payload.consumable_item_id)
             if not item:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Consumable item not found")
             self.db.add(
@@ -488,6 +499,13 @@ class ProcurementActions:
     # ── Feature 51: Goods Received Note ──────────────────────────────────────
 
     def record_grn(self, payload: GrnCreate) -> GrnResponse:
+        try:
+            return self._record_grn_internal(payload)
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def _record_grn_internal(self, payload: GrnCreate) -> GrnResponse:
         po = self.repo.get_po_by_id(payload.purchase_order_id, self.hospital_id)
         if not po:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Purchase order not found")
@@ -500,6 +518,7 @@ class ProcurementActions:
         po_items_by_id = {i.id: i for i in po.items}
 
         grn = GoodsReceivedNote(
+            id=uuid.uuid4(),
             hospital_id=self.hospital_id,
             grn_number=self.repo.next_grn_number(self.hospital_id),
             purchase_order_id=po.id,
@@ -508,9 +527,10 @@ class ProcurementActions:
             received_by_staff_id=payload.received_by_staff_id,
         )
         self.db.add(grn)
-        self.db.flush()
 
         inventory_actions = InventoryActions(self.db, self.hospital_id, self.user)
+        stock_requests: list[ReceiveStockRequest] = []
+        grn_items: list[GoodsReceivedNoteItem] = []
 
         for item_payload in payload.items:
             po_item = po_items_by_id.get(item_payload.purchase_order_item_id)
@@ -530,22 +550,22 @@ class ProcurementActions:
                     ),
                 )
 
-            self.db.add(
-                GoodsReceivedNoteItem(
-                    hospital_id=self.hospital_id,
-                    grn_id=grn.id,
-                    purchase_order_item_id=po_item.id,
-                    accepted_quantity=item_payload.accepted_quantity,
-                    rejected_quantity=item_payload.rejected_quantity,
-                    rejection_reason=item_payload.rejection_reason,
-                    batch_number=item_payload.batch_number.strip(),
-                    expiry_date=item_payload.expiry_date,
-                )
+            grn_item = GoodsReceivedNoteItem(
+                id=uuid.uuid4(),
+                hospital_id=self.hospital_id,
+                grn_id=grn.id,
+                purchase_order_item_id=po_item.id,
+                accepted_quantity=item_payload.accepted_quantity,
+                rejected_quantity=item_payload.rejected_quantity,
+                rejection_reason=item_payload.rejection_reason,
+                batch_number=item_payload.batch_number.strip(),
+                expiry_date=item_payload.expiry_date,
             )
+            grn_items.append(grn_item)
             po_item.quantity_received = round(po_item.quantity_received + item_payload.accepted_quantity, 4)
 
             if item_payload.accepted_quantity > 0:
-                inventory_actions.receive_stock(
+                stock_requests.append(
                     ReceiveStockRequest(
                         item_id=po_item.consumable_item_id,
                         batch_number=item_payload.batch_number.strip(),
@@ -559,6 +579,11 @@ class ProcurementActions:
                     )
                 )
 
+        self.db.add_all(grn_items)
+        if stock_requests:
+            inventory_actions.receive_stock_bulk(stock_requests, auto_commit=False)
+
+        # Single flush ensures all staged rows are emitted in minimal round trips
         self.db.flush()
 
         # An item is "fully closed" once accepted + rejected quantities across
@@ -568,14 +593,22 @@ class ProcurementActions:
         po_item_ids = [po_item.id for po_item in po.items]
         accounted_by_item: dict[UUID, float] = {}
         if po_item_ids:
-            for gi in (
-                self.db.query(GoodsReceivedNoteItem)
+            # Aggregate historical received quantities directly in the database
+            # rather than transferring and hydrating every historical GRN item entity.
+            sums = (
+                self.db.query(
+                    GoodsReceivedNoteItem.purchase_order_item_id,
+                    func.sum(
+                        func.coalesce(GoodsReceivedNoteItem.accepted_quantity, 0.0)
+                        + func.coalesce(GoodsReceivedNoteItem.rejected_quantity, 0.0)
+                    ),
+                )
                 .filter(GoodsReceivedNoteItem.purchase_order_item_id.in_(po_item_ids))
+                .group_by(GoodsReceivedNoteItem.purchase_order_item_id)
                 .all()
-            ):
-                accounted_by_item[gi.purchase_order_item_id] = accounted_by_item.get(
-                    gi.purchase_order_item_id, 0.0
-                ) + float(gi.accepted_quantity or 0) + float(gi.rejected_quantity or 0)
+            )
+            for po_item_id, total_qty in sums:
+                accounted_by_item[po_item_id] = float(total_qty or 0.0)
 
         all_lines_closed = True
         for po_item in po.items:

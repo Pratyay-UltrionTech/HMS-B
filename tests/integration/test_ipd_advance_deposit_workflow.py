@@ -326,7 +326,13 @@ def test_emergency_override_allows_bed_allocation_without_deposit(db_session: Se
     user_ctx = {"user_id": str(doc.id), "doctor_id": str(doc.id), "name": "Dr. Sarah"}
     resp = DoctorRequestIpdAdmissionAction(db_session).execute(h.id, doc.id, pat.id, req, user_ctx)
 
-    # 2. Record emergency financial override
+    # 2. Record emergency financial override (actor holds emergency:approve)
+    user_ctx = {
+        **user_ctx,
+        "role": "hospital_staff",
+        "hospital_uuid": str(h.id),
+        "permissions": {"emergency": {"can_view": True, "can_approve": True}},
+    }
     er_service = FinancialExceptionService(db_session, h.id)
     er_req = EmergencyOverrideRequest(
         patient_id=pat.id,
@@ -396,8 +402,25 @@ def test_financial_exception_approval_allows_bed_allocation(db_session: Session,
     assert clearance_pending.is_cleared is False
     assert clearance_pending.status == "exception_pending"
 
-    # 2. Second user (administrator / billing head) approves exception
-    approver_user = {"user_id": str(uuid.uuid4()), "name": "Finance Head Vikram"}
+    # 2. Second user (billing head holding billing:approve) approves exception
+    approver = HospitalUser(
+        id=uuid.uuid4(),
+        hospital_id=h.id,
+        role_id=uuid.uuid4(),
+        name="Finance Head Vikram",
+        phone="555-0120",
+        email="vikram.finance@apollocity.com",
+        password_hash="dummy_hash_for_test",
+    )
+    db_session.add(approver)
+    db_session.commit()
+    approver_user = {
+        "user_id": str(approver.id),
+        "name": approver.name,
+        "role": "hospital_staff",
+        "hospital_uuid": str(h.id),
+        "permissions": {"billing": {"can_view": True, "can_approve": True}},
+    }
     decision = FinancialExceptionDecision(
         status="approved",
         approval_remarks="Pre-auth claim verified on TPA portal",

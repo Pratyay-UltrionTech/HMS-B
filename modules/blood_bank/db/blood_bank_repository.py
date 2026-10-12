@@ -217,6 +217,19 @@ class BloodBankRepository:
         )
         return list(self.db.scalars(stmt).all())
 
+    def get_units_for_donations_bulk(self, donation_ids: list[UUID]) -> dict[UUID, list[BloodUnit]]:
+        """Fetch units for many donations in a single query."""
+        if not donation_ids:
+            return {}
+        stmt = select(BloodUnit).where(
+            BloodUnit.hospital_id == self.hospital_id,
+            BloodUnit.donation_id.in_(donation_ids),
+        )
+        result: dict[UUID, list[BloodUnit]] = {}
+        for u in self.db.scalars(stmt).all():
+            result.setdefault(u.donation_id, []).append(u)
+        return result
+
     def get_issues_for_units_bulk(self, unit_ids: list[UUID]) -> dict[UUID, BloodIssue]:
         """Latest BloodIssue per unit, fetched in a single query."""
         if not unit_ids:

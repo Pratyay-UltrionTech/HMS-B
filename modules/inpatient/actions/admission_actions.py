@@ -42,7 +42,10 @@ from modules.patients.entities.patient import Patient, PatientStatus
 from shared.audit.service import write_audit_log
 
 
-def to_admission_detail(a: Admission) -> AdmissionDetail:
+def to_admission_detail(
+    a: Admission,
+    source_appointment_map: dict[UUID, Any] | None = None,
+) -> AdmissionDetail:
     """Format Admission entity into AdmissionDetail response contract.
 
     FLAW-010: prefer the immutable demographic snapshot captured at admission
@@ -104,6 +107,10 @@ def to_admission_detail(a: Admission) -> AdmissionDetail:
     op_id = None
     if getattr(a, "source_appointment", None):
         op_id = a.source_appointment.op_id
+    elif source_appointment_map and getattr(a, "source_appointment_id", None) in source_appointment_map:
+        src = source_appointment_map.get(a.source_appointment_id)
+        if src:
+            op_id = src.op_id
     elif getattr(a, "source_appointment_id", None):
         from sqlalchemy.orm import object_session
         from modules.appointments.entities.appointment import Appointment
@@ -262,6 +269,20 @@ class AdmitPatientAction:
             admission_id=admission.id,
             created_by_name=actor_name,
         )
+
+        # ── Authoritative Backend Financial Clearance Check for Bed Allocation ──
+        from modules.billing.services.service_financial_clearance import enforce_bed_allocation_clearance
+        enforce_bed_allocation_clearance(
+            self.db,
+            hospital_id,
+            admission,
+            ward_id=payload.ward_id,
+            bed_id=payload.bed_id,
+            actor=actor,
+            is_emergency_override=bool(getattr(payload, "is_emergency_override", False)),
+            emergency_override_reason=getattr(payload, "emergency_override_reason", None),
+        )
+
         self.billing_svc.ensure_admission_charge(
             hospital_id=hospital_id,
             patient_id=patient.id,
@@ -420,68 +441,18 @@ class AllocateBedAction:
 
         # ── Authoritative Backend Financial Clearance Check for First Bed Allocation ──
         if admission.bed_id is None:
-            from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
-            from modules.billing.entities.financial_exception import FinancialClearanceException, FinancialExceptionStatus
-            from fastapi import HTTPException
+            from modules.billing.services.service_financial_clearance import enforce_bed_allocation_clearance
 
-            is_em = getattr(payload, "is_emergency_override", False)
-            em_reason = getattr(payload, "emergency_override_reason", None)
-
-            if is_em:
-                from modules.billing.services.service_financial_clearance import validate_emergency_override_actor
-                actor_id, actor_name = validate_emergency_override_actor(
-                    actor, em_reason, service_type="admission_bed"
-                )
-                em_reason_text = (em_reason or "").strip()
-                if actor_id:
-                    em_exc = FinancialClearanceException(
-                        hospital_id=hospital_id,
-                        patient_id=admission.patient_id,
-                        admission_id=admission.id,
-                        service_type="admission_bed",
-                        action_type="bed_allocation",
-                        source_id=new_bed.id,
-                        is_emergency=True,
-                        reason_category="emergency_life_safety",
-                        reason=em_reason_text,
-                        status=FinancialExceptionStatus.consumed.value,
-                        is_consumed=True,
-                        consumed_at=now,
-                        requested_by_id=actor_id,
-                        requested_by_name=actor_name,
-                        approved_by_id=actor_id,
-                        approved_by_name=actor_name,
-                        approval_remarks="Auto-authorized under emergency admission protocol",
-                    )
-                    self.db.add(em_exc)
-                    self.db.flush()
-            else:
-                fin_state = evaluate_bed_allocation_clearance(
-                    self.db, hospital_id, admission.id, ward_id=payload.ward_id, bed_id=payload.bed_id
-                )
-                if not fin_state.is_cleared:
-                    raise HTTPException(
-                        status_code=402,
-                        detail={
-                            "message": f"Payment or deposit required before bed allocation. Shortfall: ₹{fin_state.shortfall:.2f}.",
-                            "status": fin_state.status,
-                            "required_advance": fin_state.required_advance,
-                            "admission_fee": fin_state.admission_fee,
-                            "bed_charge_per_day": fin_state.bed_charge_per_day,
-                            "paid_or_allocated_amount": fin_state.paid_or_allocated_amount,
-                            "available_deposit": fin_state.available_deposit,
-                            "shortfall": fin_state.shortfall,
-                            "reason": fin_state.reason,
-                            "ipd_account_id": str(fin_state.ipd_account_id) if fin_state.ipd_account_id else None,
-                        },
-                    )
-                if fin_state.active_exception_id:
-                    exc = self.db.query(FinancialClearanceException).filter(
-                        FinancialClearanceException.id == fin_state.active_exception_id
-                    ).first()
-                    if exc:
-                        exc.is_consumed = True
-                        exc.consumed_at = now
+            enforce_bed_allocation_clearance(
+                self.db,
+                hospital_id,
+                admission,
+                ward_id=payload.ward_id,
+                bed_id=payload.bed_id,
+                actor=actor,
+                is_emergency_override=bool(getattr(payload, "is_emergency_override", False)),
+                emergency_override_reason=getattr(payload, "emergency_override_reason", None),
+            )
 
         old_bed = (
             self.db.query(Bed).filter(Bed.id == admission.bed_id).with_for_update().first()
@@ -825,20 +796,8 @@ class ListDischargeRequestsAction:
         rows = self.admissions_repo.list_discharge_requests(hospital_id)
         now = datetime.now(timezone.utc)
         items: list[DischargeQueueItem] = []
-        for a in rows:
-            ward = a.ward
-            self.billing_svc.ensure_bed_charge(
-                hospital_id=hospital_id,
-                patient_id=a.patient_id,
-                admission_id=a.id,
-                admitted_at=a.admitted_at,
-                discharged_at=now,
-                ward_name=ward.name if ward else None,
-                room_code=a.room.room_code if a.room else None,
-                bed_code=a.bed.bed_code if a.bed else None,
-                bed_charge_per_day=float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0,
-                created_by_name="System",
-            )
+        if rows:
+            self.billing_svc.ensure_bed_charges_bulk(hospital_id, rows, now)
         ledgers = self.billing_svc.get_ledger_totals_bulk(
             hospital_id,
             [a.patient_id for a in rows],
@@ -846,15 +805,28 @@ class ListDischargeRequestsAction:
         )
         from modules.inpatient.db.discharge_exception_repository import DischargeExceptionRepository
         exc_repo = DischargeExceptionRepository(self.db, hospital_id)
+        approved_exc_map = exc_repo.get_active_approved_exceptions_bulk([a.id for a in rows]) if rows else {}
+
+        src_appt_ids = [
+            a.source_appointment_id
+            for a in rows
+            if getattr(a, "source_appointment_id", None) and not getattr(a, "source_appointment", None)
+        ]
+        src_appt_map: dict[UUID, Any] = {}
+        if src_appt_ids:
+            from modules.appointments.entities.appointment import Appointment
+            appts = self.db.query(Appointment).filter(Appointment.id.in_(src_appt_ids)).all()
+            src_appt_map = {appt.id: appt for appt in appts}
+
         for a in rows:
             fin = ledgers.get(a.patient_id, {})
             outstanding = float(fin.get("outstanding") or 0)
             deposits_avail = float(fin.get("total_deposits_available") or 0)
             net_bal = float(fin.get("net_patient_balance") if fin.get("net_patient_balance") is not None else max(0.0, outstanding - deposits_avail))
-            approved_exc = exc_repo.get_active_approved_exception(a.id)
+            approved_exc = approved_exc_map.get(a.id)
             can_discharge = (net_bal <= 0.009) or (approved_exc is not None)
 
-            base = to_admission_detail(a)
+            base = to_admission_detail(a, source_appointment_map=src_appt_map)
             items.append(
                 DischargeQueueItem(
                     **base.model_dump(),
@@ -986,7 +958,9 @@ class DischargePatientAction:
         )
         from modules.billing.services.billing_service import (
             draw_down_deposit_for_charges,
+            draw_down_deposits_bulk_for_account,
             allocate_payment_to_charges,
+            payment_unallocated_amount,
         )
 
         acc = (
@@ -1031,6 +1005,7 @@ class DischargePatientAction:
             all_acc_charges = self.db.query(BillingCharge).filter(
                 BillingCharge.hospital_id == hospital_id,
                 BillingCharge.account_id == acc.id,
+                BillingCharge.status != BillingChargeStatus.cancelled,
             ).all()
             stale_charges = [
                 c for c in all_acc_charges
@@ -1051,11 +1026,7 @@ class DischargePatientAction:
                 .all()
             )
             for pay in acc_payments:
-                alloc_sum = sum(
-                    float(a.allocated_amount or 0)
-                    for a in self.db.query(BillingPaymentAllocation).filter(BillingPaymentAllocation.payment_id == pay.id).all()
-                )
-                unalloc_tender = round(float(pay.amount or 0) - alloc_sum, 2)
+                unalloc_tender = payment_unallocated_amount(self.db, pay)
                 if unalloc_tender > 0:
                     allocate_payment_to_charges(
                         self.db,
@@ -1067,42 +1038,15 @@ class DischargePatientAction:
                         account_id=acc.id,
                     )
 
-            # Safely draw down available deposits belonging to this admission/account
-            available_deposits = (
-                self.db.query(BillingDeposit)
-                .filter(
-                    BillingDeposit.hospital_id == hospital_id,
-                    or_(
-                        BillingDeposit.admission_id == admission.id,
-                        BillingDeposit.account_id == acc.id,
-                    ),
-                    BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
-                    BillingDeposit.available_amount > 0,
-                )
-                .order_by(BillingDeposit.created_at.asc())
-                .with_for_update()
-                .all()
+            # Safely draw down available deposits belonging to this admission/account in bulk
+            draw_down_deposits_bulk_for_account(
+                self.db,
+                hospital_id=hospital_id,
+                patient_id=admission.patient_id,
+                account_id=acc.id if acc else None,
+                created_by_name=actor.get("name") or "Discharge Settlement",
             )
-            for dep in available_deposits:
-                open_charges_due = sum(
-                    max(0.0, float(c.net_amount or 0) - float(c.amount_paid or 0))
-                    for c in self.db.query(BillingCharge)
-                    .filter(
-                        BillingCharge.hospital_id == hospital_id,
-                        BillingCharge.account_id == acc.id,
-                        BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
-                    )
-                    .all()
-                )
-                if open_charges_due <= 0.009:
-                    break
-                draw_down_deposit_for_charges(
-                    self.db,
-                    hospital_id=hospital_id,
-                    deposit_id=dep.id,
-                    max_amount=open_charges_due,
-                    created_by_name=actor.get("name") or "Discharge Settlement",
-                )
+            self.db.flush()
 
         fin = self.billing_svc.get_ledger_totals(hospital_id, admission.patient_id, admission_id=admission.id)
         outstanding = float(fin.get("outstanding") or 0)
@@ -1188,6 +1132,15 @@ class DischargePatientAction:
                 entity_id=str(admission.source_appointment_id),
                 summary="Appointment linkage carried with discharge",
             )
+
+        # Close FinancialAccount and refresh invoice status at successful discharge
+        if acc:
+            from modules.billing.entities.billing_entities import FinancialAccountStatus
+            from modules.billing.services.invoice_service import refresh_invoice_paid_status
+            if not approved_exc:
+                acc.status = FinancialAccountStatus.closed
+            refresh_invoice_paid_status(self.db, hospital_id, admission.patient_id)
+
         self.db.commit()
         refreshed = self.admissions_repo.get_admission_by_id(hospital_id, admission.id)
         return to_admission_detail(refreshed or admission)
@@ -1251,9 +1204,12 @@ class CancelAdmissionAction:
 
         # Revert/cancel admission fee and any provisional bed charges
         from modules.billing.entities.billing_entities import BillingSourceType
-        from modules.billing.services.billing_service import cancel_charge_for_source
-        cancel_charge_for_source(self.db, hospital_id, BillingSourceType.admission, admission.id)
-        cancel_charge_for_source(self.db, hospital_id, BillingSourceType.bed, admission.id)
+        from modules.billing.services.charge_reversal_service import cancel_charges_for_source
+        cancel_reason = f"Admission cancelled: {reason.strip()}" if reason and reason.strip() else "Admission cancelled"
+        for source_type in (BillingSourceType.admission, BillingSourceType.bed):
+            cancel_charges_for_source(
+                self.db, hospital_id, source_type, admission.id, reason=cancel_reason, actor=actor
+            )
 
         # Restore patient state
         if admission.patient:
@@ -1279,6 +1235,20 @@ class CancelAdmissionAction:
             entity_id=str(admission.id),
             summary=f"Cancelled admission {admission.id} — reason: {reason or 'Not specified'}",
         )
+
+        # Close FinancialAccount on admission cancellation
+        from modules.billing.entities.billing_entities import FinancialAccount, FinancialAccountStatus
+        acc = (
+            self.db.query(FinancialAccount)
+            .filter(
+                FinancialAccount.hospital_id == hospital_id,
+                FinancialAccount.admission_id == admission.id,
+            )
+            .first()
+        )
+        if acc:
+            acc.status = FinancialAccountStatus.closed
+
         self.db.commit()
         refreshed = self.admissions_repo.get_admission_by_id(hospital_id, admission.id)
         return to_admission_detail(refreshed or admission)

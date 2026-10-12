@@ -151,12 +151,14 @@ class CancelAppointmentAction:
             appt.notes = f"{existing}\n{note}".strip() if existing else note
 
         from modules.billing.entities.billing_entities import BillingSourceType
-        from modules.billing.services.billing_service import cancel_charge_for_source
-        cancel_charge_for_source(
+        from modules.billing.services.charge_reversal_service import cancel_charges_for_source
+        cancel_charges_for_source(
             self.db,
-            hospital_id=self.hospital_id,
-            source_type=BillingSourceType.consultation,
-            source_id=appt.id,
+            self.hospital_id,
+            BillingSourceType.consultation,
+            appt.id,
+            reason=f"Appointment cancelled: {reason.strip()}" if reason and reason.strip() else "Appointment cancelled",
+            actor=user,
         )
 
         write_audit_log(

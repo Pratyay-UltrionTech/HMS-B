@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from typing import Any
+import uuid
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -230,7 +231,9 @@ class InventoryActions:
         rows = self.repo.list_central_stock(self.hospital_id)
         return [_central_to_response(r) for r in rows]
 
-    def receive_stock(self, payload: ReceiveStockRequest) -> CentralInventoryStockResponse:
+    def receive_stock(
+        self, payload: ReceiveStockRequest, auto_commit: bool = True
+    ) -> CentralInventoryStockResponse:
         """Entry point for ALL new stock into the system (GRN in Feature 51 will call
         this too). Creates or increments a ConsumableBatch by batch_number, increments
         CentralInventoryStock.total_quantity, and writes a `receipt` ledger entry."""
@@ -300,9 +303,105 @@ class InventoryActions:
                 f"(batch {batch_number}) into {payload.location}"
             ),
         )
-        self.db.commit()
-        self.db.refresh(central)
+        if auto_commit:
+            self.db.commit()
+            self.db.refresh(central)
         return _central_to_response(central)
+
+    def receive_stock_bulk(
+        self, payloads: list[ReceiveStockRequest], auto_commit: bool = True
+    ) -> list[CentralInventoryStock]:
+        """Bulk variant of receive_stock: preloads items, batches, and central stock in bounded queries,
+        stages all batches, transactions, and audit logs without intermediate flushes."""
+        if not payloads:
+            return []
+
+        item_ids = list({p.item_id for p in payloads})
+        items_map = self.repo.get_items_bulk(item_ids, self.hospital_id)
+        for p in payloads:
+            if p.item_id not in items_map:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Consumable item {p.item_id} not found",
+                )
+
+        batches_map = self.repo.get_batches_bulk(self.hospital_id, item_ids, for_update=True)
+        central_map = self.repo.get_central_stocks_bulk(self.hospital_id, item_ids, for_update=True)
+
+        for p in payloads:
+            item = items_map[p.item_id]
+            batch_number = p.batch_number.strip()
+            key = (item.id, batch_number)
+            batch = batches_map.get(key)
+            if batch:
+                batch.received_quantity = round(float(batch.received_quantity or 0) + p.quantity, 4)
+                batch.remaining_quantity = round(float(batch.remaining_quantity or 0) + p.quantity, 4)
+                if p.unit_cost is not None:
+                    batch.unit_cost = p.unit_cost
+                if p.expiry_date is not None:
+                    batch.expiry_date = p.expiry_date
+            else:
+                batch = ConsumableBatch(
+                    id=uuid.uuid4(),
+                    hospital_id=self.hospital_id,
+                    item_id=item.id,
+                    batch_number=batch_number,
+                    received_quantity=p.quantity,
+                    issued_quantity=0.0,
+                    remaining_quantity=p.quantity,
+                    expiry_date=p.expiry_date,
+                    received_date=p.received_date or date.today(),
+                    unit_cost=p.unit_cost,
+                    is_active=True,
+                )
+                batches_map[key] = batch
+                self.db.add(batch)
+
+            central = central_map.get(item.id)
+            if not central:
+                central = CentralInventoryStock(
+                    id=uuid.uuid4(),
+                    hospital_id=self.hospital_id,
+                    item_id=item.id,
+                    total_quantity=0.0,
+                    location=p.location,
+                )
+                central_map[item.id] = central
+                self.db.add(central)
+            central.total_quantity = round(float(central.total_quantity or 0) + p.quantity, 4)
+            central.location = p.location or central.location
+
+            txn = InventoryStockTransaction(
+                id=uuid.uuid4(),
+                hospital_id=self.hospital_id,
+                item_id=item.id,
+                batch_id=batch.id,
+                transaction_type=InventoryStockTransactionType.receipt,
+                quantity=round(p.quantity, 4),
+                to_location=p.location,
+                performed_by_staff_id=p.performed_by_staff_id,
+                notes=p.notes,
+            )
+            self.db.add(txn)
+
+            write_audit_log(
+                self.db,
+                hospital_id=self.hospital_id,
+                actor=self.user,
+                action="create",
+                entity_type="inventory_stock_transaction",
+                entity_id=txn.id,
+                summary=(
+                    f"Received {p.quantity} of {item.item_code} "
+                    f"(batch {batch_number}) into {p.location}"
+                ),
+            )
+
+        if auto_commit:
+            self.db.commit()
+            for cs in central_map.values():
+                self.db.refresh(cs)
+        return list(central_map.values())
 
     # ── Feature 47: Departmental Stock ────────────────────────────────────────
 

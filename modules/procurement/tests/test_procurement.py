@@ -19,6 +19,7 @@ from infrastructure.postgres.session import get_transitional_sync_session
 # create_all — masters_api transitively imports the Appointment entity, which
 # has a FK to Admission, but does not import Admission itself.
 from modules.inpatient.entities.admission import Admission  # noqa: F401
+from shared.database.sequences import SequenceCounter  # noqa: F401
 from modules.inventory.api.inventory_api import router as inventory_router
 from modules.masters.api.masters_api import router as masters_router
 from modules.procurement.api.procurement_api import router as procurement_router
@@ -65,9 +66,10 @@ def _make_client(db, hospital_id=None):
         "id": str(uuid4()),
         "sub": "proc_admin@example.com",
         "email": "proc_admin@example.com",
-        "role": "admin",
+        "role": "hospital_admin",
         "name": "Procurement Admin",
         "hospital_id": str(hospital_id),
+        "hospital_uuid": str(hospital_id),
     }
 
     def override_session():
@@ -79,7 +81,9 @@ def _make_client(db, hospital_id=None):
     def override_hospital():
         return hospital_id
 
+    from shared.auth.dependencies import get_current_user
     app.dependency_overrides[get_transitional_sync_session] = override_session
+    app.dependency_overrides[get_current_user] = override_auth
     app.dependency_overrides[require_hospital_user] = override_auth
     app.dependency_overrides[require_hospital_admin] = override_auth
     app.dependency_overrides[get_hospital_context] = override_hospital

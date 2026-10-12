@@ -100,12 +100,11 @@ class BloodTraceabilityActions:
         # First pass: gather each donation's direct units, then expand the full
         # parent/child lineage frontier using bulk (one-query-per-level) lookups
         # instead of one child-unit query per unit.
-        units_by_donation: dict[UUID, list] = {}
+        donation_ids = [d.id for d in donations]
+        units_by_donation: dict[UUID, list] = self.repo.get_units_for_donations_bulk(donation_ids)
         all_units_by_id: dict[UUID, object] = {}
         frontier_ids: list[UUID] = []
-        for donation in donations:
-            units = self.repo.get_units_for_donation(donation.id)
-            units_by_donation[donation.id] = list(units)
+        for d_id, units in units_by_donation.items():
             for u in units:
                 all_units_by_id[u.id] = u
                 frontier_ids.append(u.id)

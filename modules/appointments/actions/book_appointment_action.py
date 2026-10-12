@@ -4,9 +4,10 @@ Action to book a new appointment or auto-register patient and book.
 Conforms to UltrionTech-Backend-Template modules/appointments/actions/ specification.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
@@ -27,6 +28,7 @@ from modules.appointments.exceptions.appointments_exceptions import (
 from modules.appointments.validators.appointments_validator import AppointmentsValidator
 from modules.patients.db.patients_repository import PatientRepository
 from shared.audit import write_audit_log
+from shared.hospital_clock import get_hospital_local_date, hospital_today
 
 
 class BookAppointmentAction:
@@ -39,12 +41,15 @@ class BookAppointmentAction:
         repo: AppointmentsRepository,
         avail_reader: AvailabilityReader,
         pricing_reader: PricingReader,
+        *,
+        clock_now: datetime | None = None,
     ) -> None:
         self.db = db
         self.hospital_id = hospital_id
         self.repo = repo
         self.avail_reader = avail_reader
         self.pricing_reader = pricing_reader
+        self.clock_now = clock_now
 
     def execute(
         self,
@@ -187,11 +192,17 @@ class BookAppointmentAction:
         self.db.add(appt)
         self.db.flush()
 
-        # Generate consultation billing charge (FLAW-006)
+        # Generate consultation billing charge and payment settlement (Phase B)
+        settlement_metadata: dict[str, Any] = {}
         if fee > 0:
-            from modules.billing.entities.billing_entities import BillingSourceType
-            from modules.billing.services.billing_service import ensure_charge
-            ensure_charge(
+            from modules.billing.entities.billing_entities import (
+                BillingPaymentMethod,
+                BillingSourceType,
+            )
+            from modules.billing.services.billing_service import create_payment, ensure_charge
+            from modules.billing.services.invoice_service import issue_receipt_for_payment
+
+            charge = ensure_charge(
                 self.db,
                 hospital_id=self.hospital_id,
                 patient_id=patient.id,
@@ -201,8 +212,87 @@ class BookAppointmentAction:
                 charge_amount=fee,
                 created_by_name=str(user.get("name") or "System"),
             )
+            settlement_metadata["charge_id"] = charge.id
 
-        # Audit log
+            if payload.payment_method:
+                # Phase D Closure 2: Explicit financial mutation authorization.
+                # Collecting consultation payments and creating financial records (BillingPayment,
+                # PaymentAllocation, BillingReceipt) requires explicit billing.create permission.
+                from shared.auth.service import authorization
+                auth_user = dict(user) if isinstance(user, dict) else {}
+                if not auth_user.get("hospital_uuid"):
+                    auth_user["hospital_uuid"] = str(self.hospital_id)
+                try:
+                    authorization.require(auth_user, ("billing", "create"), db=self.db)
+                except Exception:
+                    self.db.rollback()
+                    raise
+
+                try:
+                    tender_method = BillingPaymentMethod(payload.payment_method.lower())
+                except ValueError as err:
+                    self.db.rollback()
+                    raise AppointmentValidationError(
+                        f"Invalid payment method: {payload.payment_method}. Allowed: cash, card, upi, bank_transfer, other"
+                    ) from err
+
+                try:
+                    ref = payload.payment_reference.strip() if payload.payment_reference else None
+                    settlement_date = get_hospital_local_date(
+                        self.db, self.hospital_id, self.clock_now
+                    )
+                    pay = create_payment(
+                        self.db,
+                        hospital_id=self.hospital_id,
+                        patient_id=patient.id,
+                        amount=fee,
+                        payment_date=settlement_date,
+                        payment_method=tender_method,
+                        notes=f"Consultation fee settlement for {appt.op_id}",
+                        received_by_name=str(user.get("name") or "Staff"),
+                        account_id=charge.account_id,
+                        reference_number=ref,
+                        idempotency_key=f"appt_pay_{appt.id}",
+                        allocations_plan=[{"charge_id": charge.id, "amount": fee}],
+                        allocate=True,
+                    )
+                    receipt = issue_receipt_for_payment(
+                        self.db,
+                        pay,
+                        reference_number=ref,
+                    )
+
+                    write_audit_log(
+                        self.db,
+                        hospital_id=self.hospital_id,
+                        actor=user,
+                        action="create",
+                        entity_type="payment",
+                        entity_id=pay.id,
+                        summary=f"Settled consultation payment ₹{fee:.2f} via {tender_method.value} for {appt.op_id}",
+                    )
+                    write_audit_log(
+                        self.db,
+                        hospital_id=self.hospital_id,
+                        actor=user,
+                        action="create",
+                        entity_type="receipt",
+                        entity_id=receipt.id,
+                        summary=f"Issued receipt {receipt.receipt_number} for consultation {appt.op_id}",
+                    )
+
+                    settlement_metadata.update({
+                        "payment_method": tender_method.value,
+                        "payment_amount": fee,
+                        "payment_reference": ref,
+                        "receipt_number": receipt.receipt_number,
+                        "receipt_id": receipt.id,
+                    })
+                except Exception as err:
+                    self.db.rollback()
+                    raise AppointmentValidationError(f"Payment settlement failed: {err}") from err
+
+        # Audit log for appointment
         write_audit_log(
             self.db,
             hospital_id=self.hospital_id,
@@ -220,4 +310,7 @@ class BookAppointmentAction:
         self.db.refresh(appt)
 
         items = self.repo.hydrate_appointment_items([appt])
-        return items[0]
+        item = items[0]
+        if settlement_metadata:
+            item = item.model_copy(update=settlement_metadata)
+        return item

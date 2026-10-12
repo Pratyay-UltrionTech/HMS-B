@@ -15,7 +15,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import Hospital, HospitalUser, Patient, PlanType
+from modules.tenancy.entities.hospital import Hospital, PlanType
+from modules.doctors.entities.doctor import HospitalUser
+from modules.patients.entities.patient import Patient
 from infrastructure.postgres.session import (
     get_transitional_sync_session as get_db,
 )

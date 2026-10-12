@@ -62,6 +62,23 @@ class DischargeExceptionRepository:
             .first()
         )
 
+    def get_active_approved_exceptions_bulk(
+        self, admission_ids: list[UUID]
+    ) -> dict[UUID, DischargeFinancialException]:
+        """Fetch all approved discharge financial exceptions for multiple admissions in one query."""
+        if not admission_ids:
+            return {}
+        rows = (
+            self.db.query(DischargeFinancialException)
+            .filter(
+                DischargeFinancialException.hospital_id == self.hospital_id,
+                DischargeFinancialException.admission_id.in_(admission_ids),
+                DischargeFinancialException.status == ExceptionStatus.approved,
+            )
+            .all()
+        )
+        return {r.admission_id: r for r in rows}
+
     def get_latest_exception(
         self, admission_id: UUID
     ) -> DischargeFinancialException | None:

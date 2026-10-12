@@ -58,9 +58,10 @@ def _make_client(db, hospital_id=None):
         "id": str(uuid4()),
         "sub": "inv_admin@example.com",
         "email": "inv_admin@example.com",
-        "role": "admin",
+        "role": "hospital_admin",
         "name": "Inventory Admin",
         "hospital_id": str(hospital_id),
+        "hospital_uuid": str(hospital_id),
     }
 
     def override_session():

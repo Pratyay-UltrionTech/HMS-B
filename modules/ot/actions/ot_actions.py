@@ -19,9 +19,9 @@ from modules.inpatient.utils.admission_conflicts import (
 
 from modules.billing.entities.billing_entities import BillingSourceType
 from modules.billing.services.billing_service import (
-    cancel_charge_for_source,
     ensure_charge,
 )
+from modules.billing.services.charge_reversal_service import cancel_source_charges_or_400
 from modules.ot.contracts.ot_contracts import (
     OtCalendarEntry,
     OtCompleteRequest,
@@ -464,9 +464,19 @@ class StartSurgeryAction:
 
         # Enforce financial clearance before entering execution state
         from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.services.financial_authorization import has_emergency_override_permission
         from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
-        is_em = bool((item.priority == OtPriority.emergency) or (payload and getattr(payload, "is_emergency_override", False)))
-        em_reason = (payload and getattr(payload, "emergency_override_reason", None)) or (f"Emergency OT surgery ({item.surgery_no}) override")
+        is_em = bool(payload and getattr(payload, "is_emergency_override", False))
+        em_reason = getattr(payload, "emergency_override_reason", None) if payload else None
+        # Emergency priority is editable after booking, so it only implies an override
+        # when the actor starting the surgery is personally authorized to grant one.
+        if (
+            not is_em
+            and item.priority == OtPriority.emergency
+            and has_emergency_override_permission(self.db, self.hospital_id, self.user)
+        ):
+            is_em = True
+            em_reason = em_reason or f"Emergency-priority OT surgery {item.surgery_no} started by authorized clinician"
 
         assert_service_financially_cleared(
             self.db,
@@ -940,8 +950,16 @@ class CancelSurgeryAction:
         if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Surgery cannot be cancelled")
 
+        cancel_source_charges_or_400(
+            self.db,
+            self.hospital_id,
+            BillingSourceType.ot,
+            item.id,
+            reason=f"Surgery {item.surgery_no} cancelled",
+            actor=self.user,
+            performed=item.status == OtSurgeryStatus.in_progress,
+        )
         item.status = OtSurgeryStatus.cancelled
-        cancel_charge_for_source(self.db, self.hospital_id, BillingSourceType.ot, item.id)
 
         write_audit_log(
             self.db,

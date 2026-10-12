@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 import re
-from typing import Annotated
+from typing import Annotated, Any
 import uuid
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field, model_validator
@@ -71,6 +71,11 @@ class BookAppointmentRequest(BaseModel):
     notes: str | None = None
     booking_kind: str = Field(default="future", pattern="^(walk_in|future)$")
     nurse_id: uuid.UUID | None = None
+    # Phase D Closure 3 & 4: Canonical consultation payment settlement fields.
+    # Single canonical representation: payment_method and payment_reference.
+    # Client-supplied payment_amount and legacy nested payment shapes removed.
+    payment_method: str | None = Field(default=None, pattern="^(cash|card|upi|bank_transfer|other)$")
+    payment_reference: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def require_patient_or_new_details(self):
@@ -150,6 +155,13 @@ class AppointmentListItem(BaseModel):
     ledger_total_charges: float = 0.0
     ledger_total_paid: float = 0.0
     ledger_status: str = "cleared"
+    # Phase B: Consultation payment settlement metadata
+    payment_method: str | None = None
+    payment_amount: float | None = None
+    payment_reference: str | None = None
+    receipt_number: str | None = None
+    receipt_id: uuid.UUID | None = None
+    charge_id: uuid.UUID | None = None
 
 
 class UpdateInitialFindingsRequest(BaseModel):

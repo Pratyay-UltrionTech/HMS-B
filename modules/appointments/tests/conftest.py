@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from infrastructure.postgres.session import get_transitional_sync_session as legacy_get_db
 from infrastructure.postgres import get_transitional_sync_session
 from modules.appointments.api.appointments_api import router as migrated_appointments_router
+from modules.billing.api.billing_api import router as billing_router
 from shared.exceptions import register_exception_handlers
 
 # Re-use isolated SQLite database session and deterministic model fixtures
@@ -39,12 +40,14 @@ from tests.conftest import (
 @pytest.fixture(scope="function")
 def app(db_session: Session) -> FastAPI:
     """
-    Constructs an isolated FastAPI application mounting the MIGRATED appointments router.
+    Constructs an isolated FastAPI application mounting the MIGRATED appointments router
+    and billing router for integrated financial workflows.
     Registers shared exception handlers and overrides DB session with isolated SQLite session.
     """
     test_app = FastAPI(title="HMS Migrated Appointments Test App")
     register_exception_handlers(test_app)
     test_app.include_router(migrated_appointments_router, prefix="/api")
+    test_app.include_router(billing_router, prefix="/api")
 
     def _override_get_db():
         yield db_session

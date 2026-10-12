@@ -139,21 +139,21 @@ class MedicationOrderRepository:
             intervals_hours = list(range(0, horizon_hours, interval_hours))
 
         dose_label = f"{order.dose} {order.dosage_unit}".strip()
+
+        # Idempotency guard: bulk-fetch all existing scheduled times once for this order
+        existing_sched_times = {
+            row[0]
+            for row in self.db.query(MedicationAdministrationRecord.scheduled_time)
+            .filter(MedicationAdministrationRecord.order_id == order.id)
+            .all()
+        }
+
         for offset in intervals_hours:
             sched_time = order.start_time + timedelta(hours=offset)
             if order.end_time and sched_time > order.end_time:
                 break
 
-            # Idempotency guard: avoid duplicate MAR records if scheduler runs again
-            existing = (
-                self.db.query(MedicationAdministrationRecord.id)
-                .filter(
-                    MedicationAdministrationRecord.order_id == order.id,
-                    MedicationAdministrationRecord.scheduled_time == sched_time,
-                )
-                .first()
-            )
-            if existing:
+            if sched_time in existing_sched_times:
                 continue
 
             emar_entry = MedicationAdministrationRecord(

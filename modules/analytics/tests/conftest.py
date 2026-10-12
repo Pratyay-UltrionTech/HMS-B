@@ -10,7 +10,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.database import get_db as legacy_get_db
 from infrastructure.postgres.session import (
     get_transitional_sync_session as migrated_get_db,
 )
@@ -35,6 +34,5 @@ def migrated_analytics_client(db_session: Session) -> TestClient:
     def _override_get_db():
         yield db_session
 
-    test_app.dependency_overrides[legacy_get_db] = _override_get_db
     test_app.dependency_overrides[migrated_get_db] = _override_get_db
     return TestClient(test_app)

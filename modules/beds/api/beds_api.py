@@ -179,13 +179,31 @@ def list_admission_requests(
     Nurse/Admissions worklist for operational acceptance. Replaces exclusive
     reliance on Appointment.ipd_transfer_requested (spec §7).
     """
-    from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
+    from modules.billing.services.service_financial_clearance import bulk_evaluate_bed_allocation_clearance
     rows = AdmissionsRepository(db).list_admission_requests(hospital_id)
+    if not rows:
+        return []
+
+    admission_ids = [a.id for a in rows]
+    ward_overrides = {a.id: a.ward_id for a in rows}
+    bed_overrides = {a.id: a.bed_id for a in rows}
+    clearance_map = {}
+    try:
+        clearance_map = bulk_evaluate_bed_allocation_clearance(
+            db,
+            hospital_id,
+            admission_ids,
+            ward_overrides=ward_overrides,
+            bed_overrides=bed_overrides,
+        )
+    except Exception:
+        pass
+
     items: list[AdmissionDetail] = []
     for a in rows:
         d = to_admission_detail(a)
-        try:
-            fin = evaluate_bed_allocation_clearance(db, hospital_id, a.id, ward_id=a.ward_id, bed_id=a.bed_id)
+        fin = clearance_map.get(a.id)
+        if fin:
             d.required_advance = fin.required_advance
             d.paid_or_allocated_amount = fin.paid_or_allocated_amount
             d.available_deposit = fin.available_deposit
@@ -193,8 +211,6 @@ def list_admission_requests(
             d.financial_clearance_status = fin.status
             d.is_financially_cleared = fin.is_cleared
             d.financial_account_id = fin.ipd_account_id
-        except Exception:
-            pass
         items.append(d)
     return items
 

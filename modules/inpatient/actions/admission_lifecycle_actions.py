@@ -326,76 +326,18 @@ class AcceptAdmissionAction:
                 raise ValidationError("Ward/Room does not match selected bed")
 
             # ── Authoritative Backend Financial Clearance Check ─────────────
-            from modules.billing.services.service_financial_clearance import evaluate_bed_allocation_clearance
-            from modules.billing.entities.financial_exception import FinancialClearanceException, FinancialExceptionStatus
-            from decimal import Decimal
+            from modules.billing.services.service_financial_clearance import enforce_bed_allocation_clearance
 
-            now = datetime.now(timezone.utc)
-            if is_emergency_override:
-                from modules.billing.services.service_financial_clearance import validate_emergency_override_actor
-                actor_id, actor_name = validate_emergency_override_actor(
-                    actor, emergency_override_reason, service_type="admission_bed"
-                )
-                em_reason = (emergency_override_reason or "").strip()
-                if actor_id:
-                    em_exc = FinancialClearanceException(
-                        hospital_id=hospital_id,
-                        patient_id=admission.patient_id,
-                        admission_id=admission.id,
-                        service_type="admission_bed",
-                        action_type="bed_allocation",
-                        source_id=bed.id,
-                        is_emergency=True,
-                        reason_category="emergency_life_safety",
-                        reason=em_reason,
-                        status=FinancialExceptionStatus.consumed.value,
-                        is_consumed=True,
-                        consumed_at=now,
-                        requested_by_id=actor_id,
-                        requested_by_name=actor_name,
-                        approved_by_id=actor_id,
-                        approved_by_name=actor_name,
-                        approval_remarks="Auto-authorized under emergency admission protocol",
-                    )
-                    self.db.add(em_exc)
-                    self.db.flush()
-                    write_audit_log(
-                        self.db,
-                        hospital_id=hospital_id,
-                        actor=actor,
-                        action="emergency_override",
-                        entity_type="financial_clearance_exception",
-                        entity_id=em_exc.id,
-                        summary=f"Emergency financial override applied for bed {bed.bed_code}: {em_reason}",
-                    )
-            else:
-                fin_state = evaluate_bed_allocation_clearance(
-                    self.db, hospital_id, admission.id, ward_id=ward_id, bed_id=bed.id
-                )
-                if not fin_state.is_cleared:
-                    from fastapi import HTTPException
-                    raise HTTPException(
-                        status_code=402,
-                        detail={
-                            "message": f"Payment or deposit required before bed allocation. Shortfall: ₹{fin_state.shortfall:.2f}.",
-                            "status": fin_state.status,
-                            "required_advance": fin_state.required_advance,
-                            "admission_fee": fin_state.admission_fee,
-                            "bed_charge_per_day": fin_state.bed_charge_per_day,
-                            "paid_or_allocated_amount": fin_state.paid_or_allocated_amount,
-                            "available_deposit": fin_state.available_deposit,
-                            "shortfall": fin_state.shortfall,
-                            "reason": fin_state.reason,
-                            "ipd_account_id": str(fin_state.ipd_account_id) if fin_state.ipd_account_id else None,
-                        },
-                    )
-                if fin_state.active_exception_id:
-                    exc = self.db.query(FinancialClearanceException).filter(
-                        FinancialClearanceException.id == fin_state.active_exception_id
-                    ).first()
-                    if exc:
-                        exc.is_consumed = True
-                        exc.consumed_at = now
+            enforce_bed_allocation_clearance(
+                self.db,
+                hospital_id,
+                admission,
+                ward_id=ward_id,
+                bed_id=bed.id,
+                actor=actor,
+                is_emergency_override=is_emergency_override,
+                emergency_override_reason=emergency_override_reason,
+            )
 
         now = datetime.now(timezone.utc)
         admission.status = AdmissionStatus.admitted

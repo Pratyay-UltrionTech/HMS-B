@@ -85,15 +85,28 @@ def client(ipd_app: FastAPI) -> TestClient:
 
 
 @pytest.fixture(scope="function")
-def admin_headers(hospital: Hospital) -> dict[str, str]:
+def admin_headers(db_session: Session, hospital: Hospital) -> dict[str, str]:
+    user_id = uuid.uuid4()
+    user = HospitalUser(
+        id=user_id,
+        hospital_id=hospital.id,
+        role_id=uuid.uuid4(),
+        name="Admin User",
+        email=f"admin_{user_id.hex[:6]}@hospital.test",
+        phone="555-0997",
+        password_hash="test_hash",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
     token = create_access_token(
         data={
-            "sub": "admin@hospital.test",
+            "sub": user.email,
             "name": "Admin User",
-            "email": "admin@hospital.test",
+            "email": user.email,
             "role": "hospital_admin",
             "hospital_uuid": str(hospital.id),
-            "user_id": str(uuid.uuid4()),
+            "user_id": str(user_id),
         }
     )
     return {"Authorization": f"Bearer {token}"}
@@ -195,7 +208,14 @@ def test_allocate_bed_charges_admission_fee(
         is_emergency_override=True,
         emergency_override_reason="Clinical emergency placement",
     )
-    updated = action.execute(hospital_id=hospital.id, payload=req, actor={"name": "Doctor"})
+    emergency_approver = {
+        "user_id": str(doctor.id),
+        "name": doctor.name,
+        "role": "hospital_staff",
+        "hospital_uuid": str(hospital.id),
+        "permissions": {"emergency": {"can_view": True, "can_approve": True}},
+    }
+    updated = action.execute(hospital_id=hospital.id, payload=req, actor=emergency_approver)
 
     assert updated.bed_id == test_bed.id
     db_session.refresh(test_bed)
@@ -591,7 +611,7 @@ def test_cross_functional_chart_read_permission(
         "sub": "admin@hospital.test",
         "role": "hospital_admin",
         "hospital_uuid": str(hospital.id),
-        "user_id": str(uuid.uuid4()),
+        "user_id": str(doctor.id),
     })
     res = client.get(f"/api/ipd/admissions/{admission.id}/chart", headers={"Authorization": f"Bearer {admin_tok}"})
     assert res.status_code == 200

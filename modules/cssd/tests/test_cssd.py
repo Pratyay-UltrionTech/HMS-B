@@ -18,7 +18,9 @@ from infrastructure.postgres.base import Base
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.cssd.api.cssd_api import router as cssd_router
 from modules.tenancy.entities.hospital import Hospital
+from modules.doctors.entities.doctor import HospitalUser
 from shared.auth import get_hospital_context, require_hospital_user
+import tests.conftest
 
 
 @pytest.fixture
@@ -58,9 +60,9 @@ def _make_client(db, hospital_id=None):
         "id": str(uuid4()),
         "sub": "cssd_admin@example.com",
         "email": "cssd_admin@example.com",
-        "role": "admin",
+        "role": "hospital_admin",
         "name": "CSSD Admin",
-        "hospital_id": str(hospital_id),
+        "hospital_uuid": str(hospital_id),
     }
 
     def override_session():

@@ -438,6 +438,65 @@ class AppointmentsRepository(BaseRepository[Appointment]):
             except Exception:
                 ledger_map = {}
 
+        # Bulk fetch consultation settlement details (charges and receipts)
+        settlement_map: dict[UUID, dict[str, Any]] = {}
+        appt_ids = [a.id for a in appointments]
+        if appt_ids:
+            try:
+                from modules.billing.entities.billing_entities import (
+                    BillingCharge,
+                    BillingPayment,
+                    BillingPaymentAllocation,
+                    BillingReceipt,
+                    BillingReceiptStatus,
+                    BillingSourceType,
+                )
+                charge_rows = (
+                    self.db.query(BillingCharge)
+                    .filter(
+                        BillingCharge.hospital_id == self.hospital_id,
+                        BillingCharge.source_type == BillingSourceType.consultation,
+                        BillingCharge.source_id.in_(appt_ids),
+                    )
+                    .all()
+                )
+                if charge_rows:
+                    c_by_appt = {c.source_id: c for c in charge_rows}
+                    c_ids = [c.id for c in charge_rows]
+                    alloc_rows = (
+                        self.db.query(BillingPaymentAllocation, BillingPayment, BillingReceipt)
+                        .join(BillingPayment, BillingPayment.id == BillingPaymentAllocation.payment_id)
+                        .outerjoin(
+                            BillingReceipt,
+                            (BillingReceipt.payment_id == BillingPayment.id)
+                            & (BillingReceipt.status != BillingReceiptStatus.cancelled),
+                        )
+                        .filter(BillingPaymentAllocation.charge_id.in_(c_ids))
+                        .all()
+                    )
+                    pay_by_charge: dict[UUID, tuple[BillingPayment, BillingReceipt | None]] = {}
+                    for alloc, pay, rcp in alloc_rows:
+                        if alloc.charge_id not in pay_by_charge:
+                            pay_by_charge[alloc.charge_id] = (pay, rcp)
+
+                    for a_id, chg in c_by_appt.items():
+                        pay_info = pay_by_charge.get(chg.id)
+                        p_obj = pay_info[0] if pay_info else None
+                        r_obj = pay_info[1] if pay_info else None
+                        p_method = None
+                        if p_obj and getattr(p_obj, "payment_method", None):
+                            p_method = p_obj.payment_method.value if hasattr(p_obj.payment_method, "value") else str(p_obj.payment_method)
+                        settlement_map[a_id] = {
+                            "charge_id": chg.id,
+                            "payment_method": p_method,
+                            "payment_amount": float(p_obj.amount) if p_obj else None,
+                            "payment_reference": p_obj.reference_number if p_obj else None,
+                            "receipt_number": r_obj.receipt_number if r_obj else None,
+                            "receipt_id": r_obj.id if r_obj else None,
+                        }
+            except Exception:
+                settlement_map = {}
+
         items: list[AppointmentListItem] = []
         for a in appointments:
             pat = patients_map.get(a.patient_id)
@@ -457,6 +516,8 @@ class AppointmentsRepository(BaseRepository[Appointment]):
                 led_status = "unbilled" if tot_chg == 0 else "cleared"
             else:
                 led_status = "outstanding"
+
+            st_info = settlement_map.get(a.id, {})
 
             items.append(
                 AppointmentListItem(
@@ -496,6 +557,12 @@ class AppointmentsRepository(BaseRepository[Appointment]):
                     ledger_total_charges=tot_chg,
                     ledger_total_paid=tot_pd,
                     ledger_status=led_status,
+                    charge_id=st_info.get("charge_id"),
+                    payment_method=st_info.get("payment_method"),
+                    payment_amount=st_info.get("payment_amount"),
+                    payment_reference=st_info.get("payment_reference"),
+                    receipt_number=st_info.get("receipt_number"),
+                    receipt_id=st_info.get("receipt_id"),
                 )
             )
         return items

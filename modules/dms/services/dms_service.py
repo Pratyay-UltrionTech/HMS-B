@@ -100,21 +100,34 @@ def stream_data_url(data: str, name: str) -> StreamingResponse:
     )
 
 
-def build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[DmsDocumentResponse]:
+def build_documents(
+    db: Session,
+    patient_id: UUID,
+    hospital_id: UUID,
+    *,
+    preloaded_documents: list[PatientDocument] | None = None,
+    preloaded_medical_records: list[MedicalRecord] | None = None,
+    preloaded_ipd_forms: list[IpdFormSubmission] | None = None,
+) -> list[DmsDocumentResponse]:
     """Collate documents uploaded directly to DMS and attached via MedicalRecord or IPD forms."""
     docs: list[DmsDocumentResponse] = []
 
     # 1. PatientDocument (DMS native)
-    for d in (
-        db.query(PatientDocument)
-        .filter(
-            PatientDocument.hospital_id == hospital_id,
-            PatientDocument.patient_id == patient_id,
-            PatientDocument.is_deleted.is_(False),
+    native_docs = (
+        preloaded_documents
+        if preloaded_documents is not None
+        else (
+            db.query(PatientDocument)
+            .filter(
+                PatientDocument.hospital_id == hospital_id,
+                PatientDocument.patient_id == patient_id,
+                PatientDocument.is_deleted.is_(False),
+            )
+            .order_by(PatientDocument.created_at.desc())
+            .all()
         )
-        .order_by(PatientDocument.created_at.desc())
-        .all()
-    ):
+    )
+    for d in native_docs:
         docs.append(
             DmsDocumentResponse(
                 id=d.id,
@@ -123,7 +136,7 @@ def build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[Dm
                 title=d.title,
                 notes=d.notes,
                 file_name=d.file_name,
-                has_file=bool(d.file_data),
+                has_file=bool(getattr(d, "has_file", False)),
                 uploaded_by_name=d.uploaded_by_name,
                 uploaded_by_role=d.uploaded_by_role,
                 created_at=d.created_at,
@@ -132,13 +145,18 @@ def build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[Dm
         )
 
     # 2. MedicalRecord (Doctor clinical uploads)
-    for r in (
-        db.query(MedicalRecord)
-        .options(joinedload(MedicalRecord.doctor))
-        .filter(MedicalRecord.hospital_id == hospital_id, MedicalRecord.patient_id == patient_id)
-        .order_by(MedicalRecord.created_at.desc())
-        .all()
-    ):
+    med_records = (
+        preloaded_medical_records
+        if preloaded_medical_records is not None
+        else (
+            db.query(MedicalRecord)
+            .options(joinedload(MedicalRecord.doctor))
+            .filter(MedicalRecord.hospital_id == hospital_id, MedicalRecord.patient_id == patient_id)
+            .order_by(MedicalRecord.created_at.desc())
+            .all()
+        )
+    )
+    for r in med_records:
         if (r.report_type or "").strip().lower() == "ipd form":
             continue
         cat = PatientDocumentCategory.other
@@ -162,7 +180,7 @@ def build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[Dm
                 title=r.title,
                 notes=r.notes,
                 file_name=r.file_name,
-                has_file=bool(r.file_data),
+                has_file=bool(getattr(r, "has_file", False)),
                 uploaded_by_name=r.doctor.name if r.doctor else "",
                 uploaded_by_role="doctor",
                 created_at=r.created_at,
@@ -173,16 +191,21 @@ def build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[Dm
         )
 
     # 3. IPD Form submissions
-    for s in (
-        db.query(IpdFormSubmission)
-        .filter(
-            IpdFormSubmission.hospital_id == hospital_id,
-            IpdFormSubmission.patient_id == patient_id,
-            IpdFormSubmission.status == IpdFormSubmissionStatus.final,
+    ipd_submissions = (
+        preloaded_ipd_forms
+        if preloaded_ipd_forms is not None
+        else (
+            db.query(IpdFormSubmission)
+            .filter(
+                IpdFormSubmission.hospital_id == hospital_id,
+                IpdFormSubmission.patient_id == patient_id,
+                IpdFormSubmission.status == IpdFormSubmissionStatus.final,
+            )
+            .order_by(IpdFormSubmission.updated_at.desc())
+            .all()
         )
-        .order_by(IpdFormSubmission.updated_at.desc())
-        .all()
-    ):
+    )
+    for s in ipd_submissions:
         if s.patient_document_id:
             continue
         cat = (
@@ -197,8 +220,8 @@ def build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[Dm
                 category=cat,
                 title=s.form_title,
                 notes=f"IPD form · {s.form_id}",
-                file_name=f"{s.form_id}.html" if s.html_snapshot else None,
-                has_file=bool(s.html_snapshot),
+                file_name=f"{s.form_id}.html" if getattr(s, "has_html_snapshot", False) else None,
+                has_file=bool(getattr(s, "has_html_snapshot", False)),
                 uploaded_by_name=s.filled_by_name or "",
                 uploaded_by_role=s.filled_by_role or "staff",
                 created_at=s.updated_at or s.created_at,
@@ -212,7 +235,19 @@ def build_documents(db: Session, patient_id: UUID, hospital_id: UUID) -> list[Dm
     return docs
 
 
-def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[DmsTimelineEvent]:
+def build_timeline(
+    db: Session,
+    patient: Patient,
+    hospital_id: UUID,
+    *,
+    preloaded_appointments: list[Appointment] | None = None,
+    preloaded_prescriptions: list[Prescription] | None = None,
+    preloaded_lab_orders: list[LabOrder] | None = None,
+    preloaded_radiology_orders: list[Any] | None = None,
+    preloaded_admissions: list[Admission] | None = None,
+    preloaded_documents: list[PatientDocument] | None = None,
+    preloaded_ipd_forms: list[IpdFormSubmission] | None = None,
+) -> list[DmsTimelineEvent]:
     """Assemble chronological timeline of all patient events across modules."""
     events: list[DmsTimelineEvent] = []
 
@@ -231,9 +266,13 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
 
     # 2. Appointments
     appointments = (
-        db.query(Appointment)
-        .filter(Appointment.hospital_id == hospital_id, Appointment.patient_id == patient.id)
-        .all()
+        preloaded_appointments
+        if preloaded_appointments is not None
+        else (
+            db.query(Appointment)
+            .filter(Appointment.hospital_id == hospital_id, Appointment.patient_id == patient.id)
+            .all()
+        )
     )
     appt_doctor_ids = {a.doctor_id for a in appointments if a.doctor_id}
     appt_doctor_map = (
@@ -262,12 +301,17 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
         )
 
     # 3. Prescriptions
-    for p in (
-        db.query(Prescription)
-        .options(joinedload(Prescription.doctor))
-        .filter(Prescription.hospital_id == hospital_id, Prescription.patient_id == patient.id)
-        .all()
-    ):
+    timeline_prescriptions = (
+        preloaded_prescriptions
+        if preloaded_prescriptions is not None
+        else (
+            db.query(Prescription)
+            .options(joinedload(Prescription.doctor))
+            .filter(Prescription.hospital_id == hospital_id, Prescription.patient_id == patient.id)
+            .all()
+        )
+    )
+    for p in timeline_prescriptions:
         events.append(
             DmsTimelineEvent(
                 id=f"rx-{p.id}",
@@ -282,12 +326,17 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
         )
 
     # 4. Laboratory Orders
-    for o in (
-        db.query(LabOrder)
-        .options(joinedload(LabOrder.items), joinedload(LabOrder.doctor))
-        .filter(LabOrder.hospital_id == hospital_id, LabOrder.patient_id == patient.id)
-        .all()
-    ):
+    timeline_lab_orders = (
+        preloaded_lab_orders
+        if preloaded_lab_orders is not None
+        else (
+            db.query(LabOrder)
+            .options(joinedload(LabOrder.items), joinedload(LabOrder.doctor))
+            .filter(LabOrder.hospital_id == hospital_id, LabOrder.patient_id == patient.id)
+            .all()
+        )
+    )
+    for o in timeline_lab_orders:
         test_names = ", ".join(i.test_name for i in o.items if i.test_name) if o.items else "Lab tests"
         events.append(
             DmsTimelineEvent(
@@ -318,11 +367,16 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
     try:
         from modules.radiology.entities.radiology_entities import RadiologyOrder
 
-        for o in (
-            db.query(RadiologyOrder)
-            .filter(RadiologyOrder.hospital_id == hospital_id, RadiologyOrder.patient_id == patient.id)
-            .all()
-        ):
+        timeline_rad_orders = (
+            preloaded_radiology_orders
+            if preloaded_radiology_orders is not None
+            else (
+                db.query(RadiologyOrder)
+                .filter(RadiologyOrder.hospital_id == hospital_id, RadiologyOrder.patient_id == patient.id)
+                .all()
+            )
+        )
+        for o in timeline_rad_orders:
             events.append(
                 DmsTimelineEvent(
                     id=f"rad-order-{o.id}",
@@ -338,12 +392,17 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
         pass
 
     # 6. Admissions
-    for a in (
-        db.query(Admission)
-        .options(joinedload(Admission.ward), joinedload(Admission.bed))
-        .filter(Admission.hospital_id == hospital_id, Admission.patient_id == patient.id)
-        .all()
-    ):
+    timeline_admissions = (
+        preloaded_admissions
+        if preloaded_admissions is not None
+        else (
+            db.query(Admission)
+            .options(joinedload(Admission.ward), joinedload(Admission.bed))
+            .filter(Admission.hospital_id == hospital_id, Admission.patient_id == patient.id)
+            .all()
+        )
+    )
+    for a in timeline_admissions:
         ward_name = a.ward.name if a.ward else "Ward"
         bed_code = a.bed.bed_code if a.bed else "—"
         events.append(
@@ -371,15 +430,20 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
             )
 
     # 7. Patient Documents
-    for d in (
-        db.query(PatientDocument)
-        .filter(
-            PatientDocument.hospital_id == hospital_id,
-            PatientDocument.patient_id == patient.id,
-            PatientDocument.is_deleted.is_(False),
+    timeline_documents = (
+        preloaded_documents
+        if preloaded_documents is not None
+        else (
+            db.query(PatientDocument)
+            .filter(
+                PatientDocument.hospital_id == hospital_id,
+                PatientDocument.patient_id == patient.id,
+                PatientDocument.is_deleted.is_(False),
+            )
+            .all()
         )
-        .all()
-    ):
+    )
+    for d in timeline_documents:
         events.append(
             DmsTimelineEvent(
                 id=f"doc-{d.id}",
@@ -393,15 +457,20 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
         )
 
     # 8. IPD Form Submissions
-    for s in (
-        db.query(IpdFormSubmission)
-        .filter(
-            IpdFormSubmission.hospital_id == hospital_id,
-            IpdFormSubmission.patient_id == patient.id,
-            IpdFormSubmission.status == IpdFormSubmissionStatus.final,
+    timeline_forms = (
+        preloaded_ipd_forms
+        if preloaded_ipd_forms is not None
+        else (
+            db.query(IpdFormSubmission)
+            .filter(
+                IpdFormSubmission.hospital_id == hospital_id,
+                IpdFormSubmission.patient_id == patient.id,
+                IpdFormSubmission.status == IpdFormSubmissionStatus.final,
+            )
+            .all()
         )
-        .all()
-    ):
+    )
+    for s in timeline_forms:
         events.append(
             DmsTimelineEvent(
                 id=f"ipd-form-{s.id}",
@@ -411,7 +480,7 @@ def build_timeline(db: Session, patient: Patient, hospital_id: UUID) -> list[Dms
                 occurred_at=s.updated_at or s.created_at,
                 source_module="ipd",
                 entity_id=str(s.id),
-                view_path=f"/api/ipd/form-submissions/{s.id}/view" if s.html_snapshot else None,
+                view_path=f"/api/ipd/form-submissions/{s.id}/view" if getattr(s, "has_html_snapshot", False) else None,
             )
         )
 
@@ -426,6 +495,13 @@ def build_patient_file(
     hospital_id: UUID,
 ) -> DmsPatientFile:
     """Build unified patient electronic file containing records from all clinical & financial modules."""
+    raw_prescriptions = (
+        db.query(Prescription)
+        .options(joinedload(Prescription.doctor))
+        .filter(Prescription.hospital_id == hospital_id, Prescription.patient_id == patient.id)
+        .order_by(Prescription.created_at.desc())
+        .all()
+    )
     prescriptions = [
         DmsPrescriptionItem(
             id=p.id,
@@ -438,15 +514,16 @@ def build_patient_file(
             created_at=p.created_at,
             pdf_path=f"/api/doctors/{p.doctor_id}/prescriptions/{p.id}/pdf",
         )
-        for p in (
-            db.query(Prescription)
-            .options(joinedload(Prescription.doctor))
-            .filter(Prescription.hospital_id == hospital_id, Prescription.patient_id == patient.id)
-            .order_by(Prescription.created_at.desc())
-            .all()
-        )
+        for p in raw_prescriptions
     ]
 
+    raw_lab_orders = (
+        db.query(LabOrder)
+        .options(joinedload(LabOrder.items), joinedload(LabOrder.doctor))
+        .filter(LabOrder.hospital_id == hospital_id, LabOrder.patient_id == patient.id)
+        .order_by(LabOrder.ordered_at.desc())
+        .all()
+    )
     lab_reports = [
         DmsLabItem(
             id=o.id,
@@ -458,15 +535,10 @@ def build_patient_file(
             doctor_name=o.doctor.name if o.doctor else None,
             report_path=f"/api/laboratory/orders/{o.id}/report",
         )
-        for o in (
-            db.query(LabOrder)
-            .options(joinedload(LabOrder.items), joinedload(LabOrder.doctor))
-            .filter(LabOrder.hospital_id == hospital_id, LabOrder.patient_id == patient.id)
-            .order_by(LabOrder.ordered_at.desc())
-            .all()
-        )
+        for o in raw_lab_orders
     ]
 
+    rad_orders: list[Any] = []
     radiology_reports: list[DmsRadiologyItem] = []
     try:
         from modules.radiology.entities.radiology_entities import RadiologyOrder
@@ -483,6 +555,8 @@ def build_patient_file(
 
         for o in rad_orders:
             doc = doc_map.get(o.doctor_id) if o.doctor_id else None
+            has_rep = bool(getattr(o, "has_report_file", False))
+            has_img = bool(getattr(o, "has_image_file", False))
             radiology_reports.append(
                 DmsRadiologyItem(
                     id=o.id,
@@ -491,12 +565,12 @@ def build_patient_file(
                     scan_code=o.scan_code,
                     status=o.status.value,
                     ordered_at=o.ordered_at,
-                    has_report_file=bool(getattr(o, "report_file_data", None)),
-                    has_image_file=bool(getattr(o, "image_file_data", None)),
+                    has_report_file=has_rep,
+                    has_image_file=has_img,
                     doctor_name=doc.name if doc else None,
                     report_view_path=f"/api/radiology/orders/{o.id}/report-view",
-                    report_file_path=f"/api/radiology/orders/{o.id}/file/report" if getattr(o, "report_file_data", None) else None,
-                    image_file_path=f"/api/radiology/orders/{o.id}/file/image" if getattr(o, "image_file_data", None) else None,
+                    report_file_path=f"/api/radiology/orders/{o.id}/file/report" if has_rep else None,
+                    image_file_path=f"/api/radiology/orders/{o.id}/file/image" if has_img else None,
                 )
             )
     except Exception:
@@ -518,6 +592,8 @@ def build_patient_file(
 
         for s in surgeries:
             surg = surg_map.get(s.surgeon_id) if s.surgeon_id else None
+            has_ot_rep = bool(getattr(s, "has_ot_report", False))
+            has_cons = bool(getattr(s, "has_consent", False))
             ot_records.append(
                 DmsOtItem(
                     id=s.id,
@@ -527,15 +603,27 @@ def build_patient_file(
                     scheduled_at=s.scheduled_at,
                     status=s.status.value,
                     has_notes=bool(s.pre_op_diagnosis and s.procedure_performed),
-                    has_ot_report=bool(getattr(s, "ot_report_file_data", None)),
-                    has_consent=bool(getattr(s, "consent_file_data", None)),
+                    has_ot_report=has_ot_rep,
+                    has_consent=has_cons,
                     summary_path=f"/api/ot/surgeries/{s.id}/summary-view",
-                    report_file_path=f"/api/ot/surgeries/{s.id}/file/report" if getattr(s, "ot_report_file_data", None) else None,
+                    report_file_path=f"/api/ot/surgeries/{s.id}/file/report" if has_ot_rep else None,
                 )
             )
     except Exception:
         pass
 
+    raw_admissions = (
+        db.query(Admission)
+        .options(
+            joinedload(Admission.ward),
+            joinedload(Admission.room),
+            joinedload(Admission.bed),
+            joinedload(Admission.doctor),
+        )
+        .filter(Admission.hospital_id == hospital_id, Admission.patient_id == patient.id)
+        .order_by(Admission.admitted_at.desc())
+        .all()
+    )
     admissions = [
         DmsAdmissionItem(
             id=a.id,
@@ -549,19 +637,36 @@ def build_patient_file(
             admitted_at=a.admitted_at,
             discharged_at=a.discharged_at,
         )
-        for a in (
-            db.query(Admission)
-            .options(
-                joinedload(Admission.ward),
-                joinedload(Admission.room),
-                joinedload(Admission.bed),
-                joinedload(Admission.doctor),
-            )
-            .filter(Admission.hospital_id == hospital_id, Admission.patient_id == patient.id)
-            .order_by(Admission.admitted_at.desc())
-            .all()
-        )
+        for a in raw_admissions
     ]
+
+    patient_documents = (
+        db.query(PatientDocument)
+        .filter(
+            PatientDocument.hospital_id == hospital_id,
+            PatientDocument.patient_id == patient.id,
+            PatientDocument.is_deleted.is_(False),
+        )
+        .order_by(PatientDocument.created_at.desc())
+        .all()
+    )
+    medical_records = (
+        db.query(MedicalRecord)
+        .options(joinedload(MedicalRecord.doctor))
+        .filter(MedicalRecord.hospital_id == hospital_id, MedicalRecord.patient_id == patient.id)
+        .order_by(MedicalRecord.created_at.desc())
+        .all()
+    )
+    ipd_forms = (
+        db.query(IpdFormSubmission)
+        .filter(
+            IpdFormSubmission.hospital_id == hospital_id,
+            IpdFormSubmission.patient_id == patient.id,
+            IpdFormSubmission.status == IpdFormSubmissionStatus.final,
+        )
+        .order_by(IpdFormSubmission.updated_at.desc())
+        .all()
+    )
 
     billing_documents: list[DmsBillingItem] = []
     fin = patient_ledger_totals(db, hospital_id, patient.id)
@@ -675,10 +780,30 @@ def build_patient_file(
     except Exception:
         pass
 
+    documents = build_documents(
+        db,
+        patient.id,
+        hospital_id,
+        preloaded_documents=patient_documents,
+        preloaded_medical_records=medical_records,
+        preloaded_ipd_forms=ipd_forms,
+    )
+    timeline = build_timeline(
+        db,
+        patient,
+        hospital_id,
+        preloaded_prescriptions=raw_prescriptions,
+        preloaded_lab_orders=raw_lab_orders,
+        preloaded_radiology_orders=rad_orders,
+        preloaded_admissions=raw_admissions,
+        preloaded_documents=patient_documents,
+        preloaded_ipd_forms=ipd_forms,
+    )
+
     return DmsPatientFile(
         patient=patient_item,
-        timeline=build_timeline(db, patient, hospital_id),
-        documents=build_documents(db, patient.id, hospital_id),
+        timeline=timeline,
+        documents=documents,
         prescriptions=prescriptions,
         lab_reports=lab_reports,
         radiology_reports=radiology_reports,

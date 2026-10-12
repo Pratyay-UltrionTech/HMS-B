@@ -38,6 +38,21 @@ class ProcurementRepository:
             .first()
         )
 
+    def get_consumable_items_bulk(
+        self, item_ids: list[UUID], hospital_id: UUID
+    ) -> dict[UUID, ConsumableItem]:
+        if not item_ids:
+            return {}
+        items = (
+            self.db.query(ConsumableItem)
+            .filter(
+                ConsumableItem.id.in_(item_ids),
+                ConsumableItem.hospital_id == hospital_id,
+            )
+            .all()
+        )
+        return {item.id: item for item in items}
+
     def get_supplier(self, supplier_id: UUID, hospital_id: UUID) -> Supplier | None:
         return (
             self.db.query(Supplier)
@@ -48,8 +63,12 @@ class ProcurementRepository:
     # ── Feature 49: Material Requisitions ────────────────────────────────────
 
     def next_requisition_no(self, hospital_id: UUID) -> str:
-        count = self.db.query(MaterialRequisition).filter(MaterialRequisition.hospital_id == hospital_id).count()
-        return f"MR{count + 1:06d}"
+        from shared.database.sequences import counter_exists, ensure_counter_at_least, next_sequence_value
+        if not counter_exists(self.db, hospital_id, "material_requisition"):
+            count = self.db.query(MaterialRequisition).filter(MaterialRequisition.hospital_id == hospital_id).count()
+            ensure_counter_at_least(self.db, hospital_id, "material_requisition", count)
+        seq = next_sequence_value(self.db, hospital_id, "material_requisition")
+        return f"MR{seq:06d}"
 
     def get_requisition_by_id(self, requisition_id: UUID, hospital_id: UUID) -> MaterialRequisition | None:
         return (
@@ -100,8 +119,12 @@ class ProcurementRepository:
     # ── Feature 50: Purchase Orders ──────────────────────────────────────────
 
     def next_po_number(self, hospital_id: UUID) -> str:
-        count = self.db.query(PurchaseOrder).filter(PurchaseOrder.hospital_id == hospital_id).count()
-        return f"PO{count + 1:06d}"
+        from shared.database.sequences import counter_exists, ensure_counter_at_least, next_sequence_value
+        if not counter_exists(self.db, hospital_id, "purchase_order"):
+            count = self.db.query(PurchaseOrder).filter(PurchaseOrder.hospital_id == hospital_id).count()
+            ensure_counter_at_least(self.db, hospital_id, "purchase_order", count)
+        seq = next_sequence_value(self.db, hospital_id, "purchase_order")
+        return f"PO{seq:06d}"
 
     def get_po_by_id(self, po_id: UUID, hospital_id: UUID) -> PurchaseOrder | None:
         return (
@@ -135,8 +158,12 @@ class ProcurementRepository:
     # ── Feature 51: Goods Received Notes ─────────────────────────────────────
 
     def next_grn_number(self, hospital_id: UUID) -> str:
-        count = self.db.query(GoodsReceivedNote).filter(GoodsReceivedNote.hospital_id == hospital_id).count()
-        return f"GRN{count + 1:06d}"
+        from shared.database.sequences import counter_exists, ensure_counter_at_least, next_sequence_value
+        if not counter_exists(self.db, hospital_id, "goods_received_note"):
+            count = self.db.query(GoodsReceivedNote).filter(GoodsReceivedNote.hospital_id == hospital_id).count()
+            ensure_counter_at_least(self.db, hospital_id, "goods_received_note", count)
+        seq = next_sequence_value(self.db, hospital_id, "goods_received_note")
+        return f"GRN{seq:06d}"
 
     def get_grn_by_id(self, grn_id: UUID, hospital_id: UUID) -> GoodsReceivedNote | None:
         return (

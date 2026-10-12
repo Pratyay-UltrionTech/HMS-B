@@ -41,7 +41,9 @@ class GetPatientProfileAction:
         prescriptions = self.repo.profile_reader.get_prescriptions(patient_id)
         reports = self.repo.profile_reader.get_medical_reports(patient_id)
         admissions = self.repo.profile_reader.get_admissions(patient_id)
-        bills = self.repo.profile_reader.get_ledger_bills(patient_id, limit=50)
+        # Phase D Closure 1: Base patient profile retrieval does not eagerly load
+        # complete lifetime billing history. Full ledger is lazy-loaded via /api/billing/patients/{id}/ledger.
+        bills: list[dict[str, Any]] = []
         financial_summary = self.repo.profile_reader.get_financial_summary(patient_id)
 
         return PatientProfile(

@@ -159,21 +159,20 @@ def check_leave_conflicts(
     if blocked_by_date:
         raise conflict_http_exception(blocked_by_date)
 
-    # Check for overlapping existing leaves
-    for d in dates:
-        existing = (
-            db.query(DoctorLeave)
-            .filter(
-                DoctorLeave.hospital_id == hospital_id,
-                DoctorLeave.doctor_id == doctor_id,
-                DoctorLeave.leave_date == d,
-            )
-            .all()
+    # Check for overlapping existing leaves with one bulk query
+    existing_leaves = (
+        db.query(DoctorLeave)
+        .filter(
+            DoctorLeave.hospital_id == hospital_id,
+            DoctorLeave.doctor_id == doctor_id,
+            DoctorLeave.leave_date.in_(dates),
         )
-        for ex in existing:
-            if intervals_overlap(start_time, end_time, ex.start_time, ex.end_time):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Leave overlaps an existing leave block",
-                )
+        .all()
+    )
+    for ex in existing_leaves:
+        if intervals_overlap(start_time, end_time, ex.start_time, ex.end_time):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Leave overlaps an existing leave block",
+            )
 

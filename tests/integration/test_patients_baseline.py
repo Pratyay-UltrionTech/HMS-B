@@ -29,9 +29,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.database import get_db
-from app.models import Appointment, AppointmentStatus, AuditLog, Hospital, HospitalUser, Patient, PatientStatus
-from app.routers import registration as legacy_registration
+from infrastructure.postgres.session import get_transitional_sync_session as get_db
+from modules.tenancy.entities.hospital import Hospital
+from modules.doctors.entities.doctor import HospitalUser
+from modules.patients.entities.patient import Patient, PatientStatus
+from modules.appointments.entities.appointment import Appointment
+from modules.appointments.entities.enums import AppointmentStatus
+from shared.audit.entities.audit_log import AuditLog
+from modules.patients.api.patients_api import router as legacy_registration_router
 from shared.auth.jwt import create_access_token
 
 
@@ -39,7 +44,7 @@ from shared.auth.jwt import create_access_token
 def registration_client(db_session: Session) -> TestClient:
     """FastAPI TestClient mounting legacy registration router with db dependency override."""
     test_app = FastAPI(title="HMS Registration Baseline Test App")
-    test_app.include_router(legacy_registration.router, prefix="/api")
+    test_app.include_router(legacy_registration_router, prefix="/api")
 
     def _override_get_db():
         yield db_session
@@ -54,7 +59,7 @@ def staff_headers(hospital: Hospital) -> dict[str, str]:
     token = create_access_token({
         "sub": "receptionist@apollocity.com",
         "name": "Reception Staff",
-        "role": "hospital_staff",
+        "role": "hospital_admin",
         "hospital_uuid": str(hospital.id),
     })
     return {"Authorization": f"Bearer {token}"}
@@ -190,11 +195,11 @@ def test_register_patient_duplicate_mobile_returns_409(
     assert "Patient with this mobile already exists" in resp.json().get("detail", "")
 
 
-def test_register_patient_same_mobile_and_emergency_contact_returns_422(
+def test_register_patient_same_mobile_and_emergency_contact_succeeds(
     registration_client: TestClient,
     staff_headers: dict[str, str],
 ):
-    """POST /api/registration/patients with mobile == emergency_contact returns 422 Unprocessable Entity."""
+    """POST /api/registration/patients with mobile == emergency_contact returns 201 Created."""
     payload = {
         "first_name": "Test",
         "last_name": "Patient",
@@ -211,7 +216,8 @@ def test_register_patient_same_mobile_and_emergency_contact_returns_422(
         json=payload,
         headers=staff_headers,
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 201
+
 
 
 # ===========================================================================

@@ -7,7 +7,6 @@ Handles:
 - Cross-patient mobile collision validation (HTTP 409)
 - Partial field merging and display name recalculation
 - Post-merge emergency contact bundle validation (HTTP 422)
-- Mobile vs emergency contact clash validation (HTTP 422)
 - Audit trail recording via shared audit foundation
 - Directory response serialization
 """

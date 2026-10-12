@@ -51,16 +51,29 @@ def client(nursing_app: FastAPI) -> TestClient:
 
 
 @pytest.fixture(scope="function")
-def nurse_headers(hospital: Hospital) -> dict[str, str]:
+def nurse_headers(db_session: Session, hospital: Hospital) -> dict[str, str]:
+    user_id = uuid.uuid4()
+    user = HospitalUser(
+        id=user_id,
+        hospital_id=hospital.id,
+        role_id=uuid.uuid4(),
+        name="Nurse Priya",
+        email=f"nurse_{user_id.hex[:6]}@hospital.test",
+        phone="555-0999",
+        password_hash="test_hash",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
     token = create_access_token(
         data={
-            "sub": "nurse.priya@hospital.test",
+            "sub": user.email,
             "name": "Nurse Priya",
-            "email": "nurse.priya@hospital.test",
+            "email": user.email,
             "role": "hospital_admin",
             "staff_role_name": "nurse",
             "hospital_uuid": str(hospital.id),
-            "user_id": str(uuid.uuid4()),
+            "user_id": str(user_id),
         }
     )
     return {
@@ -70,16 +83,29 @@ def nurse_headers(hospital: Hospital) -> dict[str, str]:
 
 
 @pytest.fixture(scope="function")
-def doctor_headers(hospital: Hospital) -> dict[str, str]:
+def doctor_headers(db_session: Session, hospital: Hospital) -> dict[str, str]:
+    user_id = uuid.uuid4()
+    user = HospitalUser(
+        id=user_id,
+        hospital_id=hospital.id,
+        role_id=uuid.uuid4(),
+        name="Dr. Lee",
+        email=f"doctor_{user_id.hex[:6]}@hospital.test",
+        phone="555-0998",
+        password_hash="test_hash",
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
     token = create_access_token(
         data={
-            "sub": "doctor.lee@hospital.test",
+            "sub": user.email,
             "name": "Dr. Lee",
-            "email": "doctor.lee@hospital.test",
+            "email": user.email,
             "role": "hospital_admin",
             "staff_role_name": "doctor",
             "hospital_uuid": str(hospital.id),
-            "user_id": str(uuid.uuid4()),
+            "user_id": str(user_id),
         }
     )
     return {

@@ -107,14 +107,34 @@ class PatientRepository(BaseRepository[Patient]):
         if status_filter:
             q = q.filter(Patient.status == status_filter)
         if search:
-            term = f"%{search.strip()}%"
-            q = q.filter(
-                or_(
-                    Patient.name.ilike(term),
-                    Patient.uhid.ilike(term),
-                    Patient.mobile.ilike(term),
-                    Patient.first_name.ilike(term),
-                    Patient.last_name.ilike(term),
+            cleaned = search.strip()
+            digits = cleaned.lstrip("+")
+            if digits.isdigit() and len(digits) >= 5:
+                # Numeric search: route directly to mobile index
+                q = q.filter(
+                    or_(
+                        Patient.mobile == cleaned,
+                        Patient.mobile.like(f"{cleaned}%"),
+                        Patient.mobile.like(f"%{cleaned}%"),
+                        Patient.uhid == cleaned,
+                    )
                 )
-            )
+            elif cleaned.upper().startswith(("UHID", "MRN", "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9")):
+                # Identifier search: route to uhid index
+                q = q.filter(
+                    or_(
+                        Patient.uhid == cleaned,
+                        Patient.uhid.ilike(f"{cleaned}%"),
+                    )
+                )
+            else:
+                # Name / general search
+                term = f"%{cleaned}%"
+                q = q.filter(
+                    or_(
+                        Patient.name.ilike(term),
+                        Patient.uhid.ilike(f"{cleaned}%"),
+                        Patient.mobile.like(f"{cleaned}%"),
+                    )
+                )
         return q.order_by(Patient.created_at.desc()).limit(limit).offset(offset).all()

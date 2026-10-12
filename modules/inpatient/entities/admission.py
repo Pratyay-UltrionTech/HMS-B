@@ -22,11 +22,12 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    case,
     func,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 
 from infrastructure.postgres.base import Base
 from modules.beds.entities.bed import Bed, Room, Ward
@@ -178,6 +179,9 @@ class Admission(Base):
     care_team: Mapped[list["AdmissionCareTeamMember"]] = relationship(
         "AdmissionCareTeamMember", back_populates="admission", cascade="all, delete-orphan"
     )
+    source_appointment: Mapped[Any | None] = relationship(
+        "Appointment", foreign_keys=[source_appointment_id]
+    )
 
 
 class IpdFormSubmissionStatus(str, enum.Enum):
@@ -209,7 +213,10 @@ class IpdFormSubmission(Base):
     form_data: Mapped[dict] = mapped_column(
         JSONB().with_variant(JSON, "sqlite"), nullable=False, default=dict
     )
-    html_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    html_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
+    has_html_snapshot: Mapped[bool] = column_property(
+        case(((html_snapshot.isnot(None)) & (html_snapshot != ""), True), else_=False)
+    )
     status: Mapped[IpdFormSubmissionStatus] = mapped_column(
         Enum(IpdFormSubmissionStatus, name="ipd_form_submission_status"),
         nullable=False,

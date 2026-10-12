@@ -135,18 +135,28 @@ class GetSuggestedDischargeMedsAction:
             .all()
         )
 
-        out: list[SuggestedDischargeMedication] = []
-        for o in orders:
-            # Find last administration time if available
-            last_admin = (
-                self.db.query(IpdMedicationAdministration)
+        from sqlalchemy import func
+
+        order_ids = [o.id for o in orders]
+        last_admin_by_order: dict[UUID, datetime] = {}
+        if order_ids:
+            admin_rows = (
+                self.db.query(
+                    IpdMedicationAdministration.order_id,
+                    func.max(IpdMedicationAdministration.administered_at),
+                )
                 .filter(
                     IpdMedicationAdministration.hospital_id == self.hospital_id,
-                    IpdMedicationAdministration.order_id == o.id,
+                    IpdMedicationAdministration.order_id.in_(order_ids),
+                    IpdMedicationAdministration.administered_at.isnot(None),
                 )
-                .order_by(IpdMedicationAdministration.administered_at.desc())
-                .first()
+                .group_by(IpdMedicationAdministration.order_id)
+                .all()
             )
+            last_admin_by_order = {row[0]: row[1] for row in admin_rows}
+
+        out: list[SuggestedDischargeMedication] = []
+        for o in orders:
             out.append(
                 SuggestedDischargeMedication(
                     id=o.id,
@@ -160,7 +170,7 @@ class GetSuggestedDischargeMedsAction:
                     is_prn=bool(o.is_prn),
                     prn_indication=o.prn_indication,
                     status=o.status.value if hasattr(o.status, "value") else str(o.status),
-                    last_administered_at=last_admin.administered_at if last_admin else None,
+                    last_administered_at=last_admin_by_order.get(o.id),
                 )
             )
         return out

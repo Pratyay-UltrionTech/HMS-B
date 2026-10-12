@@ -49,6 +49,16 @@ class InventoryRepository:
         count = self.db.query(ConsumableItem).filter(ConsumableItem.hospital_id == hospital_id).count()
         return f"CI{count + 1:05d}"
 
+    def get_items_bulk(self, item_ids: list[UUID], hospital_id: UUID) -> dict[UUID, ConsumableItem]:
+        if not item_ids:
+            return {}
+        rows = (
+            self.db.query(ConsumableItem)
+            .filter(ConsumableItem.hospital_id == hospital_id, ConsumableItem.id.in_(item_ids))
+            .all()
+        )
+        return {r.id: r for r in rows}
+
     # ── Batches (Feature 46) ──────────────────────────────────────────────────
 
     def get_batch_by_number(self, hospital_id: UUID, item_id: UUID, batch_number: str) -> ConsumableBatch | None:
@@ -62,6 +72,19 @@ class InventoryRepository:
             .with_for_update()
             .first()
         )
+
+    def get_batches_bulk(
+        self, hospital_id: UUID, item_ids: list[UUID], for_update: bool = False
+    ) -> dict[tuple[UUID, str], ConsumableBatch]:
+        if not item_ids:
+            return {}
+        q = self.db.query(ConsumableBatch).filter(
+            ConsumableBatch.hospital_id == hospital_id,
+            ConsumableBatch.item_id.in_(item_ids),
+        )
+        if for_update:
+            q = q.with_for_update()
+        return {(b.item_id, b.batch_number): b for b in q.all()}
 
     def get_batch_by_id(self, batch_id: UUID, hospital_id: UUID) -> ConsumableBatch | None:
         return (
@@ -87,6 +110,19 @@ class InventoryRepository:
         if for_update:
             q = q.with_for_update()
         return q.first()
+
+    def get_central_stocks_bulk(
+        self, hospital_id: UUID, item_ids: list[UUID], for_update: bool = False
+    ) -> dict[UUID, CentralInventoryStock]:
+        if not item_ids:
+            return {}
+        q = self.db.query(CentralInventoryStock).filter(
+            CentralInventoryStock.hospital_id == hospital_id,
+            CentralInventoryStock.item_id.in_(item_ids),
+        )
+        if for_update:
+            q = q.with_for_update()
+        return {cs.item_id: cs for cs in q.all()}
 
     def list_central_stock(self, hospital_id: UUID) -> Sequence[CentralInventoryStock]:
         return (

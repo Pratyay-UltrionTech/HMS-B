@@ -137,20 +137,25 @@ class PatientProfileReader:
             .all()
         )
 
-    def get_ledger_bills(self, patient_id: UUID, limit: int = 50) -> list[dict[str, Any]]:
+    def get_ledger_bills(self, patient_id: UUID, limit: int | None = None) -> list[dict[str, Any]]:
         """Fetch billing ledger entries formatted for patient profile response."""
         entries = build_ledger_entries(self.db, self.hospital_id, patient_id)
+        selected = entries if limit is None else entries[:limit]
         return [
             {
                 "id": str(e["ref_id"]),
                 "type": e["entry_type"],
                 "description": e["description"],
+                "title": e["description"],
                 "debit": e["debit"],
                 "credit": e["credit"],
+                "amount": e["debit"] if e["debit"] > 0 else e["credit"],
                 "status": e["status"],
                 "occurred_at": e["occurred_at"].isoformat() if e.get("occurred_at") else None,
+                "created_at": e["occurred_at"].isoformat() if e.get("occurred_at") else None,
+                "invoice_no": str(e["ref_id"]) if e["entry_type"] == "charge" else None,
             }
-            for e in entries[:limit]
+            for e in selected
         ]
 
     def get_financial_summary(self, patient_id: UUID) -> dict[str, Any] | None:

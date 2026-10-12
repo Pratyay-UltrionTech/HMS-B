@@ -251,6 +251,35 @@ class AdmitToIcuAction:
             admitted_at=now,
         )
 
+        from modules.inpatient.services.inpatient_billing_service import InpatientBillingService
+        billing_svc = InpatientBillingService(self.db)
+        actor_name = str(actor.get("name") or "System")
+        billing_svc.ensure_financial_account(
+            hospital_id=self.hospital_id,
+            patient_id=patient.id,
+            admission_id=admission.id,
+            created_by_name=actor_name,
+        )
+        from modules.billing.services.service_financial_clearance import enforce_bed_allocation_clearance
+        enforce_bed_allocation_clearance(
+            self.db,
+            self.hospital_id,
+            admission,
+            ward_id=bed.ward_id,
+            bed_id=bed.id,
+            actor=actor,
+            is_emergency_override=True,
+            emergency_override_reason=(payload.diagnosis or "Critical care emergency direct ICU admission")[:512],
+        )
+        billing_svc.ensure_admission_charge(
+            hospital_id=self.hospital_id,
+            patient_id=patient.id,
+            admission_id=admission.id,
+            ward_name=bed.ward.name if bed.ward else None,
+            admission_fee=float(getattr(bed.ward, "admission_fee", 0.0) or 0.0) if bed.ward else 0.0,
+            created_by_name=actor_name,
+        )
+
         segment = BedStaySegment(
             hospital_id=self.hospital_id,
             admission_id=admission.id,

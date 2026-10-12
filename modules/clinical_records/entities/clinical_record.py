@@ -19,10 +19,11 @@ from sqlalchemy import (
     ForeignKey,
     String,
     Text,
+    case,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 
 from typing import TYPE_CHECKING
 
@@ -122,7 +123,13 @@ class MedicalRecord(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    file_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_data: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
+    has_file: Mapped[bool] = column_property(
+        case(
+            ((file_data.isnot(None)) & (file_data != ""), True),
+            else_=False,
+        )
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -154,7 +161,13 @@ class PatientDocument(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    file_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_data: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
+    has_file: Mapped[bool] = column_property(
+        case(
+            ((file_data.isnot(None)) & (file_data != ""), True),
+            else_=False,
+        )
+    )
     uploaded_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     uploaded_by_role: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     # FLAW-018: soft-delete + archival retention columns so clinical documents are

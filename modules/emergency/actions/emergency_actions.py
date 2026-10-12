@@ -429,6 +429,23 @@ class RecordEmergencyDispositionAction:
                 )
             if True:
                 created_admission_id = admission.id
+                billing_svc.ensure_financial_account(
+                    hospital_id=self.hospital_id,
+                    patient_id=patient.id,
+                    admission_id=admission.id,
+                    created_by_name=decider_name,
+                )
+                from modules.billing.services.service_financial_clearance import enforce_bed_allocation_clearance
+                enforce_bed_allocation_clearance(
+                    self.db,
+                    self.hospital_id,
+                    admission,
+                    ward_id=payload.destination_ward_id,
+                    bed_id=bed.id,
+                    actor=actor,
+                    is_emergency_override=True,
+                    emergency_override_reason=(payload.disposition_notes or f"Emergency admission via ER encounter {encounter.er_id}")[:512],
+                )
                 from modules.beds.entities.bed import Ward
                 ward_obj = self.db.query(Ward).filter(Ward.id == payload.destination_ward_id).first()
                 billing_svc.ensure_admission_charge(

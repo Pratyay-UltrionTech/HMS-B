@@ -99,8 +99,8 @@ def masters_client(masters_db):
     app.dependency_overrides[get_hospital_context] = lambda: hospital_id
     admin_payload = {
         "user_id": str(admin_user_id),
-        "hospital_id": str(hospital_id),
-        "role": "admin",
+        "hospital_uuid": str(hospital_id),
+        "role": "hospital_admin",
         "email": "admin@masterstest.com",
     }
     app.dependency_overrides[require_hospital_user] = lambda: admin_payload

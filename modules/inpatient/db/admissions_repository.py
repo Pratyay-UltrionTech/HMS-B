@@ -12,7 +12,7 @@ from typing import Sequence
 from uuid import UUID
 
 from sqlalchemy import or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from modules.beds.entities.bed import Bed
 from modules.inpatient.entities.admission import (
@@ -21,6 +21,7 @@ from modules.inpatient.entities.admission import (
     Admission,
     AdmissionStatus,
 )
+from modules.inpatient.entities.care_team import AdmissionCareTeamMember
 from modules.patients.entities.patient import Patient, PatientStatus
 
 # Re-exported so action/service layers share one canonical definition of
@@ -54,6 +55,8 @@ class AdmissionsRepository:
                 joinedload(Admission.room),
                 joinedload(Admission.bed),
                 joinedload(Admission.doctor),
+                selectinload(Admission.care_team).joinedload(AdmissionCareTeamMember.doctor),
+                joinedload(Admission.source_appointment),
             )
             .filter(Admission.id == admission_id, Admission.hospital_id == hospital_id)
         )
@@ -112,6 +115,8 @@ class AdmissionsRepository:
                 joinedload(Admission.room),
                 joinedload(Admission.bed),
                 joinedload(Admission.doctor),
+                selectinload(Admission.care_team).joinedload(AdmissionCareTeamMember.doctor),
+                joinedload(Admission.source_appointment),
             )
             .filter(
                 Admission.hospital_id == hospital_id,
@@ -146,6 +151,8 @@ class AdmissionsRepository:
                 joinedload(Admission.room),
                 joinedload(Admission.bed),
                 joinedload(Admission.doctor),
+                selectinload(Admission.care_team).joinedload(AdmissionCareTeamMember.doctor),
+                joinedload(Admission.source_appointment),
             )
             .filter(
                 Admission.hospital_id == hospital_id,

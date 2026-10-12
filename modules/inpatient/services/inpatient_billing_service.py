@@ -218,6 +218,195 @@ class InpatientBillingService:
 
         return totals
 
+    def ensure_bed_charges_bulk(
+        self,
+        hospital_id: UUID,
+        admissions: list[Any],
+        now: datetime,
+    ) -> None:
+        """Bulk reconcile bed charges for admissions upon discharge queue read."""
+        if not admissions:
+            return
+        from collections import defaultdict
+        from modules.billing.entities.billing_entities import (
+            BillingCharge,
+            BillingChargeStatus,
+            BillingSourceType,
+            FinancialAccount,
+            FinancialAccountStatus,
+            FinancialAccountType,
+        )
+        from modules.inpatient.entities.admission import BedStaySegment
+        from modules.billing.services.billing_service import (
+            bed_stay_days,
+            compute_net,
+            next_financial_account_number,
+        )
+
+        admission_ids = [a.id for a in admissions]
+
+        # 1. Bulk load existing bed charges
+        existing_charges = (
+            self.db.query(BillingCharge)
+            .filter(
+                BillingCharge.hospital_id == hospital_id,
+                BillingCharge.source_type == BillingSourceType.bed,
+                BillingCharge.source_id.in_(admission_ids),
+                BillingCharge.status != BillingChargeStatus.cancelled,
+            )
+            .all()
+        )
+        existing_by_adm = {c.source_id: c for c in existing_charges}
+
+        # 2. Bulk load bed stay segments
+        segments = (
+            self.db.query(BedStaySegment)
+            .filter(
+                BedStaySegment.hospital_id == hospital_id,
+                BedStaySegment.admission_id.in_(admission_ids),
+            )
+            .order_by(BedStaySegment.started_at.asc())
+            .all()
+        )
+        segments_by_adm = defaultdict(list)
+        for s in segments:
+            segments_by_adm[s.admission_id].append(s)
+
+        to_create = []
+        to_update = []
+        for a in admissions:
+            adm_segments = segments_by_adm.get(a.id, [])
+            expected_amount = 0.0
+            total_days = 0
+            notes_parts = []
+            if adm_segments:
+                for s in adm_segments:
+                    seg_start = s.started_at
+                    seg_end = s.ended_at or now
+                    seg_days = bed_stay_days(seg_start, seg_end)
+                    seg_rate = float(s.rate_per_day or 0.0)
+                    seg_amount = round(seg_rate * seg_days, 2)
+                    expected_amount += seg_amount
+                    total_days += seg_days
+                    notes_parts.append(f"seg(rate={seg_rate}, days={seg_days}, amt={seg_amount})")
+            else:
+                ward = getattr(a, "ward", None)
+                bed_charge_rate = float(getattr(ward, "bed_charge_per_day", 0) or 0) if ward else 0.0
+                days = bed_stay_days(a.admitted_at, now)
+                expected_amount = round(bed_charge_rate * days, 2)
+                total_days = days
+
+            if expected_amount <= 0:
+                continue
+
+            days = max(1, total_days)
+            day_label = "Day" if days == 1 else "Days"
+            place = " / ".join(
+                p
+                for p in [
+                    getattr(getattr(a, "ward", None), "name", None),
+                    getattr(getattr(a, "room", None), "room_code", None),
+                    getattr(getattr(a, "bed", None), "bed_code", None),
+                ]
+                if p
+            ) or "Bed"
+            description = f"Bed Charges ({days} {day_label}) — {place}"[:512]
+            notes = f"multi_segment; days={days}; {'; '.join(notes_parts)}"[:512] if notes_parts else None
+
+            existing = existing_by_adm.get(a.id)
+            if existing:
+                if abs(float(existing.net_amount or 0) - expected_amount) >= 0.01:
+                    to_update.append((existing, expected_amount, days, description, notes))
+            else:
+                to_create.append((a, expected_amount, days, description, notes))
+
+        if not to_create and not to_update:
+            return
+
+        for existing, expected_amount, days, description, notes in to_update:
+            existing.charge_amount = expected_amount
+            disc, net = compute_net(
+                expected_amount,
+                existing.discount_amount or 0.0,
+                existing.discount_percent,
+                existing.tax_amount or 0.0,
+            )
+            existing.net_amount = net
+            existing.quantity = float(days)
+            existing.unit_price = round(expected_amount / days, 2) if days > 0 else 0.0
+            existing.description = description
+            if notes:
+                existing.notes = notes
+
+        if to_create:
+            needed_adm_ids = [a.id for a, _, _, _, _ in to_create]
+            existing_accounts = (
+                self.db.query(FinancialAccount)
+                .filter(
+                    FinancialAccount.hospital_id == hospital_id,
+                    FinancialAccount.account_type == FinancialAccountType.ipd,
+                    FinancialAccount.admission_id.in_(needed_adm_ids),
+                )
+                .all()
+            )
+            account_map = {acc.admission_id: acc for acc in existing_accounts if acc.admission_id}
+
+            new_charges = []
+            new_accounts = []
+            for a, expected_amount, days, description, notes in to_create:
+                acc = account_map.get(a.id)
+                if not acc:
+                    acc_num = next_financial_account_number(self.db, hospital_id)
+                    acc = FinancialAccount(
+                        hospital_id=hospital_id,
+                        patient_id=a.patient_id,
+                        account_number=acc_num,
+                        account_type=FinancialAccountType.ipd,
+                        status=FinancialAccountStatus.open,
+                        admission_id=a.id,
+                        created_by_name="System",
+                    )
+                    new_accounts.append(acc)
+                    account_map[a.id] = acc
+
+            if new_accounts:
+                self.db.add_all(new_accounts)
+                self.db.flush()
+
+            for a, expected_amount, days, description, notes in to_create:
+                acc = account_map[a.id]
+                disc, net = compute_net(expected_amount, 0.0, None, 0.0)
+                status = BillingChargeStatus.paid if net <= 0 else BillingChargeStatus.pending
+                actual_unit_price = round(expected_amount / days, 2) if days > 0 else 0.0
+
+                chg = BillingCharge(
+                    hospital_id=hospital_id,
+                    patient_id=a.patient_id,
+                    account_id=acc.id,
+                    source_type=BillingSourceType.bed,
+                    source_id=a.id,
+                    description=description,
+                    quantity=float(days),
+                    unit_price=actual_unit_price,
+                    charge_amount=round(float(expected_amount), 2),
+                    discount_amount=disc,
+                    discount_percent=None,
+                    discount_reason=None,
+                    tax_amount=0.0,
+                    gst_rate=0.0,
+                    hsn_sac_code=None,
+                    net_amount=net,
+                    amount_paid=net if status == BillingChargeStatus.paid else 0.0,
+                    status=status,
+                    notes=notes,
+                    created_by_name="System",
+                )
+                new_charges.append(chg)
+
+            if new_charges:
+                self.db.add_all(new_charges)
+                self.db.flush()
+
     def get_ledger_totals_bulk(
         self,
         hospital_id: UUID,
@@ -225,17 +414,155 @@ class InpatientBillingService:
         admission_ids: list[UUID] | None = None,
     ) -> dict[UUID, dict[str, Any]]:
         """Compute financial totals for many patients in bulk queries."""
-        from modules.billing.entities.billing_entities import FinancialAccount
-        from modules.billing.services.billing_service import (
-            patient_ledger_totals,
-            patient_ledger_totals_bulk,
+        from modules.billing.services.billing_service import patient_ledger_totals_bulk
+
+        if not admission_ids:
+            return patient_ledger_totals_bulk(self.db, hospital_id, patient_ids)
+
+        from sqlalchemy import case, func, or_
+        from modules.billing.entities.billing_entities import (
+            BillingCharge,
+            BillingChargeStatus,
+            BillingDeposit,
+            BillingPayment,
+            DepositStatus,
+            FinancialAccount,
+            FinancialAccountType,
         )
 
-        if admission_ids:
-            # Per-admission scoping for discharge queue
-            res: dict[UUID, dict[str, Any]] = {}
-            for pid, aid in zip(patient_ids, admission_ids):
-                res[pid] = self.get_ledger_totals(hospital_id, pid, admission_id=aid)
+        res: dict[UUID, dict[str, Any]] = {}
+        if not patient_ids:
             return res
 
-        return patient_ledger_totals_bulk(self.db, hospital_id, patient_ids)
+        # 1. Bulk resolve FinancialAccount for all admissions (read-only, no write mutations on read path)
+        existing_accounts = (
+            self.db.query(FinancialAccount)
+            .filter(
+                FinancialAccount.hospital_id == hospital_id,
+                FinancialAccount.admission_id.in_(admission_ids),
+            )
+            .all()
+        )
+        acc_by_adm = {acc.admission_id: acc for acc in existing_accounts if acc.admission_id}
+
+        account_ids: list[UUID] = []
+        adm_to_acc_id: dict[UUID, UUID] = {}
+        for pid, aid in zip(patient_ids, admission_ids):
+            acc = acc_by_adm.get(aid)
+            if acc:
+                adm_to_acc_id[aid] = acc.id
+                account_ids.append(acc.id)
+
+        # 2. Bulk aggregate charges by account_id in a single query
+        chg_data: dict[UUID, dict[str, Any]] = {}
+        if account_ids:
+            chg_rows = (
+                self.db.query(
+                    BillingCharge.account_id,
+                    func.coalesce(func.sum(BillingCharge.net_amount), 0).label("tot_net"),
+                    func.coalesce(func.sum(BillingCharge.amount_paid), 0).label("tot_paid_alloc"),
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (
+                                    BillingCharge.net_amount > BillingCharge.amount_paid,
+                                    BillingCharge.net_amount - BillingCharge.amount_paid,
+                                ),
+                                else_=0.0,
+                            )
+                        ),
+                        0,
+                    ).label("tot_out"),
+                    func.count(BillingCharge.id).label("cnt"),
+                )
+                .filter(
+                    BillingCharge.hospital_id == hospital_id,
+                    BillingCharge.account_id.in_(account_ids),
+                    BillingCharge.status != BillingChargeStatus.cancelled,
+                )
+                .group_by(BillingCharge.account_id)
+                .all()
+            )
+            for r in chg_rows:
+                chg_data[r.account_id] = {
+                    "total_charges": round(float(r.tot_net or 0), 2),
+                    "total_paid_alloc": round(float(r.tot_paid_alloc or 0), 2),
+                    "outstanding": round(float(r.tot_out or 0), 2),
+                    "charge_count": int(r.cnt or 0),
+                }
+
+        # 3. Bulk aggregate payments by account_id in a single query
+        pay_data: dict[UUID, dict[str, Any]] = {}
+        if account_ids:
+            pay_rows = (
+                self.db.query(
+                    BillingPayment.account_id,
+                    func.coalesce(func.sum(BillingPayment.amount), 0).label("tot_tender"),
+                    func.count(BillingPayment.id).label("cnt"),
+                )
+                .filter(
+                    BillingPayment.hospital_id == hospital_id,
+                    BillingPayment.account_id.in_(account_ids),
+                )
+                .group_by(BillingPayment.account_id)
+                .all()
+            )
+            for r in pay_rows:
+                pay_data[r.account_id] = {
+                    "total_paid_tender": round(float(r.tot_tender or 0), 2),
+                    "payment_count": int(r.cnt or 0),
+                }
+
+        # 4. Bulk aggregate deposits (by account_id and by admission_id) in a single query
+        dep_rows = (
+            self.db.query(
+                BillingDeposit.account_id,
+                BillingDeposit.admission_id,
+                func.coalesce(func.sum(BillingDeposit.available_amount), 0).label("tot_dep"),
+            )
+            .filter(
+                BillingDeposit.hospital_id == hospital_id,
+                BillingDeposit.status.in_([DepositStatus.available, DepositStatus.partially_allocated]),
+                or_(
+                    BillingDeposit.account_id.in_(account_ids),
+                    BillingDeposit.admission_id.in_(admission_ids),
+                ),
+            )
+            .group_by(BillingDeposit.account_id, BillingDeposit.admission_id)
+            .all()
+        )
+        dep_by_acc: dict[UUID, float] = {}
+        extra_dep_by_adm: dict[UUID, float] = {}
+        for r in dep_rows:
+            tot_dep = round(float(r.tot_dep or 0), 2)
+            if r.account_id:
+                dep_by_acc[r.account_id] = round(dep_by_acc.get(r.account_id, 0.0) + tot_dep, 2)
+            if r.admission_id and r.account_id != adm_to_acc_id.get(r.admission_id):
+                extra_dep_by_adm[r.admission_id] = round(extra_dep_by_adm.get(r.admission_id, 0.0) + tot_dep, 2)
+
+        # 5. Assemble dictionary per patient
+        for pid, aid in zip(patient_ids, admission_ids):
+            acc_id = adm_to_acc_id.get(aid)
+            c_inf = chg_data.get(acc_id, {})
+            p_inf = pay_data.get(acc_id, {})
+            total_charges = c_inf.get("total_charges", 0.0)
+            total_paid = c_inf.get("total_paid_alloc", 0.0)
+            outstanding = c_inf.get("outstanding", 0.0)
+            charge_count = c_inf.get("charge_count", 0)
+            payment_count = p_inf.get("payment_count", 0)
+
+            acc_dep = dep_by_acc.get(acc_id, 0.0)
+            extra_dep = extra_dep_by_adm.get(aid, 0.0)
+            total_deposits_avail = round(acc_dep + extra_dep, 2)
+            net_patient_balance = round(outstanding - total_deposits_avail, 2)
+
+            res[pid] = {
+                "total_charges": total_charges,
+                "total_paid": total_paid,
+                "total_deposits_available": total_deposits_avail,
+                "outstanding": outstanding,
+                "net_patient_balance": net_patient_balance,
+                "charge_count": charge_count,
+                "payment_count": payment_count,
+            }
+        return res

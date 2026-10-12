@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from modules.emergency.entities.emergency_entities import (
     EmergencyArrivalSource,
@@ -109,6 +109,14 @@ class EmergencyEscalateRequest(BaseModel):
     escalation_reason: str = Field(min_length=3)
 
 
+EMERGENCY_ORDER_TYPE_ALIASES = {
+    "radiology": EmergencyOrderType.radiology_scan.value,
+    "lab": EmergencyOrderType.lab_investigation.value,
+    "laboratory": EmergencyOrderType.lab_investigation.value,
+    "stat_medication": EmergencyOrderType.medication.value,
+}
+
+
 class EmergencyOrderCreate(BaseModel):
     order_type: EmergencyOrderType = EmergencyOrderType.medication
     description: str = Field(min_length=2)
@@ -117,6 +125,14 @@ class EmergencyOrderCreate(BaseModel):
     is_stat: bool = True
     is_verbal: bool = False
     clinical_notes: str | None = None
+
+    @field_validator("order_type", mode="before")
+    @classmethod
+    def accept_frontend_aliases(cls, v):
+        """The ER console sends short names ("radiology", "stat_medication")."""
+        if isinstance(v, str):
+            return EMERGENCY_ORDER_TYPE_ALIASES.get(v.strip().lower(), v)
+        return v
 
 
 class EmergencyOrderExecute(BaseModel):

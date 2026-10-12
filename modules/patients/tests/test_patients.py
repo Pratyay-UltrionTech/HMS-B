@@ -161,11 +161,12 @@ def test_migrated_register_patient_duplicate_mobile_returns_409(
     assert "already exists" in resp2.json()["detail"]
 
 
-def test_migrated_register_patient_same_emergency_contact_returns_422(
+def test_register_patient_same_emergency_contact_succeeds(
     patients_client: TestClient,
+    db_session: Session,
     staff_headers: dict[str, str],
 ):
-    """POST /api/registration/patients raises 422 if mobile equals emergency contact."""
+    """POST /api/registration/patients succeeds when mobile equals emergency contact."""
     payload = {
         "first_name": "Sunil",
         "last_name": "Verma",
@@ -176,7 +177,32 @@ def test_migrated_register_patient_same_emergency_contact_returns_422(
         "emergency_contact_relation": "Other",
     }
     resp = patients_client.post("/api/registration/patients", json=payload, headers=staff_headers)
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["mobile"] == "9876543233"
+    saved = db_session.query(Patient).filter(Patient.id == UUID(data["id"])).first()
+    assert saved is not None
+    assert saved.mobile == "9876543233"
+    assert saved.emergency_contact == "9876543233"
+
+
+def test_register_patient_malformed_emergency_contact_returns_422(
+    patients_client: TestClient,
+    staff_headers: dict[str, str],
+):
+    """POST /api/registration/patients rejects malformed emergency contact phone."""
+    payload = {
+        "first_name": "Sunil",
+        "last_name": "Verma",
+        "gender": "Male",
+        "mobile": "9876543234",
+        "emergency_contact": "123",  # Malformed phone number
+        "emergency_contact_name": "Contact",
+        "emergency_contact_relation": "Other",
+    }
+    resp = patients_client.post("/api/registration/patients", json=payload, headers=staff_headers)
     assert resp.status_code == 422
+
 
 
 # ===========================================================================
@@ -452,3 +478,40 @@ def test_migrated_update_patient_mobile_clash_returns_409(
     )
     assert resp.status_code == 409
     assert "Mobile already used" in resp.json()["detail"]
+
+
+def test_update_patient_same_emergency_contact_succeeds(
+    patients_client: TestClient,
+    db_session: Session,
+    hospital: Hospital,
+    staff_headers: dict[str, str],
+):
+    """PUT /api/registration/patients/{id} succeeds when emergency_contact equals patient mobile."""
+    patient = Patient(
+        hospital_id=hospital.id,
+        uhid="P0601",
+        first_name="Pooja",
+        last_name="Sharma",
+        name="Pooja Sharma",
+        mobile="9876543888",
+        emergency_contact="9876543999",
+        emergency_contact_name="Family Member",
+        emergency_contact_relation="Sibling",
+        gender="Female",
+        status=PatientStatus.active,
+    )
+    db_session.add(patient)
+    db_session.commit()
+
+    resp = patients_client.put(
+        f"/api/registration/patients/{patient.id}",
+        json={"emergency_contact": "9876543888"},
+        headers=staff_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mobile"] == "9876543888"
+    db_session.refresh(patient)
+    assert patient.mobile == "9876543888"
+    assert patient.emergency_contact == "9876543888"
+
