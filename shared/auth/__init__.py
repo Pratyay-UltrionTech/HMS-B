@@ -5,6 +5,7 @@ from shared.auth.dependencies import (
     get_hospital_context,
     get_hospital_uuid,
     invalidate_role_permission_cache,
+    invalidate_tenant_status_cache,
     require_hospital_admin,
     require_hospital_user,
     require_permission,
@@ -12,6 +13,7 @@ from shared.auth.dependencies import (
     require_super_admin,
     security,
 )
+
 from shared.auth.jwt import create_access_token, decode_access_token
 from shared.auth.security import (
     generate_temp_password,
@@ -33,6 +35,8 @@ __all__ = [
     "require_permission",
     "require_any_permission",
     "invalidate_role_permission_cache",
+    "invalidate_tenant_status_cache",
     "get_hospital_context",
     "get_hospital_uuid",
 ]
+

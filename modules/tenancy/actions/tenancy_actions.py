@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import concurrent.futures
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import secrets
 import string
 from typing import Any
@@ -23,6 +24,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from modules.admin.contracts.admin_contracts import BASIC_MODULE_KEYS
 from modules.appointments.entities.appointment import Appointment
 from modules.appointments.entities.enums import AppointmentStatus
+from modules.auth.entities.setup_token import AccountSetupToken
 from modules.beds.entities.bed import Bed, Ward
 from modules.billing.entities.billing_entities import (
     BillingCharge,
@@ -34,7 +36,8 @@ from modules.billing.entities.billing_entities import (
     BillingReceiptStatus,
     BillingSourceType,
 )
-from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.doctors.entities.doctor import HospitalUser, HospitalUserRole, RolePermission, StaffRole
+
 from modules.inpatient.entities.admission import Admission, AdmissionStatus
 from modules.laboratory.entities.lab_entities import (
     LabOrder,
@@ -50,20 +53,107 @@ from modules.radiology.entities.radiology_entities import (
 )
 from modules.tenancy.contracts.tenancy_contracts import (
     DoctorRecentRevenueItem,
+    HospitalArchivePayload,
     HospitalCreate,
     HospitalCreateResponse,
     HospitalDashboardListItem,
     HospitalDashboardResponse,
     HospitalDashboardSummaryResponse,
     HospitalResponse,
+    HospitalSuspendPayload,
+    HospitalUpdate,
     RoleDashboardListItem,
     RoleDashboardMetric,
     RoleDashboardResponse,
 )
-from modules.tenancy.entities.hospital import Hospital
+
+from modules.tenancy.contracts.registration_contracts import (
+    HospitalRegistrationCreate,
+    HospitalRegistrationDetail,
+    HospitalRegistrationResponse,
+    RegistrationApprovePayload,
+    RegistrationApproveResponse,
+    RegistrationPaginatedResponse,
+    RegistrationRejectPayload,
+)
+from infrastructure.postgres.base import Base
+from modules.tenancy.contracts.callback_contracts import (
+    CallbackRequestCreate,
+    CallbackRequestResponse,
+    CallbackRequestUpdate,
+)
+from modules.tenancy.entities.callback_request import CallbackRequest
+from modules.tenancy.entities.hospital import Hospital, PlanType
+from modules.tenancy.entities.hospital_registration_request import (
+    HospitalRegistrationRequest,
+    RegistrationStatus,
+)
+
+from shared.audit.service import write_audit_log
 from shared.auth.security import generate_temp_password, hash_password
 
+
+ADMIN_INFRA_TABLES = {
+    "hospitals",
+    "hospital_users",
+    "hospital_user_roles",
+    "hospital_user_departments",
+    "hospital_user_locations",
+    "staff_roles",
+    "role_permissions",
+    "role_custom_fields",
+    "account_setup_tokens",
+    "audit_logs",
+}
+
+
+def validate_logo_url(icon_url: str | None) -> str | None:
+    if not icon_url:
+        return None
+    val = icon_url.strip()
+    if not val:
+        return None
+    if val.startswith("http://") or val.startswith("https://"):
+        if len(val) > 2048:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Logo URL must not exceed 2048 characters.",
+            )
+        return val
+    if val.startswith("data:image/"):
+        parts = val.split(",", 1)
+        if len(parts) != 2:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid data URL format for logo.",
+            )
+        header = parts[0]
+        allowed_mimes = [
+            "data:image/png;base64",
+            "data:image/jpeg;base64",
+            "data:image/webp;base64",
+            "data:image/svg+xml;base64",
+        ]
+        if not any(header.startswith(mime) for mime in allowed_mimes):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Logo image format not supported. Allowed formats: PNG, JPEG, WebP, SVG.",
+            )
+        payload_bytes = len(parts[1]) * 3 / 4
+        if payload_bytes > 500 * 1024:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Logo image size exceeds maximum allowed limit of 500 KB.",
+            )
+        return val
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Logo must be a valid HTTP/HTTPS URL or base64 image data URI.",
+    )
+
+
 HOSPITAL_ID_CHARS = string.ascii_uppercase + string.digits
+
 
 
 def generate_hospital_id(db: Session) -> str:
@@ -73,6 +163,20 @@ def generate_hospital_id(db: Session) -> str:
         if not exists:
             return code
     raise RuntimeError("Unable to generate unique hospital ID")
+
+
+def generate_request_number(db: Session) -> str:
+    year = datetime.now(timezone.utc).year
+    for _ in range(20):
+        suffix = "".join(secrets.choice(HOSPITAL_ID_CHARS) for _ in range(6))
+        code = f"REQ-{year}-{suffix}"
+        exists = db.query(HospitalRegistrationRequest.id).filter(
+            HospitalRegistrationRequest.request_number == code
+        ).first()
+        if not exists:
+            return code
+    raise RuntimeError("Unable to generate unique request number")
+
 
 
 def _is_doctor_role(name: str | None) -> bool:
@@ -202,6 +306,399 @@ class TenancyActions:
         finally:
             session.close()
 
+    # ── Callback Request Operations ───────────────────────────────────────────
+    def submit_callback_request(
+        self, payload: CallbackRequestCreate
+    ) -> CallbackRequestResponse:
+        phone = payload.phone.strip()
+        # Abuse protection: reject duplicate callback from same phone within 15 minutes
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        recent = (
+            self.db.query(CallbackRequest.id)
+            .filter(CallbackRequest.phone == phone, CallbackRequest.created_at >= recent_cutoff)
+            .first()
+        )
+        if recent:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="A callback request from this phone number was received recently. Our team will contact you shortly.",
+            )
+
+        req = CallbackRequest(
+            name=payload.name.strip(),
+            phone=phone,
+            email=payload.email.strip().lower() if payload.email else None,
+            location=payload.location.strip() if payload.location else None,
+            comments=payload.comments.strip() if payload.comments else None,
+            status="pending",
+        )
+        self.db.add(req)
+        self.db.commit()
+        self.db.refresh(req)
+        return CallbackRequestResponse.model_validate(req)
+
+    # ── Registration Request Operations ─────────────────────────────────────────
+    def submit_registration_request(
+        self, payload: HospitalRegistrationCreate
+    ) -> HospitalRegistrationResponse:
+
+        email = payload.email.strip().lower()
+        phone = payload.phone.strip()
+
+        # 1. Abuse protection: rate limit submissions per contact within 1 hour
+        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+        recent_count = (
+            self.db.query(func.count(HospitalRegistrationRequest.id))
+            .filter(
+                (HospitalRegistrationRequest.email == email) | (HospitalRegistrationRequest.phone == phone),
+                HospitalRegistrationRequest.submitted_at >= one_hour_ago,
+            )
+            .scalar()
+        )
+        if recent_count and recent_count >= 3:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many registration submissions for this contact information. Please wait before retrying.",
+            )
+
+        # 2. Check if an active hospital already exists with this email or phone
+        existing_hospital = (
+            self.db.query(Hospital)
+            .filter((Hospital.email == email) | (Hospital.phone == phone))
+            .first()
+        )
+        if existing_hospital:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A hospital with this email or phone is already registered on HMS.",
+            )
+
+        # 3. Check for duplicate pending registration request
+        existing_pending = (
+            self.db.query(HospitalRegistrationRequest)
+            .filter(
+                (HospitalRegistrationRequest.email == email)
+                | (HospitalRegistrationRequest.phone == phone),
+                HospitalRegistrationRequest.status == RegistrationStatus.pending,
+            )
+            .first()
+        )
+        if existing_pending:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A pending registration request with this email or phone already exists.",
+            )
+
+        req_number = generate_request_number(self.db)
+        req = HospitalRegistrationRequest(
+            request_number=req_number,
+            hospital_name=payload.hospital_name.strip(),
+            contact_name=payload.contact_name.strip(),
+            email=email,
+            phone=phone,
+            address=payload.address.strip(),
+            city=payload.city.strip() if payload.city else None,
+            state=payload.state.strip() if payload.state else None,
+            postal_code=payload.postal_code.strip() if payload.postal_code else None,
+            estimated_beds=payload.estimated_beds,
+            comments=payload.comments.strip() if payload.comments else None,
+            status=RegistrationStatus.pending,
+        )
+        self.db.add(req)
+        self.db.commit()
+        self.db.refresh(req)
+
+        return HospitalRegistrationResponse.model_validate(req)
+
+    def list_registration_requests(
+        self,
+        status_filter: RegistrationStatus | None = None,
+        search: str | None = None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> RegistrationPaginatedResponse:
+        query = self.db.query(HospitalRegistrationRequest).order_by(
+            HospitalRegistrationRequest.submitted_at.desc()
+        )
+        if status_filter:
+            query = query.filter(HospitalRegistrationRequest.status == status_filter)
+        if search:
+            term = f"%{search.strip().lower()}%"
+            query = query.filter(
+                HospitalRegistrationRequest.hospital_name.ilike(term)
+                | HospitalRegistrationRequest.email.ilike(term)
+                | HospitalRegistrationRequest.request_number.ilike(term)
+                | HospitalRegistrationRequest.contact_name.ilike(term)
+            )
+
+        total = query.count()
+        offset = max(0, (page - 1) * page_size)
+        rows = query.offset(offset).limit(page_size).all()
+        total_pages = max(1, (total + page_size - 1) // page_size) if total > 0 else 1
+
+        return RegistrationPaginatedResponse(
+            items=[HospitalRegistrationDetail.model_validate(r) for r in rows],
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+        )
+
+    def get_registration_request(self, req_id: UUID | str) -> HospitalRegistrationDetail:
+        try:
+            uid = UUID(str(req_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Registration request not found",
+            )
+        req = self.db.query(HospitalRegistrationRequest).filter(HospitalRegistrationRequest.id == uid).first()
+        if not req:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Registration request not found",
+            )
+        return HospitalRegistrationDetail.model_validate(req)
+
+    def approve_registration_request(
+        self, req_id: UUID | str, payload: RegistrationApprovePayload, reviewer_email: str
+    ) -> RegistrationApproveResponse:
+        try:
+            uid = UUID(str(req_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Registration request not found",
+            )
+
+        query = self.db.query(HospitalRegistrationRequest).filter(
+            HospitalRegistrationRequest.id == uid
+        )
+        if hasattr(self.db, "bind") and self.db.bind is not None and self.db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        req = query.first()
+
+        if not req:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Registration request not found",
+            )
+
+        if req.status == RegistrationStatus.approved:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This registration request has already been approved.",
+            )
+        if req.status == RegistrationStatus.rejected:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot approve a rejected registration request.",
+            )
+
+        # Ensure no active hospital with same email already exists
+        existing_hospital = self.db.query(Hospital).filter(Hospital.email == req.email).first()
+        if existing_hospital:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Hospital with email {req.email} already exists.",
+            )
+
+        # Transactional provisioning:
+        try:
+            hospital, admin_user, admin_role, raw_token = self._provision_hospital_tenant(
+                name=req.hospital_name,
+                address=req.address,
+                phone=req.phone,
+                email=req.email,
+                plan=payload.plan,
+                contact_name=req.contact_name,
+            )
+
+            # Update registration request
+            req.status = RegistrationStatus.approved
+            req.approved_hospital_id = hospital.id
+            req.reviewed_at = datetime.now(timezone.utc)
+            req.reviewed_by = reviewer_email
+
+            # Audit log
+            write_audit_log(
+                self.db,
+                hospital_id=hospital.id,
+                actor={"sub": reviewer_email, "role": "super_admin", "name": "Super Admin"},
+                action="approve",
+                entity_type="hospital_registration",
+                entity_id=req.id,
+                summary=f"Approved hospital registration for {req.hospital_name} ({hospital.hospital_id})",
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+        setup_url = f"/setup-password#token={raw_token}"
+        return RegistrationApproveResponse(
+            hospital_id=hospital.hospital_id,
+            hospital_uuid=hospital.id,
+            hospital_name=hospital.name,
+            admin_email=admin_user.email,
+            setup_token=raw_token,
+            setup_url=setup_url,
+            message=f"Hospital {hospital.name} provisioned successfully with administrator account.",
+        )
+
+    def _provision_hospital_tenant(
+        self,
+        name: str,
+        address: str,
+        phone: str,
+        email: str,
+        plan: PlanType,
+        contact_name: str | None = None,
+        icon_url: str | None = None,
+    ) -> tuple[Hospital, HospitalUser, StaffRole, str]:
+        # 1. Create Hospital organization tenant with null password_hash and user_accounts auth_model
+        hospital = Hospital(
+            hospital_id=generate_hospital_id(self.db),
+            name=name.strip(),
+            address=address.strip(),
+            phone=phone.strip(),
+            email=email.strip().lower(),
+            password_hash=None,
+            auth_model="user_accounts",
+            plan=plan,
+            icon_url=validate_logo_url(icon_url),
+            status="active",
+            is_active=True,
+        )
+        self.db.add(hospital)
+        self.db.flush()
+
+        # 2. Create canonical administrator StaffRole
+        admin_role = StaffRole(
+            hospital_id=hospital.id,
+            name="Hospital Admin",
+            code="HOSPITAL_ADMIN",
+            is_admin_role=True,
+            description="Default Hospital Administrator Role",
+            is_active=True,
+        )
+        self.db.add(admin_role)
+        self.db.flush()
+
+        # 3. Seed full permissions across all BASIC_MODULE_KEYS for the administrator role
+        for mkey in BASIC_MODULE_KEYS:
+            rp = RolePermission(
+                hospital_id=hospital.id,
+                role_id=admin_role.id,
+                module_key=mkey,
+                can_view=True,
+                can_edit=True,
+                can_create=True,
+                can_delete=True,
+                can_approve=True,
+                can_validate=True,
+                can_release=True,
+                can_dispense=True,
+                can_refund=True,
+                can_cancel=True,
+                can_administer=True,
+            )
+            self.db.add(rp)
+        self.db.flush()
+
+        # 4. Create HospitalUser administrator account
+        human_name = (contact_name or name).strip()
+        admin_user = HospitalUser(
+            hospital_id=hospital.id,
+            role_id=admin_role.id,
+            name=human_name,
+            email=email.strip().lower(),
+            phone=phone.strip(),
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            is_active=True,
+            token_version=1,
+        )
+        self.db.add(admin_user)
+        self.db.flush()
+
+        # 5. Map administrator to assigned roles
+        user_role = HospitalUserRole(
+            hospital_id=hospital.id,
+            user_id=admin_user.id,
+            role_id=admin_role.id,
+            is_primary=True,
+        )
+        self.db.add(user_role)
+
+        # 6. Generate secure single-use account setup token (valid for 3 days)
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        setup_token = AccountSetupToken(
+            token_hash=token_hash,
+            user_id=admin_user.id,
+            hospital_id=hospital.id,
+            email=email.strip().lower(),
+            token_type="setup",
+            expires_at=datetime.now(timezone.utc) + timedelta(days=3),
+        )
+        self.db.add(setup_token)
+        self.db.flush()
+
+        return hospital, admin_user, admin_role, raw_token
+
+    def reject_registration_request(
+        self, req_id: UUID | str, payload: RegistrationRejectPayload, reviewer_email: str
+    ) -> HospitalRegistrationDetail:
+        try:
+            uid = UUID(str(req_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Registration request not found",
+            )
+
+        query = self.db.query(HospitalRegistrationRequest).filter(
+            HospitalRegistrationRequest.id == uid
+        )
+        if hasattr(self.db, "bind") and self.db.bind is not None and self.db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        req = query.first()
+
+        if not req:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Registration request not found",
+            )
+
+        if req.status == RegistrationStatus.approved:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot reject an already approved registration request.",
+            )
+        if req.status == RegistrationStatus.rejected:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Registration request is already rejected.",
+            )
+
+        req.status = RegistrationStatus.rejected
+        req.rejection_reason = payload.rejection_reason.strip()
+        req.reviewed_at = datetime.now(timezone.utc)
+        req.reviewed_by = reviewer_email
+
+        write_audit_log(
+            self.db,
+            hospital_id=None,
+            actor={"sub": reviewer_email, "role": "super_admin", "name": "Super Admin"},
+            action="reject",
+            entity_type="hospital_registration",
+            entity_id=req.id,
+            summary=f"Rejected registration request for {req.hospital_name}: {req.rejection_reason}",
+        )
+        self.db.commit()
+        self.db.refresh(req)
+        return HospitalRegistrationDetail.model_validate(req)
+
     # ── CRUD Operations ───────────────────────────────────────────────────────
     def create_hospital(self, payload: HospitalCreate) -> HospitalCreateResponse:
         email = payload.email.strip().lower()
@@ -212,28 +709,53 @@ class TenancyActions:
                 detail="A hospital with this email already exists.",
             )
 
-        generated_password = generate_temp_password(5)
-        hospital = Hospital(
-            hospital_id=generate_hospital_id(self.db),
-            name=payload.name.strip(),
-            address=payload.address.strip(),
-            phone=payload.phone.strip(),
-            email=email,
-            password_hash=hash_password(generated_password),
-            plan=payload.plan,
-            icon_url=payload.icon_url,
-        )
-        self.db.add(hospital)
-        self.db.commit()
-        self.db.refresh(hospital)
+        try:
+            hospital, admin_user, admin_role, raw_token = self._provision_hospital_tenant(
+                name=payload.name,
+                address=payload.address,
+                phone=payload.phone,
+                email=email,
+                plan=payload.plan,
+                contact_name=payload.name,
+                icon_url=payload.icon_url,
+            )
+            write_audit_log(
+                self.db,
+                hospital_id=hospital.id,
+                actor={"sub": "super_admin", "role": "super_admin", "name": "Super Admin"},
+                action="create",
+                entity_type="hospital",
+                entity_id=hospital.id,
+                summary=f"Created hospital {hospital.name} ({hospital.hospital_id}) with administrator {admin_user.email}",
+            )
+            self.db.commit()
+            self.db.refresh(hospital)
+        except Exception:
+            self.db.rollback()
+            raise
 
+        setup_url = f"/setup-password#token={raw_token}"
         return HospitalCreateResponse(
             **HospitalResponse.model_validate(hospital).model_dump(),
-            generated_password=generated_password,
+            generated_password=raw_token,
+            setup_token=raw_token,
+            setup_url=setup_url,
+            admin_email=admin_user.email,
         )
 
-    def list_hospitals(self, search: str | None = None) -> list[HospitalResponse]:
+    def list_hospitals(
+        self,
+        search: str | None = None,
+        status_filter: str | None = None,
+        plan_filter: str | None = None,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[HospitalResponse]:
         query = self.db.query(Hospital).order_by(Hospital.created_at.desc())
+        if status_filter:
+            query = query.filter(Hospital.status == status_filter)
+        if plan_filter:
+            query = query.filter(Hospital.plan == plan_filter)
         if search:
             term = f"%{search.strip().lower()}%"
             query = query.filter(
@@ -241,6 +763,10 @@ class TenancyActions:
                 | (Hospital.email.ilike(term))
                 | (Hospital.hospital_id.ilike(term))
             )
+        if skip > 0:
+            query = query.offset(skip)
+        if limit:
+            query = query.limit(limit)
         rows = query.all()
         return [HospitalResponse.model_validate(r) for r in rows]
 
@@ -254,6 +780,50 @@ class TenancyActions:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
         return HospitalResponse.model_validate(hospital)
 
+    def update_hospital(self, hospital_uuid: str, payload: HospitalUpdate) -> HospitalResponse:
+        try:
+            uid = UUID(str(hospital_uuid))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+        hospital = self.db.query(Hospital).filter(Hospital.id == uid).first()
+        if not hospital:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+
+        if payload.email is not None:
+            new_email = payload.email.strip().lower()
+            if new_email != (hospital.email or "").lower():
+                dup = self.db.query(Hospital).filter(Hospital.email == new_email, Hospital.id != uid).first()
+                if dup:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Another hospital with this email already exists.",
+                    )
+                hospital.email = new_email
+
+        if payload.name is not None:
+            hospital.name = payload.name.strip()
+        if payload.address is not None:
+            hospital.address = payload.address.strip()
+        if payload.phone is not None:
+            hospital.phone = payload.phone.strip()
+        if payload.plan is not None:
+            hospital.plan = payload.plan
+        if payload.icon_url is not None:
+            hospital.icon_url = validate_logo_url(payload.icon_url)
+
+        # Generic metadata update cannot mutate lifecycle states.
+        # Transitions must strictly occur through /suspend, /reactivate, or /archive.
+        if payload.is_active is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Modifying is_active via generic update is forbidden. Archival is terminal; lifecycle transitions must exclusively go through /suspend, /reactivate, or /archive.",
+            )
+        hospital.is_active = (hospital.status == "active")
+
+        self.db.commit()
+        self.db.refresh(hospital)
+        return HospitalResponse.model_validate(hospital)
+
     def delete_hospital(self, hospital_uuid: str) -> None:
         try:
             uid = UUID(str(hospital_uuid))
@@ -262,8 +832,187 @@ class TenancyActions:
         hospital = self.db.query(Hospital).filter(Hospital.id == uid).first()
         if not hospital:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+
+        # Exhaustive domain reference check: inspect all registered tables in Base.metadata
+        # Any table outside admin infrastructure that references hospital_id blocks deletion.
+        for table_name, table in Base.metadata.tables.items():
+            if table_name in ADMIN_INFRA_TABLES:
+                continue
+            if "hospital_id" in table.c:
+                has_records = (
+                    self.db.execute(
+                        select(table.c.hospital_id)
+                        .where(table.c.hospital_id == uid)
+                        .limit(1)
+                    ).first()
+                    is not None
+                )
+                if has_records:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            f"Cannot delete hospital with existing clinical records and domain data "
+                            f"in '{table_name}'. Please archive the hospital instead to preserve data integrity."
+                        ),
+                    )
+
+        # Hospital is an unprovisioned or empty test tenant with zero domain records.
+        # Clean up auxiliary infrastructure rows cleanly.
+        self.db.query(AccountSetupToken).filter(AccountSetupToken.hospital_id == uid).delete(synchronize_session=False)
+        self.db.query(HospitalUserRole).filter(HospitalUserRole.hospital_id == uid).delete(synchronize_session=False)
+        self.db.query(HospitalUser).filter(HospitalUser.hospital_id == uid).delete(synchronize_session=False)
+        self.db.query(StaffRole).filter(StaffRole.hospital_id == uid).delete(synchronize_session=False)
+        self.db.query(HospitalRegistrationRequest).filter(
+            HospitalRegistrationRequest.approved_hospital_id == uid
+        ).update({"approved_hospital_id": None}, synchronize_session=False)
+
         self.db.delete(hospital)
         self.db.commit()
+
+    def suspend_hospital(
+        self, hospital_uuid: str, payload: HospitalSuspendPayload, actor_email: str
+    ) -> HospitalResponse:
+        try:
+            uid = UUID(str(hospital_uuid))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+        hospital = self.db.query(Hospital).filter(Hospital.id == uid).first()
+        if not hospital:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+
+        if hospital.status == "archived":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot suspend an archived hospital. Archival is terminal.",
+            )
+        if hospital.status == "suspended":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Hospital is already suspended.",
+            )
+
+        hospital.status = "suspended"
+        hospital.is_active = False
+        hospital.suspended_at = datetime.now(timezone.utc)
+        hospital.suspended_by = actor_email
+        hospital.suspension_reason = payload.reason.strip()
+
+        write_audit_log(
+            self.db,
+            hospital_id=hospital.id,
+            actor={"sub": actor_email, "role": "super_admin", "name": "Super Admin"},
+            action="suspend",
+            entity_type="hospital",
+            entity_id=hospital.id,
+            summary=f"Suspended hospital {hospital.name}: {hospital.suspension_reason}",
+        )
+        self.db.commit()
+        self.db.refresh(hospital)
+        return HospitalResponse.model_validate(hospital)
+
+    def reactivate_hospital(self, hospital_uuid: str, actor_email: str) -> HospitalResponse:
+        try:
+            uid = UUID(str(hospital_uuid))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+        hospital = self.db.query(Hospital).filter(Hospital.id == uid).first()
+        if not hospital:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+
+        if hospital.status == "archived":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot reactivate an archived hospital. Archival is terminal.",
+            )
+        if hospital.status == "active":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Hospital is already active.",
+            )
+
+        hospital.status = "active"
+        hospital.is_active = True
+        hospital.reactivated_at = datetime.now(timezone.utc)
+        hospital.reactivated_by = actor_email
+
+        write_audit_log(
+            self.db,
+            hospital_id=hospital.id,
+            actor={"sub": actor_email, "role": "super_admin", "name": "Super Admin"},
+            action="reactivate",
+            entity_type="hospital",
+            entity_id=hospital.id,
+            summary=f"Reactivated hospital {hospital.name}",
+        )
+        self.db.commit()
+        self.db.refresh(hospital)
+        return HospitalResponse.model_validate(hospital)
+
+    def archive_hospital(
+        self, hospital_uuid: str, payload: HospitalArchivePayload, actor_email: str
+    ) -> HospitalResponse:
+        try:
+            uid = UUID(str(hospital_uuid))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+        hospital = self.db.query(Hospital).filter(Hospital.id == uid).first()
+        if not hospital:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hospital not found")
+
+        if hospital.status == "archived":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Hospital is already archived.",
+            )
+
+        hospital.status = "archived"
+        hospital.is_active = False
+        hospital.archived_at = datetime.now(timezone.utc)
+        hospital.archived_by = actor_email
+
+        write_audit_log(
+            self.db,
+            hospital_id=hospital.id,
+            actor={"sub": actor_email, "role": "super_admin", "name": "Super Admin"},
+            action="archive",
+            entity_type="hospital",
+            entity_id=hospital.id,
+            summary=f"Archived hospital {hospital.name}: {payload.reason}",
+        )
+        self.db.commit()
+        self.db.refresh(hospital)
+        return HospitalResponse.model_validate(hospital)
+
+    def list_callback_requests(
+        self, status_filter: str | None = None, page: int = 1, page_size: int = 50
+    ) -> list[CallbackRequestResponse]:
+        query = self.db.query(CallbackRequest).order_by(CallbackRequest.created_at.desc())
+        if status_filter:
+            query = query.filter(CallbackRequest.status == status_filter)
+        offset = max(0, (page - 1) * page_size)
+        rows = query.offset(offset).limit(page_size).all()
+        return [CallbackRequestResponse.model_validate(r) for r in rows]
+
+    def update_callback_request(
+        self, req_id: UUID | str, payload: CallbackRequestUpdate
+    ) -> CallbackRequestResponse:
+        try:
+            uid = UUID(str(req_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Callback request not found")
+        req = self.db.query(CallbackRequest).filter(CallbackRequest.id == uid).first()
+        if not req:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Callback request not found")
+        req.status = payload.status
+        if payload.notes is not None:
+            req.notes = payload.notes
+        if payload.status == "contacted" and not req.contacted_at:
+            req.contacted_at = datetime.now(timezone.utc)
+        self.db.commit()
+        self.db.refresh(req)
+        return CallbackRequestResponse.model_validate(req)
+
+
 
     # ── Role Dashboard Logic ──────────────────────────────────────────────────
     def get_role_dashboard(self, hospital_id: UUID, user: dict[str, Any]) -> RoleDashboardResponse:

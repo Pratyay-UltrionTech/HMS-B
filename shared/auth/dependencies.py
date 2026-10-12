@@ -15,20 +15,57 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
 from config.settings import Settings, get_settings
+from infrastructure.postgres.session import get_transitional_sync_session
 
 security = HTTPBearer()
 
-# In-memory TTL cache of role permissions keyed by (hospital_uuid, role_id).
-# Each entry maps module_key -> action_dict and carries timestamp.
-_PERMISSION_CACHE_TTL = 60  # seconds
-_role_permission_cache: dict[tuple[str, str], tuple[float, dict[str, dict[str, bool]]]] = {}
+
+# Zero-cache compliance: HMS enforces direct, transactional database authorization.
+def invalidate_tenant_status_cache(hospital_uuid: str | UUID | None = None) -> None:
+    """Deprecated no-op: HMS is strictly cache-free; authorization queries authoritative DB state."""
+    pass
+
+
+def check_hospital_tenant_active(hospital_uuid: str | UUID, db: Any) -> None:
+    """Authoritative direct database check for operational status (NO CACHE)."""
+    from modules.tenancy.entities.hospital import Hospital
+
+    try:
+        h_uuid = UUID(str(hospital_uuid))
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid hospital context in token",
+        )
+
+    row = db.query(Hospital.is_active, Hospital.status).filter(Hospital.id == h_uuid).first()
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Hospital tenant no longer exists",
+        )
+    is_active = bool(row[0])
+    status_val = str(row[1] or ("active" if is_active else "suspended"))
+    if not is_active or status_val in {"suspended", "archived"}:
+        detail_msg = (
+            "Hospital account is suspended."
+            if status_val == "suspended"
+            else "Hospital tenant is archived and decommissioned. Operational access is closed; records are retained for historical audit."
+            if status_val == "archived"
+            else "Hospital account is suspended or inactive."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=detail_msg,
+        )
 
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Any = Depends(get_transitional_sync_session),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    """Validate Bearer JWT and return user claims payload."""
+    """Validate Bearer JWT and return server-authoritative principal payload (strictly cache-free)."""
     try:
         payload = jwt.decode(
             credentials.credentials,
@@ -47,6 +84,113 @@ def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token role",
         )
+
+    if role == "super_admin":
+        return payload
+
+    # For hospital principals, validate tenant operational status in authoritative DB
+    h_uuid_raw = payload.get("hospital_uuid")
+    if not h_uuid_raw:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Hospital context missing from token",
+        )
+    try:
+        h_uuid = UUID(str(h_uuid_raw))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid hospital context in token",
+        ) from exc
+
+    from modules.tenancy.entities.hospital import Hospital
+    from modules.doctors.entities.doctor import HospitalUser
+
+    hosp = db.query(Hospital).filter(Hospital.id == h_uuid).first()
+    if not hosp:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Hospital tenant no longer exists",
+        )
+
+    status_val = str(getattr(hosp, "status", None) or ("active" if hosp.is_active else "suspended"))
+    if not hosp.is_active or status_val in {"suspended", "archived"}:
+        detail_msg = (
+            "Hospital account is suspended."
+            if status_val == "suspended"
+            else "Hospital tenant is archived and decommissioned. Operational access is closed; records are retained for historical audit."
+            if status_val == "archived"
+            else "Hospital account is suspended or inactive."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=detail_msg,
+        )
+
+    user_id_raw = payload.get("user_id")
+    if user_id_raw:
+        try:
+            u_uuid = UUID(str(user_id_raw))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid user context in token",
+            ) from exc
+
+        staff = db.query(HospitalUser).filter(HospitalUser.id == u_uuid, HospitalUser.hospital_id == h_uuid).first()
+        if not staff:
+            if getattr(hosp, "auth_model", None) == "legacy_organization" or payload.get("role") == "hospital_admin":
+                payload["hospital_uuid"] = str(hosp.id)
+                payload["hospital_id"] = hosp.hospital_id
+                return payload
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User account no longer exists.",
+            )
+        if not staff.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User account is inactive.",
+            )
+
+        token_v = payload.get("token_version")
+        if token_v is not None and staff.token_version > token_v:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session expired or revoked. Please log in again.",
+            )
+
+        # Authoritative role resolution: determine if user is hospital_admin
+        is_admin = False
+        if staff.role and (getattr(staff.role, "is_admin_role", False) or getattr(staff.role, "code", None) == "HOSPITAL_ADMIN"):
+            is_admin = True
+        elif staff.assigned_roles:
+            for ur in staff.assigned_roles:
+                if ur.role and (getattr(ur.role, "is_admin_role", False) or getattr(ur.role, "code", None) == "HOSPITAL_ADMIN") and ur.role.is_active:
+                    is_admin = True
+                    break
+
+        if is_admin or payload.get("role") == "hospital_admin":
+            payload["role"] = "hospital_admin"
+        else:
+            payload["role"] = "hospital_staff"
+
+        payload["hospital_uuid"] = str(hosp.id)
+        payload["hospital_id"] = hosp.hospital_id
+        return payload
+
+    # If no user_id in token: only legacy hospital row accounts allowed
+    auth_model = getattr(hosp, "auth_model", "user_accounts")
+    if auth_model == "user_accounts":
+        has_users = db.query(HospitalUser.id).filter(HospitalUser.hospital_id == h_uuid).first()
+        if has_users:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token: human administrator account required.",
+            )
+
+    payload["hospital_uuid"] = str(hosp.id)
+    payload["hospital_id"] = hosp.hospital_id
     return payload
 
 
@@ -62,86 +206,63 @@ def require_super_admin(
     return user
 
 
-def require_hospital_user(
+def get_active_hospital_tenant(
     user: dict[str, Any] = Depends(get_current_user),
-) -> dict[str, Any]:
-    """Require hospital_admin or hospital_staff role with non-empty hospital_uuid."""
-    if user.get("role") not in {"hospital_admin", "hospital_staff"}:
+) -> UUID:
+    """Request-scoped dependency: extracts validated active hospital UUID from principal."""
+    role = user.get("role")
+    if role not in {"hospital_admin", "hospital_staff"}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Hospital access required",
         )
-    if not user.get("hospital_uuid"):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Hospital context missing from token",
-        )
+    return UUID(str(user["hospital_uuid"]))
+
+
+def require_hospital_user(
+    user: dict[str, Any] = Depends(get_current_user),
+    _: UUID = Depends(get_active_hospital_tenant),
+) -> dict[str, Any]:
+    """Require hospital_admin or hospital_staff role with active tenant in database."""
     return user
 
 
 def require_hospital_admin(
     user: dict[str, Any] = Depends(get_current_user),
+    _: UUID = Depends(get_active_hospital_tenant),
 ) -> dict[str, Any]:
-    """Require hospital_admin role with non-empty hospital_uuid."""
+    """Require hospital_admin role with active tenant in database."""
     if user.get("role") != "hospital_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Hospital admin access required",
-        )
-    if not user.get("hospital_uuid"):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Hospital context missing from token",
         )
     return user
 
 
 def get_hospital_context(
-    user: dict[str, Any] = Depends(get_current_user),
+    hospital_uuid: UUID = Depends(get_active_hospital_tenant),
 ) -> UUID:
-    """Extract and parse hospital_uuid from user claims for clinical modules."""
-    if user.get("role") not in {"hospital_admin", "hospital_staff"}:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Hospital access required",
-        )
-    try:
-        return UUID(str(user["hospital_uuid"]))
-    except (KeyError, ValueError, TypeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid hospital context in token",
-        ) from exc
+    """Extract and return validated active hospital UUID for clinical routes."""
+    return hospital_uuid
 
 
 def get_hospital_uuid(
-    user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(require_hospital_admin),
+    hospital_uuid: UUID = Depends(get_active_hospital_tenant),
 ) -> UUID:
-    """Extract hospital_uuid for hospital_admin only."""
-    if user.get("role") != "hospital_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Hospital admin access required",
-        )
-    try:
-        return UUID(str(user["hospital_uuid"]))
-    except (KeyError, ValueError, TypeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid hospital context in token",
-        ) from exc
+    """Extract hospital_uuid for hospital_admin only, ensuring active tenant in database."""
+    return hospital_uuid
+
 
 
 from shared.auth.registry import ACTION_FLAG_MAP, MODULE_REGISTRY, parse_action
 from shared.auth.service import AuthDecision, AuthReasonCode, authorization
 
 
-# ── Role-permission enforcement with multiple-role union & granular actions ───
-
 def invalidate_role_permission_cache(hospital_id: str | UUID, role_id: str | UUID) -> None:
-    """Drop the cached permissions for a single (hospital, role) pair."""
-    authorization.invalidate_cache(hospital_id, role_id)
-    _role_permission_cache.pop((str(hospital_id), str(role_id)), None)
+    """Deprecated no-op: HMS is strictly cache-free; permissions query authoritative DB state."""
+    pass
 
 
 def _load_role_permissions(db, hospital_uuid: str, role_id: str) -> dict[str, dict[str, bool]]:
@@ -150,7 +271,7 @@ def _load_role_permissions(db, hospital_uuid: str, role_id: str) -> dict[str, di
 
 
 def _get_cached_role_permissions(db, hospital_uuid: str, role_id: str) -> dict[str, dict[str, bool]]:
-    """Return role permissions, populating the TTL cache on miss or expiry."""
+    """Return fresh role permissions from DB (NO CACHE)."""
     return authorization.get_role_permissions(db, hospital_uuid, role_id)
 
 

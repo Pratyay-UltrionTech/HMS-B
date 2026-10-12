@@ -36,13 +36,50 @@ class HospitalResponse(BaseModel):
     plan: PlanType
     icon_url: str | None = None
     is_active: bool
+    status: str = "active"
+    suspended_at: datetime | None = None
+    suspended_by: str | None = None
+    suspension_reason: str | None = None
+    reactivated_at: datetime | None = None
+    reactivated_by: str | None = None
+    archived_at: datetime | None = None
+    archived_by: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
 
 
+class HospitalUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    address: str | None = None
+    phone: str | None = None
+    email: EmailStr | None = None
+    plan: PlanType | None = None
+    icon_url: str | None = None
+    is_active: bool | None = Field(
+        default=None,
+        description="Deprecated & forbidden in generic PATCH. Lifecycle changes must exclusively go through /suspend, /reactivate, or /archive.",
+    )
+
+
+class HospitalSuspendPayload(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+
+class HospitalArchivePayload(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
 class HospitalCreateResponse(HospitalResponse):
-    generated_password: str
+    setup_token: str | None = None
+    setup_url: str | None = None
+    admin_email: str | None = None
+    generated_password: str | None = Field(
+        default=None,
+        description="Deprecated: use setup_url or setup_token. Kept only for temporary backward compatibility.",
+    )
+
 
 
 class HospitalDashboardListItem(BaseModel):

@@ -51,7 +51,9 @@ MODULE_REGISTRY: dict[str, ModuleDefinition] = {
     "mis": ModuleDefinition("mis", "Management Information System", ("view",), "Analytics"),
     "billing": ModuleDefinition("billing", "Billing & Cashier", ("view", "edit", "create", "cancel", "refund", "approve"), "Financial"),
     "pharmacy": ModuleDefinition("pharmacy", "Pharmacy Operations", ("view", "edit", "create", "dispense"), "Pharmacy"),
-    "emergency": ModuleDefinition("emergency", "Emergency Department", ("view", "edit", "create", "administer"), "Emergency"),
+    # emergency.approve = authority to grant emergency financial overrides
+    # (modules/billing/services/financial_authorization.py).
+    "emergency": ModuleDefinition("emergency", "Emergency Department", ("view", "edit", "create", "administer", "approve"), "Emergency"),
     "critical_care": ModuleDefinition("critical_care", "Critical Care & ICU", ("view", "edit", "create", "administer"), "Inpatient"),
     "ambulance": ModuleDefinition("ambulance", "Ambulance Fleet", ("view", "edit", "create"), "Logistics"),
     "blood_bank": ModuleDefinition("blood_bank", "Blood Bank", ("view", "edit", "create", "release", "approve"), "Diagnostic"),
@@ -109,6 +111,7 @@ ROLE_TEMPLATES: dict[str, dict[str, list[str]]] = {
         "radiology": ["view", "create"],
         "pharmacy": ["view", "create"],
         "clinical_decision": ["view"],
+        "emergency": ["view", "approve"],
     },
     "nurse": {
         "nurses": ["view", "edit"],
@@ -136,5 +139,17 @@ ROLE_TEMPLATES: dict[str, dict[str, list[str]]] = {
     },
     "billing_manager": {
         "billing": ["view", "create", "edit", "cancel", "refund", "approve"],
+    },
+    "receptionist": {
+        "registration": ["view", "edit", "create"],
+        "appointment": ["view", "edit", "create", "cancel"],
+        "billing": ["view", "create"],
+        "vitals": ["view"],
+    },
+    "front_desk": {
+        "registration": ["view", "edit", "create"],
+        "appointment": ["view", "edit", "create", "cancel"],
+        "billing": ["view", "create"],
+        "vitals": ["view"],
     },
 }

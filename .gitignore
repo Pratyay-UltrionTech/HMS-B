@@ -73,3 +73,7 @@ instance/
 
 # Local storage uploads
 /storage/
+
+compress.bat
+compress.py
+scratch/

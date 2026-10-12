@@ -8,10 +8,40 @@ from modules.tenancy.entities.hospital import PlanType
 
 
 class LoginRequest(BaseModel):
-    """Login credentials payload."""
+    """Login credentials payload with optional tenant qualification."""
 
     email: EmailStr
     password: str
+    hospital_id: str | None = None
+
+
+class MatchingHospitalSummary(BaseModel):
+    """Summary of a hospital for disambiguation during login."""
+
+    hospital_id: str
+    name: str
+
+
+class SetupPasswordRequest(BaseModel):
+    """Payload to set password using a setup or invite token."""
+
+    token: str
+    password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Payload to initiate password reset."""
+
+    email: EmailStr
+    hospital_id: str | None = None
+
+
+class ResetPasswordRequest(BaseModel):
+    """Payload to reset password using a reset token."""
+
+    token: str
+    password: str
+
 
 
 class LoginResponse(BaseModel):

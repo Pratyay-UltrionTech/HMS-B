@@ -37,10 +37,11 @@ from modules.pharmacy.api.drug_interaction_api import router as drug_interaction
 from modules.pharmacy.api.pharmacy_api import router as pharmacy_router
 from modules.radiology.api.radiology_api import router as radiology_router
 from modules.sync.api.sync_api import router as sync_router
-from modules.tenancy.api.tenancy_api import router as tenancy_router
+from modules.tenancy.api.tenancy_api import callback_router, router as tenancy_router
 from modules.vitals.api.vitals_api import router as vitals_router
 
 root_router = APIRouter()
+
 
 # Mount migrated vertical slice routers
 root_router.include_router(auth_router)
@@ -76,3 +77,5 @@ root_router.include_router(inventory_router)
 root_router.include_router(procurement_router)
 root_router.include_router(admin_router)
 root_router.include_router(tenancy_router)
+root_router.include_router(callback_router)
+

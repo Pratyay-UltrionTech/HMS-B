@@ -71,25 +71,12 @@ class AuthDecision:
 class AuthorizationService:
     """Canonical Authorization Engine for HMS."""
 
-    def __init__(self, cache_ttl_seconds: int = 60) -> None:
-        self._cache_ttl = cache_ttl_seconds
-        # In-memory TTL cache keyed by (hospital_uuid, role_id) -> (cached_at, permissions_dict)
-        self._role_cache: dict[tuple[str, str], tuple[float, dict[str, dict[str, bool]]]] = {}
+    def __init__(self, cache_ttl_seconds: int = 0) -> None:
+        pass
 
     def invalidate_cache(self, hospital_id: str | UUID | None = None, role_id: str | UUID | None = None) -> None:
-        """Evict permission cache entries."""
-        if hospital_id is None and role_id is None:
-            self._role_cache.clear()
-            return
-        keys_to_remove = []
-        for (h, r) in self._role_cache.keys():
-            if hospital_id and str(hospital_id) != h:
-                continue
-            if role_id and str(role_id) != r:
-                continue
-            keys_to_remove.append((h, r))
-        for k in keys_to_remove:
-            self._role_cache.pop(k, None)
+        """Deprecated no-op: HMS is strictly cache-free; permissions query authoritative DB state."""
+        pass
 
     def _load_role_permissions(self, db: Any, hospital_uuid: str, role_id: str) -> dict[str, dict[str, bool]]:
         """Load granular permissions for a role from the database."""
@@ -136,15 +123,8 @@ class AuthorizationService:
         return perms
 
     def get_role_permissions(self, db: Any, hospital_uuid: str, role_id: str) -> dict[str, dict[str, bool]]:
-        """Return cached role permissions or fetch from DB."""
-        key = (str(hospital_uuid), str(role_id))
-        now = time.monotonic()
-        cached = self._role_cache.get(key)
-        if cached and (now - cached[0]) < self._cache_ttl:
-            return cached[1]
-        perms = self._load_role_permissions(db, hospital_uuid, role_id)
-        self._role_cache[key] = (now, perms)
-        return perms
+        """Return fresh role permissions loaded directly from authoritative DB state (NO CACHE)."""
+        return self._load_role_permissions(db, hospital_uuid, role_id)
 
     def evaluate(
         self,
@@ -263,6 +243,12 @@ class AuthorizationService:
                 # Caller supplied effective permissions directly
                 assigned_role_ids = ["claims_permissions"]
                 active_role_ids = ["claims_permissions"]
+            else:
+                from shared.auth.registry import ROLE_TEMPLATES
+                tmpl_key = str(user.get("role") or user.get("staff_role_name") or "").lower()
+                if tmpl_key in ROLE_TEMPLATES:
+                    assigned_role_ids = [tmpl_key]
+                    active_role_ids = [tmpl_key]
 
         if not assigned_role_ids:
             return AuthDecision(
@@ -320,6 +306,15 @@ class AuthorizationService:
                 if action_name == "create" and mod_perms.get("can_edit", False):
                     has_permission = True
                     break
+
+        if not has_permission:
+            from shared.auth.registry import ROLE_TEMPLATES
+            for r_id in active_role_ids:
+                if r_id in ROLE_TEMPLATES:
+                    tmpl_perms = ROLE_TEMPLATES[r_id].get(module_key, [])
+                    if action_name in tmpl_perms or (action_name == "create" and "edit" in tmpl_perms):
+                        has_permission = True
+                        break
 
         if not has_permission:
             return AuthDecision(

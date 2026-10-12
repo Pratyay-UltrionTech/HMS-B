@@ -7,8 +7,10 @@ while adding target architecture settings (asyncpg URL, cutover toggles).
 """
 
 from functools import lru_cache
+from typing_extensions import Self
 from urllib.parse import quote_plus
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +22,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    environment: str = "development"
+
 
     # Database settings
     postgres_host: str = "localhost"
@@ -86,6 +91,16 @@ class Settings(BaseSettings):
     use_migrated_masters: bool = False
     use_migrated_admin: bool = False
     use_migrated_hospitals: bool = False
+
+    @model_validator(mode="after")
+    def validate_production_secrets(self) -> Self:
+        if self.environment.lower() == "production":
+            if self.jwt_secret == "change-me-in-production-ultrion-hms":
+                raise ValueError("In production, JWT_SECRET must be configured with a secure random key.")
+            if self.super_admin_password == "UltrionHMS":
+                raise ValueError("In production, SUPER_ADMIN_PASSWORD must be configured with a strong secret.")
+        return self
+
 
 
     @property

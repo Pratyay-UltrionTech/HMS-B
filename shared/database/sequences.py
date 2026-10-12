@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Integer, String
+from sqlalchemy import Integer, String, case
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -73,32 +73,49 @@ def ensure_counter_at_least(
     the atomic counter existed). Returns the counter's current value after
     the bump. Safe to call repeatedly; never moves the counter backwards.
     """
-    current = (
+    values = {
+        "hospital_id": hospital_id,
+        "counter_name": counter_name,
+        "current_val": minimum,
+    }
+    update_val = case(
+        (SequenceCounter.current_val < minimum, minimum),
+        else_=SequenceCounter.current_val,
+    )
+    if db.get_bind().dialect.name == "postgresql":
+        stmt = (
+            pg_insert(SequenceCounter)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[SequenceCounter.hospital_id, SequenceCounter.counter_name],
+                set_={"current_val": update_val},
+            )
+            .returning(SequenceCounter.current_val)
+        )
+    else:
+        stmt = (
+            sqlite_insert(SequenceCounter)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[SequenceCounter.hospital_id, SequenceCounter.counter_name],
+                set_={"current_val": update_val},
+            )
+            .returning(SequenceCounter.current_val)
+        )
+    return db.execute(stmt).scalar_one()
+
+
+def counter_exists(db: Session, hospital_id: uuid.UUID, counter_name: str) -> bool:
+    """Return True if a sequence counter row is already initialized for this hospital."""
+    return (
         db.query(SequenceCounter.current_val)
         .filter(
             SequenceCounter.hospital_id == hospital_id,
             SequenceCounter.counter_name == counter_name,
         )
         .scalar()
+        is not None
     )
-    if current is None:
-        db.add(
-            SequenceCounter(
-                hospital_id=hospital_id,
-                counter_name=counter_name,
-                current_val=minimum,
-            )
-        )
-        db.flush()
-        return minimum
-    if current < minimum:
-        db.query(SequenceCounter).filter(
-            SequenceCounter.hospital_id == hospital_id,
-            SequenceCounter.counter_name == counter_name,
-        ).update({"current_val": minimum}, synchronize_session=False)
-        db.flush()
-        return minimum
-    return current
 
 
 def next_uhid(db: Session, hospital_id: uuid.UUID) -> str:

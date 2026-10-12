@@ -49,6 +49,7 @@ def get_transitional_sync_session_factory() -> sessionmaker[Session]:
         bind=get_transitional_sync_engine(),
         autocommit=False,
         autoflush=False,
+        expire_on_commit=False,
     )
 
 
