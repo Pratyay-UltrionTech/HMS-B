@@ -85,3 +85,16 @@ class ForbiddenError(AppError):
         details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message=message, code=code, details=details)
+
+
+class FinancialIntegrityError(AppError):
+    """Raised when a financial transaction cannot be completed with data integrity (maps to HTTP 500/400)."""
+
+    def __init__(
+        self,
+        message: str = "Financial integrity error",
+        code: str = "FINANCIAL_INTEGRITY_ERROR",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message=message, code=code, details=details)
+

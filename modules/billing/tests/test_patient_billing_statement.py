@@ -444,9 +444,9 @@ def test_deposit_usage_representation(client: TestClient, db_session: Session, h
         db_session,
         hospital_id=hospital.id,
         patient_id=patient.id,
-        source_type=BillingSourceType.bed,
+        source_type=BillingSourceType.other,
         source_id=uuid4(),
-        description="Bed Charge",
+        description="Service Charge",
         charge_amount=2000.0,
     )
     db_session.commit()

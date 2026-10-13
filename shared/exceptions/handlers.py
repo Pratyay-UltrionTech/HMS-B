@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from shared.exceptions.base import (
     AppError,
     ConflictError,
+    FinancialIntegrityError,
     ForbiddenError,
     NotFoundError,
     UnauthorizedError,
@@ -37,8 +38,13 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ConflictError)
     async def conflict_handler(_: Request, exc: ConflictError) -> JSONResponse:
+        status_code = getattr(exc, "status_code", None) or (
+            status.HTTP_409_CONFLICT
+            if getattr(exc, "code", "") == "IDEMPOTENCY_CONFLICT"
+            else status.HTTP_400_BAD_REQUEST
+        )
         return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status_code,
             content={"detail": exc.message},
         )
 
@@ -53,6 +59,13 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def forbidden_handler(_: Request, exc: ForbiddenError) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": exc.message},
+        )
+
+    @app.exception_handler(FinancialIntegrityError)
+    async def financial_integrity_handler(_: Request, exc: FinancialIntegrityError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
             content={"detail": exc.message},
         )
 

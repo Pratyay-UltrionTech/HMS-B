@@ -862,6 +862,28 @@ def assert_service_financially_cleared(
             detail=f"Cannot {action_description}: billing charge is cancelled.",
         )
 
+    # Automatically apply eligible deposits to cover the service charge if available
+    if state.charge_id and (state.outstanding_amount or 0) > 0:
+        from modules.billing.entities.billing_entities import BillingCharge
+        from modules.billing.services.billing_service import draw_down_account_deposits_for_charge
+
+        charge = db.query(BillingCharge).filter(
+            BillingCharge.id == state.charge_id,
+            BillingCharge.hospital_id == hospital_id,
+        ).first()
+        if charge and charge.status != BillingChargeStatus.cancelled:
+            allocated = draw_down_account_deposits_for_charge(
+                db,
+                hospital_id=hospital_id,
+                charge=charge,
+                created_by_name=str((actor or {}).get("name") or (actor or {}).get("sub") or "Auto Deposit Settlement"),
+            )
+            if allocated > 0:
+                db.flush()
+                state = check_service_financial_clearance(db, hospital_id, source_type, source_id)
+                if state.is_cleared:
+                    return state
+
     if exception_scope == "order":
         prior = _find_order_scoped_exception(db, hospital_id, source_type, source_id, patient_id)
         if prior is not None:

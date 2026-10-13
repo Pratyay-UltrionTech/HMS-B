@@ -358,14 +358,16 @@ def ensure_bed_charge_for_admission(
     patient_id: UUID,
     admission_id: UUID,
     admitted_at: datetime,
-    discharged_at: datetime,
-    ward_name: str | None,
-    room_code: str | None,
-    bed_code: str | None,
-    bed_charge_per_day: float,
+    discharged_at: datetime | None = None,
+    as_of: datetime | None = None,
+    ward_name: str | None = None,
+    room_code: str | None = None,
+    bed_code: str | None = None,
+    bed_charge_per_day: float = 0.0,
     created_by_name: str = "",
-) -> BillingCharge:
-    """Calculate and post bed stay daily charges upon discharge, accounting for transfer segments."""
+) -> BillingCharge | None:
+    """Calculate and post bed stay daily charges up to discharge or as_of for active stays, accounting for transfer segments."""
+    effective_end = discharged_at or as_of or datetime.now(timezone.utc)
     try:
         from modules.inpatient.entities.admission import BedStaySegment
         segments = (
@@ -380,13 +382,15 @@ def ensure_bed_charge_for_admission(
     except Exception:
         segments = []
 
+    charge: BillingCharge | None = None
+
     if segments:
         total_amount = 0.0
         total_days = 0
         notes_parts = []
         for s in segments:
             seg_start = s.started_at
-            seg_end = s.ended_at or discharged_at
+            seg_end = s.ended_at or effective_end
             seg_days = bed_stay_days(seg_start, seg_end)
             seg_rate = float(s.rate_per_day or 0.0)
             seg_amount = round(seg_rate * seg_days, 2)
@@ -420,61 +424,71 @@ def ensure_bed_charge_for_admission(
                 charge.quantity = float(days)
                 charge.unit_price = round(amount / days, 2) if days > 0 else 0.0
                 charge.notes = f"multi_segment; days={days}; {'; '.join(notes_parts)}"[:512]
-            return charge
-        return ensure_charge(
+        else:
+            charge = ensure_charge(
+                db,
+                hospital_id=hospital_id,
+                patient_id=patient_id,
+                source_type=BillingSourceType.bed,
+                source_id=admission_id,
+                description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
+                quantity=float(days),
+                unit_price=round(amount / days, 2) if days > 0 else 0.0,
+                charge_amount=amount,
+                created_by_name=created_by_name or "System",
+                notes=f"multi_segment; days={days}; {'; '.join(notes_parts)}"[:512],
+            )
+    else:
+        days = bed_stay_days(admitted_at, effective_end)
+        amount = round(float(bed_charge_per_day or 0) * days, 2)
+        if amount <= 0:
+            return None
+        day_label = "Day" if days == 1 else "Days"
+        place = " / ".join(
+            p for p in [ward_name or None, room_code or None, bed_code or None] if p
+        ) or "Bed"
+        existing = find_charge_by_source(db, hospital_id, BillingSourceType.bed, admission_id)
+        if existing:
+            from modules.billing.services.service_charge_resolver import sync_service_charge_amount
+            charge = sync_service_charge_amount(
+                db,
+                hospital_id=hospital_id,
+                patient_id=patient_id,
+                source_type=BillingSourceType.bed,
+                source_id=admission_id,
+                charge_amount=amount,
+                description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
+                reason=f"Bed stay updated ({days} {day_label})",
+                created_by_name=created_by_name or "System",
+            )
+            if charge:
+                charge.quantity = float(days)
+                charge.unit_price = float(bed_charge_per_day or 0)
+                charge.notes = f"days={days}; rate_per_day={float(bed_charge_per_day or 0)}"
+        else:
+            charge = ensure_charge(
+                db,
+                hospital_id=hospital_id,
+                patient_id=patient_id,
+                source_type=BillingSourceType.bed,
+                source_id=admission_id,
+                description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
+                quantity=float(days),
+                unit_price=float(bed_charge_per_day or 0),
+                charge_amount=amount,
+                created_by_name=created_by_name or "System",
+                notes=f"days={days}; rate_per_day={float(bed_charge_per_day or 0)}",
+            )
+
+    if charge and charge.account_id:
+        draw_down_account_deposits_for_charge(
             db,
             hospital_id=hospital_id,
-            patient_id=patient_id,
-            source_type=BillingSourceType.bed,
-            source_id=admission_id,
-            description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
-            quantity=float(days),
-            unit_price=round(amount / days, 2) if days > 0 else 0.0,
-            charge_amount=amount,
+            charge=charge,
             created_by_name=created_by_name or "System",
-            notes=f"multi_segment; days={days}; {'; '.join(notes_parts)}"[:512],
         )
 
-    days = bed_stay_days(admitted_at, discharged_at)
-    amount = round(float(bed_charge_per_day or 0) * days, 2)
-    if amount <= 0:
-        return None
-    day_label = "Day" if days == 1 else "Days"
-    place = " / ".join(
-        p for p in [ward_name or None, room_code or None, bed_code or None] if p
-    ) or "Bed"
-    existing = find_charge_by_source(db, hospital_id, BillingSourceType.bed, admission_id)
-    if existing:
-        from modules.billing.services.service_charge_resolver import sync_service_charge_amount
-        charge = sync_service_charge_amount(
-            db,
-            hospital_id=hospital_id,
-            patient_id=patient_id,
-            source_type=BillingSourceType.bed,
-            source_id=admission_id,
-            charge_amount=amount,
-            description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
-            reason=f"Bed stay updated ({days} {day_label})",
-            created_by_name=created_by_name or "System",
-        )
-        if charge:
-            charge.quantity = float(days)
-            charge.unit_price = float(bed_charge_per_day or 0)
-            charge.notes = f"days={days}; rate_per_day={float(bed_charge_per_day or 0)}"
-        return charge
-    return ensure_charge(
-        db,
-        hospital_id=hospital_id,
-        patient_id=patient_id,
-        source_type=BillingSourceType.bed,
-        source_id=admission_id,
-        description=f"Bed Charges ({days} {day_label}) — {place}"[:512],
-        quantity=float(days),
-        unit_price=float(bed_charge_per_day or 0),
-        charge_amount=amount,
-        created_by_name=created_by_name or "System",
-        notes=f"days={days}; rate_per_day={float(bed_charge_per_day or 0)}",
-    )
+    return charge
 
 
 MONEY_EPS = 0.005
@@ -704,8 +718,10 @@ def allocate_payment_to_charges(
             ),
         )
     )
-    if account_id:
+    if account_id is not None:
         query = query.filter(BillingCharge.account_id == account_id)
+    else:
+        query = query.filter(BillingCharge.account_id.is_(None))
     
     charges = query.order_by(BillingCharge.created_at.asc()).with_for_update().all()
     if not charges:
@@ -765,9 +781,10 @@ def allocate_specific_charges(
     Applies any per-item discount requested at settlement before recording allocations.
     Enforces that charges belong to the scoped account_id when account-bound.
     """
-    if deposit_id and account_id is None:
+    is_deposit_allocation = deposit_id is not None
+    if is_deposit_allocation and account_id is None:
         dep_row = db.query(BillingDeposit.account_id).filter(BillingDeposit.id == deposit_id).first()
-        if dep_row and dep_row[0]:
+        if dep_row:
             account_id = dep_row[0]
 
     plan_cids = [item["charge_id"] for item in allocations_plan if item.get("charge_id")]
@@ -810,11 +827,18 @@ def allocate_specific_charges(
         if not charge:
             continue
 
-        if account_id and charge.account_id != account_id:
-            raise ValueError(
-                f"Cross-account allocation prohibited: Charge {charge.id} belongs to account {charge.account_id}, "
-                f"which does not match the required account {account_id}."
-            )
+        if is_deposit_allocation:
+            if charge.account_id != account_id:
+                raise ValueError(
+                    f"Cross-account allocation prohibited: Deposit belongs to account '{account_id}', "
+                    f"which does not match charge account '{charge.account_id}'."
+                )
+        elif account_id is not None:
+            if charge.account_id != account_id:
+                raise ValueError(
+                    f"Cross-account allocation prohibited: Charge {charge.id} belongs to account {charge.account_id}, "
+                    f"which does not match the required account {account_id}."
+                )
 
         # If discount is specified at payment settlement, apply and recalculate net.
         disc_amt = item.get("discount_amount")
@@ -1007,6 +1031,18 @@ def create_deposit(
         if existing:
             return existing
 
+    # Scope and deposit type integrity
+    if deposit_type == "general":
+        if admission_id is not None or account_id is not None:
+            raise ValueError(
+                "General account deposits must be unscoped: admission_id and account_id must be None"
+            )
+    elif deposit_type == "ipd_advance":
+        if admission_id is None and account_id is None:
+            raise ValueError(
+                "Inpatient advance deposit (ipd_advance) requires a valid admission_id or account_id"
+            )
+
     # Integrity verification
     if admission_id is not None:
         from modules.inpatient.entities.admission import Admission
@@ -1147,6 +1183,7 @@ def draw_down_deposit_for_charges(
     new_avail = round(float(deposit.available_amount) - allocated, 2)
     deposit.available_amount = max(0.0, new_avail)
     refresh_deposit_status(db, deposit)
+    db.flush()
     return allocated
 
 
@@ -1173,13 +1210,11 @@ def draw_down_deposits_bulk_for_account(
             BillingDeposit.available_amount > 0,
         )
     )
-    if account_id:
-        deposit_query = deposit_query.filter(
-            or_(
-                BillingDeposit.account_id == account_id,
-                BillingDeposit.account_id.is_(None),
-            )
-        )
+    if account_id is not None:
+        deposit_query = deposit_query.filter(BillingDeposit.account_id == account_id)
+    else:
+        deposit_query = deposit_query.filter(BillingDeposit.account_id.is_(None))
+
     deposits = (
         deposit_query
         .order_by(BillingDeposit.created_at.asc())
@@ -1197,8 +1232,11 @@ def draw_down_deposits_bulk_for_account(
             BillingCharge.status.in_([BillingChargeStatus.pending, BillingChargeStatus.partially_paid]),
         )
     )
-    if account_id:
+    if account_id is not None:
         charge_query = charge_query.filter(BillingCharge.account_id == account_id)
+    else:
+        charge_query = charge_query.filter(BillingCharge.account_id.is_(None))
+
     charges = charge_query.order_by(BillingCharge.created_at.asc()).with_for_update().all()
     if not charges:
         return 0.0
@@ -1351,7 +1389,9 @@ def draw_down_account_deposits_for_charge(
     Draws from multiple deposits, oldest first, with explicit allocation rows.
     Returns the total amount allocated.
     """
-    if charge.status == BillingChargeStatus.cancelled:
+    if charge.status in (BillingChargeStatus.cancelled, BillingChargeStatus.paid):
+        return 0.0
+    if charge.amount_paid is not None and float(charge.amount_paid) >= float(charge.net_amount or 0) - MONEY_EPS:
         return 0.0
     recompute_charge_financials(db, charge)
     outstanding = round(float(charge.net_amount or 0) - float(charge.amount_paid or 0), 2)
@@ -1383,6 +1423,24 @@ def draw_down_account_deposits_for_charge(
         total = round(total + got, 2)
         outstanding = round(outstanding - got, 2)
     return total
+
+
+def auto_apply_eligible_deposits_to_charge(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    charge: BillingCharge,
+    created_by_name: str = "Auto Deposit Settlement",
+    max_amount: float | None = None,
+) -> float:
+    """Centralized service operation to auto-settle a charge against eligible account deposits."""
+    return draw_down_account_deposits_for_charge(
+        db,
+        hospital_id=hospital_id,
+        charge=charge,
+        created_by_name=created_by_name,
+        max_amount=max_amount,
+    )
 
 
 # ── Payment balances ────────────────────────────────────────────────────────
@@ -2170,3 +2228,122 @@ def account_to_dict(acc: FinancialAccount, patient: Patient | None = None) -> di
         "patient_name": pat.name if pat else None,
         "patient_uhid": pat.uhid if pat else None,
     }
+
+
+def prepare_ipd_bill(
+    db: Session,
+    *,
+    hospital_id: UUID,
+    account_id: UUID | None = None,
+    admission_id: UUID | None = None,
+    as_of: datetime | None = None,
+    actor_name: str = "Billing Preparation",
+) -> dict[str, Any]:
+    """Prepare and reconcile an active IPD bill before presenting charges or generating invoice.
+
+    1. Validates hospital tenancy and resolves FinancialAccount & Admission.
+    2. Reconciles current BedStaySegments through as_of (default now).
+    3. Creates/updates canonical bed charge.
+    4. Auto-draws down only deposits belonging strictly to this IPD account.
+    5. Recomputes current financial state.
+    6. Returns current account charges and financial summary.
+    """
+    if not account_id and not admission_id:
+        raise ValueError("Either account_id or admission_id must be provided to prepare IPD bill")
+
+    acc: FinancialAccount | None = None
+    if account_id is not None:
+        acc = (
+            db.query(FinancialAccount)
+            .filter(
+                FinancialAccount.id == account_id,
+                FinancialAccount.hospital_id == hospital_id,
+            )
+            .first()
+        )
+        if not acc:
+            raise ValueError(f"FinancialAccount {account_id} not found")
+        admission_id = acc.admission_id
+
+    adm = None
+    if admission_id is not None:
+        from modules.inpatient.entities.admission import Admission
+        adm = (
+            db.query(Admission)
+            .filter(
+                Admission.id == admission_id,
+                Admission.hospital_id == hospital_id,
+            )
+            .first()
+        )
+        if not adm:
+            raise ValueError(f"Admission {admission_id} not found")
+
+        if acc is None:
+            acc = get_or_create_financial_account(
+                db,
+                hospital_id=hospital_id,
+                patient_id=adm.patient_id,
+                account_type=FinancialAccountType.ipd,
+                admission_id=adm.id,
+                created_by_name=actor_name,
+            )
+
+    if acc is None:
+        raise ValueError("Could not resolve IPD financial account")
+
+    effective_as_of = as_of or datetime.now(timezone.utc)
+
+    # Reconcile bed stay charges through effective_as_of
+    if adm is not None:
+        ensure_bed_charge_for_admission(
+            db,
+            hospital_id=hospital_id,
+            patient_id=adm.patient_id,
+            admission_id=adm.id,
+            admitted_at=adm.admitted_at,
+            discharged_at=adm.discharged_at,
+            as_of=effective_as_of,
+            ward_name=getattr(adm, "ward_name", None),
+            room_code=getattr(adm, "room_code", None),
+            bed_code=getattr(adm, "bed_code", None),
+            bed_charge_per_day=float(getattr(adm, "bed_charge_per_day", 0.0) or 0.0),
+            created_by_name=actor_name,
+        )
+
+    # Auto-apply deposits belonging strictly to this exact IPD account
+    draw_down_deposits_bulk_for_account(
+        db,
+        hospital_id=hospital_id,
+        patient_id=acc.patient_id,
+        account_id=acc.id,
+        created_by_name=actor_name,
+    )
+
+    db.flush()
+
+    charges = (
+        db.query(BillingCharge)
+        .filter(
+            BillingCharge.hospital_id == hospital_id,
+            BillingCharge.account_id == acc.id,
+            BillingCharge.status != BillingChargeStatus.cancelled,
+        )
+        .order_by(BillingCharge.created_at.asc())
+        .all()
+    )
+
+    total_charges = round(sum(float(c.net_amount or 0.0) for c in charges), 2)
+    total_paid = round(sum(float(c.amount_paid or 0.0) for c in charges), 2)
+    outstanding = round(max(0.0, total_charges - total_paid), 2)
+
+    return {
+        "account_id": acc.id,
+        "admission_id": acc.admission_id,
+        "as_of": effective_as_of.isoformat(),
+        "total_charges": total_charges,
+        "total_paid": total_paid,
+        "outstanding": outstanding,
+        "charges": [charge_to_dict(c) for c in charges],
+    }
+

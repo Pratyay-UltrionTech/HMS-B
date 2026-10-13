@@ -15,6 +15,7 @@ from infrastructure.postgres.engine import (
     get_async_engine,
     get_transitional_sync_engine,
 )
+import shared.sync.events  # noqa: F401 - Register commit/rollback event hooks for real-time sync
 
 
 def get_async_session_factory() -> async_sessionmaker[AsyncSession]:

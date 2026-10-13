@@ -10,6 +10,7 @@ from datetime import date
 import re
 from uuid import UUID
 
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from modules.billing.entities.billing_entities import (
@@ -20,6 +21,7 @@ from modules.billing.entities.billing_entities import (
     BillingInvoiceLine,
     BillingInvoiceStatus,
     BillingPayment,
+    BillingPaymentAllocation,
     BillingPaymentMethod,
     BillingReceipt,
     BillingReceiptStatus,
@@ -235,7 +237,17 @@ def create_invoice_from_charges(
     net_sum = round(sum(float(c.net_amount or 0) for c in charges), 2)
     grand_total = round(taxable_amount + final_tax, 2)
 
-    resolved_account_id = account_id or charges[0].account_id if charges else None
+    # Validate financial account consistency across charges
+    distinct_account_ids = {c.account_id for c in charges}
+    if account_id is not None:
+        for c in charges:
+            if c.account_id != account_id:
+                raise ValueError("All selected charges must belong to the specified financial account")
+        resolved_account_id = account_id
+    else:
+        if len(distinct_account_ids) > 1:
+            raise ValueError("Cannot combine charges from different financial accounts into a single invoice")
+        resolved_account_id = list(distinct_account_ids)[0] if distinct_account_ids else None
 
     inv = BillingInvoice(
         hospital_id=hospital_id,
@@ -340,6 +352,9 @@ def issue_receipt(
     )
     db.add(receipt)
     db.flush()
+    # Authoritative immutable snapshot calculation during receipt issuance (fails loudly on error)
+    from modules.billing.services.receipt_financial_context import compute_receipt_snapshots
+    compute_receipt_snapshots(db, hospital_id, receipt)
     return receipt
 
 
@@ -377,12 +392,175 @@ def issue_receipt_for_payment(
     )
 
 
-def invoice_to_dict(inv: BillingInvoice, patient: Patient | None = None, *, include_lines: bool = True) -> dict:
+def calculate_invoice_settlement(
+    db: Session,
+    inv: BillingInvoice,
+    *,
+    hospital_id: UUID | None = None,
+    include_payment_breakdown: bool = False,
+) -> dict[str, Any]:
+    """Calculate authoritative settlement totals (grand_total, amount_paid, balance_due, payments) for an invoice.
+
+    For an active invoice:
+      Derives settlement from current authoritative charge/payment/deposit allocations.
+      If status is paid: amount_paid is grand_total.
+      Otherwise: sum of amount_paid across the invoice's linked charges (capped at grand_total).
+    For historical superseded/cancelled invoices:
+      Calculates historical allocation as of the supersession cutoff, excluding payments linked to other invoices.
+    """
+    grand_total = float(inv.grand_total or 0.0)
+    is_cancelled = (inv.status == BillingInvoiceStatus.cancelled)
+    cutoff = (inv.updated_at or inv.created_at) if is_cancelled else None
+    charge_ids = [line.charge_id for line in (inv.lines or []) if line.charge_id]
+    hosp_id = hospital_id or inv.hospital_id
+
+    payment_rows: list[dict] = []
+
+    if is_cancelled and cutoff:
+        other_invoice_payments = {
+            r[0]
+            for r in db.query(BillingReceipt.payment_id)
+            .filter(
+                BillingReceipt.payment_id.isnot(None),
+                BillingReceipt.linked_invoice_id.isnot(None),
+                BillingReceipt.linked_invoice_id != inv.id,
+            )
+            .all()
+        }
+        alloc_query = db.query(
+            BillingPaymentAllocation.payment_id,
+            BillingPaymentAllocation.allocated_amount,
+        ).filter(
+            BillingPaymentAllocation.charge_id.in_(charge_ids),
+            BillingPaymentAllocation.created_at <= cutoff,
+        )
+        if other_invoice_payments:
+            alloc_query = alloc_query.filter(
+                or_(
+                    BillingPaymentAllocation.payment_id.is_(None),
+                    ~BillingPaymentAllocation.payment_id.in_(other_invoice_payments),
+                )
+            )
+        alloc_rows = alloc_query.all() if charge_ids else []
+        historical_paid = round(sum(float(r[1] or 0) for r in alloc_rows), 2)
+        amount_paid = min(grand_total, max(0.0, historical_paid))
+
+        if include_payment_breakdown:
+            by_payment: dict[UUID, float] = {}
+            for pid, alloc_amt in alloc_rows:
+                if pid and float(alloc_amt or 0) > 0:
+                    by_payment[pid] = by_payment.get(pid, 0.0) + float(alloc_amt)
+
+            receipt_query = db.query(BillingReceipt).filter(
+                BillingReceipt.hospital_id == hosp_id,
+                BillingReceipt.patient_id == inv.patient_id,
+                BillingReceipt.status != BillingReceiptStatus.cancelled,
+                BillingReceipt.created_at <= cutoff,
+            )
+            receipt_filters = [BillingReceipt.linked_invoice_id == inv.id]
+            if by_payment:
+                valid_pids = [pid for pid in by_payment.keys() if pid not in other_invoice_payments]
+                if valid_pids:
+                    receipt_filters.append(BillingReceipt.payment_id.in_(valid_pids))
+            receipts = receipt_query.filter(or_(*receipt_filters)).all()
+            payment_rows = [
+                {
+                    "amount": float(r.amount or 0),
+                    "method": r.payment_method.value.replace("_", " ").title() if r.payment_method else "Payment",
+                    "date": r.payment_date.strftime("%d/%m/%Y") if r.payment_date else "",
+                    "receipt": r.receipt_number,
+                }
+                for r in receipts
+            ]
+    else:
+        if inv.status == BillingInvoiceStatus.paid:
+            amount_paid = grand_total
+        else:
+            charges = (
+                db.query(BillingCharge)
+                .filter(
+                    BillingCharge.hospital_id == hosp_id,
+                    BillingCharge.id.in_(charge_ids),
+                )
+                .all()
+                if charge_ids
+                else []
+            )
+            amount_paid = min(grand_total, round(sum(float(c.amount_paid or 0) for c in charges), 2))
+
+        if include_payment_breakdown:
+            by_payment: dict[UUID, float] = {}
+            if charge_ids:
+                for payment_id, allocated in (
+                    db.query(
+                        BillingPaymentAllocation.payment_id,
+                        func.sum(BillingPaymentAllocation.allocated_amount),
+                    )
+                    .filter(
+                        BillingPaymentAllocation.charge_id.in_(charge_ids),
+                        BillingPaymentAllocation.payment_id.isnot(None),
+                    )
+                    .group_by(BillingPaymentAllocation.payment_id)
+                    .all()
+                ):
+                    if payment_id and float(allocated or 0) > 0:
+                        by_payment[payment_id] = float(allocated)
+            receipt_query = db.query(BillingReceipt).filter(
+                BillingReceipt.hospital_id == hosp_id,
+                BillingReceipt.patient_id == inv.patient_id,
+                BillingReceipt.status != BillingReceiptStatus.cancelled,
+            )
+            receipt_filters = [BillingReceipt.linked_invoice_id == inv.id]
+            if by_payment:
+                receipt_filters.append(BillingReceipt.payment_id.in_(list(by_payment.keys())))
+            receipts = receipt_query.filter(or_(*receipt_filters)).all()
+            payment_rows = [
+                {
+                    "amount": float(r.amount or 0),
+                    "method": r.payment_method.value.replace("_", " ").title() if r.payment_method else "Payment",
+                    "date": r.payment_date.strftime("%d/%m/%Y") if r.payment_date else "",
+                    "receipt": r.receipt_number,
+                }
+                for r in receipts
+            ]
+
+    balance_due = max(0.0, round(grand_total - amount_paid, 2))
+    return {
+        "grand_total": grand_total,
+        "amount_paid": amount_paid,
+        "balance_due": balance_due,
+        "payments": payment_rows,
+    }
+
+
+def invoice_to_dict(
+    inv: BillingInvoice,
+    patient: Patient | None = None,
+    *,
+    include_lines: bool = True,
+    settlement: dict | None = None,
+    reissue_eligible: bool | None = None,
+    reissue_reason: str | None = None,
+) -> dict:
     """
     Serialize BillingInvoice ORM model to dictionary with patient context.
     """
     p = patient or inv.patient
     lines = sorted(inv.lines or [], key=lambda ln: ln.sort_order) if include_lines else []
+    grand_total = float(inv.grand_total or 0.0)
+    if settlement:
+        amt_paid = float(settlement.get("amount_paid", 0.0) or 0.0)
+        bal_due = float(settlement.get("balance_due", 0.0) or 0.0)
+    elif inv.status == BillingInvoiceStatus.paid:
+        amt_paid = grand_total
+        bal_due = 0.0
+    else:
+        amt_paid = 0.0
+        bal_due = grand_total
+
+    final_reissue_eligible = reissue_eligible if reissue_eligible is not None else bool(settlement.get("reissue_eligible") if settlement else False)
+    final_reissue_reason = reissue_reason or (settlement.get("reissue_reason") if settlement else None)
+
     return {
         "id": inv.id,
         "hospital_id": inv.hospital_id,
@@ -398,6 +576,8 @@ def invoice_to_dict(inv: BillingInvoice, patient: Patient | None = None, *, incl
         "sgst_amount": getattr(inv, "sgst_amount", 0.0) or 0.0,
         "igst_amount": getattr(inv, "igst_amount", 0.0) or 0.0,
         "grand_total": inv.grand_total,
+        "amount_paid": amt_paid,
+        "balance_due": bal_due,
         "status": inv.status,
         "notes": inv.notes,
         "created_by_name": inv.created_by_name,
@@ -405,6 +585,8 @@ def invoice_to_dict(inv: BillingInvoice, patient: Patient | None = None, *, incl
         "updated_at": inv.updated_at,
         "patient_name": p.name if p else None,
         "patient_uhid": p.uhid if p else None,
+        "reissue_eligible": final_reissue_eligible,
+        "reissue_reason": final_reissue_reason,
         "lines": [
             {
                 "id": ln.id,
@@ -1346,9 +1528,15 @@ def invoice_html(
     amount_paid = min(grand_total, max(0.0, float(amt_paid_val or 0.0)))
     balance_due = max(0.0, round(grand_total - amount_paid, 2))
 
+    replacement_num = kwargs.get("replacement_invoice_number") or settlement.get("replacement_invoice_number")
+    is_hist = raw_status in ("cancelled", "void")
+
     # Evaluate lifecycle status based on authoritative accounting data
-    if raw_status in ("cancelled", "void"):
-        status_label = "CANCELLED"
+    if is_hist:
+        if replacement_num:
+            status_label = f"SUPERSEDED (REPLACED BY {replacement_num})"
+        else:
+            status_label = "CANCELLED / SUPERSEDED"
         status_class = "status-cancelled"
     elif raw_status == "paid" or (grand_total > 0 and balance_due == 0):
         status_label = "PAID"
@@ -1453,6 +1641,20 @@ def invoice_html(
     due_class = "due-zero" if balance_due == 0 else "due-positive"
     print_script = "<script>window.onload=function(){window.print();}</script>" if auto_print else ""
 
+    paid_title = "Amount Paid (as of supersession)" if is_hist else "Amount Paid"
+    due_title = "Balance Due (as of supersession)" if is_hist else "Balance Due"
+    hist_banner = (
+        f'<div style="margin-bottom:14px;padding:10px 14px;border:1px solid #f87171;background:#fef2f2;color:#991b1b;border-radius:6px;font-size:12px;font-weight:600;">'
+        f'HISTORICAL DOCUMENT — SUPERSEDED. Replaced by Invoice {_esc(replacement_num)}. Historical settlement snapshot preserved.'
+        f'</div>'
+        if is_hist and replacement_num else (
+            f'<div style="margin-bottom:14px;padding:10px 14px;border:1px solid #f87171;background:#fef2f2;color:#991b1b;border-radius:6px;font-size:12px;font-weight:600;">'
+            f'HISTORICAL DOCUMENT — CANCELLED / SUPERSEDED. Historical settlement snapshot preserved.'
+            f'</div>'
+            if is_hist else ''
+        )
+    )
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1470,6 +1672,7 @@ def invoice_html(
         status_label=status_label,
         status_class=status_class,
     )}
+    {hist_banner}
 
     <div class="meta-grid">
       <div class="meta-col">
@@ -1536,11 +1739,11 @@ def invoice_html(
             <td class="num">₹{grand_total:,.2f}</td>
           </tr>
           <tr>
-            <td>Amount Paid</td>
+            <td>{paid_title}</td>
             <td class="num">₹{amount_paid:,.2f}</td>
           </tr>
           <tr class="settlement-due-row {due_class}">
-            <td>Balance Due</td>
+            <td>{due_title}</td>
             <td class="num">₹{balance_due:,.2f}</td>
           </tr>
         </table>
@@ -1597,16 +1800,24 @@ def receipt_html(
     linked_invoice: BillingInvoice | None = None,
     auto_print: bool = True,
     paid_against: list[dict] | None = None,
+    financial_context: Any = None,
 ) -> str:
     """Render full HTML document for a payment receipt.
 
-    Emphasizes AMOUNT RECEIVED, PAYMENT METHOD, RECEIPT REF, PAYMENT DATE,
-    and PAYMENT ALLOCATION, clearly distinguishing it from an invoice.
+    Emphasizes AMOUNT RECEIVED, PAYMENT METHOD, RECEIPT REF, AUTHORITATIVE TIMESTAMP,
+    PAYMENT ALLOCATION, and AUTHORITATIVE REMAINING BALANCE.
     """
     p_name = _esc(patient.name if patient else "—")
     p_uhid = _esc(patient.uhid if patient else "—")
     p_phone = _esc(getattr(patient, "mobile", None) or getattr(patient, "phone", None) or "")
-    rcpt_date = receipt.payment_date.strftime("%d/%m/%Y") if receipt.payment_date else "—"
+    if financial_context and getattr(financial_context, "payment_timestamp", None):
+        rcpt_date = financial_context.payment_timestamp.strftime("%d/%m/%Y %I:%M %p")
+    elif getattr(receipt, "created_at", None):
+        rcpt_date = receipt.created_at.strftime("%d/%m/%Y %I:%M %p")
+    elif receipt.payment_date:
+        rcpt_date = receipt.payment_date.strftime("%d/%m/%Y")
+    else:
+        rcpt_date = "—"
 
     method = receipt.payment_method.value if receipt.payment_method else "cash"
     if method == "bank_transfer":
@@ -1655,6 +1866,54 @@ def receipt_html(
             (item for item in paid_against if float(item.get("amount") or 0) > 0), start=1
         )
     )
+
+    balance_section_html = ""
+    if financial_context and financial_context != "unavailable":
+        enc_title = getattr(financial_context, "encounter_identifier", None) or "This Encounter / Account"
+        acc_bal = float(getattr(financial_context, "account_balance_after_payment", 0.0) or 0.0)
+        global_bal = float(getattr(financial_context, "patient_overall_outstanding_after_payment", 0.0) or 0.0)
+        dep_bal = float(getattr(financial_context, "available_deposit_balance_after_payment", 0.0) or 0.0)
+
+        is_legacy = getattr(financial_context, "is_legacy_estimate", False)
+        balance_label = f"Current Account Balance ({_esc(enc_title)})" if is_legacy else f"Remaining Balance ({_esc(enc_title)})"
+        legacy_badge = """
+      <div style="margin-top: 4px; font-size: 11px; color: #64748b; font-style: italic;">
+        Historical balance snapshot unavailable for this legacy receipt. Displaying current account balance.
+      </div>""" if is_legacy else ""
+
+        other_html = ""
+        if global_bal > 0 and abs(global_bal - acc_bal) > 0.01:
+            other_label = "Current Overall Patient Outstanding:" if is_legacy else "Other / Overall Patient Outstanding:"
+            other_html = f"""
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px; padding-top: 6px; border-top: 1px dashed #cbd5e1; font-size: 11px; color: #475569;">
+        <span>{other_label}</span>
+        <span style="font-weight: 600;">₹{global_bal:,.2f}</span>
+      </div>"""
+
+        dep_html = ""
+        if dep_bal > 0:
+            dep_html = f"""
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px; font-size: 11px; color: #166534;">
+        <span>Available Advance Deposits:</span>
+        <span style="font-weight: 600;">₹{dep_bal:,.2f}</span>
+      </div>"""
+
+        balance_section_html = f"""
+    <!-- AUTHORITATIVE BALANCE SECTION -->
+    <div class="receipt-balance-summary" style="margin: 16px 0; padding: 12px 16px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; color: #0f172a;">
+        <span>{balance_label}:</span>
+        <span style="font-size: 15px; font-weight: 700;">₹{acc_bal:,.2f}</span>
+      </div>{other_html}{dep_html}{legacy_badge}
+    </div>"""
+    else:
+        balance_section_html = """
+    <!-- BALANCE UNAVAILABLE SECTION -->
+    <div class="receipt-balance-summary" style="margin: 16px 0; padding: 12px 16px; background: #fffbeb; border: 1px solid #fef3c7; border-radius: 6px;">
+      <div style="font-size: 13px; font-weight: 500; color: #92400e;">
+        Balance information unavailable
+      </div>
+    </div>"""
 
     print_script = "<script>window.onload=function(){window.print();}</script>" if auto_print else ""
 
@@ -1752,6 +2011,7 @@ def receipt_html(
         </tbody>
       </table>''' if paid_rows else '<p class="allocation-empty">Payment credited to patient ledger / invoice settlement.</p>'}
     </div>
+    {balance_section_html}
 
     <div class="signatures">
       <div class="sig-col">

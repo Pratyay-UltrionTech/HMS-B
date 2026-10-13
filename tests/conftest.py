@@ -57,6 +57,7 @@ import modules.laboratory.entities.lab_entities
 import modules.radiology.entities.radiology_entities
 import modules.billing.entities.billing_entities
 import modules.billing.entities.financial_exception
+import modules.billing.entities.idempotency
 import modules.pharmacy.entities.pharmacy_entities
 import modules.inpatient.entities.admission
 import modules.beds.entities.bed

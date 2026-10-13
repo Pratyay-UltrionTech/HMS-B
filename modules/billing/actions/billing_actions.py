@@ -18,16 +18,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from modules.billing.contracts.billing_contracts import (
+    BillingBillPreparationResponse,
     BillingChargeCreate,
     BillingChargeResponse,
     BillingChargeUpdate,
     BillingDashboardResponse,
     BillingDepositAllocate,
     BillingDepositCreate,
+    BillingDepositPage,
     BillingDepositResponse,
     BillingInvoiceCreate,
+    BillingInvoicePage,
+    BillingInvoiceReissueRequest,
     BillingInvoiceResponse,
     BillingPaymentCreate,
+    BillingPaymentPage,
     BillingPaymentResponse,
     BillingReceiptCreate,
     BillingReceiptResponse,
@@ -84,12 +89,17 @@ from modules.billing.services.billing_service import (
     get_or_create_financial_account,
     patient_ledger_totals,
     payment_to_dict,
+    prepare_ipd_bill,
     process_refund,
     refund_to_dict,
     recompute_charge_financials,
 )
+from modules.billing.services.invoice_freshness_service import (
+    check_invoice_reissue_eligibility,
+)
 from modules.billing.services.invoice_service import (
     _resolve_encounter_details,
+    calculate_invoice_settlement,
     create_invoice_from_charges,
     deposit_receipt_html,
     invoice_html,
@@ -110,6 +120,7 @@ from modules.billing.services.charge_reversal_service import (
 from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
 from shared.audit.service import write_audit_log
+from shared.sync import stage_sync_event
 
 
 def _actor(user: dict[str, Any]) -> str:
@@ -423,10 +434,52 @@ class CreateChargeAction:
 
     def execute(self, payload: BillingChargeCreate, user: dict[str, Any]) -> BillingChargeResponse:
         patient = _get_patient_or_404(self.repo, payload.patient_id)
+        account_id = None
+        if payload.account_id is not None:
+            account = self.db.scalars(
+                select(FinancialAccount).where(
+                    FinancialAccount.id == payload.account_id,
+                    FinancialAccount.hospital_id == self.repo.hospital_id,
+                )
+            ).first()
+            if not account:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Financial account {payload.account_id} not found for this hospital.",
+                )
+            if account.patient_id != payload.patient_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Financial account {payload.account_id} belongs to a different patient.",
+                )
+            if account.status == FinancialAccountStatus.closed:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Financial account {payload.account_id} is closed and cannot accept new charges.",
+                )
+            account_id = account.id
+        elif not payload.explicit_unscoped:
+            open_ipd_accounts = self.db.scalars(
+                select(FinancialAccount).where(
+                    FinancialAccount.patient_id == payload.patient_id,
+                    FinancialAccount.hospital_id == self.repo.hospital_id,
+                    FinancialAccount.account_type == FinancialAccountType.ipd,
+                    FinancialAccount.status == FinancialAccountStatus.open,
+                )
+            ).all()
+            if len(open_ipd_accounts) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Patient has multiple open IPD admissions. Explicit account selection is required.",
+                )
+            elif len(open_ipd_accounts) == 1:
+                account_id = open_ipd_accounts[0].id
+
         row = ensure_charge(
             self.db,
             hospital_id=self.repo.hospital_id,
             patient_id=payload.patient_id,
+            account_id=account_id,
             source_type=payload.source_type,
             source_id=payload.source_id,
             description=payload.description,
@@ -455,6 +508,13 @@ class CreateChargeAction:
             entity_type="billing_charge",
             entity_id=row.id,
             summary=audit_summary,
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            entity_type="billing_charge",
+            action="create",
+            entity_id=row.id,
         )
         self.db.commit()
         return BillingChargeResponse.model_validate(charge_to_dict(row, patient))
@@ -546,6 +606,13 @@ class UpdateChargeAction:
                 "credit_deposit_id": str(released.credit_deposit_id) if released and released.credit_deposit_id else None,
             },
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            entity_type="billing_charge",
+            action="update",
+            entity_id=charge.id,
+        )
         self.db.commit()
         self.db.refresh(charge)
         return BillingChargeResponse.model_validate(charge_to_dict(charge))
@@ -569,6 +636,13 @@ class CancelChargeAction:
             actor=user,
             performed=is_charge_service_performed(self.db, charge),
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            entity_type="billing_charge",
+            action="cancel",
+            entity_id=charge.id,
+        )
         self.db.commit()
         self.db.refresh(charge)
         return BillingChargeResponse.model_validate(charge_to_dict(charge))
@@ -582,24 +656,17 @@ class ListPaymentsAction:
         self.repo = BillingRepository(db, hospital_id)
 
     def execute(
-        self,
-        *,
-        patient_id: UUID | None = None,
-        from_date: date | None = None,
-        to_date: date | None = None,
-        payment_method: BillingPaymentMethod | None = None,
-        limit: int = 200,
-        offset: int = 0,
-    ) -> list[BillingPaymentResponse]:
-        payments = self.repo.list_payments(
-            patient_id=patient_id,
-            from_date=from_date,
-            to_date=to_date,
-            payment_method=payment_method,
-            limit=limit,
-            offset=offset,
-        )
-        return _payment_response_dtos(self.db, payments)
+        self, *, page: int = 1, page_size: int = 15,
+        patient_id: UUID | None = None, from_date: date | None = None,
+        to_date: date | None = None, payment_method: BillingPaymentMethod | None = None,
+        search: str | None = None, collected_by: str | None = None,
+        invoice_number: str | None = None, sort: str = "newest",
+    ) -> BillingPaymentPage:
+        return BillingPaymentPage.model_validate(self.repo.list_payments(
+            page=page, page_size=page_size, patient_id=patient_id,
+            from_date=from_date, to_date=to_date, payment_method=payment_method,
+            search=search, collected_by=collected_by, invoice_number=invoice_number, sort=sort,
+        ))
 
 
 class CreatePaymentAction:
@@ -652,6 +719,32 @@ class CreatePaymentAction:
         selected_charge_ids = list(dict.fromkeys(
             item["charge_id"] for item in (allocations_plan or []) if item.get("charge_id")
         ))
+        effective_account_id = payload.account_id
+        effective_invoice_id: UUID | None = payload.linked_invoice_id
+        if selected_charge_ids:
+            selected_charges = (
+                self.db.query(BillingCharge)
+                .filter(
+                    BillingCharge.id.in_(selected_charge_ids),
+                    BillingCharge.hospital_id == self.repo.hospital_id,
+                    BillingCharge.patient_id == payload.patient_id,
+                )
+                .all()
+            )
+            distinct_account_ids = {c.account_id for c in selected_charges}
+            if len(distinct_account_ids) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected charges belong to multiple or mixed financial accounts. Cannot settle across different accounts in a single payment.",
+                )
+            if distinct_account_ids:
+                inferred_acc_id = next(iter(distinct_account_ids))
+                if effective_account_id is not None and effective_account_id != inferred_acc_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Supplied account_id {effective_account_id} does not match selected charges' account ({inferred_acc_id}).",
+                    )
+                effective_account_id = inferred_acc_id
         created_invoice_for_payment = False
         if selected_charge_ids:
             existing_lines = (
@@ -713,7 +806,7 @@ class CreatePaymentAction:
                         hospital_id=self.repo.hospital_id,
                         patient_id=payload.patient_id,
                         charge_ids=selected_charge_ids,
-                        account_id=payload.account_id,
+                        account_id=effective_account_id,
                         created_by_name=_actor(user),
                     )
                     effective_invoice_id = inv.id
@@ -729,8 +822,38 @@ class CreatePaymentAction:
                 allocation["discount_amount"] = None
                 allocation["discount_percent"] = None
                 allocation["discount_reason"] = None
-        else:
+        elif not effective_invoice_id:
             effective_invoice_id = payload.linked_invoice_id
+
+        if effective_invoice_id:
+            inv_to_check = (
+                self.db.query(BillingInvoice)
+                .filter(
+                    BillingInvoice.id == effective_invoice_id,
+                    BillingInvoice.hospital_id == self.repo.hospital_id,
+                )
+                .first()
+            )
+            if inv_to_check:
+                if effective_account_id is None and inv_to_check.account_id:
+                    effective_account_id = inv_to_check.account_id
+                if inv_to_check.status == BillingInvoiceStatus.cancelled:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Cannot collect payment against a cancelled invoice",
+                    )
+                settlement = calculate_invoice_settlement(self.db, inv_to_check, hospital_id=self.repo.hospital_id)
+                inv_bal = round(float(settlement.get("balance_due", 0.0) or 0.0), 2)
+                if inv_bal <= 0.0:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invoice is already fully settled; balance due is zero",
+                    )
+                if round(float(payload.amount), 2) > inv_bal:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Payment amount ({payload.amount}) exceeds invoice balance due ({inv_bal})",
+                    )
 
         try:
             pay = create_payment(
@@ -740,7 +863,7 @@ class CreatePaymentAction:
                 amount=payload.amount,
                 payment_date=pdate,
                 payment_method=payload.payment_method,
-                account_id=payload.account_id,
+                account_id=effective_account_id,
                 reference_number=payload.reference_number,
                 idempotency_key=payload.idempotency_key,
                 notes=payload.notes,
@@ -827,6 +950,13 @@ class CreatePaymentAction:
             entity_id=pay.id,
             summary=f"Payment ₹{pay.amount:.2f} received for {patient.name} ({receipt.receipt_number})",
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            entity_type="payment",
+            action="create",
+            entity_id=pay.id,
+        )
         self.db.commit()
         return _payment_response_dto(
             self.db, pay, patient, receipt_id=receipt.id, receipt_number=receipt.receipt_number
@@ -843,33 +973,27 @@ class ListInvoicesAction:
     def execute(
         self,
         *,
+        page: int = 1,
+        page_size: int = 15,
         patient_id: UUID | None = None,
         status: BillingInvoiceStatus | None = None,
         from_date: date | None = None,
         to_date: date | None = None,
         search: str | None = None,
-        limit: int = 200,
-        offset: int = 0,
-    ) -> list[BillingInvoiceResponse]:
-        invoices = self.repo.list_invoices(
-            patient_id=patient_id,
-            status=status,
-            from_date=from_date,
-            to_date=to_date,
-            search=search,
-            limit=limit,
-            offset=offset,
+        sort: str = "newest",
+    ) -> BillingInvoicePage:
+        return BillingInvoicePage.model_validate(
+            self.repo.list_invoices(
+                page=page,
+                page_size=page_size,
+                patient_id=patient_id,
+                status=status,
+                from_date=from_date,
+                to_date=to_date,
+                search=search,
+                sort=sort,
+            )
         )
-        # include_lines=False: the Invoices tab table never reads line items
-        # (only the "view invoice" detail modal does, which fetches its own
-        # full detail via GET /invoices/{id} — see BillingPage.tsx's
-        # setViewInvoice). Dropping lines here trims this list response and
-        # lets the repository skip eager-loading them (see list_invoices()
-        # in billing_repository.py).
-        return [
-            BillingInvoiceResponse.model_validate(invoice_to_dict(inv, include_lines=False))
-            for inv in invoices
-        ]
 
 
 class GetInvoiceAction:
@@ -881,7 +1005,18 @@ class GetInvoiceAction:
         inv = self.repo.get_invoice_by_id(invoice_id)
         if not inv:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
-        return BillingInvoiceResponse.model_validate(invoice_to_dict(inv))
+        settlement = calculate_invoice_settlement(self.db, inv, hospital_id=self.repo.hospital_id)
+        is_eligible, stale_msg = check_invoice_reissue_eligibility(self.db, self.repo.hospital_id, inv)
+        patient = inv.patient or self.repo.get_patient(inv.patient_id)
+        return BillingInvoiceResponse.model_validate(
+            invoice_to_dict(
+                inv,
+                patient,
+                settlement=settlement,
+                reissue_eligible=is_eligible,
+                reissue_reason=stale_msg,
+            )
+        )
 
 
 class CreateInvoiceAction:
@@ -891,6 +1026,75 @@ class CreateInvoiceAction:
 
     def execute(self, payload: BillingInvoiceCreate, user: dict[str, Any]) -> BillingInvoiceResponse:
         patient = _get_patient_or_404(self.repo, payload.patient_id)
+
+        # Section 24: Validate explicitly supplied account_id BEFORE reconciliation
+        account: FinancialAccount | None = None
+        if payload.account_id:
+            account = self.db.scalars(
+                select(FinancialAccount).where(
+                    FinancialAccount.id == payload.account_id,
+                    FinancialAccount.hospital_id == self.repo.hospital_id,
+                )
+            ).first()
+            if not account:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Financial account not found",
+                )
+            if account.patient_id != payload.patient_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Financial account does not belong to the patient",
+                )
+        else:
+            # General scope: explicitly verify charges are unscoped
+            chg_with_acc = self.db.query(BillingCharge.id).filter(
+                BillingCharge.id.in_(payload.charge_ids),
+                BillingCharge.hospital_id == self.repo.hospital_id,
+                BillingCharge.account_id.isnot(None),
+            ).first()
+            if chg_with_acc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selected charges belong to a specific financial episode and cannot be billed under General scope.",
+                )
+
+        # IPD account scope reconciliation & completeness
+        if account and account.account_type == FinancialAccountType.ipd:
+            pre_charges = {
+                c.id: float(c.net_amount)
+                for c in self.db.query(BillingCharge).filter(
+                    BillingCharge.account_id == account.id,
+                    BillingCharge.hospital_id == self.repo.hospital_id,
+                    BillingCharge.status != BillingChargeStatus.cancelled,
+                ).all()
+            }
+            prepare_ipd_bill(self.db, hospital_id=self.repo.hospital_id, account_id=account.id)
+            post_charges_objs = self.db.query(BillingCharge).filter(
+                BillingCharge.account_id == account.id,
+                BillingCharge.hospital_id == self.repo.hospital_id,
+                BillingCharge.status != BillingChargeStatus.cancelled,
+            ).all()
+            post_charges = {c.id: float(c.net_amount) for c in post_charges_objs}
+            if post_charges != pre_charges:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Billing state changed. Refresh charges before generating invoice.",
+                )
+
+            from modules.billing.services.invoice_service import charges_already_invoiced
+            active_invoiced = set(charges_already_invoiced(self.db, self.repo.hospital_id, list(post_charges.keys())))
+            all_uninvoiced = {
+                c.id for c in post_charges_objs
+                if c.id not in active_invoiced
+            }
+            submitted_charge_ids_set = set(payload.charge_ids)
+            if all_uninvoiced and not all_uninvoiced.issubset(submitted_charge_ids_set):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Billing state changed. Refresh charges before generating invoice.",
+                )
+
         try:
             inv = create_invoice_from_charges(
                 self.db,
@@ -914,6 +1118,15 @@ class CreateInvoiceAction:
                 if "uq_billing_invoice_number" not in str(e.orig or e):
                     raise
                 _resync_billing_counters(self.db, self.repo.hospital_id)
+                if payload.account_id:
+                    acc = self.db.scalars(
+                        select(FinancialAccount).where(
+                            FinancialAccount.id == payload.account_id,
+                            FinancialAccount.hospital_id == self.repo.hospital_id,
+                        )
+                    ).first()
+                    if acc and acc.account_type == FinancialAccountType.ipd:
+                        prepare_ipd_bill(self.db, hospital_id=self.repo.hospital_id, account_id=acc.id)
                 inv = create_invoice_from_charges(
                     self.db,
                     hospital_id=self.repo.hospital_id,
@@ -951,7 +1164,8 @@ class CreateInvoiceAction:
             summary=f"Invoice {inv.invoice_number} (₹{inv.grand_total:.2f}) created for {patient.name}",
         )
         self.db.commit()
-        return BillingInvoiceResponse.model_validate(invoice_to_dict(inv, patient))
+        settlement = calculate_invoice_settlement(self.db, inv, hospital_id=self.repo.hospital_id)
+        return BillingInvoiceResponse.model_validate(invoice_to_dict(inv, patient, settlement=settlement))
 
 
 class CancelInvoiceAction:
@@ -959,11 +1173,24 @@ class CancelInvoiceAction:
         self.db = db
         self.repo = BillingRepository(db, hospital_id)
 
-    def execute(self, invoice_id: UUID, user: dict[str, Any]) -> BillingInvoiceResponse:
+    def execute(self, invoice_id: UUID, user: dict[str, Any], reason: str | None = None) -> BillingInvoiceResponse:
         inv = self.repo.get_invoice_by_id(invoice_id)
         if not inv:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+        if inv.status == BillingInvoiceStatus.paid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot cancel a fully paid invoice. Settle via credit note or refund.",
+            )
+        has_payments = any(float(line.charge.amount_paid or 0) > 0 for line in inv.lines if line.charge)
+        if has_payments:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot cancel an invoice with recorded payments. Use invoice reissue or credit note.",
+            )
         inv.status = BillingInvoiceStatus.cancelled
+        cancel_reason = (reason or "").strip() or "Cancelled at billing desk"
+        inv.notes = f"{(inv.notes or '').strip()} [Cancelled: {cancel_reason}]".strip()
         self.db.commit()
         self.db.refresh(inv)
         write_audit_log(
@@ -973,10 +1200,193 @@ class CancelInvoiceAction:
             action="cancel",
             entity_type="billing_invoice",
             entity_id=inv.id,
-            summary=f"Cancelled invoice {inv.invoice_number}",
+            summary=f"Cancelled invoice {inv.invoice_number} (Reason: {cancel_reason})",
         )
         self.db.commit()
         return BillingInvoiceResponse.model_validate(invoice_to_dict(inv))
+
+
+def resolve_reissue_charges(
+    db: Session,
+    hospital_id: UUID,
+    inv: BillingInvoice,
+) -> list[BillingCharge]:
+    """Resolve deterministic replacement scope for invoice reissue.
+
+    1. Loads original invoice line charge IDs.
+    2. Reloads those current charges from the database.
+    3. Excludes cancelled/invalid lines according to replacement policy.
+    4. Recomputes current financial values.
+    5. Returns deterministic replacement scope.
+    """
+    orig_charge_ids = [line.charge_id for line in (inv.lines or []) if line.charge_id]
+    if not orig_charge_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No active charges available to reissue this invoice.",
+        )
+    charges = (
+        db.query(BillingCharge)
+        .filter(
+            BillingCharge.hospital_id == hospital_id,
+            BillingCharge.id.in_(orig_charge_ids),
+        )
+        .order_by(BillingCharge.created_at.asc())
+        .all()
+    )
+    valid_charges = [c for c in charges if c.status != BillingChargeStatus.cancelled]
+    if not valid_charges:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No active charges available to reissue this invoice.",
+        )
+    for c in valid_charges:
+        recompute_charge_financials(db, c)
+    return valid_charges
+
+
+class ReissueInvoiceAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(
+        self, invoice_id: UUID, payload: BillingInvoiceReissueRequest | None, user: dict[str, Any]
+    ) -> BillingInvoiceResponse:
+        inv = self.repo.get_invoice_by_id(invoice_id)
+        if not inv:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+        if inv.status == BillingInvoiceStatus.cancelled:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Invoice is already cancelled."
+            )
+
+        # Require a non-empty replacement reason
+        reissue_reason = (
+            payload.reason.strip()
+            if payload and payload.reason and payload.reason.strip()
+            else ""
+        )
+        if not reissue_reason:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reissue reason is required.",
+            )
+
+        # 1. Reconcile IPD billing first if tied to an account
+        if inv.account_id:
+            account = self.db.scalars(
+                select(FinancialAccount).where(
+                    FinancialAccount.id == inv.account_id,
+                    FinancialAccount.hospital_id == self.repo.hospital_id,
+                )
+            ).first()
+            if account and account.account_type == FinancialAccountType.ipd:
+                prepare_ipd_bill(self.db, hospital_id=self.repo.hospital_id, account_id=account.id)
+
+        # 2. Server-side reissue eligibility check:
+        # Reissue is strictly to replace a stale/changed invoice snapshot.
+        is_eligible, stale_reason = check_invoice_reissue_eligibility(self.db, self.repo.hospital_id, inv)
+        if not is_eligible:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Invoice is current and does not require reissue. Use the appropriate cancellation/refund/correction workflow instead.",
+            )
+
+        # 3. Deterministic replacement execution with rollback-safe retry
+        def _attempt_reissue(target_inv: BillingInvoice) -> BillingInvoice:
+            if target_inv.account_id:
+                acc = self.db.scalars(
+                    select(FinancialAccount).where(
+                        FinancialAccount.id == target_inv.account_id,
+                        FinancialAccount.hospital_id == self.repo.hospital_id,
+                    )
+                ).first()
+                if acc and acc.account_type == FinancialAccountType.ipd:
+                    prepare_ipd_bill(self.db, hospital_id=self.repo.hospital_id, account_id=acc.id)
+
+            charges = resolve_reissue_charges(self.db, self.repo.hospital_id, target_inv)
+            charge_ids = [c.id for c in charges]
+
+            target_inv.status = BillingInvoiceStatus.cancelled
+            target_inv.notes = f"{(target_inv.notes or '').strip()} [Superseded: {reissue_reason}]".strip()
+            self.db.flush()
+
+            return create_invoice_from_charges(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                patient_id=target_inv.patient_id,
+                charge_ids=charge_ids,
+                account_id=target_inv.account_id,
+                notes=f"Reissued replacement for {target_inv.invoice_number}. {reissue_reason}".strip(),
+                created_by_name=_actor(user),
+            )
+
+        try:
+            new_inv = _attempt_reissue(inv)
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            _resync_billing_counters(self.db, self.repo.hospital_id)
+            reloaded_inv = self.repo.get_invoice_by_id(invoice_id)
+            if not reloaded_inv:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Invoice not found after rollback.",
+                )
+            new_inv = _attempt_reissue(reloaded_inv)
+            try:
+                self.db.commit()
+            except IntegrityError:
+                self.db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Invoice numbering conflict — please retry reissuing the invoice",
+                )
+
+        # Historical receipts remain immutable and linked to their original invoice snapshot
+        refresh_invoice_paid_status(self.db, self.repo.hospital_id, inv.patient_id)
+        self.db.commit()
+        self.db.refresh(new_inv)
+
+        write_audit_log(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            actor=user,
+            action="reissue",
+            entity_type="billing_invoice",
+            entity_id=new_inv.id,
+            summary=f"Reissued invoice {new_inv.invoice_number} superseding {inv.invoice_number} (Reason: {reissue_reason})",
+        )
+        self.db.commit()
+
+        patient = _get_patient_or_404(self.repo, new_inv.patient_id)
+        settlement = calculate_invoice_settlement(self.db, new_inv, hospital_id=self.repo.hospital_id)
+        return BillingInvoiceResponse.model_validate(invoice_to_dict(new_inv, patient, settlement=settlement))
+
+
+class PrepareIpdBillAction:
+    def __init__(self, db: Session, hospital_id: UUID) -> None:
+        self.db = db
+        self.repo = BillingRepository(db, hospital_id)
+
+    def execute(
+        self, account_id: UUID, user: dict[str, Any], as_of: datetime | None = None
+    ) -> BillingBillPreparationResponse:
+        actor_name = _actor(user)
+        try:
+            res = prepare_ipd_bill(
+                self.db,
+                hospital_id=self.repo.hospital_id,
+                account_id=account_id,
+                as_of=as_of,
+                actor_name=actor_name,
+            )
+            self.db.commit()
+            return BillingBillPreparationResponse.model_validate(res)
+        except ValueError as e:
+            self.db.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 class PrintInvoiceAction:
@@ -991,41 +1401,32 @@ class PrintInvoiceAction:
         hospital = self.db.query(Hospital).filter(Hospital.id == self.repo.hospital_id).first()
         patient = inv.patient or self.repo.get_patient(inv.patient_id)
         encounter = _resolve_encounter_details(self.db, getattr(inv, "account_id", None))
-        charge_ids = [line.charge_id for line in inv.lines if line.charge_id]
-        charges = self.db.query(BillingCharge).filter(BillingCharge.id.in_(charge_ids)).all() if charge_ids else []
-        amount_paid = min(float(inv.grand_total or 0), round(sum(float(c.amount_paid or 0) for c in charges), 2))
-        by_payment: dict[UUID, float] = {}
-        if charge_ids:
-            for payment_id, allocated in (
-                self.db.query(BillingPaymentAllocation.payment_id, func.sum(BillingPaymentAllocation.allocated_amount))
-                .filter(
-                    BillingPaymentAllocation.charge_id.in_(charge_ids),
-                    BillingPaymentAllocation.payment_id.isnot(None),
-                ).group_by(BillingPaymentAllocation.payment_id).all()
-            ):
-                if payment_id and float(allocated or 0) > 0:
-                    by_payment[payment_id] = float(allocated)
-        receipt_query = self.db.query(BillingReceipt).filter(
-            BillingReceipt.hospital_id == self.repo.hospital_id,
-            BillingReceipt.patient_id == inv.patient_id,
-            BillingReceipt.status != BillingReceiptStatus.cancelled,
+        is_cancelled = (inv.status == BillingInvoiceStatus.cancelled)
+
+        replacement_num = None
+        if is_cancelled:
+            rep = self.db.query(BillingInvoice).filter(
+                BillingInvoice.hospital_id == self.repo.hospital_id,
+                BillingInvoice.patient_id == inv.patient_id,
+                BillingInvoice.notes.like(f"%Reissued replacement for {inv.invoice_number}%"),
+            ).first()
+            if rep:
+                replacement_num = rep.invoice_number
+
+        settlement = calculate_invoice_settlement(
+            self.db,
+            inv,
+            hospital_id=self.repo.hospital_id,
+            include_payment_breakdown=True,
         )
-        receipt_filters = [BillingReceipt.linked_invoice_id == inv.id]
-        if by_payment:
-            receipt_filters.append(BillingReceipt.payment_id.in_(by_payment))
-        receipts = receipt_query.filter(or_(*receipt_filters)).all()
-        payment_rows = [
-            {
-                "amount": float(r.amount or 0),
-                "method": r.payment_method.value.replace("_", " ").title() if r.payment_method else "Payment",
-                "date": r.payment_date.strftime("%d/%m/%Y") if r.payment_date else "",
-                "receipt": r.receipt_number,
-            }
-            for r in receipts
-        ]
         return invoice_html(
-            inv, hospital, patient, encounter=encounter, auto_print=auto_print,
-            settlement={"amount_paid": amount_paid, "payments": payment_rows},
+            inv,
+            hospital,
+            patient,
+            encounter=encounter,
+            auto_print=auto_print,
+            settlement=settlement,
+            replacement_invoice_number=replacement_num,
         )
 
 
@@ -1182,9 +1583,23 @@ class PrintReceiptAction:
                 }
                 for cid, amount in totals.items()
             ]
+        financial_context = None
+        try:
+            from modules.billing.services.receipt_financial_context import (
+                build_receipt_financial_context,
+            )
+            financial_context = build_receipt_financial_context(self.db, self.repo.hospital_id, r)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to build receipt financial context for receipt %s: %s", getattr(r, "id", None), exc
+            )
+            financial_context = "unavailable"
+
         return receipt_html(
             r, hospital, patient, linked_invoice=linked_inv, auto_print=auto_print,
             paid_against=paid_against,
+            financial_context=financial_context,
         )
 
 
@@ -1284,9 +1699,37 @@ class ListDepositsAction:
         status: DepositStatus | None = None,
         from_date: date | None = None,
         to_date: date | None = None,
+        search: str | None = None,
+        sort: str = "newest",
+        page: int | None = None,
+        page_size: int = 15,
         limit: int = 200,
         offset: int = 0,
-    ) -> list[BillingDepositResponse]:
+    ) -> BillingDepositPage | list[BillingDepositResponse]:
+        if page is not None:
+            res = self.repo.list_deposits_paginated(
+                patient_id=patient_id,
+                account_id=account_id,
+                admission_id=admission_id,
+                status=status,
+                from_date=from_date,
+                to_date=to_date,
+                search=search,
+                sort=sort,
+                page=page,
+                page_size=page_size,
+            )
+            return BillingDepositPage(
+                items=[BillingDepositResponse.model_validate(deposit_to_dict(d)) for d in res["items"]],
+                total=res["total"],
+                page=res["page"],
+                page_size=res["page_size"],
+                total_pages=res["total_pages"],
+                total_deposited=res["total_deposited"],
+                total_available=res["total_available"],
+                total_allocated=res["total_allocated"],
+                total_refunded=res.get("total_refunded", 0.0),
+            )
         deposits = self.repo.list_deposits(
             patient_id=patient_id,
             account_id=account_id,
@@ -1377,6 +1820,13 @@ class CreateDepositAction:
                 summary=f"Advance deposit {deposit.deposit_number} (₹{deposit.original_amount:.2f}) linked to admission",
                 details={"deposit_id": str(deposit.id), "amount": float(deposit.original_amount)},
             )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            entity_type="deposit",
+            action="create",
+            entity_id=deposit.id,
+        )
         self.db.commit()
         return BillingDepositResponse.model_validate(deposit_to_dict(deposit, patient))
 
@@ -1417,8 +1867,17 @@ class AllocateDepositAction:
             entity_id=deposit_id,
             summary=f"Allocated ₹{allocated:.2f} from deposit {deposit.deposit_number} to {len(payload.allocations)} charges",
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            entity_type="deposit",
+            action="allocate",
+            entity_id=deposit_id,
+        )
         self.db.commit()
-        return BillingDepositResponse.model_validate(deposit_to_dict(deposit))
+        resp_data = deposit_to_dict(deposit)
+        resp_data["allocated_amount"] = allocated
+        return BillingDepositResponse.model_validate(resp_data)
 
 
 class PrintDepositAction:
@@ -1514,6 +1973,13 @@ class CreateRefundAction:
                 "amount": float(refund.amount),
                 "reversed_charge_ids": reversed_charge_ids,
             },
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.repo.hospital_id,
+            entity_type="refund",
+            action="create",
+            entity_id=refund.id,
         )
         self.db.commit()
         self.db.refresh(refund)
@@ -2126,6 +2592,8 @@ def _esc_stmt(val: Any) -> str:
 
 
 def statement_html(statement: PatientBillingStatementResponse, auto_print: bool = True) -> str:
+    from modules.billing.services.invoice_service import _shared_doc_styles
+
     h = statement.hospital
     p = statement.patient
     s = statement.summary
@@ -2139,18 +2607,16 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
         tax_text = f"₹{c.tax_amount:,.2f}" if c.tax_amount > 0 else "—"
         charges_rows.append(
             f"<tr>"
-            f"<td style='white-space:nowrap;font-family:monospace;'>{dt_str}</td>"
-            f"<td style='text-transform:capitalize;'>{c.source_type.replace('_', ' ')}</td>"
-            f"<td><strong>{_esc_stmt(c.description)}</strong>{ref_text}</td>"
+            f"<td>{dt_str}<span class='secondary'>{_esc_stmt(c.source_type.replace('_', ' '))}</span></td>"
+            f"<td><strong>{_esc_stmt(c.description)}</strong>{ref_text}<span class='secondary'>Status: {_esc_stmt(c.status)}</span></td>"
             f"<td style='text-align:right;'>{c.quantity:g}</td>"
             f"<td style='text-align:right;'>₹{c.unit_price:,.2f}</td>"
             f"<td style='text-align:right;'>{disc_text}</td>"
             f"<td style='text-align:right;'>{tax_text}</td>"
             f"<td style='text-align:right;font-weight:bold;'>₹{c.net_amount:,.2f}</td>"
-            f"<td style='text-align:center;text-transform:uppercase;font-size:10px;'>{c.status}</td>"
             f"</tr>"
         )
-    charges_tbody = "".join(charges_rows) or "<tr><td colspan='9' style='text-align:center;padding:15px;'>No charges recorded</td></tr>"
+    charges_tbody = "".join(charges_rows) or "<tr><td colspan='7' style='text-align:center;padding:15px;'>No charges recorded</td></tr>"
 
     invoices_rows = []
     for inv in statement.invoices:
@@ -2159,16 +2625,36 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
         tax_text = f"₹{inv.tax_amount:,.2f}" if inv.tax_amount > 0 else "—"
         invoices_rows.append(
             f"<tr>"
-            f"<td style='font-family:monospace;font-weight:bold;'>{inv.invoice_number}</td>"
+            f"<td style='font-family:monospace;font-weight:bold;'>{_esc_stmt(inv.invoice_number)}</td>"
             f"<td>{dt_str}</td>"
             f"<td style='text-align:right;'>₹{inv.subtotal:,.2f}</td>"
             f"<td style='text-align:right;'>{disc_text}</td>"
             f"<td style='text-align:right;'>{tax_text}</td>"
             f"<td style='text-align:right;font-weight:bold;'>₹{inv.grand_total:,.2f}</td>"
-            f"<td style='text-align:center;text-transform:uppercase;font-size:10px;'>{inv.status}</td>"
+            f"<td style='text-align:center;text-transform:uppercase;font-size:10px;'>{_esc_stmt(inv.status.value)}</td>"
             f"</tr>"
         )
     invoices_tbody = "".join(invoices_rows) or "<tr><td colspan='7' style='text-align:center;padding:15px;'>No invoices issued</td></tr>"
+
+    # Preserve the invoice line details printed by the statement modal.
+    invoice_details = []
+    for inv in statement.invoices:
+        line_rows = "".join(
+            f"<tr><td>{_esc_stmt(line.description)}"
+            f"<span class='secondary'>{_esc_stmt(line.category_label or '')}</span></td>"
+            f"<td style='text-align:right;'>{line.quantity:g}</td>"
+            f"<td style='text-align:right;'>₹{line.rate:,.2f}</td>"
+            f"<td style='text-align:right;'>₹{line.amount:,.2f}</td></tr>"
+            for line in inv.lines
+        ) or "<tr><td colspan='4'>Itemized line details included in total.</td></tr>"
+        invoice_details.append(
+            "<table class='data-table'><colgroup><col style='width:55%'>"
+            "<col style='width:9%'><col style='width:18%'><col style='width:18%'></colgroup>"
+            f"<thead><tr><th colspan='4'>Invoice {_esc_stmt(inv.invoice_number)} — Line details</th></tr>"
+            "<tr><th>Line Item</th><th style='text-align:right;'>Qty</th>"
+            "<th style='text-align:right;'>Rate</th><th style='text-align:right;'>Amount</th></tr></thead>"
+            f"<tbody>{line_rows}</tbody></table>"
+        )
 
     payments_rows = []
     for pay in statement.payments:
@@ -2176,9 +2662,9 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
         payments_rows.append(
             f"<tr>"
             f"<td style='font-family:monospace;'>{dt_str}</td>"
-            f"<td style='font-family:monospace;font-weight:bold;'>{pay.receipt_number or '—'}</td>"
+            f"<td style='font-family:monospace;font-weight:bold;'>{_esc_stmt(pay.receipt_number or '—')}</td>"
             f"<td style='text-transform:capitalize;'>{pay.payment_method.replace('_', ' ')}</td>"
-            f"<td>{pay.reference_number or '—'}</td>"
+            f"<td>{_esc_stmt(pay.reference_number or '—')}</td>"
             f"<td>{_esc_stmt(pay.received_by_name or 'Cashier')}</td>"
             f"<td style='text-align:right;font-weight:bold;color:#166534;'>₹{pay.amount:,.2f}</td>"
             f"</tr>"
@@ -2193,7 +2679,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
             dep_rows.append(
                 f"<tr>"
                 f"<td style='font-family:monospace;'>{dt_str}</td>"
-                f"<td style='font-family:monospace;font-weight:bold;'>{d.deposit_number}</td>"
+                f"<td style='font-family:monospace;font-weight:bold;'>{_esc_stmt(d.deposit_number)}</td>"
                 f"<td style='text-transform:capitalize;'>{d.deposit_type} · {d.payment_method}</td>"
                 f"<td style='text-align:right;'>₹{d.original_amount:,.2f}</td>"
                 f"<td style='text-align:right;'>₹{d.used_amount:,.2f}</td>"
@@ -2225,7 +2711,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
             ref_rows.append(
                 f"<tr>"
                 f"<td style='font-family:monospace;'>{dt_str}</td>"
-                f"<td style='font-family:monospace;font-weight:bold;'>{r.refund_number}</td>"
+                f"<td style='font-family:monospace;font-weight:bold;'>{_esc_stmt(r.refund_number)}</td>"
                 f"<td style='text-transform:capitalize;'>{r.refund_method}</td>"
                 f"<td>{_esc_stmt(r.reason)}</td>"
                 f"<td style='text-align:center;text-transform:uppercase;font-size:10px;'>{r.status}</td>"
@@ -2254,6 +2740,12 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
         d_from = scope.date_from.strftime("%d/%m/%Y")
         d_to = scope.date_to.strftime("%d/%m/%Y") if scope.date_to else "Present"
         scope_str += f" ({d_from} to {d_to})"
+    elif scope.date_to:
+        scope_str += f" (through {scope.date_to.strftime('%d/%m/%Y')})"
+    if scope.source_filter:
+        scope_str += f" · Department: {_esc_stmt(scope.source_filter.replace('_', ' ').title())}"
+    if scope.account_number:
+        scope_str += f" · Account: {_esc_stmt(scope.account_number)}"
 
     auto_script = "<script>window.onload = function() { window.print(); };</script>" if auto_print else ""
 
@@ -2265,54 +2757,47 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
     gstin_val = h.gstin or h.tax_identifier
     if gstin_val:
         meta_parts.append(f"GSTIN: {_esc_stmt(gstin_val)}")
+    if h.registration_number:
+        meta_parts.append(f"Reg No: {_esc_stmt(h.registration_number)}")
     hosp_meta_line = " | ".join(meta_parts)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Billing Statement - {p.uhid} - {statement.statement_id}</title>
+  <title>Billing Statement - {_esc_stmt(p.uhid)} - {_esc_stmt(statement.statement_id)}</title>
   <style>
-    @page {{ size: A4 portrait; margin: 12mm; }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      color: #111; margin: 0; padding: 12px; font-size: 11px; line-height: 1.4; background: #fff;
-    }}
-    .header-table {{ width: 100%; border-bottom: 2px solid #0f172a; padding-bottom: 10px; margin-bottom: 12px; }}
-    .header-table td {{ vertical-align: top; }}
-    .hosp-title {{ font-size: 18px; font-weight: 800; text-transform: uppercase; margin: 0; color: #0f172a; }}
-    .badge {{
-      display: inline-block; padding: 3px 8px; border: 1px solid #0f172a;
-      font-weight: 700; font-size: 10px; text-transform: uppercase; border-radius: 3px;
-    }}
-    .patient-box {{
-      width: 100%; border: 1px solid #cbd5e1; border-radius: 4px; padding: 10px;
-      margin-bottom: 14px; background: #f8fafc;
-    }}
+    {_shared_doc_styles()}
+    /* Statement-specific extensions to the invoice/receipt document family. */
+    body {{ background: #fff; color: #111; padding: 0; }}
+    .statement-document {{ max-width: 820px; margin: 0 auto; padding: 24px; }}
+    .header-table {{ width: 100%; border-collapse: collapse; border-bottom: 1.5px solid #111; margin-bottom: 14px; }}
+    .header-table td {{ vertical-align: top; padding: 0 0 14px; }}
+    .hosp-title {{ color: #111; font-size: 19px; font-weight: 700; margin: 0 0 4px; }}
+    .badge {{ display: inline-block; font-weight: 700; font-size: 11px; border-bottom: 1px solid #777; padding-bottom: 4px; }}
+    .patient-box {{ border: 1px solid #bbb; padding: 8px; margin-bottom: 18px; break-inside: avoid; }}
     .patient-table {{ width: 100%; border-collapse: collapse; }}
-    .patient-table td {{ padding: 3px 6px; font-size: 11px; }}
-    .patient-table .lbl {{ color: #64748b; font-weight: 600; text-transform: uppercase; font-size: 9px; }}
-    .data-table {{ width: 100%; border-collapse: collapse; margin-bottom: 14px; font-size: 10px; }}
-    .data-table th {{
-      background: #f1f5f9; border-top: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1;
-      padding: 5px 6px; text-align: left; font-weight: 700; text-transform: uppercase; font-size: 9px;
-    }}
-    .data-table td {{ padding: 5px 6px; border-bottom: 1px solid #e2e8f0; }}
-    .summary-box {{
-      width: 100%; border: 1px solid #cbd5e1; border-radius: 4px; padding: 12px; margin-top: 16px;
-      page-break-inside: avoid;
-    }}
+    .patient-table td {{ padding: 4px 6px; vertical-align: top; overflow-wrap: anywhere; }}
+    .lbl {{ color: #555; font-size: 9px; font-weight: 600; }}
+    h3 {{ break-after: avoid; page-break-after: avoid; }}
+    .data-table {{ width: 100%; border-collapse: collapse; margin-bottom: 18px; font-size: 10px; table-layout: fixed; }}
+    .data-table th {{ background: #f3f3f3; border-top: 1px solid #aaa; border-bottom: 1.5px solid #aaa; padding: 6px 4px; text-align: left; font-size: 9px; font-weight: 600; }}
+    .data-table td {{ padding: 6px 4px; border-bottom: 1px solid #ddd; vertical-align: top; overflow-wrap: anywhere; }}
+    .data-table [style*="text-align:right"] {{ white-space: nowrap; font-variant-numeric: tabular-nums; }}
+    .secondary {{ display: block; color: #555; font-size: 9px; margin-top: 2px; text-transform: capitalize; }}
+    thead {{ display: table-header-group; }}
+    tr {{ break-inside: avoid; page-break-inside: avoid; }}
+    .summary-box {{ border: 1px solid #aaa; padding: 12px; margin-top: 18px; break-inside: avoid; page-break-inside: avoid; }}
     .summary-table {{ width: 100%; border-collapse: collapse; }}
-    .summary-table td {{ padding: 4px 8px; font-size: 11px; }}
-    .summary-total {{ font-weight: 800; font-size: 12px; border-top: 2px solid #0f172a; border-bottom: 2px solid #0f172a; }}
-    .cert-box {{
-      margin-top: 24px; padding-top: 12px; border-top: 1px solid #e2e8f0; font-size: 9px; color: #64748b;
-      page-break-inside: avoid;
-    }}
+    .summary-table td {{ padding: 5px 6px; font-size: 11px; }}
+    .summary-table td:nth-child(even) {{ white-space: nowrap; font-variant-numeric: tabular-nums; }}
+    .summary-total {{ font-weight: 700; border-top: 1.5px solid #111; border-bottom: 1.5px solid #111; }}
+    .cert-box {{ margin-top: 24px; padding-top: 12px; border-top: 1px solid #bbb; font-size: 9px; color: #555; break-inside: avoid; page-break-inside: avoid; }}
     @media print {{
       body {{ padding: 0; }}
+      .statement-document {{ max-width: none; padding: 0; }}
       .no-print {{ display: none !important; }}
+      .statement-document * {{ color: #111 !important; box-shadow: none !important; }}
     }}
   </style>
   {auto_script}
@@ -2322,6 +2807,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
     <button onclick="window.print()" style="padding:6px 14px;background:#0284c7;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer;">Print Document</button>
   </div>
 
+  <main class="statement-document">
   <table class="header-table">
     <tr>
       <td style="width:60%;">
@@ -2333,7 +2819,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
       </td>
       <td style="text-align:right;width:40%;">
         <span class="badge">Consolidated Billing Statement</span>
-        <div style="font-family:monospace;font-weight:bold;font-size:11px;margin-top:4px;">Ref: {statement.statement_id}</div>
+        <div style="font-family:monospace;font-weight:bold;font-size:11px;margin-top:4px;">Ref: {_esc_stmt(statement.statement_id)}</div>
         <div style="font-size:10px;color:#64748b;">Generated: {gen_time_str}</div>
         <div style="font-size:10px;color:#64748b;">Scope: <strong>{scope_str}</strong></div>
       </td>
@@ -2345,7 +2831,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
       <tr>
         <td style="width:25%;"><span class="lbl">Patient Name</span><br/><strong>{_esc_stmt(p.name)}</strong></td>
         <td style="width:25%;"><span class="lbl">UHID</span><br/><strong style="font-family:monospace;">{_esc_stmt(p.uhid)}</strong></td>
-        <td style="width:25%;"><span class="lbl">Age / Gender</span><br/>{f"{p.age} Yrs" if p.age else "—"} / {_esc_stmt(p.gender or "—")}</td>
+        <td style="width:25%;"><span class="lbl">Age / Gender</span><br/>{f"{p.age} Yrs" if p.age is not None else "—"} / {_esc_stmt(p.gender or "—")}</td>
         <td style="width:25%;"><span class="lbl">Contact Phone</span><br/>{_esc_stmt(p.mobile or "—")}</td>
       </tr>
       <tr>
@@ -2357,13 +2843,14 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
   </div>
 
   <h3 style="font-size:12px;text-transform:uppercase;margin:0 0 6px 0;letter-spacing:0.5px;">1. Itemized Hospital Services &amp; Charges ({len(statement.charges)})</h3>
-  <table class="data-table">
+  <table class="data-table charges-table">
+    <colgroup><col style="width:14%"><col style="width:33%"><col style="width:5%"><col style="width:12%"><col style="width:12%"><col style="width:12%"><col style="width:12%"></colgroup>
     <thead>
       <tr>
-        <th>Date</th><th>Department</th><th>Service Description</th>
+        <th>Date / Department</th><th>Service Description / Status</th>
         <th style="text-align:right;">Qty</th><th style="text-align:right;">Rate</th>
         <th style="text-align:right;">Discount</th><th style="text-align:right;">Tax</th>
-        <th style="text-align:right;">Net Amount</th><th>Status</th>
+        <th style="text-align:right;">Net Amount</th>
       </tr>
     </thead>
     <tbody>{charges_tbody}</tbody>
@@ -2381,6 +2868,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
     </thead>
     <tbody>{invoices_tbody}</tbody>
   </table>
+  {"".join(invoice_details)}
 
   <h3 style="font-size:12px;text-transform:uppercase;margin:16px 0 6px 0;letter-spacing:0.5px;">3. Payments Received &amp; Receipts Issued ({len(statement.payments)})</h3>
   <table class="data-table">
@@ -2398,7 +2886,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
 
   <div class="summary-box">
     <div style="font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:8px;border-bottom:1px solid #cbd5e1;padding-bottom:4px;">
-      Financial Summary &amp; Ledger Reconciliation (Canonical Accounting)
+      Financial Summary &amp; Ledger Reconciliation
     </div>
     <table class="summary-table">
       <tr>
@@ -2420,7 +2908,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
         <td style="font-family:monospace;text-align:right;">₹{s.total_refunds:,.2f}</td>
       </tr>
       <tr class="summary-total">
-        <td>Net Canonical Charges:</td>
+        <td>Net Charges:</td>
         <td style="font-family:monospace;text-align:right;">₹{s.net_charges:,.2f}</td>
         <td style="color:#991b1b;">Outstanding Balance:</td>
         <td style="font-family:monospace;text-align:right;color:#991b1b;">₹{s.outstanding:,.2f}</td>
@@ -2439,7 +2927,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
         <td style="width:65%;vertical-align:bottom;">
           <strong>Statement Certification</strong><br/>
           This is an official consolidated billing statement generated from the hospital financial ledger.
-          Original invoice numbers, receipt numbers, and transaction records are preserved as canonical audit references
+          Original invoice numbers, receipt numbers, and transaction records are preserved as audit references
           for insurance reimbursement and clinical accounting.
         </td>
         <td style="width:35%;text-align:center;vertical-align:bottom;">
@@ -2451,6 +2939,7 @@ def statement_html(statement: PatientBillingStatementResponse, auto_print: bool 
       </tr>
     </table>
   </div>
+  </main>
 </body>
 </html>"""
 

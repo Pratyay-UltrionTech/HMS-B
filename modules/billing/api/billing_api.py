@@ -6,9 +6,10 @@ Provides complete route parity for all 21 billing endpoints under /billing.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 from uuid import UUID
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
@@ -42,24 +43,31 @@ from modules.billing.actions.billing_actions import (
     ListPaymentsAction,
     ListReceiptsAction,
     ListRefundsAction,
+    PrepareIpdBillAction,
     PrintDepositAction,
     PrintInvoiceAction,
     PrintPatientStatementAction,
     PrintReceiptAction,
     PrintRefundAction,
+    ReissueInvoiceAction,
     UpdateChargeAction,
 )
 from modules.billing.contracts.billing_contracts import (
+    BillingBillPreparationResponse,
     BillingChargeCreate,
     BillingChargeResponse,
     BillingChargeUpdate,
     BillingDashboardResponse,
     BillingDepositAllocate,
     BillingDepositCreate,
+    BillingDepositPage,
     BillingDepositResponse,
     BillingInvoiceCreate,
+    BillingInvoicePage,
+    BillingInvoiceReissueRequest,
     BillingInvoiceResponse,
     BillingPaymentCreate,
+    BillingPaymentPage,
     BillingPaymentResponse,
     BillingReceiptCreate,
     BillingReceiptResponse,
@@ -183,25 +191,28 @@ def cancel_charge(
 
 # ── Payments ────────────────────────────────────────────────────────────────
 
-@router.get("/payments", response_model=list[BillingPaymentResponse])
+@router.get("/payments", response_model=BillingPaymentPage)
 def list_payments(
     patient_id: UUID | None = Query(default=None),
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
     payment_method: BillingPaymentMethod | None = Query(default=None),
-    limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    search: str | None = Query(default=None, max_length=200),
+    collected_by: str | None = Query(default=None, max_length=255),
+    invoice_number: str | None = Query(default=None, max_length=64),
+    sort: Literal["newest", "oldest", "amount_desc", "amount_asc"] = Query(default="newest"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=15, ge=1, le=100),
     db: Session = Depends(get_transitional_sync_session),
     _: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> list[BillingPaymentResponse]:
+) -> BillingPaymentPage:
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(status_code=422, detail="From date must be on or before to date")
     return ListPaymentsAction(db, hospital_id).execute(
-        patient_id=patient_id,
-        from_date=from_date,
-        to_date=to_date,
-        payment_method=payment_method,
-        limit=limit,
-        offset=offset,
+        patient_id=patient_id, from_date=from_date, to_date=to_date,
+        payment_method=payment_method, search=search, collected_by=collected_by,
+        invoice_number=invoice_number, sort=sort, page=page, page_size=page_size,
     )
 
 
@@ -217,27 +228,31 @@ def record_payment(
 
 # ── Invoices ────────────────────────────────────────────────────────────────
 
-@router.get("/invoices", response_model=list[BillingInvoiceResponse])
+@router.get("/invoices", response_model=BillingInvoicePage)
 def list_invoices(
     patient_id: UUID | None = Query(default=None),
     status_filter: BillingInvoiceStatus | None = Query(default=None, alias="status"),
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
-    search: str | None = Query(default=None),
-    limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    search: str | None = Query(default=None, max_length=200),
+    sort: Literal["newest", "oldest", "amount_desc", "amount_asc", "date_desc", "date_asc"] = Query(default="newest"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=15, ge=1, le=100),
     db: Session = Depends(get_transitional_sync_session),
     _: dict = Depends(require_permission("billing", "view")),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> list[BillingInvoiceResponse]:
+) -> BillingInvoicePage:
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(status_code=422, detail="From date must be on or before to date")
     return ListInvoicesAction(db, hospital_id).execute(
+        page=page,
+        page_size=page_size,
         patient_id=patient_id,
         status=status_filter,
         from_date=from_date,
         to_date=to_date,
         search=search,
-        limit=limit,
-        offset=offset,
+        sort=sort,
     )
 
 
@@ -264,11 +279,23 @@ def create_invoice(
 @router.post("/invoices/{invoice_id}/cancel", response_model=BillingInvoiceResponse, dependencies=[Depends(require_permission("billing", "edit"))])
 def cancel_invoice(
     invoice_id: UUID,
+    reason: str | None = Query(default=None),
     db: Session = Depends(get_transitional_sync_session),
     user: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> BillingInvoiceResponse:
-    return CancelInvoiceAction(db, hospital_id).execute(invoice_id, user)
+    return CancelInvoiceAction(db, hospital_id).execute(invoice_id, user, reason=reason)
+
+
+@router.post("/invoices/{invoice_id}/reissue", response_model=BillingInvoiceResponse, dependencies=[Depends(require_permission("billing", "edit"))])
+def reissue_invoice(
+    invoice_id: UUID,
+    payload: BillingInvoiceReissueRequest | None = None,
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> BillingInvoiceResponse:
+    return ReissueInvoiceAction(db, hospital_id).execute(invoice_id, payload, user)
 
 
 @router.get("/invoices/{invoice_id}/print")
@@ -490,9 +517,20 @@ def close_financial_account_route(
     return CloseFinancialAccountAction(db, hospital_id).execute(account_id, user)
 
 
+@router.post("/accounts/{account_id}/prepare-bill", response_model=BillingBillPreparationResponse)
+def prepare_ipd_bill_route(
+    account_id: UUID,
+    as_of: datetime | None = Query(default=None),
+    db: Session = Depends(get_transitional_sync_session),
+    user: dict = Depends(require_permission("billing", "edit")),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> BillingBillPreparationResponse:
+    return PrepareIpdBillAction(db, hospital_id).execute(account_id, user, as_of=as_of)
+
+
 # ── Advance Deposits ────────────────────────────────────────────────────────
 
-@router.get("/deposits", response_model=list[BillingDepositResponse])
+@router.get("/deposits", response_model=BillingDepositPage | list[BillingDepositResponse])
 def list_deposits(
     patient_id: UUID | None = Query(default=None),
     account_id: UUID | None = Query(default=None),
@@ -500,12 +538,16 @@ def list_deposits(
     status_filter: DepositStatus | None = Query(default=None, alias="status"),
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
+    search: str | None = Query(default=None),
+    sort: str = Query(default="newest"),
+    page: int | None = Query(default=None, ge=1),
+    page_size: int = Query(default=15, ge=1, le=100),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_transitional_sync_session),
     _: dict = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
-) -> list[BillingDepositResponse]:
+) -> BillingDepositPage | list[BillingDepositResponse]:
     return ListDepositsAction(db, hospital_id).execute(
         patient_id=patient_id,
         account_id=account_id,
@@ -513,6 +555,10 @@ def list_deposits(
         status=status_filter,
         from_date=from_date,
         to_date=to_date,
+        search=search,
+        sort=sort,
+        page=page,
+        page_size=page_size,
         limit=limit,
         offset=offset,
     )

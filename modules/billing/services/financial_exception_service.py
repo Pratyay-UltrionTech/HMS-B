@@ -29,6 +29,7 @@ from modules.billing.services.financial_authorization import (
     resolve_actor,
 )
 from shared.audit.service import write_audit_log
+from shared.sync import stage_sync_event
 
 ENTITY_TYPE = "financial_clearance_exception"
 
@@ -204,6 +205,14 @@ def record_emergency_override(
         summary=f"Emergency financial override for {scope.service_type} ({scope_label}) by {actor.name}: {reason_text}",
         details=exception_audit_details(exc, **actor.audit_fields()),
     )
+    stage_sync_event(
+        db,
+        hospital_id=hospital_id,
+        entity_type=ENTITY_TYPE,
+        action="emergency_override",
+        entity_id=exc.id,
+        details=exception_audit_details(exc, **actor.audit_fields()),
+    )
     return exc
 
 
@@ -263,6 +272,14 @@ class FinancialExceptionService:
             summary=f"Requested financial exception for {payload.service_type}/{payload.action_type}: {reason_text}",
             details=exception_audit_details(exc, **requester.audit_fields()),
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type=ENTITY_TYPE,
+            action="create",
+            entity_id=exc.id,
+            details=exception_audit_details(exc, **requester.audit_fields()),
+        )
         self.db.commit()
         self.db.refresh(exc)
         return FinancialExceptionResponse.model_validate(exc)
@@ -320,6 +337,20 @@ class FinancialExceptionService:
             entity_type=ENTITY_TYPE,
             entity_id=exc.id,
             summary=f"Financial exception {payload.status} by {approver.name}: {payload.approval_remarks or ''}",
+            details=exception_audit_details(
+                exc,
+                decision=payload.status,
+                approval_remarks=payload.approval_remarks,
+                requested_by_id=str(exc.requested_by_id),
+                **approver.audit_fields(),
+            ),
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type=ENTITY_TYPE,
+            action="update",
+            entity_id=exc.id,
             details=exception_audit_details(
                 exc,
                 decision=payload.status,

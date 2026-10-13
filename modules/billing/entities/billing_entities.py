@@ -529,6 +529,7 @@ class BillingInvoice(Base):
     __table_args__ = (
         UniqueConstraint("hospital_id", "invoice_number", name="uq_billing_invoice_number"),
         Index("ix_billing_invoices_hospital_created", "hospital_id", "created_at"),
+        Index("ix_billing_invoices_hospital_date", "hospital_id", "invoice_date"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -656,6 +657,29 @@ class BillingReceipt(Base):
     collected_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    # Immutable historical financial snapshots (frozen at receipt issuance)
+    account_id_snapshot: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    amount_allocated_snapshot: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
+    )
+    account_balance_before_snapshot: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
+    )
+    account_balance_after_snapshot: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
+    )
+    patient_outstanding_after_snapshot: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
+    )
+    available_deposit_after_snapshot: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
+    )
+    net_patient_balance_after_snapshot: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True
     )
 
     patient: Mapped["Patient"] = relationship("Patient", foreign_keys=[patient_id])

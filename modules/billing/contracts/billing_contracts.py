@@ -74,6 +74,7 @@ class BillingChargeCreate(BaseModel):
     gst_rate: float | None = Field(default=0, ge=0)
     hsn_sac_code: str | None = None
     notes: str | None = None
+    explicit_unscoped: bool = False
 
     @model_validator(mode="after")
     def validate_discount_reason(self) -> "BillingChargeCreate":
@@ -236,6 +237,31 @@ class BillingPaymentResponse(BaseModel):
 
 # ── Deposits (Advances) ─────────────────────────────────────────────────────
 
+class BillingPaymentListItem(BaseModel):
+    """Flat register row, without allocations, notes, or clinical detail."""
+    id: UUID
+    patient_id: UUID
+    amount: float
+    payment_date: date
+    payment_method: BillingPaymentMethod
+    reference_number: str | None = None
+    received_by_name: str = ""
+    created_at: datetime
+    patient_name: str | None = None
+    patient_uhid: str | None = None
+    receipt_id: UUID | None = None
+    receipt_number: str | None = None
+
+
+class BillingPaymentPage(BaseModel):
+    items: list[BillingPaymentListItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    total_collected: float
+
+
 class BillingDepositCreate(BaseModel):
     patient_id: UUID
     account_id: UUID | None = None
@@ -274,7 +300,21 @@ class BillingDepositResponse(BaseModel):
     patient_name: str | None = None
     patient_uhid: str | None = None
 
+    allocated_amount: float | None = None
+
     model_config = ConfigDict(from_attributes=True)
+
+
+class BillingDepositPage(BaseModel):
+    items: list[BillingDepositResponse]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    total_deposited: float
+    total_available: float
+    total_allocated: float
+    total_refunded: float = 0.0
 
 
 # ── Refunds ─────────────────────────────────────────────────────────────────
@@ -354,24 +394,93 @@ class BillingInvoiceResponse(BaseModel):
     account_id: UUID | None = None
     invoice_number: str
     invoice_date: date
-    subtotal: float
-    discount_amount: float
-    taxable_amount: float = 0
-    tax_amount: float
-    cgst_amount: float = 0
-    sgst_amount: float = 0
-    igst_amount: float = 0
-    grand_total: float
+    subtotal: float = 0.0
+    discount_amount: float = 0.0
+    taxable_amount: float | None = 0.0
+    tax_amount: float = 0.0
+    cgst_amount: float | None = 0.0
+    sgst_amount: float | None = 0.0
+    igst_amount: float | None = 0.0
+    grand_total: float = 0.0
+    amount_paid: float = 0.0
+    balance_due: float = 0.0
     status: BillingInvoiceStatus
     notes: str | None = None
-    created_by_name: str = ""
+    created_by_name: str | None = ""
     created_at: datetime
     updated_at: datetime | None = None
     patient_name: str | None = None
     patient_uhid: str | None = None
+    reissue_eligible: bool = False
+    reissue_reason: str | None = None
     lines: list[BillingInvoiceLineResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class BillingInvoiceReissueRequest(BaseModel):
+    reason: str | None = None
+
+
+class BillingBillPreparationResponse(BaseModel):
+    account_id: UUID
+    admission_id: UUID | None = None
+    as_of: str
+    total_charges: float
+    total_paid: float
+    outstanding: float
+    charges: list[BillingChargeResponse] = []
+
+
+class BillingInvoiceListItem(BaseModel):
+    """Flat lightweight register row, without line items or clinical detail."""
+    id: UUID
+    hospital_id: UUID
+    patient_id: UUID
+    account_id: UUID | None = None
+    invoice_number: str
+    invoice_date: date
+    subtotal: float = 0.0
+    discount_amount: float = 0.0
+    taxable_amount: float | None = 0.0
+    tax_amount: float = 0.0
+    cgst_amount: float | None = 0.0
+    sgst_amount: float | None = 0.0
+    igst_amount: float | None = 0.0
+    grand_total: float = 0.0
+    amount_paid: float = 0.0
+    balance_due: float = 0.0
+    status: BillingInvoiceStatus
+    created_by_name: str | None = ""
+    created_at: datetime
+    patient_name: str | None = None
+    patient_uhid: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BillingInvoicePage(BaseModel):
+    items: list[BillingInvoiceListItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    total_amount: float
+
+
+class BillingInvoiceReissueRequest(BaseModel):
+    reason: str = "Superseded because billable charges changed after generation"
+    notes: str | None = None
+
+
+class BillingBillPreparationResponse(BaseModel):
+    account_id: UUID
+    admission_id: UUID | None = None
+    as_of: str
+    total_charges: float
+    total_paid: float
+    outstanding: float
+    charges: list[BillingChargeResponse]
 
 
 # ── Receipts ────────────────────────────────────────────────────────────────

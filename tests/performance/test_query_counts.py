@@ -1272,3 +1272,58 @@ def test_query_count_billing_deposit_drawdown_bounded(
     assert allocated == 1000.0  # 5 * 200 = 1000 total deposit funds drawn down
     assert counter_alloc.count <= 10
 
+
+# ==============================================================================
+# 19. Invoice List: Bounded Pagination & No Line Item Loading
+# ==============================================================================
+def test_query_count_invoice_list_bounded(
+    db_session: Session, hospital: Hospital
+):
+    """
+    Invoice Listing:
+    Query count for fetching a page of 15 invoices across a dataset of 50 invoices
+    with multiple line items is strictly bounded (<= 2 queries: count/sum aggregate +
+    projected limit/offset rows) and does NOT load invoice lines or generate N+1 queries.
+    """
+    from modules.billing.actions.billing_actions import ListInvoicesAction
+
+    pat = Patient(hospital_id=hospital.id, uhid=f"UHID-INV-{uuid4().hex[:6].upper()}", name="Invoice Query Patient", mobile="9800000555")
+    db_session.add(pat)
+    db_session.flush()
+
+    for i in range(50):
+        inv = BillingInvoice(
+            hospital_id=hospital.id,
+            patient_id=pat.id,
+            invoice_number=f"INV-QC-{i:03}",
+            invoice_date=date.today(),
+            grand_total=100.0 + i,
+            status=BillingInvoiceStatus.generated,
+            created_at=datetime.now(timezone.utc) + timedelta(seconds=i),
+        )
+        db_session.add(inv)
+        db_session.flush()
+        for j in range(4):
+            db_session.add(BillingInvoiceLine(
+                hospital_id=hospital.id,
+                invoice_id=inv.id,
+                source_type="consultation",
+                description=f"Item {j}",
+                quantity=1.0,
+                rate=25.0,
+                amount=25.0,
+                sort_order=j,
+            ))
+    db_session.commit()
+
+    with query_counter(session=db_session) as counter:
+        page = ListInvoicesAction(db_session, hospital.id).execute(page=1, page_size=15)
+
+    assert len(page.items) == 15
+    assert page.total == 50
+    assert page.total_pages == 4
+    billing_queries = [sql for sql in counter.statements if "billing_invoices" in sql]
+    assert len(billing_queries) == 2  # exactly 2 queries: count/sum aggregate + projected limit/offset rows
+    assert all("billing_invoice_lines" not in sql for sql in counter.statements)
+
+
