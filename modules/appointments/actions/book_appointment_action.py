@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from modules.appointments.contracts.appointments_contracts import (
@@ -26,9 +27,11 @@ from modules.appointments.exceptions.appointments_exceptions import (
     AppointmentValidationError,
 )
 from modules.appointments.validators.appointments_validator import AppointmentsValidator
+from modules.billing.services.idempotency_service import IdempotencyService
 from modules.patients.db.patients_repository import PatientRepository
 from shared.audit import write_audit_log
 from shared.hospital_clock import get_hospital_local_date, hospital_today
+from shared.sync import stage_sync_event
 
 
 class BookAppointmentAction:
@@ -55,29 +58,63 @@ class BookAppointmentAction:
         self,
         payload: BookAppointmentRequest,
         user: dict[str, Any],
+        idempotency_key: str | None = None,
     ) -> AppointmentListItem:
+        idemp_svc = IdempotencyService(self.db)
+        scope = "appointment_booking"
+        clean_key = idempotency_key.strip() if idempotency_key else None
+        req_hash = idemp_svc.compute_request_hash(payload) if clean_key else ""
+
+        if clean_key:
+            claimed, cached = idemp_svc.claim_or_replay(
+                self.hospital_id, scope, clean_key, req_hash
+            )
+            if not claimed and cached is not None:
+                return AppointmentListItem.model_validate(cached[1])
+
         # 1. Past slot validation
         AppointmentsValidator.assert_not_past_slot(
             payload.appointment_date, payload.appointment_time
         )
 
-        # 2. Holiday guard
-        holiday = self.avail_reader.get_holiday(payload.appointment_date)
-        if holiday:
-            raise AppointmentValidationError(
-                f"Hospital is closed on {payload.appointment_date} ({holiday['name']})"
+        # 2. Canonical Doctor Availability & Concurrency Guard
+        from modules.doctors.services.effective_availability_service import (
+            EffectiveDoctorAvailabilityService,
+        )
+        avail_svc = EffectiveDoctorAvailabilityService(self.db, self.hospital_id)
+        duration = 15
+        if payload.appointment_type_id:
+            from modules.appointments.entities.appointment_type import AppointmentType
+            appt_type = (
+                self.db.query(AppointmentType)
+                .filter(
+                    AppointmentType.id == payload.appointment_type_id,
+                    AppointmentType.hospital_id == self.hospital_id,
+                )
+                .first()
             )
+            if appt_type and appt_type.slot_duration_minutes:
+                duration = appt_type.slot_duration_minutes
+        else:
+            duration = avail_svc.get_slot_duration()
 
-        # 3. Doctor exists check
-        doctor = self.avail_reader.get_doctor(payload.doctor_id)
-        if not doctor:
-            raise AppointmentNotFoundError("Doctor not found")
+        ok, reason, code = avail_svc.check_slot_availability(
+            payload.doctor_id,
+            payload.appointment_date,
+            payload.appointment_time,
+            duration,
+            for_update=True,
+        )
+        if not ok:
+            if code == "DOCTOR_NOT_FOUND":
+                raise AppointmentNotFoundError(reason or "Doctor not found")
+            elif code in ("HOLIDAY", "OUTSIDE_SHIFT"):
+                raise AppointmentValidationError(reason or "Invalid appointment slot")
+            else:
+                raise AppointmentConflictError(reason or "Doctor is not available at this time")
 
-        # 4. Slot conflict guard
-        if self.avail_reader.has_slot_conflict(
-            payload.doctor_id, payload.appointment_date, payload.appointment_time
-        ):
-            raise AppointmentConflictError("Doctor already has an appointment at this time")
+        doctor_user = avail_svc.get_doctor(payload.doctor_id)
+        doctor_name = doctor_user.name if doctor_user else "Doctor"
 
         # 5. Resolve patient (existing or auto-register)
         patient_repo = PatientRepository(db=self.db, hospital_id=self.hospital_id)
@@ -208,7 +245,7 @@ class BookAppointmentAction:
                 patient_id=patient.id,
                 source_type=BillingSourceType.consultation,
                 source_id=appt.id,
-                description=f"Consultation Fee - Dr. {doctor['name']} ({appt.op_id})",
+                description=f"Consultation Fee - Dr. {doctor_name} ({appt.op_id})",
                 charge_amount=fee,
                 created_by_name=str(user.get("name") or "System"),
             )
@@ -287,12 +324,12 @@ class BookAppointmentAction:
                         "payment_reference": ref,
                         "receipt_number": receipt.receipt_number,
                         "receipt_id": receipt.id,
+                        "remaining_balance": 0.0,
                     })
                 except Exception as err:
                     self.db.rollback()
                     raise AppointmentValidationError(f"Payment settlement failed: {err}") from err
 
-        # Audit log for appointment
         write_audit_log(
             self.db,
             hospital_id=self.hospital_id,
@@ -302,15 +339,49 @@ class BookAppointmentAction:
             entity_id=appt.id,
             summary=(
                 f"Booked ({'Walk-in' if payload.booking_kind == 'walk_in' else 'Future'} → Scheduled) "
-                f"{patient.name} with {doctor['name']} on {payload.appointment_date} "
+                f"{patient.name} with {doctor_name} on {payload.appointment_date} "
                 f"{payload.appointment_time} fee={appt.consultation_fee}"
             ),
         )
-        self.db.commit()
-        self.db.refresh(appt)
-
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="appointment",
+            action="create",
+            entity_id=appt.id,
+            details={"patient_id": str(patient.id), "doctor_id": str(payload.doctor_id)},
+        )
+        if "receipt_id" in settlement_metadata:
+            stage_sync_event(
+                self.db,
+                hospital_id=self.hospital_id,
+                entity_type="payment",
+                action="create",
+                entity_id=settlement_metadata.get("receipt_id"),
+            )
         items = self.repo.hydrate_appointment_items([appt])
         item = items[0]
         if settlement_metadata:
             item = item.model_copy(update=settlement_metadata)
+
+        if clean_key:
+            idemp_svc.finalize_response(
+                hospital_id=self.hospital_id,
+                scope=scope,
+                idempotency_key=clean_key,
+                response_code=201,
+                response_payload=item.model_dump(mode="json"),
+            )
+
+        try:
+            self.db.commit()
+            self.db.refresh(appt)
+        except IntegrityError:
+            self.db.rollback()
+            if clean_key:
+                cached = idemp_svc.get_recorded_response(self.hospital_id, scope, clean_key, req_hash)
+                if cached is not None:
+                    return AppointmentListItem.model_validate(cached[1])
+            raise
+
         return item

@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from infrastructure.postgres.session import get_transitional_sync_session
@@ -34,6 +34,7 @@ from modules.admin.contracts.admin_contracts import (
     HospitalFacilitySettingsUpdate,
 )
 from shared.auth import (
+    get_current_user,
     get_hospital_context,
     require_hospital_admin,
     require_hospital_user,
@@ -44,12 +45,24 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 # ── Modules ────────────────────────────────────────────────────────────────────
+# Module catalog is platform-static (BASIC_MODULE_KEYS) — it is not scoped to a
+# hospital tenant. Hospital admins/staff need it for the permission-matrix editor
+# and the super_admin Dashboard needs it for the Module Catalog page, but a
+# super_admin token carries no hospital_uuid, so the hospital-scoped
+# require_hospital_user / get_hospital_context chain rejects it with 403
+# "Hospital access required". Accept any authenticated principal here instead.
 @router.get("/modules", response_model=list[ModuleInfo])
 def list_modules(
-    _: dict[str, Any] = Depends(require_hospital_user),
+    user: dict[str, Any] = Depends(get_current_user),
     db: Session = Depends(get_transitional_sync_session),
-    hospital_id: UUID = Depends(get_hospital_context),
 ) -> list[ModuleInfo]:
+    if user.get("role") not in {"super_admin", "hospital_admin", "hospital_staff"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Hospital access required")
+    hospital_uuid_raw = user.get("hospital_uuid")
+    try:
+        hospital_id = UUID(str(hospital_uuid_raw)) if hospital_uuid_raw else uuid4()
+    except (ValueError, TypeError, AttributeError):
+        hospital_id = uuid4()
     return AdminActions(db, hospital_id).list_modules()
 
 

@@ -20,7 +20,11 @@ from sqlalchemy.orm import Session
 
 from modules.appointments.entities.appointment import Appointment
 from modules.appointments.entities.enums import AppointmentStatus
-from modules.appointments.services.appointment_lifecycle import mark_in_progress
+from modules.appointments.services.appointment_lifecycle import (
+    complete_appointment_record,
+    mark_in_progress,
+)
+from shared.sync import stage_sync_event
 from modules.clinical_records.contracts.clinical_contracts import (
     MedicalRecordCreate,
     MedicalRecordResponse,
@@ -146,9 +150,12 @@ class CreatePrescriptionAction:
                 )
                 .first()
             )
-            if appt:
-                appt_status = appt.status
-                mark_in_progress(appt)
+            if not appt:
+                raise HTTPException(status_code=404, detail="Appointment not found")
+            if appt.patient_id != payload.patient_id:
+                raise HTTPException(status_code=400, detail="Appointment does not belong to the selected patient")
+            appt_status = appt.status
+            mark_in_progress(appt)
 
         if payload.admission_id:
             from modules.inpatient.entities.admission import Admission
@@ -250,11 +257,13 @@ class CreatePrescriptionAction:
 
         # Investigations are part of the prescription transaction: an invalid test/scan
         # selection fails the whole request instead of silently dropping the orders.
+        lab_req = None
+        rad_req = None
         if payload.test_ids or payload.panel_ids or payload.scan_ids:
             from modules.laboratory.services.lab_prescription_service import (
                 create_investigation_requests_for_prescription,
             )
-            create_investigation_requests_for_prescription(
+            lab_req, rad_req = create_investigation_requests_for_prescription(
                 self.db,
                 hospital_id=hospital_id,
                 doctor_id=doctor_id,
@@ -268,6 +277,25 @@ class CreatePrescriptionAction:
                 clinical_notes=f"Ordered with prescription · {rx.diagnosis[:120]}",
             )
 
+        # Phase 2: Decouple consultation completion from diagnostic fulfillment
+        if payload.appointment_id and status != "draft":
+            appt_record = (
+                self.db.query(Appointment)
+                .filter(
+                    Appointment.id == payload.appointment_id,
+                    Appointment.hospital_id == hospital_id,
+                )
+                .first()
+            )
+            if appt_record:
+                appt_record.consultation_status = "consultation_completed"
+                if payload.test_ids or payload.panel_ids or payload.scan_ids:
+                    appt_record.diagnostic_review_status = "pending_order"
+                else:
+                    appt_record.diagnostic_review_status = "not_required"
+                    # No diagnostics ordered, complete the appointment cleanly
+                    complete_appointment_record(self.db, hospital_id, appt_record, force=False)
+
         write_audit_log(
             self.db,
             hospital_id=hospital_id,
@@ -277,6 +305,37 @@ class CreatePrescriptionAction:
             entity_id=str(rx.id),
             summary=f"Created prescription for {patient.name} ({rx.diagnosis})",
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="prescription",
+            action="create",
+            entity_id=rx.id,
+        )
+        if payload.appointment_id:
+            stage_sync_event(
+                self.db,
+                hospital_id=hospital_id,
+                entity_type="appointment",
+                action="workflow_update",
+                entity_id=payload.appointment_id,
+            )
+        if lab_req and getattr(lab_req, "id", None):
+            stage_sync_event(
+                self.db,
+                hospital_id=hospital_id,
+                entity_type="lab_prescription_request",
+                action="create",
+                entity_id=lab_req.id,
+            )
+        if rad_req and getattr(rad_req, "id", None):
+            stage_sync_event(
+                self.db,
+                hospital_id=hospital_id,
+                entity_type="rad_prescription_request",
+                action="create",
+                entity_id=rad_req.id,
+            )
         self.db.commit()
         refreshed = self.repo.get_prescription(hospital_id, doctor_id, rx.id)
         return to_prescription_response(refreshed or rx, appt_status, db=self.db)
@@ -382,6 +441,21 @@ class UpdatePrescriptionAction:
             entity_id=str(rx.id),
             summary=f"Updated prescription {rx.id} for {rx.patient.name if rx.patient else 'patient'}",
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="prescription",
+            action="update",
+            entity_id=rx.id,
+        )
+        if target_appt_id:
+            stage_sync_event(
+                self.db,
+                hospital_id=hospital_id,
+                entity_type="appointment",
+                action="workflow_update",
+                entity_id=target_appt_id,
+            )
         self.db.commit()
         refreshed = self.repo.get_prescription(hospital_id, doctor_id, rx.id)
         return to_prescription_response(refreshed or rx, appt_status, db=self.db)

@@ -28,6 +28,7 @@ from modules.patients.validators.patients_validator import (
 )
 from modules.inpatient.entities.admission import Admission, AdmissionStatus
 from shared.audit import write_audit_log
+from shared.sync import stage_sync_event
 
 
 class UpdatePatientAction:
@@ -142,6 +143,14 @@ class UpdatePatientAction:
         )
 
         self._propagate_demographic_amendment(patient, before_demo, user)
+
+        stage_sync_event(
+            self.repo.db,
+            hospital_id=self.repo.hospital_id,
+            entity_type="patient",
+            action="update",
+            entity_id=patient.id,
+        )
 
         self.repo.commit()
         self.repo.refresh(patient)

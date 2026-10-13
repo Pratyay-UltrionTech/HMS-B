@@ -151,10 +151,10 @@ class AppointmentListItem(BaseModel):
     admission_status: str | None = None
     nurse_id: uuid.UUID | None = None
     nurse_name: str | None = None
-    ledger_outstanding: float = 0.0
-    ledger_total_charges: float = 0.0
-    ledger_total_paid: float = 0.0
-    ledger_status: str = "cleared"
+    ledger_outstanding: float | None = None
+    ledger_total_charges: float | None = None
+    ledger_total_paid: float | None = None
+    ledger_status: str | None = None
     # Phase B: Consultation payment settlement metadata
     payment_method: str | None = None
     payment_amount: float | None = None
@@ -162,6 +162,25 @@ class AppointmentListItem(BaseModel):
     receipt_number: str | None = None
     receipt_id: uuid.UUID | None = None
     charge_id: uuid.UUID | None = None
+    remaining_balance: float | None = None
+    patient_outstanding: float | None = None
+    # Phase 2: Decoupled Consultation & Diagnostic Workflow State
+    consultation_status: str | None = None
+    investigation_status: str | None = None
+    diagnostic_review_status: str | None = None
+    overall_workflow_status: str | None = None
+    workflow_status_label: str | None = None
+    diagnostic_summary: dict[str, Any] | None = None
+    clinical_override_reason: str | None = None
+    clinical_override_actor: str | None = None
+    clinical_override_at: datetime | None = None
+    diagnostics_reviewed_by: str | None = None
+    diagnostics_reviewed_at: datetime | None = None
+    diagnostic_review_notes: str | None = None
+
+
+class ReviewDiagnosticsRequest(BaseModel):
+    notes: str | None = None
 
 
 class UpdateInitialFindingsRequest(BaseModel):

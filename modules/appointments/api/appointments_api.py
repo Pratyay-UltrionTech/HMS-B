@@ -9,7 +9,7 @@ from datetime import date
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Header, Query, status
 from sqlalchemy.orm import Session
 
 from infrastructure.postgres import get_transitional_sync_session as get_db
@@ -24,6 +24,9 @@ from modules.appointments.actions.appointment_status_actions import (
 )
 from modules.appointments.actions.book_appointment_action import (
     BookAppointmentAction,
+)
+from modules.appointments.actions.review_diagnostics_action import (
+    ReviewDiagnosticsAction,
 )
 from modules.appointments.actions.check_availability_action import (
     CheckAvailabilityAction,
@@ -151,6 +154,7 @@ def check_doctor_availability(
     dependencies=[Depends(require_permission("appointment", "edit"))])
 def book_appointment(
     payload: BookAppointmentRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     db: Session = Depends(get_db),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
@@ -160,7 +164,7 @@ def book_appointment(
     pricing_reader = PricingReader(db, hospital_id)
     return BookAppointmentAction(
         db, hospital_id, repo, avail_reader, pricing_reader
-    ).execute(payload=payload, user=user)
+    ).execute(payload=payload, user=user, idempotency_key=idempotency_key)
 
 
 @router.get("/today", response_model=list[AppointmentListItem])
@@ -274,12 +278,43 @@ def check_appointment_complete_access(
 def complete_appointment(
     appointment_id: UUID,
     force: bool = False,
+    override_reason: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    user: dict[str, Any] = Depends(require_hospital_user),
+    hospital_id: UUID = Depends(get_hospital_context),
+) -> AppointmentListItem:
+    if force:
+        if not override_reason or not override_reason.strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="An explicit non-empty override reason is required for force completion",
+            )
+        role = user.get("role")
+        if role not in {"super_admin", "hospital_admin"}:
+            from shared.auth.service import authorization
+            if not authorization.is_authorized(user, ("appointment", "approve"), db=db):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Permission appointment:approve is required to force complete an appointment with open clinical blockers",
+                )
+    repo = AppointmentsRepository(db, hospital_id)
+    return CompleteAppointmentAction(db, hospital_id, repo).execute(
+        appointment_id, user, force=force, override_reason=override_reason
+    )
+
+
+@router.post("/{appointment_id}/review-diagnostics", response_model=AppointmentListItem, dependencies=[Depends(check_appointment_complete_access)])
+def review_diagnostics(
+    appointment_id: UUID,
+    notes: str | None = Query(default=None),
     db: Session = Depends(get_db),
     user: dict[str, Any] = Depends(require_hospital_user),
     hospital_id: UUID = Depends(get_hospital_context),
 ) -> AppointmentListItem:
     repo = AppointmentsRepository(db, hospital_id)
-    return CompleteAppointmentAction(db, hospital_id, repo).execute(appointment_id, user, force=force)
+    return ReviewDiagnosticsAction(db, hospital_id, repo).execute(
+        appointment_id, user, notes=notes
+    )
 
 
 @router.post("/{appointment_id}/cancel", response_model=AppointmentListItem, dependencies=[Depends(require_permission("appointment", "edit"))])

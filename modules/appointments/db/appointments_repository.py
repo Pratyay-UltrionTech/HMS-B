@@ -431,12 +431,14 @@ class AppointmentsRepository(BaseRepository[Appointment]):
 
         # Bulk fetch ledger totals
         ledger_map: dict[UUID, dict[str, Any]] = {}
+        ledger_error = False
         if patient_ids:
             try:
                 from modules.billing.services.billing_service import patient_ledger_totals_bulk
                 ledger_map = patient_ledger_totals_bulk(self.db, self.hospital_id, patient_ids)
             except Exception:
                 ledger_map = {}
+                ledger_error = True
 
         # Bulk fetch consultation settlement details (charges and receipts)
         settlement_map: dict[UUID, dict[str, Any]] = {}
@@ -493,9 +495,23 @@ class AppointmentsRepository(BaseRepository[Appointment]):
                             "payment_reference": p_obj.reference_number if p_obj else None,
                             "receipt_number": r_obj.receipt_number if r_obj else None,
                             "receipt_id": r_obj.id if r_obj else None,
+                            "remaining_balance": max(0.0, round(float(chg.net_amount - chg.amount_paid), 2)),
                         }
             except Exception:
                 settlement_map = {}
+
+        # Bulk derive decoupled workflow states (consultation vs investigation vs overall)
+        workflow_map: dict[UUID, Any] = {}
+        workflow_error = False
+        try:
+            from modules.appointments.services.appointment_workflow_service import (
+                AppointmentWorkflowService,
+            )
+            wf_svc = AppointmentWorkflowService(self.db, self.hospital_id)
+            workflow_map = wf_svc.bulk_derive_workflows(appointments)
+        except Exception:
+            workflow_map = {}
+            workflow_error = True
 
         items: list[AppointmentListItem] = []
         for a in appointments:
@@ -508,16 +524,39 @@ class AppointmentsRepository(BaseRepository[Appointment]):
             adm_bed = adm_info.get("bed") if adm_info else None
             adm_status = adm_info.get("status") if adm_info else None
 
-            led = ledger_map.get(a.patient_id, {})
-            out = float(led.get("outstanding", 0.0) or 0.0)
-            tot_chg = float(led.get("total_charges", 0.0) or 0.0)
-            tot_pd = float(led.get("total_paid", 0.0) or 0.0)
-            if out <= 0.009:
-                led_status = "unbilled" if tot_chg == 0 else "cleared"
+            if ledger_error or (patient_ids and a.patient_id not in ledger_map):
+                out = None
+                tot_chg = None
+                tot_pd = None
+                led_status = "unavailable"
             else:
-                led_status = "outstanding"
+                led = ledger_map.get(a.patient_id, {})
+                out = float(led.get("outstanding", 0.0) or 0.0)
+                tot_chg = float(led.get("total_charges", 0.0) or 0.0)
+                tot_pd = float(led.get("total_paid", 0.0) or 0.0)
+                if out <= 0.009:
+                    led_status = "unbilled" if tot_chg == 0 else "cleared"
+                else:
+                    led_status = "outstanding"
 
             st_info = settlement_map.get(a.id, {})
+            if workflow_error:
+                c_status = "unavailable"
+                inv_status = "unavailable"
+                overall_status = "workflow_unavailable"
+                wf_label = "Clinical Status Unavailable"
+                diag_summary = None
+            else:
+                wf = workflow_map.get(a.id)
+                c_status = (
+                    wf.consultation_status
+                    if wf
+                    else (getattr(a, "consultation_status", None) or "scheduled")
+                )
+                inv_status = wf.investigation_status if wf else "none"
+                overall_status = wf.overall_workflow_status if wf else a.status.value
+                wf_label = wf.workflow_status_label if wf else a.status.value.title()
+                diag_summary = wf.diagnostic_summary if wf else None
 
             items.append(
                 AppointmentListItem(
@@ -563,6 +602,20 @@ class AppointmentsRepository(BaseRepository[Appointment]):
                     payment_reference=st_info.get("payment_reference"),
                     receipt_number=st_info.get("receipt_number"),
                     receipt_id=st_info.get("receipt_id"),
+                    remaining_balance=st_info.get("remaining_balance"),
+                    patient_outstanding=out,
+                    consultation_status=c_status,
+                    investigation_status=inv_status,
+                    diagnostic_review_status=getattr(a, "diagnostic_review_status", None),
+                    overall_workflow_status=overall_status,
+                    workflow_status_label=wf_label,
+                    diagnostic_summary=diag_summary,
+                    clinical_override_reason=getattr(a, "clinical_override_reason", None),
+                    clinical_override_actor=getattr(a, "clinical_override_actor", None),
+                    clinical_override_at=getattr(a, "clinical_override_at", None),
+                    diagnostics_reviewed_by=getattr(a, "diagnostics_reviewed_by", None),
+                    diagnostics_reviewed_at=getattr(a, "diagnostics_reviewed_at", None),
+                    diagnostic_review_notes=getattr(a, "diagnostic_review_notes", None),
                 )
             )
         return items

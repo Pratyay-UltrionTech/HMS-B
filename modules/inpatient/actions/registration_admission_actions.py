@@ -30,6 +30,7 @@ from modules.inpatient.services.inpatient_billing_service import (
 )
 from modules.patients.entities.patient import Patient, PatientStatus
 from shared.audit.service import write_audit_log
+from shared.sync import stage_sync_event
 
 
 class RegistrationAdmitAction:
@@ -349,20 +350,12 @@ class RegistrationDischargeAction:
                     "Final billing required: A generated final invoice must exist for the admission account before discharge."
                 )
 
-            # Avoid Stale Final Bills: Check if any active billable charges were posted after invoice generation
-            stale_charges = (
-                self.db.query(BillingCharge)
-                .filter(
-                    BillingCharge.hospital_id == hospital_id,
-                    BillingCharge.account_id == acc.id,
-                    BillingCharge.status != BillingChargeStatus.cancelled,
-                    BillingCharge.created_at > latest_invoice.created_at,
-                )
-                .all()
-            )
-            if stale_charges:
+            # Avoid Stale Final Bills: Comprehensive freshness check
+            from modules.billing.services.invoice_freshness_service import verify_invoice_freshness
+            is_fresh, stale_reason = verify_invoice_freshness(self.db, hospital_id, latest_invoice)
+            if not is_fresh:
                 raise ValidationError(
-                    "Final bill out of date: New billable charges were added after the final invoice was generated. Please regenerate the final bill before discharge."
+                    f"Final bill out of date: {stale_reason} Please regenerate the final bill before discharge."
                 )
 
             acc_payments = (
@@ -467,12 +460,27 @@ class RegistrationDischargeAction:
             entity_id=str(admission.patient_id),
             summary="Patient discharged via registration",
         )
-        # Close FinancialAccount and refresh invoice status at successful discharge
         if acc:
             from modules.billing.entities.billing_entities import FinancialAccountStatus
             from modules.billing.services.invoice_service import refresh_invoice_paid_status
             acc.status = FinancialAccountStatus.closed
             refresh_invoice_paid_status(self.db, hospital_id, admission.patient_id)
+
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="admission",
+            action="discharge",
+            entity_id=str(admission.id),
+        )
+        if admission.bed_id:
+            stage_sync_event(
+                self.db,
+                hospital_id=hospital_id,
+                entity_type="bed",
+                action="release",
+                entity_id=str(admission.bed_id),
+            )
 
         self.db.commit()
         return DischargeResponse(

@@ -214,6 +214,33 @@ class CreateSurgeryAction:
             surgeon = self.repo.get_surgeon(payload.surgeon_id)
             if not surgeon:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Surgeon not found")
+            from modules.doctors.services.effective_availability_service import (
+                EffectiveDoctorAvailabilityService,
+            )
+            from shared.hospital_clock import get_hospital_tz
+            avail_svc = EffectiveDoctorAvailabilityService(self.db, self.hospital_id)
+            tz = get_hospital_tz(self.db, self.hospital_id)
+            s_dt = payload.scheduled_at
+            if s_dt.tzinfo is None:
+                s_dt = s_dt.replace(tzinfo=timezone.utc)
+            local_dt = s_dt.astimezone(tz)
+            dur_mins = int(payload.duration_minutes or 60)
+
+            ok, reason, code = avail_svc.check_slot_availability(
+                payload.surgeon_id,
+                local_dt.date(),
+                local_dt.time(),
+                dur_mins,
+                for_update=True,
+            )
+            if not ok:
+                if code == "DOCTOR_NOT_FOUND":
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=reason)
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Surgeon is not available: {reason}",
+                    )
 
         dept = self.repo.get_department(payload.department_id)
         if not dept:
@@ -337,11 +364,37 @@ class UpdateSurgeryAction:
         if item.status in (OtSurgeryStatus.completed, OtSurgeryStatus.cancelled):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot edit completed/cancelled surgery")
 
-        data = payload.model_dump(exclude_unset=True)
-        if "surgeon_id" in data and data["surgeon_id"]:
-            surgeon = self.repo.get_surgeon(data["surgeon_id"])
-            if not surgeon:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Surgeon not found")
+        target_surgeon_id = data.get("surgeon_id", item.surgeon_id)
+        target_scheduled_at = data.get("scheduled_at", item.scheduled_at)
+        target_duration = int(data.get("duration_minutes", item.duration_minutes) or 60)
+
+        if target_surgeon_id and ("scheduled_at" in data or "duration_minutes" in data or "surgeon_id" in data):
+            from modules.doctors.services.effective_availability_service import (
+                EffectiveDoctorAvailabilityService,
+            )
+            from shared.hospital_clock import get_hospital_tz
+            avail_svc = EffectiveDoctorAvailabilityService(self.db, self.hospital_id)
+            tz = get_hospital_tz(self.db, self.hospital_id)
+            s_dt = target_scheduled_at
+            if s_dt.tzinfo is None:
+                s_dt = s_dt.replace(tzinfo=timezone.utc)
+            local_dt = s_dt.astimezone(tz)
+            ok, reason, code = avail_svc.check_slot_availability(
+                target_surgeon_id,
+                local_dt.date(),
+                local_dt.time(),
+                target_duration,
+                exclude_ot_id=item.id,
+                for_update=True,
+            )
+            if not ok:
+                if code == "DOCTOR_NOT_FOUND":
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=reason)
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Surgeon is not available: {reason}",
+                    )
 
         for key, value in data.items():
             if isinstance(value, str):
@@ -463,9 +516,20 @@ class StartSurgeryAction:
             )
 
         # Enforce financial clearance before entering execution state
-        from modules.billing.entities.billing_entities import BillingSourceType
+        from modules.billing.entities.billing_entities import BillingChargeStatus, BillingSourceType
+        from modules.billing.services.billing_service import auto_apply_eligible_deposits_to_charge
         from modules.billing.services.financial_authorization import has_emergency_override_permission
+        from modules.billing.services.service_charge_resolver import resolve_service_charge
         from modules.billing.services.service_financial_clearance import assert_service_financially_cleared
+
+        ot_charge = resolve_service_charge(self.db, self.hospital_id, BillingSourceType.ot, item.id)
+        if ot_charge and ot_charge.status in (BillingChargeStatus.pending, BillingChargeStatus.partially_paid):
+            auto_apply_eligible_deposits_to_charge(
+                self.db,
+                hospital_id=self.hospital_id,
+                charge=ot_charge,
+                created_by_name=str(self.user.get("name") or "Staff"),
+            )
         is_em = bool(payload and getattr(payload, "is_emergency_override", False))
         em_reason = getattr(payload, "emergency_override_reason", None) if payload else None
         # Emergency priority is editable after booking, so it only implies an override

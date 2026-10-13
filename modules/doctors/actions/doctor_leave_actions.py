@@ -29,6 +29,7 @@ from modules.doctors.services.doctor_schedule_service import (
     slot_duration_minutes,
 )
 from shared.audit.service import write_audit_log
+from shared.sync import stage_sync_event
 
 
 def to_leave_response(leave: DoctorLeave) -> DoctorLeaveResponse:
@@ -111,6 +112,13 @@ class CreateDoctorLeaveAction:
             entity_id=str(leave.id),
             summary=f"Created leave on {leave.leave_date} for doctor {doctor.name}",
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="doctor_leave",
+            action="create",
+            entity_id=str(leave.id),
+        )
         self.db.commit()
         return to_leave_response(leave)
 
@@ -183,6 +191,18 @@ class CreateDoctorLeaveRangeAction:
             entity_id=f"range_{payload.start_date}_{payload.end_date}",
             summary=f"Created {len(created_leaves)} leave day(s) for doctor {doctor.name}",
         )
+        for l in created_leaves:
+            stage_sync_event(
+                self.db,
+                hospital_id=hospital_id,
+                entity_type="doctor_leave",
+                action="create",
+                entity_id=str(l.id),
+                details={
+                    "doctor_id": str(doctor_id),
+                    "leave_date": l.leave_date.isoformat(),
+                },
+            )
         self.db.commit()
         return [to_leave_response(l) for l in created_leaves]
 
@@ -210,5 +230,12 @@ class DeleteDoctorLeaveAction:
             entity_type="doctor_leave",
             entity_id=str(leave_id),
             summary=f"Deleted leave {leave_id}",
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="doctor_leave",
+            action="delete",
+            entity_id=str(leave_id),
         )
         self.db.commit()

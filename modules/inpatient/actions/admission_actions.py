@@ -944,123 +944,10 @@ class DischargePatientAction:
                     "Discharge prescription required: Please prescribe discharge medications or explicitly record 'No discharge medicines required' before discharge."
                 )
 
-        # 3. Automatic allocation of account payments & deposits before clearance check (Section 1.3 & 1.4)
-        from modules.billing.entities.billing_entities import (
-            BillingCharge,
-            BillingChargeStatus,
-            BillingDeposit,
-            BillingInvoice,
-            BillingInvoiceStatus,
-            BillingPayment,
-            BillingPaymentAllocation,
-            DepositStatus,
-            FinancialAccount,
-        )
-        from modules.billing.services.billing_service import (
-            draw_down_deposit_for_charges,
-            draw_down_deposits_bulk_for_account,
-            allocate_payment_to_charges,
-            payment_unallocated_amount,
-        )
-
-        acc = (
-            self.db.query(FinancialAccount)
-            .filter(
-                FinancialAccount.hospital_id == hospital_id,
-                FinancialAccount.admission_id == admission.id,
-            )
-            .first()
-        )
-        if acc:
-            # 3.1 Final Billing Gate: An admission-scoped final generated invoice must exist
-            latest_invoice = (
-                self.db.query(BillingInvoice)
-                .filter(
-                    BillingInvoice.hospital_id == hospital_id,
-                    BillingInvoice.account_id == acc.id,
-                    BillingInvoice.status.in_([BillingInvoiceStatus.generated, BillingInvoiceStatus.paid]),
-                )
-                .order_by(BillingInvoice.created_at.desc())
-                .first()
-            )
-            if not latest_invoice:
-                raise ValidationError(
-                    "Final billing required: A generated final invoice must exist for the admission account before discharge."
-                )
-
-            # 3.2 Avoid Stale / Un-invoiced Final Bills: Every charge on this account must be included in a final invoice
-            from modules.billing.entities.billing_entities import BillingInvoiceLine
-            invoiced_charge_ids = {
-                str(row[0])
-                for row in self.db.query(BillingInvoiceLine.charge_id)
-                .join(BillingInvoice, BillingInvoice.id == BillingInvoiceLine.invoice_id)
-                .filter(
-                    BillingInvoice.hospital_id == hospital_id,
-                    BillingInvoice.account_id == acc.id,
-                    BillingInvoice.status.in_([BillingInvoiceStatus.generated, BillingInvoiceStatus.paid]),
-                    BillingInvoiceLine.charge_id.isnot(None),
-                )
-                .all()
-            }
-            all_acc_charges = self.db.query(BillingCharge).filter(
-                BillingCharge.hospital_id == hospital_id,
-                BillingCharge.account_id == acc.id,
-                BillingCharge.status != BillingChargeStatus.cancelled,
-            ).all()
-            stale_charges = [
-                c for c in all_acc_charges
-                if str(c.id) not in invoiced_charge_ids
-            ]
-            if stale_charges:
-                raise ValidationError(
-                    "Final bill out of date: New billable charges were added after the final invoice was generated. Please regenerate the final bill before discharge."
-                )
-
-            # Reconcile any unallocated payments tied to this financial account
-            acc_payments = (
-                self.db.query(BillingPayment)
-                .filter(
-                    BillingPayment.hospital_id == hospital_id,
-                    BillingPayment.account_id == acc.id,
-                )
-                .all()
-            )
-            for pay in acc_payments:
-                unalloc_tender = payment_unallocated_amount(self.db, pay)
-                if unalloc_tender > 0:
-                    allocate_payment_to_charges(
-                        self.db,
-                        hospital_id,
-                        admission.patient_id,
-                        unalloc_tender,
-                        payment_id=pay.id,
-                        created_by_name=actor.get("name") or "Discharge Settlement",
-                        account_id=acc.id,
-                    )
-
-            # Safely draw down available deposits belonging to this admission/account in bulk
-            draw_down_deposits_bulk_for_account(
-                self.db,
-                hospital_id=hospital_id,
-                patient_id=admission.patient_id,
-                account_id=acc.id if acc else None,
-                created_by_name=actor.get("name") or "Discharge Settlement",
-            )
-            self.db.flush()
-
-        fin = self.billing_svc.get_ledger_totals(hospital_id, admission.patient_id, admission_id=admission.id)
-        outstanding = float(fin.get("outstanding") or 0)
-        deposits_avail = float(fin.get("total_deposits_available") or 0)
-
-        from modules.inpatient.db.discharge_exception_repository import DischargeExceptionRepository
-        exc_repo = DischargeExceptionRepository(self.db, hospital_id)
-        approved_exc = exc_repo.get_active_approved_exception(admission.id)
-
-        if outstanding > 0.009 and not approved_exc:
-            raise ValidationError(
-                f"Cannot discharge — outstanding balance ₹{outstanding:,.2f} (after ₹{deposits_avail:,.2f} deposit credit). "
-                f"Clear all dues or obtain an approved financial discharge exception before discharging."
-            )
+        # 3. Canonical Financial Clearance & Discharge Reconciliation (Phase 4, XMOD-016)
+        from modules.billing.services.financial_clearance_service import FinancialClearanceService
+        fin_clearance_svc = FinancialClearanceService(self.db)
+        fin_clearance_res = fin_clearance_svc.reconcile_and_clear_for_discharge(hospital_id, admission, actor)
 
         admission.status = AdmissionStatus.discharged
         # Invariant: discharged ⇔ discharged_at set (spec §23).
@@ -1070,7 +957,7 @@ class DischargePatientAction:
 
         if admission.bed_id:
             locked_bed = (
-                self.db.query(Bed).filter(Bed.id == admission.bed_id).with_for_update().first()
+                self.db.query(Bed).filter(Bed.id == admission.bed_id, Bed.hospital_id == hospital_id).with_for_update().first()
             )
             if locked_bed:
                 locked_bed.is_occupied = False
@@ -1079,9 +966,9 @@ class DischargePatientAction:
         if admission.patient:
             admission.patient.status = PatientStatus.active
 
-        # Close any open stay segment at discharge so no open segment survives
-        # the episode (Invariant 7).
-        open_segment = (
+        # Close any open stay segments at discharge so no open segment survives
+        # the episode (Invariant 7) and free associated beds atomically.
+        open_segments = (
             self.db.query(BedStaySegment)
             .filter(
                 BedStaySegment.hospital_id == hospital_id,
@@ -1089,10 +976,19 @@ class DischargePatientAction:
                 BedStaySegment.ended_at.is_(None),
             )
             .with_for_update()
-            .first()
+            .all()
         )
-        if open_segment:
+        for open_segment in open_segments:
             open_segment.ended_at = discharged_at
+            if open_segment.bed_id and open_segment.bed_id != admission.bed_id:
+                seg_bed = (
+                    self.db.query(Bed)
+                    .filter(Bed.id == open_segment.bed_id, Bed.hospital_id == hospital_id)
+                    .with_for_update()
+                    .first()
+                )
+                if seg_bed:
+                    seg_bed.is_occupied = False
 
         write_audit_log(
             self.db,
@@ -1134,10 +1030,18 @@ class DischargePatientAction:
             )
 
         # Close FinancialAccount and refresh invoice status at successful discharge
+        from modules.billing.entities.billing_entities import FinancialAccount, FinancialAccountStatus
+        from modules.billing.services.invoice_service import refresh_invoice_paid_status
+        acc = (
+            self.db.query(FinancialAccount)
+            .filter(
+                FinancialAccount.hospital_id == hospital_id,
+                FinancialAccount.admission_id == admission.id,
+            )
+            .first()
+        )
         if acc:
-            from modules.billing.entities.billing_entities import FinancialAccountStatus
-            from modules.billing.services.invoice_service import refresh_invoice_paid_status
-            if not approved_exc:
+            if fin_clearance_res.status not in ("exception_approved", "emergency_override"):
                 acc.status = FinancialAccountStatus.closed
             refresh_invoice_paid_status(self.db, hospital_id, admission.patient_id)
 
@@ -1181,15 +1085,15 @@ class CancelAdmissionAction:
         # Free bed if occupied
         if admission.bed_id:
             locked_bed = (
-                self.db.query(Bed).filter(Bed.id == admission.bed_id).with_for_update().first()
+                self.db.query(Bed).filter(Bed.id == admission.bed_id, Bed.hospital_id == hospital_id).with_for_update().first()
             )
             if locked_bed:
                 locked_bed.is_occupied = False
         elif admission.bed:
             admission.bed.is_occupied = False
 
-        # Close open stay segment
-        open_segment = (
+        # Close all open stay segments and free associated beds atomically
+        open_segments = (
             self.db.query(BedStaySegment)
             .filter(
                 BedStaySegment.hospital_id == hospital_id,
@@ -1197,10 +1101,19 @@ class CancelAdmissionAction:
                 BedStaySegment.ended_at.is_(None),
             )
             .with_for_update()
-            .first()
+            .all()
         )
-        if open_segment:
+        for open_segment in open_segments:
             open_segment.ended_at = now
+            if open_segment.bed_id and open_segment.bed_id != admission.bed_id:
+                seg_bed = (
+                    self.db.query(Bed)
+                    .filter(Bed.id == open_segment.bed_id, Bed.hospital_id == hospital_id)
+                    .with_for_update()
+                    .first()
+                )
+                if seg_bed:
+                    seg_bed.is_occupied = False
 
         # Revert/cancel admission fee and any provisional bed charges
         from modules.billing.entities.billing_entities import BillingSourceType

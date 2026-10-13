@@ -13,12 +13,13 @@ import logging
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import column, select, table
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Session
 
 from modules.appointments.entities.appointment import Appointment
 from modules.appointments.entities.enums import AppointmentStatus
+from modules.appointments.exceptions.appointments_exceptions import (
+    ClinicalBlockerResolutionError,
+)
 from modules.tenancy.entities.hospital import Hospital
 
 logger = logging.getLogger("hms.appointments.lifecycle")
@@ -35,41 +36,6 @@ TERMINAL = {
     AppointmentStatus.cancelled,
     AppointmentStatus.no_show,
 }
-
-# Open status sets for diagnostics
-_OPEN_LAB = {"ordered", "sample_collected", "in_progress"}
-_OPEN_RAD = {"ordered", "scheduled", "in_progress"}
-# Only unfulfilled doctor requests block completion. Once a lab order exists
-# (partially_processed), the lab_orders check above is the source of truth —
-# otherwise the same work blocks twice and the visit can never close.
-_OPEN_LAB_REQUESTS = {"pending"}
-
-# SQLAlchemy Core table references for clinical blocker checks
-_lab_orders = table(
-    "lab_orders",
-    column("id", PG_UUID(as_uuid=True)),
-    column("hospital_id", PG_UUID(as_uuid=True)),
-    column("appointment_id", PG_UUID(as_uuid=True)),
-    column("order_no", column("order_no").type),
-    column("status", column("status").type),
-)
-
-_lab_prescription_requests = table(
-    "lab_prescription_requests",
-    column("id", PG_UUID(as_uuid=True)),
-    column("hospital_id", PG_UUID(as_uuid=True)),
-    column("appointment_id", PG_UUID(as_uuid=True)),
-    column("status", column("status").type),
-)
-
-_radiology_orders = table(
-    "radiology_orders",
-    column("id", PG_UUID(as_uuid=True)),
-    column("hospital_id", PG_UUID(as_uuid=True)),
-    column("appointment_id", PG_UUID(as_uuid=True)),
-    column("order_no", column("order_no").type),
-    column("status", column("status").type),
-)
 
 
 def status_display_label(status: AppointmentStatus | str | None) -> str:
@@ -206,42 +172,38 @@ def mark_in_progress(appt: Appointment, *, assign_checked_in: bool = True) -> bo
 
 
 def get_open_clinical_blockers(db: Session, hospital_id: UUID, appointment_id: UUID) -> list[str]:
-    """Return list of diagnostic orders that block completing the appointment."""
-    blockers: list[str] = []
+    """Return list of diagnostic orders that block completing the appointment.
+    Fails closed: raises ClinicalBlockerResolutionError on database/query error.
+    """
     try:
-        # Check lab orders
-        stmt_lab = select(_lab_orders.c.order_no, _lab_orders.c.status).where(
-            _lab_orders.c.hospital_id == hospital_id,
-            _lab_orders.c.appointment_id == appointment_id,
-            _lab_orders.c.status.in_(_OPEN_LAB),
+        from modules.laboratory.services.lab_encounter_workflow_reader import (
+            LabEncounterWorkflowReader,
         )
-        for row in db.execute(stmt_lab).all():
-            st = str(row[1]).replace("_", " ") if row[1] else "open"
-            blockers.append(f"Lab order {row[0]} is {st}")
+        from modules.radiology.services.radiology_encounter_workflow_reader import (
+            RadiologyEncounterWorkflowReader,
+        )
 
-        # Check lab prescription requests
-        stmt_req = select(_lab_prescription_requests.c.status).where(
-            _lab_prescription_requests.c.hospital_id == hospital_id,
-            _lab_prescription_requests.c.appointment_id == appointment_id,
-            _lab_prescription_requests.c.status.in_(_OPEN_LAB_REQUESTS),
+        lab_summary = LabEncounterWorkflowReader(db).get_for_appointment(
+            hospital_id, appointment_id
         )
-        for row in db.execute(stmt_req).all():
-            st = str(row[0]).replace("_", " ") if row[0] else "pending"
-            blockers.append(f"Doctor lab request pending ({st})")
+        rad_summary = RadiologyEncounterWorkflowReader(db).get_for_appointment(
+            hospital_id, appointment_id
+        )
 
-        # Check radiology orders
-        stmt_rad = select(_radiology_orders.c.order_no, _radiology_orders.c.status).where(
-            _radiology_orders.c.hospital_id == hospital_id,
-            _radiology_orders.c.appointment_id == appointment_id,
-            _radiology_orders.c.status.in_(_OPEN_RAD),
-        )
-        for row in db.execute(stmt_rad).all():
-            st = str(row[1]).replace("_", " ") if row[1] else "open"
-            blockers.append(f"Radiology order {row[0]} is {st}")
+        blockers: list[str] = []
+        blockers.extend(lab_summary.blocker_descriptions)
+        blockers.extend(rad_summary.blocker_descriptions)
+        return blockers
     except Exception as exc:
-        logger.debug("Diagnostics blocker inspection skipped or failed: %s", exc)
-
-    return blockers
+        logger.error(
+            "Diagnostics blocker inspection failed for appointment %s: %s",
+            appointment_id,
+            exc,
+            exc_info=True,
+        )
+        raise ClinicalBlockerResolutionError(
+            f"Diagnostic safety verification failed for appointment {appointment_id}: unable to verify completion requirements (fail-closed)"
+        ) from exc
 
 
 def can_complete_appointment(
@@ -257,9 +219,13 @@ def can_complete_appointment(
     if appt.status not in {AppointmentStatus.scheduled, IN_PROGRESS}:
         return False, [f"Cannot complete from status {status_display_label(appt.status)}"]
     if not force:
-        blockers = get_open_clinical_blockers(db, hospital_id, appt.id)
-        if blockers:
-            return False, blockers
+        try:
+            blockers = get_open_clinical_blockers(db, hospital_id, appt.id)
+            if blockers:
+                return False, blockers
+        except ClinicalBlockerResolutionError as err:
+            logger.error("can_complete_appointment fail-closed: %s", err)
+            return False, [str(err.message)]
     return True, []
 
 

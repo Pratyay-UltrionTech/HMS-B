@@ -78,6 +78,14 @@ class Appointment(Base):
         nullable=False,
         default=AppointmentStatus.scheduled,
     )
+    consultation_status: Mapped[str] = mapped_column(String(32), nullable=False, default="scheduled")
+    diagnostic_review_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_required")
+    clinical_override_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    clinical_override_actor: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    clinical_override_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    diagnostics_reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    diagnostics_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    diagnostic_review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     booking_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="future")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     initial_findings: Mapped[str | None] = mapped_column(Text, nullable=True)

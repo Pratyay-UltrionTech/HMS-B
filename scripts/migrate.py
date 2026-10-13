@@ -223,6 +223,49 @@ DDL_STATEMENTS = [
         END IF;
     END $$;
     """,
+
+    # 10. Cross-Module Integrity & Workflow Columns
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS consultation_status VARCHAR(32) NOT NULL DEFAULT 'scheduled';",
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS diagnostic_review_status VARCHAR(32) NOT NULL DEFAULT 'not_required';",
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinical_override_reason TEXT;",
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinical_override_actor VARCHAR(255);",
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS clinical_override_at TIMESTAMPTZ;",
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS diagnostics_reviewed_by VARCHAR(255);",
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS diagnostics_reviewed_at TIMESTAMPTZ;",
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS diagnostic_review_notes TEXT;",
+    "CREATE INDEX IF NOT EXISTS ix_appointments_consultation_status ON appointments(consultation_status);",
+    "CREATE INDEX IF NOT EXISTS ix_appointments_diagnostic_review_status ON appointments(diagnostic_review_status);",
+
+    # 11. IPD Form Engine & Signer Integrity Columns
+    "ALTER TABLE ipd_form_submissions ADD COLUMN IF NOT EXISTS form_schema_version INTEGER NOT NULL DEFAULT 1;",
+    "ALTER TABLE ipd_form_submissions ADD COLUMN IF NOT EXISTS signer_type VARCHAR(64);",
+    "ALTER TABLE ipd_form_submissions ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255);",
+    "ALTER TABLE ipd_form_submissions ADD COLUMN IF NOT EXISTS signer_relationship VARCHAR(128);",
+    "ALTER TABLE ipd_form_submissions ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ;",
+    "CREATE INDEX IF NOT EXISTS ix_ipd_form_submissions_schema_ver ON ipd_form_submissions(form_schema_version);",
+
+    # 12. DB-Backed Idempotency Records
+    """
+    CREATE TABLE IF NOT EXISTS idempotency_keys (
+        id UUID PRIMARY KEY,
+        hospital_id UUID NOT NULL REFERENCES hospitals(id) ON DELETE CASCADE,
+        idempotency_key VARCHAR(255) NOT NULL,
+        scope VARCHAR(128) NOT NULL,
+        request_hash VARCHAR(64) NOT NULL,
+        response_code INTEGER NOT NULL,
+        response_payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_idempotency_key UNIQUE (hospital_id, scope, idempotency_key)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_idempotency_keys_created_at ON idempotency_keys(created_at);",
+    "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS account_id_snapshot UUID;",
+    "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS amount_allocated_snapshot NUMERIC(14, 2);",
+    "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS account_balance_before_snapshot NUMERIC(14, 2);",
+    "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS account_balance_after_snapshot NUMERIC(14, 2);",
+    "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS patient_outstanding_after_snapshot NUMERIC(14, 2);",
+    "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS available_deposit_after_snapshot NUMERIC(14, 2);",
+    "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS net_patient_balance_after_snapshot NUMERIC(14, 2);",
 ]
 
 
@@ -309,10 +352,8 @@ def backfill_hospital_admin_roles(conn) -> tuple[int, int]:
     Backfill canonical Hospital Admin roles with is_admin_role = TRUE and code = 'HOSPITAL_ADMIN'.
     Targets:
       1. Canonical exact names ('Hospital Admin', 'hospital_admin') -> auto-migrated.
-      2. Generic name ('Administrator') -> promoted ONLY with strong evidence:
-         - Assigned to user matching hospital's registered primary email (historical primary admin), OR
-         - Has unrestricted administrative permissions across core modules (>= 5 modules).
-      3. Ambiguous 'Administrator' roles without strong evidence -> left unmigrated and flagged for manual review.
+      2. Generic name ('Administrator') -> ambiguous, left unchanged and flagged for manual review.
+         (No permission-count heuristic or broad access patterns can create Hospital Admin authority).
     
     Returns:
         (canonical_promoted_count, ambiguous_unmigrated_count)
@@ -328,7 +369,9 @@ def backfill_hospital_admin_roles(conn) -> tuple[int, int]:
     res_canonical = conn.execute(canonical_sql)
     canonical_count = res_canonical.rowcount or 0
 
-    # 2. Inspect generic 'Administrator' roles
+    # 2. Generic 'Administrator' roles:
+    # A role named exactly 'Administrator' must NOT become Hospital Admin merely
+    # because it has many permissions. Leave unchanged and report for manual review.
     ambiguous_count = 0
     candidate_roles_sql = text("""
         SELECT r.id, r.hospital_id, r.name
@@ -341,57 +384,12 @@ def backfill_hospital_admin_roles(conn) -> tuple[int, int]:
     for row in candidate_roles:
         role_id = row.id
         hospital_id = row.hospital_id
-
-        # Evidence A: Role is assigned to a hospital user whose email matches the hospital's registered email
-        email_match_sql = text("""
-            SELECT 1
-            FROM hospital_users u
-            JOIN hospitals h ON u.hospital_id = h.id
-            WHERE h.id = :hid
-              AND (
-                  u.role_id = :rid 
-                  OR EXISTS (
-                      SELECT 1 FROM hospital_user_roles ur 
-                      WHERE ur.user_id = u.id AND ur.role_id = :rid
-                  )
-              )
-              AND lower(u.email) = lower(h.email)
-            LIMIT 1;
-        """)
-        has_primary_admin = conn.execute(email_match_sql, {"hid": hospital_id, "rid": role_id}).first() is not None
-
-        # Evidence B: Role has unrestricted permissions across core modules (>= 5 modules with can_view AND can_edit)
-        perm_count_sql = text("""
-            SELECT count(*)
-            FROM role_permissions p
-            WHERE p.role_id = :rid
-              AND p.can_view = TRUE
-              AND p.can_edit = TRUE;
-        """)
-        perm_count = conn.execute(perm_count_sql, {"rid": role_id}).scalar() or 0
-        has_unrestricted_perms = perm_count >= 5
-
-        if has_primary_admin or has_unrestricted_perms:
-            # Strong evidence verified -> safe to promote
-            promote_sql = text("""
-                UPDATE staff_roles
-                SET is_admin_role = TRUE,
-                    code = 'HOSPITAL_ADMIN'
-                WHERE id = :rid;
-            """)
-            conn.execute(promote_sql, {"rid": role_id})
-            canonical_count += 1
-            logger.info(
-                "Promoted verified canonical 'Administrator' role %s for hospital %s to HOSPITAL_ADMIN (evidence: primary_admin=%s, perms=%d)",
-                role_id, hospital_id, has_primary_admin, perm_count,
-            )
-        else:
-            # Ambiguous: ordinary permissions, not historical primary admin -> DO NOT PROMOTE
-            ambiguous_count += 1
-            logger.warning(
-                "Ambiguous 'Administrator' role %s for hospital %s left unmigrated (requires manual review; perms=%d, primary_admin=False)",
-                role_id, hospital_id, perm_count,
-            )
+        # Ambiguous generic role: do not auto-promote. Report role/hospital ID without sensitive user data.
+        ambiguous_count += 1
+        logger.warning(
+            "Ambiguous 'Administrator' role %s for hospital %s left unmigrated (requires manual review; no auto-promotion)",
+            role_id, hospital_id,
+        )
 
     return canonical_count, ambiguous_count
 
@@ -456,9 +454,10 @@ def run_migration() -> None:
         logger.info("Hospital auth_model backfill: %d legacy_organization, %d user_accounts", legacy_updated, modern_updated)
 
         admin_roles_updated, ambiguous_admin_roles = backfill_hospital_admin_roles(conn)
-        logger.info("StaffRole admin backfill: %d canonical admin role(s) updated to HOSPITAL_ADMIN / is_admin_role=TRUE", admin_roles_updated)
-        logger.info("Canonical admin roles auto-migrated: %d", admin_roles_updated)
-        logger.info("Ambiguous 'Administrator' roles requiring manual review: %d", ambiguous_admin_roles)
+        logger.info("Canonical admin roles migrated: %d", admin_roles_updated)
+        logger.info("Ambiguous Administrator roles: %d", ambiguous_admin_roles)
+        print(f"Canonical admin roles migrated: {admin_roles_updated}")
+        print(f"Ambiguous Administrator roles: {ambiguous_admin_roles}")
 
         # 4. Post-migration verification
         logger.info("--- Post-Migration Validation ---")

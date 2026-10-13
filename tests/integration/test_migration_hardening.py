@@ -159,8 +159,15 @@ def test_fix1_inactive_admin_preserves_user_accounts_and_blocks_fallback(db_sess
     assert res_global_fallback.status_code == 401
 
 
-def test_fix2_case_a_hospital_admin_canonical_promoted(db_session):
-    """Case A: exact name 'Hospital Admin' is canonically promoted."""
+def test_case_1_hospital_admin_canonical_promoted(db_session):
+    """
+    Case 1:
+    name = "Hospital Admin"
+
+    EXPECTED:
+    code = HOSPITAL_ADMIN
+    is_admin_role = TRUE
+    """
     h_id = uuid.uuid4()
     r = StaffRole(
         id=uuid.uuid4(),
@@ -183,8 +190,19 @@ def test_fix2_case_a_hospital_admin_canonical_promoted(db_session):
     assert ambiguous == 0
 
 
-def test_fix2_case_b_hospital_admin_lowercase_promoted(db_session):
-    """Case B: exact name 'hospital_admin' is canonically promoted."""
+# Backward compatibility alias
+test_fix2_case_a_hospital_admin_canonical_promoted = test_case_1_hospital_admin_canonical_promoted
+
+
+def test_case_2_hospital_admin_lowercase_promoted(db_session):
+    """
+    Case 2:
+    name = "hospital_admin"
+
+    EXPECTED:
+    code = HOSPITAL_ADMIN
+    is_admin_role = TRUE
+    """
     h_id = uuid.uuid4()
     r = StaffRole(
         id=uuid.uuid4(),
@@ -207,10 +225,21 @@ def test_fix2_case_b_hospital_admin_lowercase_promoted(db_session):
     assert ambiguous == 0
 
 
-def test_fix2_case_c_custom_administrator_role_not_promoted(db_session):
+# Backward compatibility alias
+test_fix2_case_b_hospital_admin_lowercase_promoted = test_case_2_hospital_admin_lowercase_promoted
+
+
+def test_case_4_custom_administrator_limited_permissions_not_promoted(db_session):
     """
-    Case C: Custom role named 'Administrator' with ordinary limited permissions
-    is NOT automatically elevated and reported as ambiguous for manual review.
+    Case 4:
+    custom Administrator
+    limited permissions
+
+    EXPECTED:
+    NOT promoted
+    code remains unchanged/null
+    is_admin_role remains FALSE
+    reported as ambiguous
     """
     h_id = uuid.uuid4()
     role_id = uuid.uuid4()
@@ -278,96 +307,72 @@ def test_fix2_case_c_custom_administrator_role_not_promoted(db_session):
     assert ambiguous >= 1, "Must report at least 1 ambiguous role requiring manual review"
 
 
-def test_fix2_case_d_administrator_with_strong_evidence_promoted(db_session):
+# Backward compatibility alias
+test_fix2_case_c_custom_administrator_role_not_promoted = test_case_4_custom_administrator_limited_permissions_not_promoted
+
+
+def test_case_3_administrator_broad_permissions_not_promoted(db_session):
     """
-    Case D: Role named 'Administrator' with strong evidence
-    (assigned to hospital primary admin email AND/OR unrestricted permissions)
-    IS migrated when evidence is satisfied.
+    Case 3:
+    name = "Administrator"
+    permissions on 5+ modules (e.g. patients, appointments, beds, billing, inventory, vitals)
+
+    EXPECTED:
+    NOT promoted
+    code remains unchanged/null
+    is_admin_role remains FALSE
+    reported as ambiguous
     """
-    # D1: Matches hospital's primary admin email
-    h1_id = uuid.uuid4()
-    r1_id = uuid.uuid4()
-    h1 = Hospital(
-        id=h1_id,
-        hospital_id="HMS-CANON-D1",
-        name="Historical Admin Hospital",
-        address="100 Historical Way",
-        phone="9876543210",
-        email="director@historical.org",
+    h_id = uuid.uuid4()
+    r_id = uuid.uuid4()
+    h = Hospital(
+        id=h_id,
+        hospital_id="HMS-AMBIG-5P",
+        name="Broad Permissions Hospital",
+        address="500 Multi Perm Way",
+        phone="9876543500",
+        email="hospital@broadperms.org",
         is_active=True,
         status="active",
     )
-    db_session.add(h1)
+    db_session.add(h)
 
-    r1 = StaffRole(
-        id=r1_id,
-        hospital_id=h1_id,
+    r = StaffRole(
+        id=r_id,
+        hospital_id=h_id,
         name="Administrator",
         code=None,
         is_admin_role=False,
     )
-    db_session.add(r1)
+    db_session.add(r)
 
-    u1 = HospitalUser(
-        id=uuid.uuid4(),
-        hospital_id=h1_id,
-        role_id=r1_id,
-        name="Hospital Director",
-        phone="9876543211",
-        email="director@historical.org",  # Matches hospital email exactly
-        password_hash=hash_password("DirectorPass123!"),
-        is_active=True,
-    )
-    db_session.add(u1)
-
-    # D2: Unrestricted multi-module permissions
-    h2_id = uuid.uuid4()
-    r2_id = uuid.uuid4()
-    h2 = Hospital(
-        id=h2_id,
-        hospital_id="HMS-CANON-D2",
-        name="Unrestricted Role Hospital",
-        address="200 Unrestricted Way",
-        phone="9876543220",
-        email="admin2@unrestricted.org",
-        is_active=True,
-        status="active",
-    )
-    db_session.add(h2)
-
-    r2 = StaffRole(
-        id=r2_id,
-        hospital_id=h2_id,
-        name="Administrator",
-        code=None,
-        is_admin_role=False,
-    )
-    db_session.add(r2)
-
-    for mod in ["appointments", "billing", "patients", "pharmacy", "vitals", "laboratory"]:
+    # 6 modules with view & edit permissions (e.g., Patients, Appointments, Beds, Billing, Inventory, Vitals)
+    modules = ["patients", "appointments", "beds", "billing", "inventory", "vitals"]
+    for mod in modules:
         db_session.add(
             RolePermission(
                 id=uuid.uuid4(),
-                hospital_id=h2_id,
-                role_id=r2_id,
+                hospital_id=h_id,
+                role_id=r_id,
                 module_key=mod,
                 can_view=True,
                 can_edit=True,
             )
         )
-
     db_session.commit()
 
     conn = db_session.connection()
     promoted, ambiguous = backfill_hospital_admin_roles(conn)
     db_session.commit()
 
-    db_session.refresh(r1)
-    db_session.refresh(r2)
-    assert r1.code == "HOSPITAL_ADMIN"
-    assert r1.is_admin_role is True
-    assert r2.code == "HOSPITAL_ADMIN"
-    assert r2.is_admin_role is True
+    db_session.refresh(r)
+    assert r.code is None or r.code != "HOSPITAL_ADMIN", (
+        f"Administrator role with 5+ permissions must not receive HOSPITAL_ADMIN code, got {r.code}"
+    )
+    assert r.is_admin_role is False, (
+        "Administrator role with 5+ permissions must not receive is_admin_role=True"
+    )
+    assert ambiguous >= 1, "Must report as ambiguous Administrator role"
 
 
 def test_genuine_legacy_tenant_remains_legacy_and_authenticates(db_session, auth_client):
@@ -413,8 +418,16 @@ def test_genuine_legacy_tenant_remains_legacy_and_authenticates(db_session, auth
     assert res.json()["hospital_id"] == "HMS-LEGACY-GEN"
 
 
-def test_migration_backfill_idempotency(db_session):
-    """Second execution of migration backfills produces zero drift and zero changes."""
+def test_case_5_migration_run_twice_idempotency(db_session):
+    """
+    Case 5:
+    Run migration twice.
+
+    Expected:
+    same role states
+    same counts
+    no duplicate updates
+    """
     h_id = uuid.uuid4()
     r_id = uuid.uuid4()
     h = Hospital(
@@ -454,10 +467,27 @@ def test_migration_backfill_idempotency(db_session):
     prom1, amb1 = backfill_hospital_admin_roles(conn1)
     db_session.commit()
     assert prom1 == 1
+    assert amb1 == 0
+    db_session.refresh(r)
+    db_session.refresh(h)
+    state1_code = r.code
+    state1_admin = r.is_admin_role
+    state1_auth = h.auth_model
 
     # Run 2
     conn2 = db_session.connection()
     leg2, mod2 = backfill_hospital_auth_models(conn2)
     prom2, amb2 = backfill_hospital_admin_roles(conn2)
     db_session.commit()
-    assert prom2 == 0, "Second run must not re-promote already canonical roles"
+    assert prom2 == 0, "Second run must not re-promote already canonical roles (0 duplicate updates)"
+    assert amb2 == 0
+    db_session.refresh(r)
+    db_session.refresh(h)
+    assert r.code == state1_code, "Role code must remain identical on run 2"
+    assert r.is_admin_role == state1_admin, "Role is_admin_role must remain identical on run 2"
+    assert h.auth_model == state1_auth, "Hospital auth_model must remain identical on run 2"
+
+
+# Backward compatibility alias
+test_migration_backfill_idempotency = test_case_5_migration_run_twice_idempotency
+

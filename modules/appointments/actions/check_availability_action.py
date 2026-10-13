@@ -15,50 +15,36 @@ from modules.appointments.db.availability_reader import AvailabilityReader
 from modules.appointments.exceptions.appointments_exceptions import (
     AppointmentNotFoundError,
 )
+from modules.doctors.services.effective_availability_service import (
+    EffectiveDoctorAvailabilityService,
+)
 
 
 class CheckAvailabilityAction:
-    """Calculates doctor schedule, leave blocks, booked slots, and shift bounds."""
+    """Calculates doctor schedule, leave blocks, booked slots, and shift bounds using canonical service."""
 
     def __init__(self, avail_reader: AvailabilityReader) -> None:
         self.avail_reader = avail_reader
 
     def execute(self, doctor_id: UUID, on_date: date) -> DoctorAvailability:
-        doctor = self.avail_reader.get_doctor(doctor_id)
-        if not doctor:
+        svc = EffectiveDoctorAvailabilityService(self.avail_reader.db, self.avail_reader.hospital_id)
+        daily = svc.get_daily_availability(doctor_id, on_date)
+        if daily.reason == "Doctor not found":
             raise AppointmentNotFoundError("Doctor not found")
 
-        holiday = self.avail_reader.get_holiday(on_date)
-        if holiday:
-            return DoctorAvailability(
-                doctor_id=doctor_id,
-                doctor_name=doctor["name"],
-                date=on_date,
-                available=False,
-                reason=f"Hospital closed — {holiday['name']}",
-                booked_slots=[],
-                leave_blocks=[],
-                shift_start=None,
-                shift_end=None,
-            )
-
-        leave_rows = self.avail_reader.list_leaves_for_doctor(doctor_id, on_date)
         leave_blocks = [
             LeaveBlock(start=l["start"], end=l["end"], reason=l.get("reason"))
-            for l in leave_rows
+            for l in daily.leave_blocks
         ]
-
-        booked_slots = self.avail_reader.get_booked_slots(doctor_id, on_date)
-        shift_start, shift_end = self.avail_reader.get_shift_bounds(doctor.get("shift_id"))
 
         return DoctorAvailability(
             doctor_id=doctor_id,
-            doctor_name=doctor["name"],
+            doctor_name=daily.doctor_name,
             date=on_date,
-            available=True,
-            reason=None,
-            booked_slots=booked_slots,
+            available=daily.available,
+            reason=daily.reason,
+            booked_slots=daily.booked_slots,
             leave_blocks=leave_blocks,
-            shift_start=shift_start,
-            shift_end=shift_end,
+            shift_start=daily.shift_start,
+            shift_end=daily.shift_end,
         )

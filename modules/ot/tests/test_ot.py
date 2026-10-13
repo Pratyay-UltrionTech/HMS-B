@@ -5,7 +5,7 @@ Unit and integration tests for Operation Theatre (OT) domain.
 from __future__ import annotations
 
 import base64
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI
@@ -275,7 +275,8 @@ def test_surgery_booking_validations_and_billing_charge(ot_client, ot_db):
     ).isoformat()
     resp_conflict = ot_client.post("/api/ot/surgeries", json=overlap_payload)
     assert resp_conflict.status_code == 409
-    assert "already booked" in resp_conflict.json()["detail"]
+    detail_msg = resp_conflict.json()["detail"]
+    assert "already booked" in detail_msg or "Surgeon is not available" in detail_msg
 
 
 def test_surgery_full_lifecycle_and_medical_records(ot_client, ot_db):
@@ -320,7 +321,9 @@ def test_surgery_full_lifecycle_and_medical_records(ot_client, ot_db):
             "surgery_type": "Appendectomy",
             "department_id": str(ot_client.test_dept_id),
             "ot_room_id": str(ot_client.test_room_id),
-            "scheduled_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+            "scheduled_at": datetime.combine(
+                date.today() + timedelta(days=1), time(10, 0), tzinfo=timezone.utc
+            ).isoformat(),
             "duration_minutes": 60,
         },
     ).json()
@@ -332,7 +335,9 @@ def test_surgery_full_lifecycle_and_medical_records(ot_client, ot_db):
     assert conf_resp.json()["status"] == "confirmed"
 
     # 2. Reschedule surgery
-    new_time = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    new_time = datetime.combine(
+        date.today() + timedelta(days=1), time(11, 30), tzinfo=timezone.utc
+    ).isoformat()
     resched_resp = ot_client.post(
         f"/api/ot/surgeries/{surgery_id}/reschedule",
         json={"scheduled_at": new_time, "duration_minutes": 75},

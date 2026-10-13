@@ -94,21 +94,20 @@ class AvailabilityReader:
         appt_date: date,
         appt_time: time,
         exclude_id: UUID | None = None,
+        duration_minutes: int | None = None,
     ) -> bool:
-        """Check if doctor has an active appointment booked at exact date and time."""
-        q = (
-            self.db.query(Appointment.id)
-            .filter(
-                Appointment.hospital_id == self.hospital_id,
-                Appointment.doctor_id == doctor_id,
-                Appointment.appointment_date == appt_date,
-                Appointment.appointment_time == appt_time,
-                Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.no_show]),
-            )
+        """Check if doctor has a scheduling conflict using the canonical EffectiveDoctorAvailabilityService."""
+        from modules.doctors.services.effective_availability_service import EffectiveDoctorAvailabilityService
+        svc = EffectiveDoctorAvailabilityService(self.db, self.hospital_id)
+        dur = duration_minutes or svc.get_slot_duration()
+        ok, _, _ = svc.check_slot_availability(
+            doctor_id,
+            appt_date,
+            appt_time,
+            dur,
+            exclude_appointment_id=exclude_id,
         )
-        if exclude_id:
-            q = q.filter(Appointment.id != exclude_id)
-        return q.first() is not None
+        return not ok
 
     def get_doctor(self, doctor_id: UUID) -> dict[str, Any] | None:
         """Fetch active doctor details."""

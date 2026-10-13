@@ -28,8 +28,10 @@ from modules.inpatient.entities.admission import (
     IpdFormSubmission,
     IpdFormSubmissionStatus,
 )
+from modules.inpatient.services.clinical_document_service import ClinicalDocumentService
 from modules.patients.entities.patient import Patient
 from shared.audit.service import write_audit_log
+from shared.sync import stage_sync_event
 
 
 def to_form_response(sub: IpdFormSubmission) -> IpdFormSubmissionResponse:
@@ -42,12 +44,18 @@ def to_form_response(sub: IpdFormSubmission) -> IpdFormSubmissionResponse:
         form_title=sub.form_title,
         form_data=sub.form_data or {},
         status=sub.status,
+        form_schema_version=getattr(sub, "form_schema_version", 1) or 1,
+        signer_type=getattr(sub, "signer_type", None),
+        signer_name=getattr(sub, "signer_name", None),
+        signer_relationship=getattr(sub, "signer_relationship", None),
+        finalized_at=getattr(sub, "finalized_at", None),
         filled_by_id=sub.filled_by_id,
         filled_by_name=sub.filled_by_name,
         filled_by_role=sub.filled_by_role,
         medical_record_id=sub.medical_record_id,
         patient_document_id=sub.patient_document_id,
         has_html_snapshot=bool(sub.html_snapshot),
+        rendered_html=sub.html_snapshot,
         created_at=sub.created_at,
         updated_at=sub.updated_at,
         patient_name=sub.patient.name if sub.patient else None,
@@ -173,19 +181,54 @@ class CreateFormSubmissionAction:
         actor_name = str(actor.get("name") or actor.get("sub") or "Staff")
         actor_role = str(actor.get("staff_role_name") or actor.get("role") or "")
 
+        doc_svc = ClinicalDocumentService(self.db, hospital_id)
+        pat_entity, adm_entity, canonical_pat = doc_svc.resolve_canonical_patient(
+            payload.patient_id, admission_id
+        )
+
+        form_data = dict(payload.form_data or {})
+        for demo_key in ("uhid", "name", "patient_name", "first_name", "last_name", "age", "gender", "dob", "date_of_birth", "mobile"):
+            if demo_key in canonical_pat and canonical_pat[demo_key] is not None:
+                form_data[demo_key] = canonical_pat[demo_key]
+        form_data["canonical_patient"] = canonical_pat
+
+        is_final = payload.status == IpdFormSubmissionStatus.final
+        signer_type, signer_name, signer_rel = doc_svc.validate_and_extract_signer(
+            payload.form_id,
+            payload.form_title,
+            form_data,
+            payload.signer_type,
+            payload.signer_name,
+            payload.signer_relationship,
+            is_final,
+            canonical_pat,
+        )
+
+        finalized_at = datetime.now(timezone.utc) if is_final else None
+        schema_ver = payload.form_schema_version or 2
+
         sub = IpdFormSubmission(
             hospital_id=hospital_id,
             patient_id=payload.patient_id,
             admission_id=admission_id,
             form_id=payload.form_id.strip(),
             form_title=payload.form_title.strip(),
-            form_data=payload.form_data or {},
+            form_data=form_data,
             html_snapshot=payload.html_snapshot,
             status=payload.status,
+            form_schema_version=schema_ver,
+            signer_type=signer_type,
+            signer_name=signer_name,
+            signer_relationship=signer_rel,
+            finalized_at=finalized_at,
             filled_by_id=actor_id,
             filled_by_name=actor_name,
             filled_by_role=actor_role,
         )
+        if is_final:
+            sub.html_snapshot = doc_svc.render_authoritative_document(
+                sub, pat_entity, adm_entity, (signer_type, signer_name, signer_rel), actor
+            )
         self.db.add(sub)
         self.db.flush()
 
@@ -201,6 +244,13 @@ class CreateFormSubmissionAction:
             entity_id=str(sub.id),
             summary=f"Saved IPD form '{sub.form_title}' ({sub.status.value}) for patient",
             details={"form_id": sub.form_id, "patient_id": str(sub.patient_id)},
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="ipd_form_submission",
+            action="create",
+            entity_id=str(sub.id),
         )
         self.db.commit()
         refreshed = self.repo.get_by_id(hospital_id, sub.id)
@@ -243,8 +293,43 @@ class UpdateFormSubmissionAction:
                 raise ValidationError("Invalid admission for patient")
             _require_open_document_admission(adm)
 
+        doc_svc = ClinicalDocumentService(self.db, hospital_id)
+        pat_entity, adm_entity, canonical_pat = doc_svc.resolve_canonical_patient(
+            sub.patient_id, sub.admission_id
+        )
+
+        form_data = dict(sub.form_data or {})
         if payload.form_data is not None:
-            sub.form_data = payload.form_data
+            form_data.update(payload.form_data)
+        for demo_key in ("uhid", "name", "patient_name", "first_name", "last_name", "age", "gender", "dob", "date_of_birth", "mobile"):
+            if demo_key in canonical_pat and canonical_pat[demo_key] is not None:
+                form_data[demo_key] = canonical_pat[demo_key]
+        form_data["canonical_patient"] = canonical_pat
+        sub.form_data = form_data
+
+        target_status = payload.status or sub.status
+        is_final = target_status == IpdFormSubmissionStatus.final
+
+        req_signer_type = payload.signer_type if payload.signer_type is not None else sub.signer_type
+        req_signer_name = payload.signer_name if payload.signer_name is not None else sub.signer_name
+        req_signer_rel = payload.signer_relationship if payload.signer_relationship is not None else sub.signer_relationship
+
+        signer_type, signer_name, signer_rel = doc_svc.validate_and_extract_signer(
+            sub.form_id,
+            payload.form_title or sub.form_title,
+            form_data,
+            req_signer_type,
+            req_signer_name,
+            req_signer_rel,
+            is_final,
+            canonical_pat,
+        )
+        sub.signer_type = signer_type
+        sub.signer_name = signer_name
+        sub.signer_relationship = signer_rel
+
+        if payload.form_schema_version:
+            sub.form_schema_version = payload.form_schema_version
         if payload.html_snapshot is not None:
             sub.html_snapshot = payload.html_snapshot
         if payload.form_title is not None:
@@ -263,7 +348,11 @@ class UpdateFormSubmissionAction:
         sub.filled_by_role = str(actor.get("staff_role_name") or actor.get("role") or "")
         sub.updated_at = datetime.now(timezone.utc)
 
-        if sub.status == IpdFormSubmissionStatus.final:
+        if is_final:
+            sub.finalized_at = datetime.now(timezone.utc)
+            sub.html_snapshot = doc_svc.render_authoritative_document(
+                sub, pat_entity, adm_entity, (signer_type, signer_name, signer_rel), actor
+            )
             self.repo.sync_final_to_patient_record(sub, actor_id)
 
         write_audit_log(
@@ -275,6 +364,13 @@ class UpdateFormSubmissionAction:
             entity_id=str(sub.id),
             summary=f"Updated IPD form '{sub.form_title}' ({sub.status.value})",
             details={"form_id": sub.form_id, "patient_id": str(sub.patient_id)},
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="ipd_form_submission",
+            action="update",
+            entity_id=str(sub.id),
         )
         self.db.commit()
         refreshed = self.repo.get_by_id(hospital_id, sub.id)

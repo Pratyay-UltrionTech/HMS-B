@@ -20,6 +20,8 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session, joinedload
 
+from shared.sync import stage_sync_event
+
 from modules.admin.contracts.admin_contracts import (
     BASIC_MODULE_KEYS,
     BASIC_MODULE_LABELS,
@@ -1000,6 +1002,19 @@ class AdminActions:
                 notes=payload.notes,
             )
             self.db.add(row)
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="staff_roster",
+            action="assign",
+            entity_id=payload.user_id,
+            details={
+                "roster_date": payload.roster_date.isoformat(),
+                "user_id": str(payload.user_id),
+                "status": status_val,
+                "shift_id": str(shift_id) if shift_id else None,
+            },
+        )
         self.db.commit()
 
         entries = self._build_roster_entries(payload.roster_date)
@@ -1040,6 +1055,16 @@ class AdminActions:
                         notes=None,
                     )
                 )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="staff_roster",
+            action="seed",
+            details={
+                "roster_date": payload.roster_date.isoformat(),
+                "overwrite": payload.overwrite,
+            },
+        )
         self.db.commit()
         hospital = self.db.query(Hospital).filter(Hospital.id == self.hospital_id).first()
         entries = self._build_roster_entries(payload.roster_date)
@@ -1055,6 +1080,15 @@ class AdminActions:
             StaffDailyShift.hospital_id == self.hospital_id,
             StaffDailyShift.roster_date == roster_date,
         ).delete(synchronize_session=False)
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="staff_roster",
+            action="clear",
+            details={
+                "roster_date": roster_date.isoformat(),
+            },
+        )
         self.db.commit()
 
     def get_shift_roster_snapshot(self, roster_date: date) -> ShiftRosterSnapshot:

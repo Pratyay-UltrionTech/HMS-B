@@ -28,6 +28,7 @@ from modules.masters.entities.organization_entities import Department
 from modules.tenancy.entities.hospital import Hospital
 from shared.audit import write_audit_log
 from shared.auth import (
+    get_current_user,
     get_hospital_context,
     require_hospital_admin,
     require_hospital_user,
@@ -97,6 +98,9 @@ def admin_client(admin_db):
     }
     app.dependency_overrides[require_hospital_user] = lambda: admin_payload
     app.dependency_overrides[require_hospital_admin] = lambda: admin_payload
+    # /admin/modules now depends on get_current_user directly so the static
+    # catalog is reachable for super_admin (no hospital_uuid) as well.
+    app.dependency_overrides[get_current_user] = lambda: admin_payload
 
     client = TestClient(app)
     client.hospital_id = hospital_id

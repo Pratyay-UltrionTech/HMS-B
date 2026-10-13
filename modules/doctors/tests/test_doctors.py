@@ -480,8 +480,18 @@ def test_direct_backend_completion_diagnostic_blockers_enforced(
     assert "Cannot complete appointment" in res.json()["detail"]
     assert "Lab order LAB-TEST-001 is ordered" in res.json()["detail"]
 
-    # 2. Complete the lab order
+    # 2. Complete the lab order and record finalized result
     lab_order.status = LabOrderStatus.completed
+    from modules.laboratory.entities.lab_entities import LabResult
+    db_session.add(
+        LabResult(
+            id=uuid4(),
+            hospital_id=hospital.id,
+            order_id=lab_order.id,
+            parameter_name="Hemoglobin",
+            result_value="14.2",
+        )
+    )
     db_session.commit()
 
     # 3. Re-attempt completion - now should succeed cleanly

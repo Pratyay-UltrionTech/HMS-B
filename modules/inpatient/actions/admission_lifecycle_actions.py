@@ -36,6 +36,7 @@ from modules.inpatient.db.admissions_repository import AdmissionsRepository
 from modules.inpatient.entities.admission import AdmissionStatus
 from modules.patients.entities.patient import Patient
 from shared.audit.service import write_audit_log
+from shared.sync import stage_sync_event
 
 
 def _link_appointment_compat(
@@ -190,6 +191,13 @@ class EnsureAdmissionRequestAction:
             entity_type="admission",
             entity_id=str(admission.id),
             summary=f"Admission requested for {patient.uhid} {patient.name}",
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="admission",
+            action="create",
+            entity_id=str(admission.id),
         )
         if not commit:
             self.db.flush()
@@ -500,6 +508,21 @@ class AcceptAdmissionAction:
                 entity_type="appointment",
                 entity_id=str(admission.source_appointment_id),
                 summary="Appointment transferred to inpatient on accept",
+            )
+        stage_sync_event(
+            self.db,
+            hospital_id=hospital_id,
+            entity_type="admission",
+            action="accept",
+            entity_id=str(admission.id),
+        )
+        if bed is not None:
+            stage_sync_event(
+                self.db,
+                hospital_id=hospital_id,
+                entity_type="bed",
+                action="occupy",
+                entity_id=str(bed.id),
             )
         try:
             self.db.commit()

@@ -227,6 +227,11 @@ class IpdFormSubmission(Base):
     )
     filled_by_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     filled_by_role: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    form_schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    signer_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    signer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    signer_relationship: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     medical_record_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
     )

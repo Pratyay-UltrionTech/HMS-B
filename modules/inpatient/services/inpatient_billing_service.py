@@ -112,14 +112,15 @@ class InpatientBillingService:
         patient_id: UUID,
         admission_id: UUID,
         admitted_at: datetime,
-        discharged_at: datetime,
-        ward_name: str | None,
-        room_code: str | None,
-        bed_code: str | None,
-        bed_charge_per_day: float,
+        discharged_at: datetime | None = None,
+        as_of: datetime | None = None,
+        ward_name: str | None = None,
+        room_code: str | None = None,
+        bed_code: str | None = None,
+        bed_charge_per_day: float = 0.0,
         created_by_name: str = "System",
     ) -> None:
-        """Create bed stay fee charge using target billing service."""
+        """Create or reconcile bed stay fee charge using target billing service."""
         from modules.billing.services.billing_service import ensure_bed_charge_for_admission
         ensure_bed_charge_for_admission(
             self.db,
@@ -128,6 +129,7 @@ class InpatientBillingService:
             admission_id=admission_id,
             admitted_at=admitted_at,
             discharged_at=discharged_at,
+            as_of=as_of,
             ward_name=ward_name,
             room_code=room_code,
             bed_code=bed_code,

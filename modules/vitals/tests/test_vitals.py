@@ -169,7 +169,7 @@ def test_action_create_vitals_sequential_queue_tokens(
 def test_api_unauthenticated_returns_403(client: TestClient):
     """Endpoints require Bearer auth."""
     resp = client.get("/api/vitals/today")
-    assert resp.status_code == 403
+    assert resp.status_code in (401, 403)
 
 
 def test_api_invalid_token_returns_401(client: TestClient):

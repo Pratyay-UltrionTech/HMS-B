@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from modules.appointments.services.appointment_lifecycle import (
     sync_appointment_after_clinical_change,
 )
+from modules.appointments.entities.appointment import Appointment
 from modules.billing.entities.billing_entities import BillingSourceType
 from modules.billing.services.episode_account_service import resolve_episode_account
 from modules.billing.services.service_charge_resolver import (
@@ -91,6 +92,7 @@ from modules.laboratory.services.lab_prescription_service import (
     sync_lab_request_charge,
     sync_request_after_order_change,
 )
+from modules.billing.services.billing_service import auto_apply_eligible_deposits_to_charge
 from modules.billing.services.service_financial_clearance import (
     assert_order_financially_cleared,
     assert_service_financially_cleared,
@@ -104,6 +106,7 @@ from modules.laboratory.services.lab_report_service import (
 from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
 from shared.audit.service import write_audit_log
+from shared.sync import stage_sync_event
 
 
 def _actor_name(user: dict) -> str:
@@ -1059,10 +1062,45 @@ class CreateLabOrderAction:
         rx_request: LabPrescriptionRequest | None = None
         if payload.prescription_request_id:
             rx_request = get_prescription_request(self.db, payload.prescription_request_id, self.hospital_id)
+            if not rx_request:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prescription request not found")
+            if rx_request.patient_id != patient.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Prescription request does not belong to the selected patient",
+                )
             if payload.test_ids or payload.panel_ids:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Doctor-prescribed orders cannot add or change tests; fulfill the prescription as written",
+                )
+
+        if payload.appointment_id:
+            appt = (
+                self.db.query(Appointment)
+                .filter(Appointment.id == payload.appointment_id, Appointment.hospital_id == self.hospital_id)
+                .first()
+            )
+            if not appt:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
+            if appt.patient_id != patient.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Appointment does not belong to the selected patient",
+                )
+
+        if payload.admission_id:
+            adm = (
+                self.db.query(Admission)
+                .filter(Admission.id == payload.admission_id, Admission.hospital_id == self.hospital_id)
+                .first()
+            )
+            if not adm:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admission not found")
+            if adm.patient_id != patient.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Admission does not belong to the selected patient",
                 )
 
         order = self.build_order(
@@ -1124,7 +1162,14 @@ class CreateLabOrderAction:
                 LabPrescriptionRequestStatus.pending,
                 LabPrescriptionRequestStatus.partially_processed,
             } and lab_request_billable_items(rx_request):
-                ensure_lab_request_charge(self.db, rx_request, created_by_name=_actor_name(user))
+                rx_charge = ensure_lab_request_charge(self.db, rx_request, created_by_name=_actor_name(user))
+                if rx_charge:
+                    auto_apply_eligible_deposits_to_charge(
+                        self.db,
+                        hospital_id=self.hospital_id,
+                        charge=rx_charge,
+                        created_by_name=_actor_name(user),
+                    )
 
             # A clinical priority flag never bypasses billing on its own.
             assert_service_financially_cleared(
@@ -1275,7 +1320,7 @@ class CreateLabOrderAction:
             panel_labels = sorted({row[2] for row in item_rows if row[2]})
             lab_total = round(sum(float(row[6] or 0) for row in item_rows), 2)
             desc_bits = panel_labels or [row[4] for row in item_rows[:3]]
-            ensure_service_charge(
+            lab_charge = ensure_service_charge(
                 self.db,
                 hospital_id=self.hospital_id,
                 patient_id=patient.id,
@@ -1292,6 +1337,13 @@ class CreateLabOrderAction:
                 ).account_id,
                 created_by_name=_actor_name(user),
             )
+            if lab_charge:
+                auto_apply_eligible_deposits_to_charge(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    charge=lab_charge,
+                    created_by_name=_actor_name(user),
+                )
 
         write_audit_log(
             self.db,
@@ -1314,6 +1366,22 @@ class CreateLabOrderAction:
                 summary=f"Created specimen {s.specimen_no} for order {order.order_no}",
                 details={"order_id": str(order.id), "specimen_id": str(s.id), "specimen_no": s.specimen_no, "patient_id": str(order.patient_id)},
             )
+        for s in specimen_map.values():
+            stage_sync_event(
+                self.db,
+                hospital_id=self.hospital_id,
+                entity_type="lab_specimen",
+                action="create",
+                entity_id=s.id,
+                details={"order_id": str(order.id), "specimen_no": s.specimen_no},
+            )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="lab_order",
+            action="create",
+            entity_id=order.id,
+        )
         self.db.flush()
         return order
 
@@ -1357,6 +1425,13 @@ class CancelLabOrderAction:
             entity_id=order.id,
             summary=f"Cancelled lab order {order.order_no}",
             details={"order_id": str(order.id), "order_no": order.order_no, "patient_id": str(order.patient_id)},
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="lab_order",
+            action="cancel",
+            entity_id=order.id,
         )
         self.db.commit()
         if order.appointment_id:
@@ -1415,6 +1490,13 @@ class CollectSampleAction:
             details={"order_id": str(order.id), "order_no": order.order_no, "status": order.status.value, "patient_id": str(order.patient_id)},
         )
 
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="lab_order",
+            action="sample_collected",
+            entity_id=order.id,
+        )
         self.db.commit()
         return GetLabOrderAction(self.db, self.hospital_id).execute(order_id)
 
@@ -1488,6 +1570,14 @@ class CollectSpecimenAction:
                 details={"order_id": str(order.id), "status": order.status.value, "patient_id": str(order.patient_id)},
             )
 
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="lab_specimen",
+            action="collect",
+            entity_id=specimen.id,
+            details={"order_id": str(order.id)},
+        )
         self.db.commit()
         return GetLabOrderAction(self.db, self.hospital_id).execute(order_id)
 
@@ -1555,6 +1645,13 @@ class UpdateItemStatusAction:
             entity_id=order.id,
             summary=f"Updated item {item.test_name} status to {payload.status.value} on order {order.order_no}",
             details={"order_id": str(order.id), "item_id": str(item_id), "status": payload.status.value, "patient_id": str(order.patient_id)},
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="lab_order",
+            action="update_status",
+            entity_id=order.id,
         )
         self.db.commit()
         order = self.repo.get_order(order_id)
@@ -1645,6 +1742,13 @@ class SaveLabResultsAction:
                 summary=f"Completed lab order {order.order_no}",
                 details={"order_id": str(order.id), "status": "completed", "patient_id": str(order.patient_id)},
             )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="lab_order",
+            action="complete" if payload.mark_completed else "save_results",
+            entity_id=order.id,
+        )
         self.db.commit()
 
         order = self.repo.get_order(order_id)

@@ -39,7 +39,7 @@ MODULE_REGISTRY: dict[str, ModuleDefinition] = {
     "doctors": ModuleDefinition("doctors", "Doctors Management", ("view", "edit", "create", "delete"), "Clinical"),
     "nurses": ModuleDefinition("nurses", "Nurses Management", ("view", "edit", "create", "delete"), "Clinical"),
     "registration": ModuleDefinition("registration", "Patient Registration", ("view", "edit", "create", "delete"), "Patient Access"),
-    "appointment": ModuleDefinition("appointment", "Appointments", ("view", "edit", "create", "delete", "cancel"), "Patient Access"),
+    "appointment": ModuleDefinition("appointment", "Appointments", ("view", "edit", "create", "delete", "cancel", "approve"), "Patient Access"),
     "vitals": ModuleDefinition("vitals", "Vitals & Triage", ("view", "edit", "create"), "Clinical"),
     "bed": ModuleDefinition("bed", "Bed Management", ("view", "edit", "create"), "Inpatient"),
     "all_ipd": ModuleDefinition("all_ipd", "Inpatient Operations (IPD)", ("view", "edit", "create", "approve"), "Inpatient"),

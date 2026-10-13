@@ -361,6 +361,10 @@ class IpdFormSubmissionCreate(BaseModel):
     form_data: dict[str, Any] = Field(default_factory=dict)
     html_snapshot: str | None = None
     status: IpdFormSubmissionStatus = IpdFormSubmissionStatus.draft
+    form_schema_version: int = 1
+    signer_type: str | None = None
+    signer_name: str | None = None
+    signer_relationship: str | None = None
 
 
 class IpdFormSubmissionUpdate(BaseModel):
@@ -369,6 +373,10 @@ class IpdFormSubmissionUpdate(BaseModel):
     html_snapshot: str | None = None
     status: IpdFormSubmissionStatus | None = None
     form_title: str | None = Field(default=None, min_length=1, max_length=255)
+    form_schema_version: int | None = None
+    signer_type: str | None = None
+    signer_name: str | None = None
+    signer_relationship: str | None = None
 
 
 class IpdFormSubmissionResponse(BaseModel):
@@ -380,12 +388,18 @@ class IpdFormSubmissionResponse(BaseModel):
     form_title: str
     form_data: dict[str, Any]
     status: IpdFormSubmissionStatus
+    form_schema_version: int = 1
+    signer_type: str | None = None
+    signer_name: str | None = None
+    signer_relationship: str | None = None
+    finalized_at: datetime | None = None
     filled_by_id: UUID | None = None
     filled_by_name: str = ""
     filled_by_role: str = ""
     medical_record_id: UUID | None = None
     patient_document_id: UUID | None = None
     has_html_snapshot: bool = False
+    rendered_html: str | None = None
     addenda_count: int = 0
     created_at: datetime
     updated_at: datetime

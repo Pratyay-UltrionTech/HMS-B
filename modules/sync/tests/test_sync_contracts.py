@@ -172,25 +172,78 @@ def test_lab_order_and_specimen_events_published_on_commit(sync_test_env):
 def test_rollback_does_not_publish_sync_events(sync_test_env):
     session = sync_test_env["session"]
     h_id = sync_test_env["hospital_id"]
+    hid_str = str(h_id)
 
-    history_before = list(sync_broker._history.get(h_id, []))
-    actor = {"sub": "staff@test.com", "name": "Lab Tech", "role": "hospital_staff"}
+    history_before = list(sync_broker._history.get(hid_str, []))
 
-    # Stage an audit log / sync event
-    write_audit_log(
+    # Stage a sync event
+    from shared.sync.events import stage_sync_event
+    stage_sync_event(
         session=session,
         hospital_id=h_id,
-        actor=actor,
-        action="uncommitted_action",
-        entity_type="lab_order",
+        entity_type="appointment",
+        action="cancel",
         entity_id=uuid.uuid4(),
-        summary="Testing aborted action",
-        details={"status": "aborted"},
     )
 
     # Roll back transaction
     session.rollback()
 
     # Verify no new events were published to the sync broker
-    history_after = list(sync_broker._history.get(h_id, []))
+    history_after = list(sync_broker._history.get(hid_str, []))
     assert len(history_after) == len(history_before)
+
+
+def test_audit_log_does_not_implicitly_stage_sync_event(sync_test_env):
+    """Verify that writing an audit log does NOT stage or dispatch a sync event (explicit decoupling)."""
+    session = sync_test_env["session"]
+    h_id = sync_test_env["hospital_id"]
+    hid_str = str(h_id)
+
+    history_before = list(sync_broker._history.get(hid_str, []))
+    actor = {"sub": "auditor@test.com", "name": "Auditor", "role": "compliance"}
+
+    # Write audit log without staging sync event
+    write_audit_log(
+        session=session,
+        hospital_id=h_id,
+        actor=actor,
+        action="read",
+        entity_type="audit_report",
+        entity_id=uuid.uuid4(),
+        summary="Viewed compliance report",
+    )
+    session.commit()
+
+    # Verify no sync event was published
+    history_after = list(sync_broker._history.get(hid_str, []))
+    assert len(history_after) == len(history_before)
+
+
+def test_stage_sync_event_publishes_on_commit_without_audit(sync_test_env):
+    """Verify non-audited mutation can explicitly publish a sync event upon commit."""
+    session = sync_test_env["session"]
+    h_id = sync_test_env["hospital_id"]
+    hid_str = str(h_id)
+
+    from shared.sync.events import stage_sync_event
+    history_before = list(sync_broker._history.get(hid_str, []))
+    appt_id = uuid.uuid4()
+
+    stage_sync_event(
+        session=session,
+        hospital_id=h_id,
+        entity_type="appointment",
+        action="reschedule",
+        entity_id=appt_id,
+        details={"slot": "10:30"},
+    )
+    session.commit()
+
+    history_after = list(sync_broker._history.get(hid_str, []))
+    new_events = history_after[len(history_before):]
+    assert len(new_events) == 1
+    assert new_events[0]["entity_type"] == "appointment"
+    assert new_events[0]["action"] == "reschedule"
+    assert new_events[0]["entity_id"] == str(appt_id)
+    assert new_events[0]["details"]["slot"] == "10:30"

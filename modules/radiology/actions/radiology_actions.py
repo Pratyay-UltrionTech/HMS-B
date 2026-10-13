@@ -21,10 +21,12 @@ from modules.billing.services.service_charge_resolver import (
     cancel_service_charges_or_400,
     ensure_service_charge,
 )
+from modules.billing.services.billing_service import auto_apply_eligible_deposits_to_charge
 from modules.billing.services.service_financial_clearance import (
     assert_order_financially_cleared,
     assert_service_financially_cleared,
 )
+from modules.appointments.entities.appointment import Appointment
 from modules.inpatient.entities.admission import Admission
 from modules.radiology.contracts.radiology_contracts import (
     RadAttachmentResponse,
@@ -67,6 +69,7 @@ from modules.radiology.services.rad_prescription_service import (
     sync_request_after_order_change,
 )
 from shared.audit import write_audit_log
+from shared.sync import stage_sync_event
 
 
 def _actor_name(user: dict[str, Any]) -> str:
@@ -96,8 +99,11 @@ def _gate_order(
     )
 
 
+from modules.radiology.services.report_status import is_radiology_report_finalized
+
+
 def _is_report_finalized(order: RadiologyOrder) -> bool:
-    return bool(order.findings or order.impression)
+    return is_radiology_report_finalized(order)
 
 
 def _actor_role(user: dict[str, Any]) -> str:
@@ -337,7 +343,14 @@ class CreateOrdersAction:
 
             # Legacy requests (or ones whose charge was cancelled at the billing desk) get
             # their canonical charge back before the clearance check.
-            ensure_rad_request_charge(self.db, rad_request, created_by_name=_actor_name(self.user))
+            rad_charge = ensure_rad_request_charge(self.db, rad_request, created_by_name=_actor_name(self.user))
+            if rad_charge:
+                auto_apply_eligible_deposits_to_charge(
+                    self.db,
+                    hospital_id=self.hospital_id,
+                    charge=rad_charge,
+                    created_by_name=_actor_name(self.user),
+                )
 
             # Enforce financial clearance when accessioning doctor-prescribed radiology requests
             # A clinical priority flag (payload.is_emergency) never bypasses billing on its own.
@@ -391,6 +404,20 @@ class CreateOrdersAction:
                     detail="Admission does not belong to the selected patient",
                 )
 
+        if appointment_id:
+            appt = (
+                self.db.query(Appointment)
+                .filter(Appointment.id == appointment_id, Appointment.hospital_id == self.hospital_id)
+                .first()
+            )
+            if not appt:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
+            if appt.patient_id != patient.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Appointment does not belong to the selected patient",
+                )
+
         actor_name = _actor_name(self.user)
         actor_role = _actor_role(self.user)
         created_ids: list[UUID] = []
@@ -434,7 +461,7 @@ class CreateOrdersAction:
             # Prescription orders are billed by the request's canonical charge (resolved
             # via order.prescription_request_id); direct orders own a charge on order.id.
             if not rad_request:
-                ensure_service_charge(
+                rad_charge = ensure_service_charge(
                     self.db,
                     hospital_id=self.hospital_id,
                     patient_id=patient.id,
@@ -445,6 +472,13 @@ class CreateOrdersAction:
                     account_id=direct_account_id,
                     created_by_name=actor_name,
                 )
+                if rad_charge:
+                    auto_apply_eligible_deposits_to_charge(
+                        self.db,
+                        hospital_id=self.hospital_id,
+                        charge=rad_charge,
+                        created_by_name=actor_name,
+                    )
 
             write_audit_log(
                 self.db,
@@ -455,6 +489,13 @@ class CreateOrdersAction:
                 entity_id=order.id,
                 summary=f"Radiology order {order.order_no} for {patient.name}: {scan_name}",
                 details={"order_id": str(order.id), "order_no": order.order_no, "patient_id": str(order.patient_id)},
+            )
+            stage_sync_event(
+                self.db,
+                hospital_id=self.hospital_id,
+                entity_type="radiology_order",
+                action="create",
+                entity_id=order.id,
             )
 
         if rad_request:
@@ -688,6 +729,13 @@ class CancelOrderAction:
             summary=f"Cancelled radiology order {order.order_no}",
             details={"order_id": str(order.id), "order_no": order.order_no, "status": "cancelled", "patient_id": str(order.patient_id)},
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="radiology_order",
+            action="cancel",
+            entity_id=order.id,
+        )
         sync_request_after_order_change(self.db, order)
         self.db.commit()
 
@@ -729,6 +777,13 @@ class ScheduleOrderAction:
             summary=f"Scheduled {order.order_no} on {order.machine} at {payload.scheduled_at.isoformat()}",
             details={"order_id": str(order.id), "status": "scheduled", "patient_id": str(order.patient_id)},
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="radiology_order",
+            action="schedule",
+            entity_id=order.id,
+        )
         self.db.commit()
         return order_to_response(self.repo.get_order(order_id), self.repo.db)
 
@@ -765,6 +820,13 @@ class StartScanAction:
             summary=f"Started scan for {order.order_no}",
             details={"order_id": str(order.id), "status": "in_progress", "patient_id": str(order.patient_id)},
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="radiology_order",
+            action="in_progress",
+            entity_id=order.id,
+        )
         self.db.commit()
         return order_to_response(self.repo.get_order(order_id), self.repo.db)
 
@@ -799,6 +861,13 @@ class CompleteScanAction:
             entity_id=order.id,
             summary=f"Completed scan for {order.order_no} (report may still be pending)",
             details={"order_id": str(order.id), "status": "completed", "patient_id": str(order.patient_id)},
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="radiology_order",
+            action="completed",
+            entity_id=order.id,
         )
         sync_request_after_order_change(self.db, order)
         self.db.commit()
@@ -886,6 +955,13 @@ class UploadReportAction:
             entity_id=order.id,
             summary=f"Radiology order {order.order_no} finalized with report",
             details={"order_id": str(order.id), "status": "completed", "patient_id": str(order.patient_id)},
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="radiology_report",
+            action="complete",
+            entity_id=order.id,
         )
         if not was_completed:
             sync_request_after_order_change(self.db, order)

@@ -27,3 +27,13 @@ class AppointmentConflictError(ConflictError):
 
     def __init__(self, message: str = "Doctor already has an appointment at this time") -> None:
         super().__init__(message=message)
+
+
+class ClinicalBlockerResolutionError(ValidationError):
+    """Raised when diagnostic blocker status cannot be determined and safety check fails closed."""
+
+    def __init__(
+        self,
+        message: str = "Diagnostic safety verification failed: unable to verify completion requirements (fail-closed)",
+    ) -> None:
+        super().__init__(message=message, code="DIAGNOSTIC_BLOCKER_RESOLUTION_FAILED")

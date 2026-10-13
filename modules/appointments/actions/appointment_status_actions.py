@@ -26,10 +26,13 @@ from modules.appointments.exceptions.appointments_exceptions import (
 )
 from modules.appointments.services.appointment_lifecycle import (
     complete_appointment_record,
+    get_open_clinical_blockers,
     mark_in_progress,
 )
+
 from modules.appointments.validators.appointments_validator import AppointmentsValidator
 from shared.audit import write_audit_log
+from shared.sync import stage_sync_event
 
 
 class CheckInAction:
@@ -67,6 +70,13 @@ class CheckInAction:
             entity_id=appt.id,
             summary=f"Checked in appointment {appt.id} (Queue Token #{appt.queue_token})",
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="appointment",
+            action="check_in",
+            entity_id=appt.id,
+        )
         self.db.commit()
         self.db.refresh(appt)
 
@@ -93,15 +103,47 @@ class CompleteAppointmentAction:
         user: dict[str, Any],
         *,
         force: bool = False,
+        override_reason: str | None = None,
     ) -> AppointmentListItem:
         appt = self.repo.get_by_id(appointment_id)
         if not appt:
             raise AppointmentNotFoundError()
 
+        actor_name = str(user.get("name") or user.get("sub") or "Staff")
+        reason: str | None = None
+        if force:
+            reason = (override_reason or "").strip()
+            if not reason:
+                raise AppointmentValidationError(
+                    "An explicit override reason is required to force complete an appointment with open blockers."
+                )
+
         ok, blockers = complete_appointment_record(self.db, self.hospital_id, appt, force=force)
         if not ok:
             raise AppointmentValidationError(f"Cannot complete appointment: {'; '.join(blockers)}")
 
+        if force:
+            open_blockers = blockers if not ok else get_open_clinical_blockers(self.db, self.hospital_id, appt.id)
+            appt.clinical_override_reason = reason
+            appt.clinical_override_actor = actor_name
+            appt.clinical_override_at = datetime.now(timezone.utc)
+            write_audit_log(
+                self.db,
+                hospital_id=self.hospital_id,
+                actor=user,
+                action="CLINICAL_SAFETY_OVERRIDE_DIAGNOSTICS",
+                entity_type="appointment",
+                entity_id=appt.id,
+                summary=f"Clinical override forced appointment completion despite blockers. Reason: {reason}",
+                details={
+                    "reason": reason,
+                    "authority": "appointment:approve" if user.get("role") not in {"super_admin", "hospital_admin"} else user.get("role"),
+                    "open_blockers": open_blockers,
+                    "overridden_at": appt.clinical_override_at.isoformat(),
+                },
+            )
+
+        appt.consultation_status = "consultation_completed"
         write_audit_log(
             self.db,
             hospital_id=self.hospital_id,
@@ -110,6 +152,13 @@ class CompleteAppointmentAction:
             entity_type="appointment",
             entity_id=appt.id,
             summary=f"Marked appointment {appt.id} Completed",
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="appointment",
+            action="complete",
+            entity_id=appt.id,
         )
         self.db.commit()
         self.db.refresh(appt)
@@ -170,6 +219,13 @@ class CancelAppointmentAction:
             entity_id=appt.id,
             summary=f"Cancelled appointment {appt.id}",
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="appointment",
+            action="cancel",
+            entity_id=appt.id,
+        )
         self.db.commit()
         self.db.refresh(appt)
 
@@ -210,6 +266,13 @@ class NoShowAction:
             entity_id=appt.id,
             summary=f"Marked appointment {appt.id} as No Show",
         )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="appointment",
+            action="no_show",
+            entity_id=appt.id,
+        )
         self.db.commit()
         self.db.refresh(appt)
 
@@ -247,16 +310,41 @@ class RescheduleAction:
             payload.appointment_date, payload.appointment_time
         )
 
-        holiday = self.avail_reader.get_holiday(payload.appointment_date)
-        if holiday:
-            raise AppointmentValidationError(
-                f"Hospital is closed on {payload.appointment_date} ({holiday['name']})"
+        from modules.doctors.services.effective_availability_service import (
+            EffectiveDoctorAvailabilityService,
+        )
+        avail_svc = EffectiveDoctorAvailabilityService(self.db, self.hospital_id)
+        duration = 15
+        if appt.appointment_type_id:
+            from modules.appointments.entities.appointment_type import AppointmentType
+            appt_type = (
+                self.db.query(AppointmentType)
+                .filter(
+                    AppointmentType.id == appt.appointment_type_id,
+                    AppointmentType.hospital_id == self.hospital_id,
+                )
+                .first()
             )
+            if appt_type and appt_type.slot_duration_minutes:
+                duration = appt_type.slot_duration_minutes
+        else:
+            duration = avail_svc.get_slot_duration()
 
-        if self.avail_reader.has_slot_conflict(
-            appt.doctor_id, payload.appointment_date, payload.appointment_time, exclude_id=appt.id
-        ):
-            raise AppointmentConflictError("Doctor already has an appointment at this time")
+        ok, reason, code = avail_svc.check_slot_availability(
+            appt.doctor_id,
+            payload.appointment_date,
+            payload.appointment_time,
+            duration,
+            exclude_appointment_id=appt.id,
+            for_update=True,
+        )
+        if not ok:
+            if code == "DOCTOR_NOT_FOUND":
+                raise AppointmentNotFoundError(reason or "Doctor not found")
+            elif code in ("HOLIDAY", "OUTSIDE_SHIFT"):
+                raise AppointmentValidationError(reason or "Invalid appointment slot")
+            else:
+                raise AppointmentConflictError(reason or "Doctor is not available at this time")
 
         old_dt = f"{appt.appointment_date} {appt.appointment_time}"
         appt.appointment_date = payload.appointment_date
@@ -273,6 +361,13 @@ class RescheduleAction:
             entity_type="appointment",
             entity_id=appt.id,
             summary=f"Rescheduled appointment {appt.id} from {old_dt} to {payload.appointment_date} {payload.appointment_time}",
+        )
+        stage_sync_event(
+            self.db,
+            hospital_id=self.hospital_id,
+            entity_type="appointment",
+            action="reschedule",
+            entity_id=appt.id,
         )
         self.db.commit()
         self.db.refresh(appt)

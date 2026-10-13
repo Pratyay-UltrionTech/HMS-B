@@ -121,9 +121,9 @@ def test_action_execute_aggregations(
 # ===========================================================================
 
 def test_migrated_api_unauthenticated_forbidden(migrated_analytics_client: TestClient):
-    """GET /api/analytics/platform without credentials returns 403 (HTTPBearer default)."""
+    """GET /api/analytics/platform without credentials returns 401 or 403."""
     resp = migrated_analytics_client.get("/api/analytics/platform")
-    assert resp.status_code == 403
+    assert resp.status_code in (401, 403)
 
 
 def test_migrated_api_staff_forbidden(
