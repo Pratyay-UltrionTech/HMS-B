@@ -515,3 +515,40 @@ def test_15_update_finalize_unlinked_draft_is_rejected(db_session: Session, hosp
         )
     db_session.rollback()
     assert repo.get_open_admission(hospital.id, patient.id) is None
+
+
+# ── Test 16: Attempting final discharge while admitted raises state-aware error ─
+def test_16_discharge_without_request_raises_lifecycle_validation_error(db_session: Session, hospital: Hospital):
+    patient = _make_patient(db_session, hospital)
+    ward, room, bed, *_ = _make_ward(db_session, hospital)
+    adm_row = _finalize(db_session, hospital, patient)
+    AcceptAdmissionAction(db_session).execute(
+        hospital.id,
+        ACTOR,
+        admission_id=adm_row.admission_id,
+        ward_id=ward.id,
+        room_id=room.id,
+        bed_id=bed.id,
+    )
+
+    repo = AdmissionsRepository(db_session)
+    adm = repo.get_admission_by_id(hospital.id, adm_row.admission_id)
+    assert adm.status == AdmissionStatus.admitted
+
+    # Attempting final discharge without discharge_requested must raise state-aware ValidationError
+    with pytest.raises(ValidationError, match="Discharge has not been requested for this admission"):
+        DischargePatientAction(db_session).execute(
+            hospital.id,
+            DischargeRequest(
+                admission_id=adm_row.admission_id,
+                discharge_date=date.today(),
+                discharge_time=time(10, 0),
+            ),
+            ACTOR,
+        )
+
+    # Verify admission remains safely in admitted status
+    db_session.rollback()
+    adm_after = repo.get_admission_by_id(hospital.id, adm_row.admission_id)
+    assert adm_after.status == AdmissionStatus.admitted
+

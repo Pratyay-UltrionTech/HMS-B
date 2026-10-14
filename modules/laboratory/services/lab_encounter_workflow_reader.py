@@ -93,6 +93,11 @@ class LabEncounterWorkflowReader:
                 continue
             if st in _OPEN_LAB_ORDER_STATUSES:
                 s.active_order_count += 1
+                if st in (LabOrderStatus.sample_collected, LabOrderStatus.in_progress):
+                    s.in_progress_count += 1
+                    s.has_in_progress = True
+                elif st == LabOrderStatus.ordered:
+                    s.waiting_count += 1
                 status_label = (st.value if hasattr(st, "value") else str(st)).replace("_", " ")
                 s.blocker_descriptions.append(f"Lab order {order_no} is {status_label}")
             elif st == LabOrderStatus.completed:
@@ -127,6 +132,7 @@ class LabEncounterWorkflowReader:
             s.requested_count += 1
             if st in _OPEN_LAB_REQUEST_STATUSES:
                 s.open_request_count += 1
+                s.waiting_count += 1
                 status_label = (st.value if hasattr(st, "value") else str(st)).replace("_", " ")
                 s.blocker_descriptions.append(f"Doctor lab request pending ({status_label})")
             elif st == LabPrescriptionRequestStatus.cancelled:
@@ -160,6 +166,7 @@ class LabEncounterWorkflowReader:
                 or s.active_order_count > 0
                 or s.report_pending_count > 0
             )
+            s.has_in_progress = (s.in_progress_count > 0)
             s.has_final_result = (s.finalized_result_count > 0)
             has_any = (
                 s.requested_count > 0

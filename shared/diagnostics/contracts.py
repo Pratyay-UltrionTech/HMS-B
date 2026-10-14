@@ -18,11 +18,14 @@ class DiagnosticDomainSummary:
     requested_count: int = 0
     open_request_count: int = 0
     active_order_count: int = 0
+    waiting_count: int = 0
+    in_progress_count: int = 0
     finalized_result_count: int = 0
     report_pending_count: int = 0
     cancelled_count: int = 0
     unavailable_count: int = 0
     has_open_work: bool = False
+    has_in_progress: bool = False
     has_final_result: bool = False
     requires_doctor_attention: bool = False
     blocker_descriptions: list[str] = field(default_factory=list)

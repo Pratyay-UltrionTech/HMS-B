@@ -203,7 +203,7 @@ def test_surgery_booking_validations_and_billing_charge(ot_client, ot_db):
         "priority": "elective",
         "department_id": str(ot_client.test_dept_id),
         "ot_room_id": str(ot_client.test_room_id),
-        "scheduled_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        "scheduled_at": (datetime.now(timezone.utc).replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat(),
         "duration_minutes": 90,
     }
 
@@ -457,7 +457,7 @@ def test_surgery_cancellation_and_billing_cancellation(ot_client, ot_db):
             "surgery_type": "Hernia Repair",
             "department_id": str(ot_client.test_dept_id),
             "ot_room_id": str(ot_client.test_room_id),
-            "scheduled_at": (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(),
+            "scheduled_at": (datetime.now(timezone.utc).replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=2)).isoformat(),
         },
     ).json()
     surgery_id = booked["id"]

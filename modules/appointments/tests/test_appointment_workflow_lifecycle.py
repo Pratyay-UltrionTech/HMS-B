@@ -254,3 +254,105 @@ def test_doctor_review_diagnostics_action(db_session: Session, hospital, doctor,
     actor = {"id": str(doctor.id), "name": doctor.name, "role": "doctor"}
     res = ReviewDiagnosticsAction(db_session, hospital.id, repo).execute(appt.id, actor, notes="Results within normal limits")
     assert res.diagnostic_review_status == "reviewed"
+
+
+def test_appointment_workflow_lab_sample_collected_is_in_progress(db_session: Session, hospital, doctor, patient):
+    appt = _create_appointment(db_session, hospital.id, doctor, patient)
+    lab_order = LabOrder(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        order_no=f"LAB-{uuid4().hex[:6].upper()}",
+        patient_id=patient.id,
+        appointment_id=appt.id,
+        order_source=LabOrderSource.doctor_prescribed,
+        status=LabOrderStatus.sample_collected,
+    )
+    db_session.add(lab_order)
+    db_session.commit()
+
+    repo = AppointmentsRepository(db_session, hospital.id)
+    items = repo.hydrate_appointment_items([appt])
+    assert items[0].investigation_status == "in_progress"
+    assert items[0].overall_workflow_status == "investigations_in_progress"
+    assert items[0].workflow_status_label == "Investigations In Progress"
+
+
+def test_appointment_workflow_rad_in_progress_is_in_progress(db_session: Session, hospital, doctor, patient):
+    appt = _create_appointment(db_session, hospital.id, doctor, patient)
+    rad_order = RadiologyOrder(
+        id=uuid4(),
+        hospital_id=hospital.id,
+        order_no=f"RAD-{uuid4().hex[:6].upper()}",
+        patient_id=patient.id,
+        appointment_id=appt.id,
+        scan_code=f"MRI-{uuid4().hex[:4]}",
+        scan_name="Brain MRI",
+        status=RadiologyOrderStatus.in_progress,
+    )
+    db_session.add(rad_order)
+    db_session.commit()
+
+    repo = AppointmentsRepository(db_session, hospital.id)
+    items = repo.hydrate_appointment_items([appt])
+    assert items[0].investigation_status == "in_progress"
+    assert items[0].overall_workflow_status == "investigations_in_progress"
+    assert items[0].workflow_status_label == "Investigations In Progress"
+
+
+def test_pure_state_machine_comprehensive_matrix():
+    from shared.diagnostics.contracts import DiagnosticDomainSummary
+
+    # 1. Lab ordered (waiting)
+    lab_w = DiagnosticDomainSummary(domain="laboratory", active_order_count=1, waiting_count=1, has_open_work=True)
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(lab_summary=lab_w)
+    assert overall == "awaiting_lab_results"
+    assert label == "Awaiting Lab Results"
+
+    # 2. Lab sample collected / in progress
+    lab_ip = DiagnosticDomainSummary(domain="laboratory", active_order_count=1, in_progress_count=1, has_open_work=True, has_in_progress=True)
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(lab_summary=lab_ip)
+    assert overall == "investigations_in_progress"
+    assert label == "Investigations In Progress"
+
+    # 3. Radiology ordered / scheduled (waiting)
+    rad_w = DiagnosticDomainSummary(domain="radiology", active_order_count=1, waiting_count=1, has_open_work=True)
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(rad_summary=rad_w)
+    assert overall == "awaiting_radiology_results"
+    assert label == "Awaiting Radiology Results"
+
+    # 4. Radiology in progress
+    rad_ip = DiagnosticDomainSummary(domain="radiology", active_order_count=1, in_progress_count=1, has_open_work=True, has_in_progress=True)
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(rad_summary=rad_ip)
+    assert overall == "investigations_in_progress"
+    assert label == "Investigations In Progress"
+
+    # 5. Both waiting
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(lab_summary=lab_w, rad_summary=rad_w)
+    assert overall == "awaiting_lab_and_radiology_results"
+    assert label == "Awaiting Lab & Radiology Results"
+
+    # 6. Lab in progress + Rad waiting
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(lab_summary=lab_ip, rad_summary=rad_w)
+    assert overall == "investigations_in_progress"
+    assert label == "Investigations In Progress"
+
+    # 7. Lab final result ready + Rad in progress
+    lab_final = DiagnosticDomainSummary(domain="laboratory", finalized_result_count=1, has_final_result=True)
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(lab_summary=lab_final, rad_summary=rad_ip)
+    assert overall == "investigations_in_progress"
+    assert label == "Investigations In Progress"
+
+    # 8. All results final, review pending
+    rad_final = DiagnosticDomainSummary(domain="radiology", finalized_result_count=1, has_final_result=True)
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(lab_summary=lab_final, rad_summary=rad_final)
+    assert overall == "results_ready_review_pending"
+    assert label == "Results Ready — Doctor Review Pending"
+
+    # 9. Doctor review completed
+    _, overall, label = AppointmentWorkflowService.compute_workflow_status(
+        consultation_status="consultation_completed",
+        diagnostic_review_status="reviewed",
+        lab_summary=lab_final,
+        rad_summary=rad_final,
+    )
+    assert overall == "consultation_completed"

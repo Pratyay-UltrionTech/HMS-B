@@ -7,6 +7,7 @@ Includes Financial Accounts, Charges, Payments, Selective Allocations, Deposits,
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -532,6 +533,9 @@ class LedgerEntry(BaseModel):
     status: str | None = None
     ref_id: UUID | None = None
     reference_number: str | None = None
+    payment_method: str | None = None
+    business_date: str | None = None
+    allocations: list[dict[str, Any]] = []
 
 
 class PatientLedgerResponse(BaseModel):

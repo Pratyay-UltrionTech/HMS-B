@@ -136,7 +136,7 @@ def test_diagnostic_workflow_all_13_deterministic_combinations():
             DiagnosticDomainSummary(),
             "results_ready",
             "results_ready_review_pending",
-            "Results Ready (Review Pending)",
+            "Results Ready — Doctor Review Pending",
         ),
         # 6. Lab None, Rad ready (has final) -> Results ready
         (
@@ -144,7 +144,7 @@ def test_diagnostic_workflow_all_13_deterministic_combinations():
             DiagnosticDomainSummary(total_orders=1, completed_orders=1, has_final_result=True),
             "results_ready",
             "results_ready_review_pending",
-            "Results Ready (Review Pending)",
+            "Results Ready — Doctor Review Pending",
         ),
         # 7. Both ready (has final) -> Results ready
         (
@@ -152,7 +152,7 @@ def test_diagnostic_workflow_all_13_deterministic_combinations():
             DiagnosticDomainSummary(total_orders=1, completed_orders=1, has_final_result=True),
             "results_ready",
             "results_ready_review_pending",
-            "Results Ready (Review Pending)",
+            "Results Ready — Doctor Review Pending",
         ),
         # 8. Lab ready, Rad open -> Awaiting radiology (open blocker takes precedence)
         (
@@ -484,7 +484,7 @@ def test_closure1_diagnostic_lifecycle_integration_scenarios(db_session: Session
     db_session.commit()
     wf3 = workflow_svc.derive_workflow(a1)
     assert wf3.overall_workflow_status == "results_ready_review_pending"
-    assert wf3.workflow_status_label == "Results Ready (Review Pending)"
+    assert wf3.workflow_status_label == "Results Ready — Doctor Review Pending"
 
     # Scenario 4: Radiology scheduled -> Awaiting Radiology Results
     a4 = make_appt()
@@ -520,7 +520,7 @@ def test_closure1_diagnostic_lifecycle_integration_scenarios(db_session: Session
     db_session.commit()
     wf6 = workflow_svc.derive_workflow(a4)
     assert wf6.overall_workflow_status == "results_ready_review_pending"
-    assert wf6.workflow_status_label == "Results Ready (Review Pending)"
+    assert wf6.workflow_status_label == "Results Ready — Doctor Review Pending"
 
     # Scenario 7: Lab final + Radiology report pending -> Awaiting Radiology Results
     a7 = make_appt()
@@ -567,7 +567,7 @@ def test_closure1_diagnostic_lifecycle_integration_scenarios(db_session: Session
     db_session.commit()
     wf8 = workflow_svc.derive_workflow(a7)
     assert wf8.overall_workflow_status == "results_ready_review_pending"
-    assert wf8.workflow_status_label == "Results Ready (Review Pending)"
+    assert wf8.workflow_status_label == "Results Ready — Doctor Review Pending"
 
     # Scenario 9: All cancelled/unavailable -> Investigation Follow-up Required, NOT Results Ready
     a9 = make_appt()

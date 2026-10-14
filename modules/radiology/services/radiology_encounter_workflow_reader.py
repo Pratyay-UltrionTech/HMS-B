@@ -76,6 +76,11 @@ class RadiologyEncounterWorkflowReader:
                 continue
             if st in _OPEN_RAD_ORDER_STATUSES:
                 s.active_order_count += 1
+                if st == RadiologyOrderStatus.in_progress:
+                    s.in_progress_count += 1
+                    s.has_in_progress = True
+                elif st in (RadiologyOrderStatus.ordered, RadiologyOrderStatus.scheduled):
+                    s.waiting_count += 1
                 status_label = (st.value if hasattr(st, "value") else str(st)).replace("_", " ")
                 s.blocker_descriptions.append(f"Radiology order {order_no} is {status_label}")
             elif st == RadiologyOrderStatus.completed:
@@ -114,6 +119,7 @@ class RadiologyEncounterWorkflowReader:
             s.requested_count += 1
             if st in _OPEN_RAD_REQUEST_STATUSES:
                 s.open_request_count += 1
+                s.waiting_count += 1
                 status_label = (st.value if hasattr(st, "value") else str(st)).replace("_", " ")
                 s.blocker_descriptions.append(f"Doctor radiology request pending ({status_label})")
             elif st == RadPrescriptionRequestStatus.cancelled:
@@ -147,6 +153,7 @@ class RadiologyEncounterWorkflowReader:
                 or s.active_order_count > 0
                 or s.report_pending_count > 0
             )
+            s.has_in_progress = (s.in_progress_count > 0)
             s.has_final_result = (s.finalized_result_count > 0)
             has_any = (
                 s.requested_count > 0

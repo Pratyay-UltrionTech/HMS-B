@@ -2041,6 +2041,9 @@ class GetPatientLedgerAction:
         # Base payments query
         q_pay = (
             self.db.query(BillingPayment)
+            .options(
+                selectinload(BillingPayment.allocations).joinedload(BillingPaymentAllocation.charge)
+            )
             .filter(
                 BillingPayment.hospital_id == self.repo.hospital_id,
                 BillingPayment.patient_id == patient_id,
@@ -2055,6 +2058,9 @@ class GetPatientLedgerAction:
         # Deposits query
         q_dep = (
             self.db.query(BillingDeposit)
+            .options(
+                selectinload(BillingDeposit.allocations).joinedload(BillingPaymentAllocation.charge)
+            )
             .filter(
                 BillingDeposit.hospital_id == self.repo.hospital_id,
                 BillingDeposit.patient_id == patient_id,

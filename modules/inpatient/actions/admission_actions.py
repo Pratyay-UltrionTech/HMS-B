@@ -864,13 +864,25 @@ class DischargePatientAction:
                 (Admission.id == payload.admission_id)
                 if payload.admission_id
                 else (Admission.patient_id == payload.patient_id),
-                Admission.status == AdmissionStatus.discharge_requested,
             )
             .with_for_update()
             .first()
         )
         if not admission:
             raise NotFoundError("Active admission not found")
+
+        if admission.status != AdmissionStatus.discharge_requested:
+            if admission.status == AdmissionStatus.discharged:
+                raise ValidationError("Admission is already discharged")
+            if admission.status == AdmissionStatus.cancelled:
+                raise ValidationError("Cannot discharge a cancelled admission")
+            if admission.status == AdmissionStatus.requested:
+                raise ValidationError(
+                    "Admission has not been accepted yet — accept it before discharge"
+                )
+            raise ValidationError(
+                f"Discharge has not been requested for this admission. Current status is '{admission.status.value}'. A doctor's discharge request is required before final discharge."
+            )
 
         d_date = payload.discharge_date or date.today()
         d_time = payload.discharge_time or datetime.now(timezone.utc).time().replace(microsecond=0)

@@ -321,7 +321,7 @@ def transfer_bed(
     return TransferBedAction(db).execute(hospital_id, payload, user)
 
 
-@router.post("/discharge-request", response_model=AdmissionDetail, dependencies=[Depends(require_permission("bed", "edit"))])
+@router.post("/discharge-request", response_model=AdmissionDetail, dependencies=[Depends(require_permission("doctors", "edit"))])
 def request_discharge(
     payload: DischargeRequestCreate,
     db: Session = Depends(get_transitional_sync_session),

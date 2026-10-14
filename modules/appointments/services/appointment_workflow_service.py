@@ -63,7 +63,7 @@ def _format_workflow_label(status_code: str) -> str:
         "awaiting_radiology_results": "Awaiting Radiology Results",
         "awaiting_lab_and_radiology_results": "Awaiting Lab & Radiology Results",
         "investigations_in_progress": "Investigations In Progress",
-        "results_ready_review_pending": "Results Ready (Review Pending)",
+        "results_ready_review_pending": "Results Ready — Doctor Review Pending",
         "diagnostic_attention_required": "Investigation Follow-up Required",
         "completed": "Completed",
         "cancelled": "Cancelled",
@@ -153,9 +153,12 @@ class AppointmentWorkflowService:
         )
 
         # Investigation status
+        any_in_progress = getattr(lab_summary, "has_in_progress", False) or getattr(rad_summary, "has_in_progress", False)
         inv_status: str | None = None
         if has_diagnostics:
-            if open_lab and open_rad:
+            if any_in_progress:
+                inv_status = "in_progress"
+            elif open_lab and open_rad:
                 inv_status = "awaiting_lab_and_radiology"
             elif open_lab:
                 inv_status = "awaiting_lab"
@@ -183,6 +186,8 @@ class AppointmentWorkflowService:
             overall = "no_show"
         elif status == AppointmentStatus.transferred_to_inpatient:
             overall = "transferred_to_inpatient"
+        elif any_in_progress:
+            overall = "investigations_in_progress"
         elif open_lab and open_rad:
             overall = "awaiting_lab_and_radiology_results"
         elif open_lab:

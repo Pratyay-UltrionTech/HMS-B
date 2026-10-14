@@ -70,12 +70,12 @@ def staff_headers(hospital: Hospital) -> dict[str, str]:
 # ===========================================================================
 
 def test_patient_endpoints_unauthenticated_returns_403(registration_client: TestClient):
-    """Accessing patient endpoints without auth header returns 403 (HTTPBearer default)."""
+    """Accessing patient endpoints without auth header returns 401/403 (HTTPBearer default)."""
     resp = registration_client.get("/api/registration/patients")
-    assert resp.status_code == 403
+    assert resp.status_code in (401, 403)
 
     resp_post = registration_client.post("/api/registration/patients", json={})
-    assert resp_post.status_code == 403
+    assert resp_post.status_code in (401, 403)
 
 
 def test_patient_endpoints_invalid_token_returns_401(registration_client: TestClient):

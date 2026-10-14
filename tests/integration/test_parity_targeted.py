@@ -444,6 +444,8 @@ def test_inpatient_discharge_blocks_on_outstanding_dues(parity_db: Session, samp
         source_id=admission.id,
         description="Room Stay Dues",
         charge_amount=1000.0,
+        unit_price=1000.0,
+        quantity=1.0,
         net_amount=1000.0,
         amount_paid=0.0,
         status=BillingChargeStatus.pending,
@@ -474,6 +476,7 @@ def test_inpatient_discharge_blocks_on_outstanding_dues(parity_db: Session, samp
         invoice_id=invoice.id,
         charge_id=charge.id,
         description="Room Stay Dues",
+        rate=Decimal("1000.00"),
         amount=Decimal("1000.00"),
     )
     parity_db.add(inv_line)

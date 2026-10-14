@@ -313,16 +313,14 @@ def cancel_charge_for_source(
 def bed_stay_days(admitted_at: datetime, discharged_at: datetime) -> int:
     """
     Billable bed days using standard hospital midnight census accounting.
-    Same-day stay bills minimum 1 day. Multi-day bills calendar days crossing midnights
-    plus 1 if checkout is after standard 12:00 PM cutoff.
+    Same-day stay bills minimum 1 day. Multi-day bills calendar days crossing midnights.
     """
     start = admitted_at if admitted_at.tzinfo else admitted_at.replace(tzinfo=timezone.utc)
     end = discharged_at if discharged_at.tzinfo else discharged_at.replace(tzinfo=timezone.utc)
     calendar_diff = (end.date() - start.date()).days
     if calendar_diff <= 0:
         return 1
-    extra_day = 1 if end.hour >= 12 else 0
-    return max(1, calendar_diff + extra_day)
+    return max(1, calendar_diff)
 
 
 def ensure_admission_charge(
@@ -1988,6 +1986,7 @@ def build_ledger_entries(
     for c in charges:
         if c.status == BillingChargeStatus.cancelled:
             continue
+        status_label = "settled" if c.status.value in ("settled", "paid") else c.status.value
         raw_items.append({
             "id": str(c.id),
             "entry_type": "charge",
@@ -1996,38 +1995,83 @@ def build_ledger_entries(
             "source_type": c.source_type.value if c.source_type else None,
             "debit": float(c.net_amount),
             "credit": 0.0,
-            "status": c.status.value,
+            "status": status_label,
             "ref_id": c.id,
             "reference_number": None,
+            "payment_method": None,
+            "business_date": c.created_at.date().isoformat() if c.created_at else None,
+            "allocations": [],
         })
 
     # 2. Payments (Credits: patient paid hospital against bill)
     for p in payments:
-        dt = (
+        dt = p.created_at or (
             datetime.combine(p.payment_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-            if p.payment_date else p.created_at
+            if p.payment_date else None
         )
+        allocations_list = []
+        total_allocated = 0.0
+        if hasattr(p, "allocations") and p.allocations:
+            for alloc in p.allocations:
+                amt = float(alloc.allocated_amount or 0.0)
+                if amt > 0:
+                    total_allocated += amt
+                    charge_desc = alloc.charge.description if (hasattr(alloc, "charge") and alloc.charge) else None
+                    allocations_list.append({
+                        "allocation_id": str(alloc.id),
+                        "charge_id": str(alloc.charge_id),
+                        "amount": amt,
+                        "charge_description": charge_desc,
+                    })
+        pay_amount = float(p.amount)
+        if total_allocated >= pay_amount and pay_amount > 0:
+            payment_status = "allocated"
+        elif total_allocated > 0:
+            payment_status = "partially_allocated"
+        else:
+            payment_status = "received"
+
+        method_str = p.payment_method.value if hasattr(p.payment_method, "value") else str(p.payment_method)
         raw_items.append({
             "id": str(p.id),
             "entry_type": "payment",
             "occurred_at": dt,
-            "description": f"Payment ({p.payment_method.value.replace('_', ' ').title()})",
+            "description": f"Payment ({method_str.replace('_', ' ').title()})",
             "source_type": None,
             "debit": 0.0,
-            "credit": float(p.amount),
-            "status": "received",
+            "credit": pay_amount,
+            "status": payment_status,
             "ref_id": p.id,
             "reference_number": p.reference_number,
+            "payment_method": method_str,
+            "business_date": p.payment_date.isoformat() if p.payment_date else None,
+            "allocations": allocations_list,
         })
 
     # 3. Deposits (Credits: patient advance payment). A cancellation credit is money
     # already credited through its source payment, so it is shown without re-crediting.
     for d in deposits:
-        dt = (
+        dt = d.created_at or (
             datetime.combine(d.deposit_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-            if d.deposit_date else d.created_at
+            if d.deposit_date else None
         )
         is_credit_reclass = d.deposit_type == "cancellation_credit"
+        allocations_list = []
+        if hasattr(d, "allocations") and d.allocations:
+            for alloc in d.allocations:
+                amt = float(alloc.allocated_amount or 0.0)
+                if amt > 0:
+                    charge_desc = alloc.charge.description if (hasattr(alloc, "charge") and alloc.charge) else None
+                    allocations_list.append({
+                        "allocation_id": str(alloc.id),
+                        "charge_id": str(alloc.charge_id),
+                        "amount": amt,
+                        "charge_description": charge_desc,
+                    })
+        method_str = (
+            d.payment_method.value if hasattr(getattr(d, "payment_method", None), "value")
+            else str(getattr(d, "payment_method", "") or "")
+        )
         raw_items.append({
             "id": str(d.id),
             "entry_type": "deposit",
@@ -2040,16 +2084,23 @@ def build_ledger_entries(
             "source_type": None,
             "debit": 0.0,
             "credit": 0.0 if is_credit_reclass else float(d.original_amount),
-            "status": d.status.value,
+            "status": d.status.value if hasattr(d.status, "value") else str(d.status),
             "ref_id": d.id,
             "reference_number": d.deposit_number,
+            "payment_method": method_str or None,
+            "business_date": d.deposit_date.isoformat() if d.deposit_date else None,
+            "allocations": allocations_list,
         })
 
     # 4. Refunds (Debits: hospital returns cash/credit to patient)
     for r in refunds:
-        dt = (
+        dt = r.created_at or (
             datetime.combine(r.refund_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-            if r.refund_date else r.created_at
+            if r.refund_date else None
+        )
+        method_str = (
+            r.refund_method.value if hasattr(getattr(r, "refund_method", None), "value")
+            else str(getattr(r, "refund_method", "") or "")
         )
         raw_items.append({
             "id": str(r.id),
@@ -2059,9 +2110,12 @@ def build_ledger_entries(
             "source_type": None,
             "debit": float(r.amount),
             "credit": 0.0,
-            "status": r.status.value,
+            "status": r.status.value if hasattr(r.status, "value") else str(r.status),
             "ref_id": r.id,
             "reference_number": r.refund_number,
+            "payment_method": method_str or None,
+            "business_date": r.refund_date.isoformat() if r.refund_date else None,
+            "allocations": [],
         })
 
     def _norm(dt: Any) -> datetime:
@@ -2073,8 +2127,9 @@ def build_ledger_entries(
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
 
-    # Sort forward in time to compute running passbook balance
-    raw_items.sort(key=lambda x: _norm(x["occurred_at"]))
+    # Sort forward in time to compute running passbook balance.
+    # Tie-breaking: Debits (charges) before credits (payments/deposits) when timestamps are identical.
+    raw_items.sort(key=lambda x: (_norm(x["occurred_at"]), 0 if x["debit"] > 0 else 1))
 
     running = 0.0
     for item in raw_items:
@@ -2083,7 +2138,7 @@ def build_ledger_entries(
         item["running_balance"] = running
 
     # Return reverse chronological (newest first) for UI display with exact running balance attached
-    raw_items.sort(key=lambda x: _norm(x["occurred_at"]), reverse=True)
+    raw_items.sort(key=lambda x: (_norm(x["occurred_at"]), 1 if x["debit"] > 0 else 0), reverse=True)
     return raw_items
 
 
