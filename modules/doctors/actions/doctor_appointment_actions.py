@@ -476,13 +476,59 @@ class GetDoctorScheduleContextAction:
         doctor = self.repo.get_doctor(hospital_id, doctor_id)
         if not doctor:
             raise HTTPException(status_code=404, detail="Doctor not found")
-        shift_start, shift_end, shift_name = get_shift_bounds(doctor)
-        uses_default = doctor.shift is None or not doctor.shift.is_active
+
+        from datetime import date
+        from modules.doctors.contracts.doctor_contracts import DoctorScheduleSegment
+        from modules.doctors.services.effective_availability_service import (
+            EffectiveDoctorAvailabilityService,
+        )
+        avail_svc = EffectiveDoctorAvailabilityService(self.db, hospital_id)
+        effective_segs = avail_svc.get_effective_duty_segments(doctor_id, date.today())
+
+        segment_models = [
+            DoctorScheduleSegment(
+                start_time=s.start_time.strftime("%H:%M"),
+                end_time=s.end_time.strftime("%H:%M"),
+                duty_kind=s.duty_kind,
+                presence_type=s.presence_type,
+                is_bookable=s.is_bookable,
+                shift_name=s.shift_name,
+            )
+            for s in effective_segs
+        ]
+
+        if len(effective_segs) == 1:
+            s0 = effective_segs[0]
+            shift_start_str = s0.start_time.strftime("%H:%M")
+            shift_end_str = s0.end_time.strftime("%H:%M")
+            shift_name_str = s0.shift_name
+            working_summary = f"{s0.shift_name or 'Shift'} · {shift_start_str}–{shift_end_str}"
+            uses_default = s0.source in ("default_shift", "pattern")
+        elif len(effective_segs) > 1:
+            shift_start_str = effective_segs[0].start_time.strftime("%H:%M")
+            shift_end_str = effective_segs[0].end_time.strftime("%H:%M")
+            shift_name_str = f"{len(effective_segs)} Duty Sessions"
+            working_summary = ", ".join(
+                f"{s.start_time.strftime('%H:%M')}–{s.end_time.strftime('%H:%M')} ({s.duty_kind})"
+                for s in effective_segs
+            )
+            uses_default = all(s.source in ("default_shift", "pattern") for s in effective_segs)
+        else:
+            shift_start, shift_end, shift_name = get_shift_bounds(doctor)
+            shift_start_str = fmt_time_hhmm(shift_start)
+            shift_end_str = fmt_time_hhmm(shift_end)
+            shift_name_str = shift_name
+            working_summary = "Not scheduled on duty today"
+            uses_default = True
+
         return DoctorScheduleContext(
             doctor_id=doctor_id,
-            shift_name=shift_name,
-            shift_start=fmt_time_hhmm(shift_start),
-            shift_end=fmt_time_hhmm(shift_end),
+            shift_name=shift_name_str,
+            shift_start=shift_start_str,
+            shift_end=shift_end_str,
             slot_duration_minutes=slot_duration_minutes(self.db, hospital_id),
             uses_default_shift=uses_default,
+            segments=segment_models,
+            working_summary=working_summary,
         )
+

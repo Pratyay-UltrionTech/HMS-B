@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from modules.beds.entities.bed import Bed, Room, Ward
 from modules.inpatient.entities.admission import Admission, AdmissionStatus
+from shared.sync.events import stage_sync_event
 
 
 class BedsRepository:
@@ -39,19 +40,37 @@ class BedsRepository:
         if not rooms:
             return
         room_ids = [room.id for room in rooms]
-        count_rows = (
-            self.db.query(Bed.room_id, func.count(Bed.id))
-            .filter(Bed.hospital_id == hospital_id, Bed.room_id.in_(room_ids))
-            .group_by(Bed.room_id)
+        # Serialize legacy inventory hydration with Masters room mutations.
+        rooms = (
+            self.db.query(Room)
+            .filter(Room.hospital_id == hospital_id, Room.id.in_(room_ids), Room.is_active.is_(True))
+            .order_by(Room.id)
+            .populate_existing()
+            .with_for_update()
             .all()
         )
-        existing_counts = {room_id: int(cnt) for room_id, cnt in count_rows}
+        room_ids = [room.id for room in rooms]
+        if not room_ids:
+            return
+        code_rows = (
+            self.db.query(Bed.room_id, Bed.bed_code)
+            .filter(Bed.hospital_id == hospital_id, Bed.room_id.in_(room_ids))
+            .all()
+        )
+        existing_codes = {}
+        for room_id, code in code_rows:
+            existing_codes.setdefault(room_id, set()).add(code)
         new_beds = []
         for room in rooms:
-            existing = existing_counts.get(room.id, 0)
+            codes = existing_codes.get(room.id, set())
+            existing = len(codes)
             if existing >= room.bed_count:
                 continue
-            for i in range(existing + 1, room.bed_count + 1):
+            i = 1
+            for _ in range(room.bed_count - existing):
+                while f"Bed-{i}" in codes:
+                    i += 1
+                codes.add(f"Bed-{i}")
                 new_beds.append(
                     Bed(
                         hospital_id=hospital_id,
@@ -59,11 +78,12 @@ class BedsRepository:
                         room_id=room.id,
                         bed_code=f"Bed-{i}",
                         is_occupied=False,
-                        is_active=True,
+                        is_active=room.is_active,
                     )
                 )
         if new_beds:
             self.db.add_all(new_beds)
+            stage_sync_event(self.db, hospital_id, "bed", "create")
         self.db.flush()
 
     def sync_all_beds(self, hospital_id: UUID) -> None:

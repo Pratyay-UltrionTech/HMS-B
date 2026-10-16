@@ -31,6 +31,7 @@ from modules.appointments.entities.appointment_type import AppointmentType
 from modules.beds.entities.bed import Bed, Room, Ward, WardType
 from modules.billing.entities.billing_entities import ConsultationPricing
 from modules.clinical_records.entities.clinical_record import Prescription
+from modules.critical_care.entities.critical_care_entities import CodeBlueIncident, CodeBlueStatus
 from modules.doctors.entities.doctor import Holiday, HospitalUser, ShiftType, StaffRole
 from modules.masters.api.masters_api import router as masters_router
 from modules.masters.entities.organization_entities import Department, Supplier, Wing
@@ -325,6 +326,13 @@ def test_ot_rooms_and_consultation_pricing(masters_client, masters_db):
     )
     apt_id = apt_res.json()["id"]
 
+    # Consultation pricing requires a real eligible doctor, even for an admin caller.
+    admin = masters_db.get(HospitalUser, masters_client.admin_user_id)
+    doctor_role = StaffRole(hospital_id=masters_client.hospital_id, name="Doctor")
+    masters_db.add(doctor_role)
+    masters_db.flush()
+    admin.role_id = doctor_role.id
+    masters_db.commit()
     pricing_res = masters_client.post(
         "/masters/consultation-pricing",
         json={
@@ -348,3 +356,205 @@ def test_ot_rooms_and_consultation_pricing(masters_client, masters_db):
 
     del_ot = masters_client.delete(f"/masters/ot-rooms/{ot_id}")
     assert del_ot.status_code == 204
+
+
+def test_room_capacity_is_transactional(masters_client, masters_db):
+    ward = masters_client.post('/masters/wards', json={'name': 'Capacity ward', 'ward_type': 'general'}).json()
+    room = masters_client.post('/masters/rooms', json={'ward_id': ward['id'], 'room_code': 'CAP', 'bed_count': 2}).json()
+    beds = masters_db.query(Bed).filter(Bed.room_id == UUID(room['id'])).all()
+    assert len(beds) == 2
+    assert masters_client.put(f"/masters/rooms/{room['id']}", json={'bed_count': 3}).status_code == 200
+    beds = masters_db.query(Bed).filter(Bed.room_id == UUID(room['id'])).all()
+    assert len(beds) == 3
+    for bed in beds:
+        bed.is_occupied = True
+    masters_db.commit()
+    rejected = masters_client.put(f"/masters/rooms/{room['id']}", json={'bed_count': 1})
+    assert rejected.status_code == 409
+    assert masters_db.get(Room, UUID(room['id'])).bed_count == 3
+    for bed in beds:
+        bed.is_occupied = False
+    masters_db.commit()
+    assert masters_client.put(f"/masters/rooms/{room['id']}", json={'bed_count': 1}).status_code == 200
+    assert masters_db.query(Bed).filter(Bed.room_id == UUID(room['id'])).count() == 1
+
+
+def test_ward_rejects_mismatched_department(masters_client):
+    wing = masters_client.post('/masters/wings', json={'name': 'One'}).json()
+    other = masters_client.post('/masters/wings', json={'name': 'Two'}).json()
+    dept = masters_client.post('/masters/departments', json={'wing_id': wing['id'], 'name': 'Dept'}).json()
+    response = masters_client.post('/masters/wards', json={'name': 'Bad', 'ward_type': 'general', 'wing_id': other['id'], 'department_id': dept['id']})
+    assert response.status_code == 422
+
+
+def test_insurance_get_is_read_only_and_inactive_manageable(masters_client, masters_db):
+    from modules.masters.entities.insurance_entities import InsuranceProvider
+    assert masters_client.get('/masters/insurance').json() == []
+    assert masters_db.query(InsuranceProvider).count() == 0
+    item = masters_client.post('/masters/insurance', json={'code': ' ins-1 ', 'name': 'Provider', 'is_active': False}).json()
+    assert item['code'] == 'INS-1'
+    assert len(masters_client.get('/masters/insurance?active=false').json()) == 1
+    assert masters_client.get('/masters/insurance?active=true').json() == []
+    assert masters_client.post('/masters/insurance', json={'code': 'Ins-1', 'name': 'Duplicate'}).status_code == 409
+
+
+def test_room_move_and_history_safety(masters_client, masters_db):
+    from modules.inpatient.entities.admission import Admission, AdmissionStatus
+    ward = masters_client.post('/masters/wards', json={'name': 'Original', 'ward_type': 'general'}).json()
+    other = masters_client.post('/masters/wards', json={'name': 'Destination', 'ward_type': 'general'}).json()
+    room = masters_client.post('/masters/rooms', json={'ward_id': ward['id'], 'room_code': 'MOVE', 'bed_count': 2}).json()
+    assert masters_client.put(f"/masters/rooms/{room['id']}", json={'ward_id': other['id']}).status_code == 200
+    beds = masters_db.query(Bed).filter(Bed.room_id == UUID(room['id'])).all()
+    assert all(bed.ward_id == UUID(other['id']) for bed in beds)
+    # Discharged history still protects bed and room identifiers from deletion/moving.
+    masters_db.add(Admission(hospital_id=masters_client.hospital_id, patient_id=uuid4(), ward_id=UUID(other['id']), room_id=UUID(room['id']), bed_id=beds[0].id, status=AdmissionStatus.discharged))
+    masters_db.commit()
+    assert masters_client.put(f"/masters/rooms/{room['id']}", json={'ward_id': ward['id']}).status_code == 409
+    assert masters_client.delete(f"/masters/rooms/{room['id']}").status_code == 409
+    assert masters_client.put(f"/masters/rooms/{room['id']}", json={'bed_count': 1}).status_code == 200
+    assert masters_db.get(Bed, beds[0].id) is not None
+
+
+def test_master_delete_dependency_guard(masters_client):
+    wing = masters_client.post('/masters/wings', json={'name': 'Dependent wing'}).json()
+    dept = masters_client.post('/masters/departments', json={'wing_id': wing['id'], 'name': 'Dependent department'}).json()
+    assert masters_client.delete(f"/masters/wings/{wing['id']}").status_code == 409
+    masters_client.post('/masters/shift-types', json={'department_id': dept['id'], 'name': 'Linked shift', 'start_time': '09:00', 'end_time': '17:00'})
+    assert masters_client.delete(f"/masters/departments/{dept['id']}").status_code == 409
+
+
+def test_pricing_and_beds_use_secondary_doctor_role(masters_client, masters_db):
+    from modules.doctors.entities.doctor import HospitalUserRole
+    from modules.beds.api.beds_api import _list_staff_doctors
+    wing = masters_client.post('/masters/wings', json={'name': 'Pricing wing'}).json()
+    other = masters_client.post('/masters/wings', json={'name': 'Wrong wing'}).json()
+    dept = masters_client.post('/masters/departments', json={'wing_id': wing['id'], 'name': 'Pricing dept'}).json()
+    appointment = masters_client.post('/masters/appointment-types', json={'name': 'Pricing type'}).json()
+    payload = {'wing_id': wing['id'], 'department_id': dept['id'], 'doctor_id': str(masters_client.admin_user_id), 'appointment_type_id': appointment['id'], 'consultation_fee': 50}
+    assert masters_client.post('/masters/consultation-pricing', json=payload).status_code == 422
+    role = StaffRole(hospital_id=masters_client.hospital_id, name='Doctor')
+    masters_db.add(role)
+    masters_db.flush()
+    masters_db.add(HospitalUserRole(hospital_id=masters_client.hospital_id, user_id=masters_client.admin_user_id, role_id=role.id))
+    masters_db.commit()
+    assert masters_client.post('/masters/consultation-pricing', json=payload).status_code == 201
+    payload['wing_id'] = other['id']
+    assert masters_client.post('/masters/consultation-pricing', json=payload).status_code == 422
+    assert [item['id'] for item in _list_staff_doctors(masters_db, masters_client.hospital_id)] == [str(masters_client.admin_user_id)]
+
+
+def test_master_events_publish_after_commit_and_rollback_discards(masters_client, masters_db, monkeypatch):
+    from shared.sync.events import sync_broker
+    from sqlalchemy.exc import IntegrityError
+    published = []
+    def publish(hospital, entity, action, *args, **kwargs):
+        assert not masters_db.in_transaction() or not masters_db.get_transaction().is_active
+        published.append((entity, action))
+    monkeypatch.setattr(sync_broker, 'publish', publish)
+    assert masters_client.post('/masters/holidays', json={'name': 'Successful', 'holiday_date': '2026-10-14'}).status_code == 201
+    assert published == [('holiday', 'create')]
+    published.clear()
+    def fail_commit():
+        raise IntegrityError('simulated', {}, Exception('failure'))
+    monkeypatch.setattr(masters_db, 'commit', fail_commit)
+    assert masters_client.post('/masters/holidays', json={'name': 'Rolled back', 'holiday_date': '2026-10-15'}).status_code == 409
+    assert published == []
+    assert 'pending_sync_events' not in masters_db.info
+
+
+@pytest.mark.parametrize('count', [1, 30])
+def test_master_lists_and_bed_selectors_have_bounded_queries(masters_client, masters_db, count):
+    from modules.masters.actions.masters_actions import MastersActions
+    from modules.beds.api.beds_api import _list_staff_doctors
+    from tests.helpers.query_counter import query_counter
+    wing = Wing(hospital_id=masters_client.hospital_id, name='Query wing')
+    masters_db.add(wing)
+    masters_db.flush()
+    dept = Department(hospital_id=masters_client.hospital_id, wing_id=wing.id, name='Query dept')
+    masters_db.add(dept)
+    masters_db.flush()
+    masters_db.add_all([OtRoom(hospital_id=masters_client.hospital_id, department_id=dept.id, code=f'OT{i}', name=f'OT {i}') for i in range(count)])
+    masters_db.commit()
+    masters_db.expire_all()
+    actions = MastersActions(masters_db, masters_client.hospital_id)
+    with query_counter(session=masters_db) as queries:
+        assert len(actions.list_ot_rooms()) == count
+        actions.list_departments()
+        actions.list_insurance_providers()
+        _list_staff_doctors(masters_db, masters_client.hospital_id)
+    assert queries.select_count == 4
+    assert queries.insert_count == queries.update_count == queries.delete_count == 0
+
+
+def test_legacy_bed_hydration_reloads_locked_room_state(masters_client, masters_db):
+    from sqlalchemy import update
+    from modules.beds.db.beds_repository import BedsRepository
+    ward = masters_client.post('/masters/wards', json={'name': 'Stale ward', 'ward_type': 'general'}).json()
+    other = masters_client.post('/masters/wards', json={'name': 'Current ward', 'ward_type': 'general'}).json()
+    room = Room(hospital_id=masters_client.hospital_id, ward_id=UUID(ward['id']), room_code='STALE', bed_count=4)
+    masters_db.add(room)
+    masters_db.commit()
+    assert room.bed_count == 4
+    # A database change bypasses the identity map, as a concurrent writer would.
+    masters_db.execute(update(Room).where(Room.id == room.id).values(bed_count=1, ward_id=UUID(other['id'])), execution_options={'synchronize_session': False})
+    BedsRepository(masters_db)._ensure_beds_bulk(masters_client.hospital_id, [room])
+    beds = masters_db.query(Bed).filter(Bed.room_id == room.id).all()
+    assert len(beds) == 1
+    assert beds[0].ward_id == UUID(other['id'])
+    masters_db.execute(update(Room).where(Room.id == room.id).values(is_active=False, bed_count=5), execution_options={'synchronize_session': False})
+    BedsRepository(masters_db)._ensure_beds_bulk(masters_client.hospital_id, [room])
+    assert masters_db.query(Bed).filter(Bed.room_id == room.id).count() == 1
+
+
+@pytest.mark.parametrize('count', [1, 30])
+def test_bed_inventory_options_queries_do_not_grow_with_rooms(masters_client, masters_db, count):
+    from modules.beds.actions.bed_actions import ListBedOptionsAction
+    from tests.helpers.query_counter import query_counter
+    ward = Ward(hospital_id=masters_client.hospital_id, name='Bed query ward', ward_type=WardType.general)
+    masters_db.add(ward)
+    masters_db.flush()
+    for i in range(count):
+        room = Room(hospital_id=masters_client.hospital_id, ward_id=ward.id, room_code=f'BQ{i}', bed_count=1)
+        masters_db.add(room)
+        masters_db.flush()
+        masters_db.add(Bed(hospital_id=masters_client.hospital_id, room_id=room.id, ward_id=ward.id, bed_code='Bed-1'))
+    masters_db.commit()
+    masters_db.expire_all()
+    with query_counter(session=masters_db) as queries:
+        assert len(ListBedOptionsAction(masters_db).execute(masters_client.hospital_id)) == count
+    assert queries.select_count == 5
+    assert queries.insert_count == queries.update_count == queries.delete_count == 0
+
+
+def test_masters_reject_cross_hospital_references_and_partial_pair_mismatch(masters_client, masters_db):
+    other_hospital = Hospital(hospital_id='OTHER-MASTERS', name='Other hospital', address='Elsewhere', phone='123', email='other@masters.test', password_hash='fake')
+    masters_db.add(other_hospital)
+    masters_db.flush()
+    foreign_wing = Wing(hospital_id=other_hospital.id, name='Foreign wing')
+    masters_db.add(foreign_wing)
+    masters_db.commit()
+    assert masters_client.post('/masters/departments', json={'wing_id': str(foreign_wing.id), 'name': 'Invalid'}).status_code == 404
+    wing = masters_client.post('/masters/wings', json={'name': 'Partial wing'}).json()
+    other = masters_client.post('/masters/wings', json={'name': 'Partial other wing'}).json()
+    dept = masters_client.post('/masters/departments', json={'wing_id': wing['id'], 'name': 'Partial dept'}).json()
+    ward = masters_client.post('/masters/wards', json={'name': 'Partial ward', 'ward_type': 'general', 'wing_id': wing['id'], 'department_id': dept['id']}).json()
+    assert masters_client.put(f"/masters/wards/{ward['id']}", json={'wing_id': other['id']}).status_code == 422
+    assert masters_client.put(f"/masters/departments/{dept['id']}", json={'wing_id': other['id']}).status_code == 409
+    assert masters_client.post('/masters/ot-rooms', json={'wing_id': other['id'], 'department_id': dept['id'], 'code': 'WRONG', 'name': 'Invalid'}).status_code == 422
+    assert masters_client.put(f"/masters/wards/{ward['id']}", json={'department_id': None}).status_code == 200
+
+
+def test_code_blue_history_protects_beds_and_wards(masters_client, masters_db):
+    from modules.critical_care.entities.critical_care_entities import CodeBlueIncident, CodeBlueStatus
+    ward = masters_client.post('/masters/wards', json={'name': 'Code Blue ward', 'ward_type': 'general'}).json()
+    room = masters_client.post('/masters/rooms', json={'ward_id': ward['id'], 'room_code': 'CB', 'bed_count': 2}).json()
+    beds = masters_db.query(Bed).filter(Bed.room_id == UUID(room['id'])).all()
+    for index, bed in enumerate(beds):
+        masters_db.add(CodeBlueIncident(hospital_id=masters_client.hospital_id, incident_code=f'CB-{index}', location_description='Historic resuscitation', ward_id=UUID(ward['id']), bed_id=bed.id, activated_by_name='Test staff', status=CodeBlueStatus.concluded))
+    masters_db.commit()
+    assert masters_client.put(f"/masters/rooms/{room['id']}", json={'bed_count': 1}).status_code == 409
+    assert masters_client.delete(f"/masters/rooms/{room['id']}").status_code == 409
+    empty_ward = masters_client.post('/masters/wards', json={'name': 'Historical ward only', 'ward_type': 'general'}).json()
+    masters_db.add(CodeBlueIncident(hospital_id=masters_client.hospital_id, incident_code='CB-WARD', location_description='Historic ward event', ward_id=UUID(empty_ward['id']), activated_by_name='Test staff', status=CodeBlueStatus.concluded))
+    masters_db.commit()
+    assert masters_client.delete(f"/masters/wards/{empty_ward['id']}").status_code == 409

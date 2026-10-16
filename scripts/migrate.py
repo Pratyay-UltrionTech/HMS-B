@@ -266,7 +266,84 @@ DDL_STATEMENTS = [
     "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS patient_outstanding_after_snapshot NUMERIC(14, 2);",
     "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS available_deposit_after_snapshot NUMERIC(14, 2);",
     "ALTER TABLE billing_receipts ADD COLUMN IF NOT EXISTS net_patient_balance_after_snapshot NUMERIC(14, 2);",
+
+    # 13. Multi-Segment Hospital Rostering and Recurring Work Patterns
+    """
+    CREATE TABLE IF NOT EXISTS staff_roster_days (
+        id UUID PRIMARY KEY,
+        hospital_id UUID NOT NULL REFERENCES hospitals(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES hospital_users(id) ON DELETE CASCADE,
+        roster_date DATE NOT NULL,
+        status VARCHAR(32) NOT NULL DEFAULT 'working',
+        notes TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_staff_roster_day UNIQUE (hospital_id, user_id, roster_date)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_staff_roster_days_hosp_date ON staff_roster_days(hospital_id, roster_date);",
+    "CREATE INDEX IF NOT EXISTS ix_staff_roster_days_lookup ON staff_roster_days(hospital_id, user_id, roster_date);",
+
+    """
+    CREATE TABLE IF NOT EXISTS staff_roster_segments (
+        id UUID PRIMARY KEY,
+        hospital_id UUID NOT NULL REFERENCES hospitals(id) ON DELETE CASCADE,
+        roster_day_id UUID NOT NULL REFERENCES staff_roster_days(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES hospital_users(id) ON DELETE CASCADE,
+        shift_type_id UUID REFERENCES shift_types(id) ON DELETE SET NULL,
+        department_id UUID REFERENCES departments(id) ON DELETE SET NULL,
+        start_at TIMESTAMPTZ NOT NULL,
+        end_at TIMESTAMPTZ NOT NULL,
+        duty_kind VARCHAR(32) NOT NULL DEFAULT 'OPD',
+        presence_type VARCHAR(32) NOT NULL DEFAULT 'ONSITE',
+        is_bookable BOOLEAN NOT NULL DEFAULT TRUE,
+        notes TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_roster_seg_hosp_user_dates ON staff_roster_segments(hospital_id, user_id, start_at, end_at);",
+    "CREATE INDEX IF NOT EXISTS ix_roster_seg_hosp_dept_dates ON staff_roster_segments(hospital_id, department_id, start_at);",
+    "CREATE INDEX IF NOT EXISTS ix_roster_seg_hosp_dates ON staff_roster_segments(hospital_id, start_at, end_at);",
+    "CREATE INDEX IF NOT EXISTS ix_roster_seg_day_id ON staff_roster_segments(roster_day_id);",
+
+    """
+    CREATE TABLE IF NOT EXISTS staff_work_patterns (
+        id UUID PRIMARY KEY,
+        hospital_id UUID NOT NULL REFERENCES hospitals(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES hospital_users(id) ON DELETE CASCADE,
+        name VARCHAR(128) NOT NULL DEFAULT 'Default Recurring Schedule',
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        notes TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT uq_staff_work_pattern_user UNIQUE (hospital_id, user_id)
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_staff_work_patterns_lookup ON staff_work_patterns(hospital_id, user_id);",
+
+    """
+    CREATE TABLE IF NOT EXISTS staff_work_pattern_segments (
+        id UUID PRIMARY KEY,
+        hospital_id UUID NOT NULL REFERENCES hospitals(id) ON DELETE CASCADE,
+        pattern_id UUID NOT NULL REFERENCES staff_work_patterns(id) ON DELETE CASCADE,
+        day_of_week INTEGER NOT NULL,
+        start_time TIME NOT NULL,
+        end_time TIME NOT NULL,
+        shift_type_id UUID REFERENCES shift_types(id) ON DELETE SET NULL,
+        department_id UUID REFERENCES departments(id) ON DELETE SET NULL,
+        duty_kind VARCHAR(32) NOT NULL DEFAULT 'OPD',
+        presence_type VARCHAR(32) NOT NULL DEFAULT 'ONSITE',
+        is_bookable BOOLEAN NOT NULL DEFAULT TRUE,
+        notes TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_work_pattern_seg_pattern_day ON staff_work_pattern_segments(pattern_id, day_of_week);",
+    "CREATE INDEX IF NOT EXISTS ix_work_pattern_seg_hosp_day ON staff_work_pattern_segments(hospital_id, day_of_week);",
 ]
+
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +536,16 @@ def run_migration() -> None:
         print(f"Canonical admin roles migrated: {admin_roles_updated}")
         print(f"Ambiguous Administrator roles: {ambiguous_admin_roles}")
 
+        # Rostering backfill
+        from scripts.migrate_multi_segment_rostering import (
+            migrate_daily_shifts,
+            backfill_work_patterns_from_users,
+        )
+        migrated_segs = migrate_daily_shifts(conn)
+        logger.info("Migrated historical shifts into roster segments: %d", migrated_segs)
+        created_pats = backfill_work_patterns_from_users(conn)
+        logger.info("Backfilled default work patterns: %d", created_pats)
+
         # 4. Post-migration verification
         logger.info("--- Post-Migration Validation ---")
         dist = conn.execute(text("SELECT auth_model, count(*) FROM hospitals GROUP BY auth_model")).fetchall()
@@ -483,7 +570,8 @@ def show_status() -> None:
     target_tables = [
         "hospitals", "hospital_users", "staff_roles", "role_permissions",
         "hospital_user_roles", "account_setup_tokens", "login_attempts",
-        "hospital_registration_requests", "callback_requests", "audit_logs"
+        "hospital_registration_requests", "callback_requests", "audit_logs",
+        "staff_roster_days", "staff_roster_segments", "staff_work_patterns", "staff_work_pattern_segments",
     ]
 
     print("\n" + "=" * 70)
@@ -491,6 +579,7 @@ def show_status() -> None:
     print("=" * 70)
 
     for t in target_tables:
+
         present = t in tables
         print(f"Table {t:<35} : {'PRESENT' if present else 'MISSING'}")
 

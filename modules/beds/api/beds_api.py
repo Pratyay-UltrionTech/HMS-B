@@ -11,7 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session
 
 from infrastructure.postgres.session import get_transitional_sync_session
 from modules.beds.actions.bed_actions import (
@@ -31,6 +31,7 @@ from modules.beds.contracts.bed_contracts import (
     WardsRoomsCatalog,
 )
 from modules.doctors.entities.doctor import HospitalUser
+from modules.doctors.services.doctor_eligibility import doctor_eligibility_clause
 from modules.inpatient.actions.admission_actions import (
     AdmitPatientAction,
     AllocateBedAction,
@@ -67,15 +68,14 @@ router = APIRouter(prefix="/beds", tags=["beds"])
 registration_inpatient_router = APIRouter(prefix="/registration", tags=["registration"])
 
 
-def _is_doctor(user: HospitalUser) -> bool:
-    return bool(user.role and "doctor" in (user.role.name or "").lower())
-
-
 def _list_staff_doctors(db: Session, hospital_id: UUID) -> list[dict[str, Any]]:
     users = (
-        db.query(HospitalUser)
-        .options(joinedload(HospitalUser.role))
-        .filter(HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
+        db.query(HospitalUser.id, HospitalUser.name, HospitalUser.phone, HospitalUser.email,
+                 HospitalUser.specialization, HospitalUser.qualification,
+                 HospitalUser.medical_registration_number, HospitalUser.years_of_experience,
+                 HospitalUser.consultation_room)
+        .filter(doctor_eligibility_clause(hospital_id))
+        .order_by(HospitalUser.name, HospitalUser.id)
         .all()
     )
     return [
@@ -91,7 +91,6 @@ def _list_staff_doctors(db: Session, hospital_id: UUID) -> list[dict[str, Any]]:
             "consultation_room": d.consultation_room,
         }
         for d in users
-        if _is_doctor(d)
     ]
 
 

@@ -32,9 +32,21 @@ class CheckAvailabilityAction:
         if daily.reason == "Doctor not found":
             raise AppointmentNotFoundError("Doctor not found")
 
+        from modules.appointments.contracts.appointments_contracts import AvailabilityPeriod
         leave_blocks = [
             LeaveBlock(start=l["start"], end=l["end"], reason=l.get("reason"))
             for l in daily.leave_blocks
+        ]
+        periods = [
+            AvailabilityPeriod(
+                start_time=s["start_time"],
+                end_time=s["end_time"],
+                duty_kind=s.get("duty_kind", "OPD"),
+                presence_type=s.get("presence_type", "ONSITE"),
+                is_bookable=s.get("is_bookable", True),
+                shift_name=s.get("shift_name"),
+            )
+            for s in daily.segments
         ]
 
         return DoctorAvailability(
@@ -47,4 +59,8 @@ class CheckAvailabilityAction:
             leave_blocks=leave_blocks,
             shift_start=daily.shift_start,
             shift_end=daily.shift_end,
+            segments=periods,
+            availability_periods=periods,
+            rest_warnings=daily.rest_warnings,
         )
+

@@ -105,32 +105,33 @@ class PricingReader:
         if not rows:
             return None
 
-        # When a specific appointment type is requested, only consider rows
-        # for that exact type or generic rows (NULL type). Otherwise an
-        # unrelated type's tariff could win with score 0 and show wrong price.
-        if appt_type_id:
-            filtered = [
-                r
-                for r in rows
-                if r["appointment_type_id"] == appt_type_id or r["appointment_type_id"] is None
-            ]
-            if not filtered:
-                return None
-            rows = filtered
+        # When specific parameters are requested, candidate rows must not contradict them
+        filtered = []
+        for r in rows:
+            if appt_type_id and r["appointment_type_id"] not in (appt_type_id, None):
+                continue
+            if wing_id and r["wing_id"] not in (wing_id, None):
+                continue
+            if department_id and r["department_id"] not in (department_id, None):
+                continue
+            filtered.append(r)
+
+        if not filtered:
+            return None
 
         def _score(r):
             score = 0
             if appt_type_id and r["appointment_type_id"] == appt_type_id:
-                score += 4
+                score += 8
             elif r["appointment_type_id"] is None:
                 score += 1
-            if wing_id and r["wing_id"] == wing_id:
-                score += 2
             if department_id and r["department_id"] == department_id:
+                score += 4
+            if wing_id and r["wing_id"] == wing_id:
                 score += 2
             return score
 
-        sorted_rows = sorted(rows, key=_score, reverse=True)
+        sorted_rows = sorted(filtered, key=_score, reverse=True)
         return dict(sorted_rows[0]) if sorted_rows else None
 
     def resolve_wing_department_for_doctor(
@@ -144,7 +145,7 @@ class PricingReader:
         if wing_id and department_id:
             return wing_id, department_id
 
-        # 1. Try pricing match
+        # 1. Try pricing match constraining to supplied dimensions
         stmt = select(
             _consultation_pricing.c.wing_id,
             _consultation_pricing.c.department_id,
@@ -154,17 +155,57 @@ class PricingReader:
             _consultation_pricing.c.is_active.is_(True),
         )
         if appointment_type_id:
-            row = self.db.execute(
-                stmt.where(_consultation_pricing.c.appointment_type_id == appointment_type_id)
-            ).first()
-            if row and (row[0] or row[1]):
-                return wing_id or row[0], department_id or row[1]
-        row = self.db.execute(stmt).first()
-        if row and (row[0] or row[1]):
-            return wing_id or row[0], department_id or row[1]
+            stmt = stmt.where(
+                or_(
+                    _consultation_pricing.c.appointment_type_id == appointment_type_id,
+                    _consultation_pricing.c.appointment_type_id.is_(None),
+                )
+            )
+        if wing_id:
+            stmt = stmt.where(
+                or_(_consultation_pricing.c.wing_id == wing_id, _consultation_pricing.c.wing_id.is_(None))
+            )
+        if department_id:
+            stmt = stmt.where(
+                or_(_consultation_pricing.c.department_id == department_id, _consultation_pricing.c.department_id.is_(None))
+            )
 
-        # 2. Fallback to active wing and department
+        pricing_rows = self.db.execute(stmt).all()
+        # Verify Wing<->Department compatibility for pricing matches
+        for r_wing_id, r_dept_id in pricing_rows:
+            candidate_wing = wing_id or r_wing_id
+            candidate_dept = department_id or r_dept_id
+            if candidate_wing and candidate_dept:
+                dept_check = self.db.execute(
+                    select(_departments.c.wing_id).where(
+                        _departments.c.id == candidate_dept,
+                        _departments.c.hospital_id == self.hospital_id,
+                        _departments.c.is_active.is_(True),
+                    )
+                ).first()
+                if dept_check and (dept_check[0] is None or dept_check[0] == candidate_wing):
+                    return candidate_wing, candidate_dept
+            elif candidate_wing and not candidate_dept:
+                wing_id = candidate_wing
+                break
+            elif candidate_dept and not candidate_wing:
+                department_id = candidate_dept
+                break
+
+        # 2. Fallback to active wing and department ensuring compatibility
         w = wing_id
+        d = department_id
+        if d and not w:
+            dept_row = self.db.execute(
+                select(_departments.c.wing_id).where(
+                    _departments.c.id == d,
+                    _departments.c.hospital_id == self.hospital_id,
+                    _departments.c.is_active.is_(True),
+                )
+            ).first()
+            if dept_row and dept_row[0]:
+                w = dept_row[0]
+
         if not w:
             wing_stmt = (
                 select(_wings.c.id)
@@ -179,7 +220,6 @@ class PricingReader:
             if w_row:
                 w = w_row[0]
 
-        d = department_id
         if not d:
             dept_stmt = select(_departments.c.id, _departments.c.wing_id).where(
                 _departments.c.hospital_id == self.hospital_id,

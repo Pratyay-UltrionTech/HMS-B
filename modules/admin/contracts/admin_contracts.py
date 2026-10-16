@@ -270,6 +270,50 @@ class HospitalUserResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class HospitalUserListItem(BaseModel):
+    id: UUID
+    hospital_id: UUID
+    role_id: UUID
+    name: str
+    phone: str
+    email: str
+    role_name: str | None = None
+    department_id: UUID | None = None
+    department_name: str | None = None
+    shift_id: UUID | None = None
+    shift_name: str | None = None
+    is_active: bool
+    created_at: datetime
+    roles: list[UserRoleAssignmentResponse] = Field(default_factory=list)
+    departments: list[UserDepartmentAssignmentResponse] = Field(default_factory=list)
+
+
+class HospitalUserPage(BaseModel):
+    items: list[HospitalUserListItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class StaffRosterSegmentItem(BaseModel):
+    id: UUID
+    roster_day_id: UUID | None = None
+    shift_type_id: UUID | None = None
+    shift_name: str | None = None
+    start_at: datetime
+    end_at: datetime
+    start_time: str  # "HH:MM"
+    end_time: str  # "HH:MM"
+    duty_kind: str = "OTHER"
+    presence_type: str = "ONSITE"
+    is_bookable: bool = False
+    department_id: UUID | None = None
+    department_name: str | None = None
+    notes: str | None = None
+    is_cross_midnight: bool = False
+
+
 # ── Daily shift roster ──────────────────────────────────────────────────────────
 class ShiftRosterEntry(BaseModel):
     user_id: UUID
@@ -287,6 +331,10 @@ class ShiftRosterEntry(BaseModel):
     is_override: bool = False
     notes: str | None = None
     default_shift_id: UUID | None = None
+    eligible_department_ids: list[UUID] = Field(default_factory=list)
+    primary_department_id: UUID | None = None
+    primary_department_name: str | None = None
+    segments: list[StaffRosterSegmentItem] = Field(default_factory=list)
 
 
 class ShiftRosterResponse(BaseModel):
@@ -294,19 +342,113 @@ class ShiftRosterResponse(BaseModel):
     hospital_name: str
     holiday_name: str | None = None
     entries: list[ShiftRosterEntry]
+    unique_staff_working: int = 0
+    total_duty_segments: int = 0
+    total_staff: int = 0
+    off_count: int = 0
+    leave_count: int = 0
 
 
 class ShiftRosterAssign(BaseModel):
     roster_date: date
     user_id: UUID
     shift_id: UUID | None = None
-    status: str = Field(default="on_duty", pattern="^(on_duty|off|leave)$")
+    status: str = Field(default="on_duty", pattern="^(on_duty|off|leave|working)$")
     notes: str | None = Field(default=None, max_length=500)
+
+
+class RosterDutySegmentCreate(BaseModel):
+    roster_date: date
+    user_id: UUID
+    shift_type_id: UUID | None = None
+    start_time: str = Field(pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    end_time: str = Field(pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    duty_kind: str = Field(default="OTHER", pattern="^(OPD|WARD|ICU|EMERGENCY|OT|LAB|RADIOLOGY|ON_CALL|ADMIN|TRAINING|OTHER)$")
+    presence_type: str = Field(default="ONSITE", pattern="^(ONSITE|ON_CALL|REMOTE)$")
+    department_id: UUID | None = None
+    is_bookable: bool = False
+    notes: str | None = None
+
+
+# ── Staff Recurring Work Pattern ──────────────────────────────────────────────
+class WorkPatternSegmentItem(BaseModel):
+    id: UUID | None = None
+    day_of_week: int = Field(ge=0, le=6)  # 0=Monday .. 6=Sunday
+    start_time: str = Field(pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    end_time: str = Field(pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    shift_type_id: UUID | None = None
+    shift_name: str | None = None
+    department_id: UUID | None = None
+    department_name: str | None = None
+    duty_kind: str = Field(default="OTHER", pattern="^(OPD|WARD|ICU|EMERGENCY|OT|LAB|RADIOLOGY|ON_CALL|ADMIN|TRAINING|OTHER)$")
+    presence_type: str = Field(default="ONSITE", pattern="^(ONSITE|ON_CALL|REMOTE)$")
+    is_bookable: bool = False
+    notes: str | None = None
+
+
+class StaffWorkPatternResponse(BaseModel):
+    user_id: UUID
+    pattern_id: UUID | None = None
+    name: str = "Default Recurring Schedule"
+    is_active: bool = True
+    notes: str | None = None
+    segments: list[WorkPatternSegmentItem] = Field(default_factory=list)
+
+
+class StaffWorkPatternUpdate(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+    notes: str | None = None
+    segments: list[WorkPatternSegmentItem] = Field(default_factory=list)
+
+
+class WorkPatternSegmentCreate(BaseModel):
+    day_of_week: int = Field(ge=0, le=6)
+    start_time: str = Field(pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    end_time: str = Field(pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    shift_type_id: UUID | None = None
+    department_id: UUID | None = None
+    duty_kind: str = Field(default="OTHER", pattern="^(OPD|WARD|ICU|EMERGENCY|OT|LAB|RADIOLOGY|ON_CALL|ADMIN|TRAINING|OTHER)$")
+    presence_type: str = Field(default="ONSITE", pattern="^(ONSITE|ON_CALL|REMOTE)$")
+    is_bookable: bool = False
+    notes: str | None = None
+
+
+class WorkPatternSegmentUpdate(BaseModel):
+    day_of_week: int | None = Field(default=None, ge=0, le=6)
+    start_time: str | None = Field(default=None, pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    end_time: str | None = Field(default=None, pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    shift_type_id: UUID | None = None
+    department_id: UUID | None = None
+    duty_kind: str | None = Field(default=None, pattern="^(OPD|WARD|ICU|EMERGENCY|OT|LAB|RADIOLOGY|ON_CALL|ADMIN|TRAINING|OTHER)$")
+    presence_type: str | None = Field(default=None, pattern="^(ONSITE|ON_CALL|REMOTE)$")
+    is_bookable: bool | None = None
+    notes: str | None = None
+
+
+class RosterDutySegmentUpdate(BaseModel):
+    shift_type_id: UUID | None = None
+    start_time: str | None = Field(default=None, pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    end_time: str | None = Field(default=None, pattern=r"^\d{1,2}:\d{2}(:\d{2})?$")
+    duty_kind: str | None = Field(default=None, pattern="^(OPD|WARD|ICU|EMERGENCY|OT|LAB|RADIOLOGY|ON_CALL|ADMIN|TRAINING|OTHER)$")
+    presence_type: str | None = Field(default=None, pattern="^(ONSITE|ON_CALL|REMOTE)$")
+    department_id: UUID | None = None
+    is_bookable: bool | None = None
+    notes: str | None = None
+
+
+class StaffRosterDayUpdate(BaseModel):
+    roster_date: date
+    user_id: UUID
+    status: str = Field(default="working", pattern="^(working|on_duty|off|leave)$")
+    notes: str | None = None
+    segments: list[RosterDutySegmentCreate] | None = None
 
 
 class ShiftRosterSeed(BaseModel):
     roster_date: date
     overwrite: bool = False
+
 
 
 class ShiftRosterSnapshot(BaseModel):
@@ -399,4 +541,50 @@ class AuthSimulateRequest(BaseModel):
 class AuthSimulateResponse(BaseModel):
     decision: str
     details: dict[str, Any]
+
+
+class WorkPatternSegmentItem(BaseModel):
+    id: UUID | None = None
+    day_of_week: int  # 0=Monday .. 6=Sunday
+    shift_type_id: UUID | None = None
+    shift_name: str | None = None
+    department_id: UUID | None = None
+    department_name: str | None = None
+    start_time: str
+    end_time: str
+    duty_kind: str = "OTHER"
+    presence_type: str = "ONSITE"
+    is_bookable: bool = False
+    notes: str | None = None
+
+
+class StaffWorkPatternResponse(BaseModel):
+    id: UUID | None = None
+    pattern_id: UUID | None = None
+    hospital_id: UUID | None = None
+    user_id: UUID
+    name: str = "Default Recurring Schedule"
+    is_active: bool = True
+    notes: str | None = None
+    segments: list[WorkPatternSegmentItem] = Field(default_factory=list)
+
+
+class StaffWorkPatternUpdate(BaseModel):
+    name: str | None = None
+    is_active: bool | None = True
+    notes: str | None = None
+    segments: list[WorkPatternSegmentItem] = Field(default_factory=list)
+
+
+class WorkPatternSegmentCreate(BaseModel):
+    user_id: UUID
+    day_of_week: int
+    start_time: str
+    end_time: str
+    shift_type_id: UUID | None = None
+    department_id: UUID | None = None
+    duty_kind: str = "OTHER"
+    presence_type: str = "ONSITE"
+    is_bookable: bool = False
+    notes: str | None = None
 

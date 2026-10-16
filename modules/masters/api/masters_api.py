@@ -506,6 +506,7 @@ def delete_consultation_pricing(
 # ── Insurance & TPA Master ───────────────────────────────────────────────────
 @router.get("/insurance", response_model=list[InsuranceProviderResponse])
 def list_insurance_providers(
+    active: bool | None = Query(default=None),
     search: str | None = Query(default=None),
     category: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
@@ -514,6 +515,7 @@ def list_insurance_providers(
     _: dict[str, Any] = Depends(require_hospital_user),
 ) -> list[InsuranceProviderResponse]:
     return MastersActions(db, hospital_id).list_insurance_providers(
+        active=active,
         search=search,
         category=category,
         status_filter=status_filter,

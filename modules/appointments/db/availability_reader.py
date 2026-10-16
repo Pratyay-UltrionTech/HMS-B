@@ -111,6 +111,9 @@ class AvailabilityReader:
 
     def get_doctor(self, doctor_id: UUID) -> dict[str, Any] | None:
         """Fetch active doctor details."""
+        from modules.doctors.services.doctor_eligibility import is_eligible_doctor
+        if not is_eligible_doctor(self.db, self.hospital_id, doctor_id):
+            return None
         stmt = (
             select(
                 _hospital_users.c.id,

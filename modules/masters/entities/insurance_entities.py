@@ -17,6 +17,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Index,
     String,
     Text,
     UniqueConstraint,
@@ -63,3 +64,11 @@ class InsuranceProvider(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+Index(
+    "uq_insurance_hospital_normalized_code",
+    InsuranceProvider.hospital_id,
+    func.upper(func.trim(InsuranceProvider.code)),
+    unique=True,
+)

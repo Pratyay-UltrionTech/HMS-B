@@ -146,7 +146,7 @@ class ShiftType(Base):
         UUID(as_uuid=True), ForeignKey("hospitals.id", ondelete="CASCADE"), nullable=False, index=True
     )
     department_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
@@ -436,3 +436,16 @@ class StaffDailyShift(Base):
 
     user: Mapped["HospitalUser"] = relationship(foreign_keys=[user_id])
     shift: Mapped["ShiftType | None"] = relationship(foreign_keys=[shift_id])
+
+
+# Re-export rostering entities for backward compatibility
+from modules.doctors.entities.rostering_entities import (  # noqa: E402
+    DutyKind,
+    PresenceType,
+    RosterDayStatus,
+    StaffRosterDay,
+    StaffRosterSegment,
+    StaffWorkPattern,
+    StaffWorkPatternSegment,
+)
+

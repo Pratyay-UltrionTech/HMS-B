@@ -219,6 +219,15 @@ class LeaveBlock(BaseModel):
     reason: str | None = None
 
 
+class AvailabilityPeriod(BaseModel):
+    start_time: str
+    end_time: str
+    duty_kind: str = "OPD"
+    presence_type: str = "ONSITE"
+    is_bookable: bool = True
+    shift_name: str | None = None
+
+
 class DoctorAvailability(BaseModel):
     doctor_id: uuid.UUID
     doctor_name: str
@@ -229,6 +238,10 @@ class DoctorAvailability(BaseModel):
     leave_blocks: list[LeaveBlock] = []
     shift_start: str | None = None
     shift_end: str | None = None
+    segments: list[AvailabilityPeriod] = Field(default_factory=list)
+    availability_periods: list[AvailabilityPeriod] = Field(default_factory=list)
+    rest_warnings: list[str] = Field(default_factory=list)
+
 
 
 class QueueGroup(BaseModel):

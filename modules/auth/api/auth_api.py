@@ -12,7 +12,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from config.settings import Settings, get_settings
 from infrastructure.postgres.session import get_transitional_sync_session
@@ -50,8 +50,9 @@ def _extract_user_session_info(db: Session, staff: HospitalUser):
     """Aggregate assigned roles, departments, locations, and union permissions."""
     assigned_roles = (
         db.query(HospitalUserRole)
-        .options(joinedload(HospitalUserRole.role).joinedload(StaffRole.permissions))
-        .filter(HospitalUserRole.user_id == staff.id)
+        .options(joinedload(HospitalUserRole.role).selectinload(StaffRole.permissions))
+        .filter(HospitalUserRole.user_id == staff.id, HospitalUserRole.hospital_id == staff.hospital_id,
+                or_(HospitalUserRole.expires_at.is_(None), HospitalUserRole.expires_at > datetime.now(timezone.utc)))
         .all()
     )
 
@@ -182,7 +183,7 @@ def me(
     if user_id and hospital_uuid:
         staff = (
             db.query(HospitalUser)
-            .options(joinedload(HospitalUser.role).joinedload(StaffRole.permissions))
+            .options(joinedload(HospitalUser.role).selectinload(StaffRole.permissions))
             .filter(HospitalUser.id == UUID(str(user_id)), HospitalUser.hospital_id == UUID(str(hospital_uuid)))
             .first()
         )
@@ -521,7 +522,7 @@ def login(
         # Check hospital user in target hospital (both active and inactive)
         staff = (
             db.query(HospitalUser)
-            .options(joinedload(HospitalUser.role).joinedload(StaffRole.permissions))
+            .options(joinedload(HospitalUser.role).selectinload(StaffRole.permissions))
             .filter(
                 HospitalUser.hospital_id == target_hosp.id,
                 HospitalUser.email.ilike(email),
@@ -566,7 +567,7 @@ def login(
     # 3. Model B Candidate Verification: query accounts across all active hospitals
     all_staff_accounts = (
         db.query(HospitalUser)
-        .options(joinedload(HospitalUser.role).joinedload(StaffRole.permissions))
+        .options(joinedload(HospitalUser.role).selectinload(StaffRole.permissions))
         .filter(HospitalUser.email.ilike(email))
         .all()
     )

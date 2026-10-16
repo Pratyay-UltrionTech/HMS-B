@@ -195,7 +195,7 @@ class AuthorizationService:
         expired_role_ids: list[str] = []
 
         if db is not None and user_id:
-            from modules.doctors.entities.doctor import HospitalUserRole, HospitalUser
+            from modules.doctors.entities.doctor import HospitalUserRole, HospitalUser, StaffRole
             try:
                 user_uuid = UUID(user_id)
                 h_uuid = UUID(hospital_uuid_str)
@@ -203,7 +203,8 @@ class AuthorizationService:
 
                 role_records = (
                     db.query(HospitalUserRole)
-                    .filter(
+                    .join(StaffRole, StaffRole.id == HospitalUserRole.role_id)
+                    .filter(StaffRole.hospital_id == h_uuid, StaffRole.is_active.is_(True),
                         HospitalUserRole.hospital_id == h_uuid,
                         HospitalUserRole.user_id == user_uuid,
                     )
@@ -221,11 +222,10 @@ class AuthorizationService:
                             continue
                     active_role_ids.append(rid_str)
 
-                # Fallback to legacy HospitalUser.role_id if no M2M rows
-                if not assigned_role_ids:
-                    legacy_user = db.query(HospitalUser).filter(HospitalUser.id == user_uuid).first()
-                    if legacy_user and legacy_user.role_id:
-                        rid_str = str(legacy_user.role_id)
+                legacy_user = db.query(HospitalUser).filter(HospitalUser.id == user_uuid, HospitalUser.hospital_id == h_uuid).first()
+                if legacy_user and legacy_user.role and legacy_user.role.is_active and legacy_user.role.hospital_id == h_uuid:
+                    rid_str = str(legacy_user.role_id)
+                    if rid_str not in assigned_role_ids:
                         assigned_role_ids.append(rid_str)
                         active_role_ids.append(rid_str)
             except Exception:

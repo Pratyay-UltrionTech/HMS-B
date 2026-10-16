@@ -44,7 +44,7 @@ from modules.billing.entities.billing_entities import (
 )
 from modules.billing.entities.idempotency import IdempotencyRecord
 from modules.billing.services.idempotency_service import IdempotencyService
-from modules.doctors.entities.doctor import HospitalUser, StaffRole
+from modules.doctors.entities.doctor import HospitalUser, ShiftType, StaffRole
 from modules.patients.entities.patient import Patient
 from modules.tenancy.entities.hospital import Hospital
 from shared.exceptions.base import ConflictError
@@ -59,11 +59,18 @@ def get_pg_engine():
         or "postgresql+psycopg://carwash_admin_dev:Postgre%402026@postgresql-db-dev-1.postgres.database.azure.com:5432/HMSstage2?sslmode=require"
     )
 
-    # Ensure psycopg (psycopg3) dialect is used
+    try:
+        import psycopg  # type: ignore
+        preferred = "postgresql+psycopg://"
+    except ImportError:
+        preferred = "postgresql+psycopg2://"
+
     if raw_url.startswith("postgresql://"):
-        pg_url = raw_url.replace("postgresql://", "postgresql+psycopg://", 1)
-    elif raw_url.startswith("postgresql+psycopg2://"):
-        pg_url = raw_url.replace("postgresql+psycopg2://", "postgresql+psycopg://", 1)
+        pg_url = raw_url.replace("postgresql://", preferred, 1)
+    elif raw_url.startswith("postgresql+psycopg2://") and preferred != "postgresql+psycopg2://":
+        pg_url = raw_url.replace("postgresql+psycopg2://", preferred, 1)
+    elif raw_url.startswith("postgresql+psycopg://") and preferred != "postgresql+psycopg://":
+        pg_url = raw_url.replace("postgresql+psycopg://", preferred, 1)
     else:
         pg_url = raw_url
 
@@ -118,11 +125,35 @@ def pg_fixtures(pg_session_factory):
             )
             session.add(doc)
             session.commit()
-        else:
             cv = dict(doc.custom_values or {})
             cv["consultation_fee"] = 500.0
             doc.custom_values = cv
             session.commit()
+
+        # Ensure doctor has active default shift for scheduling
+        if not doc.shift_id:
+            shift = session.query(ShiftType).filter_by(hospital_id=hospital_id, is_active=True).first()
+            if not shift:
+                from modules.masters.entities.organization_entities import Department
+                dept = session.query(Department).filter_by(hospital_id=hospital_id).first()
+                if not dept:
+                    dept = Department(hospital_id=hospital_id, name="General Medicine", code=f"GEN-{uuid4().hex[:4]}")
+                    session.add(dept)
+                    session.flush()
+                shift = ShiftType(
+                    hospital_id=hospital_id,
+                    department_id=dept.id,
+                    name="All Day OPD",
+                    start_time=dt_time(8, 0),
+                    end_time=dt_time(20, 0),
+                    is_active=True,
+                )
+                session.add(shift)
+                session.flush()
+            doc.shift_id = shift.id
+        if not doc.specialization:
+            doc.specialization = "General Medicine"
+        session.commit()
         doctor_id = doc.id
 
         # 3. Patient with non-null UHID (fresh patient per test session)

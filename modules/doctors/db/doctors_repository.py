@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, joinedload
 from modules.appointments.entities.appointment import Appointment
 from modules.appointments.entities.enums import AppointmentStatus
 from modules.doctors.entities.doctor import HospitalUser
+from modules.doctors.services.doctor_eligibility import doctor_eligibility_clause
 from modules.inpatient.entities.admission import Admission, IpdFormSubmission
 from modules.patients.entities.patient import Patient
 from modules.vitals.entities.vital_reading import VitalReading
@@ -36,13 +37,13 @@ class DoctorsRepository:
         q = (
             self.db.query(HospitalUser)
             .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift))
-            .filter(HospitalUser.hospital_id == hospital_id, HospitalUser.is_active.is_(True))
+            .filter(doctor_eligibility_clause(hospital_id))
         )
         if specialization:
             q = q.filter(HospitalUser.specialization.ilike(f"%{specialization.strip()}%"))
 
         users = q.order_by(HospitalUser.name.asc()).all()
-        doctors = [u for u in users if u.role and "doctor" in (u.role.name or "").lower()]
+        doctors = users
 
         today = date.today()
         # Today appointment counts per doctor
@@ -101,7 +102,7 @@ class DoctorsRepository:
         return (
             self.db.query(HospitalUser)
             .options(joinedload(HospitalUser.role), joinedload(HospitalUser.shift))
-            .filter(HospitalUser.id == doctor_id, HospitalUser.hospital_id == hospital_id)
+            .filter(HospitalUser.id == doctor_id, doctor_eligibility_clause(hospital_id))
             .first()
         )
 

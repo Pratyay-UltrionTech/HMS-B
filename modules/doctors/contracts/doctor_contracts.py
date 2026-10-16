@@ -158,13 +158,25 @@ class HospitalClinicProfile(BaseModel):
     website: str | None = None
 
 
+class DoctorScheduleSegment(BaseModel):
+    start_time: str
+    end_time: str
+    duty_kind: str = "OPD"
+    presence_type: str = "ONSITE"
+    is_bookable: bool = True
+    shift_name: str | None = None
+
+
 class DoctorScheduleContext(BaseModel):
     doctor_id: UUID
     shift_name: str | None = None
-    shift_start: str
-    shift_end: str
+    shift_start: str = "09:00"
+    shift_end: str = "17:00"
     slot_duration_minutes: int = 15
     uses_default_shift: bool = False
+    segments: list[DoctorScheduleSegment] = Field(default_factory=list)
+    working_summary: str | None = None
+
 
 
 LEAVE_TYPES = (

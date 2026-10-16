@@ -19,6 +19,7 @@ from modules.admin.actions.admin_actions import AdminActions
 from modules.admin.contracts.admin_contracts import (
     AuditLogResponse,
     HospitalUserCreate,
+    HospitalUserPage,
     HospitalUserResponse,
     HospitalUserUpdate,
     ModuleInfo,
@@ -30,8 +31,17 @@ from modules.admin.contracts.admin_contracts import (
     ShiftRosterResponse,
     ShiftRosterSeed,
     ShiftRosterSnapshot,
+    StaffRosterSegmentItem,
+    RosterDutySegmentCreate,
+    RosterDutySegmentUpdate,
+    StaffRosterDayUpdate,
     HospitalFacilitySettings,
     HospitalFacilitySettingsUpdate,
+    WorkPatternSegmentItem,
+    StaffWorkPatternResponse,
+    StaffWorkPatternUpdate,
+    WorkPatternSegmentCreate,
+    WorkPatternSegmentUpdate,
 )
 from shared.auth import (
     get_current_user,
@@ -71,7 +81,7 @@ def list_modules(
 def list_roles(
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    _: dict[str, Any] = Depends(require_hospital_user),
+    _: dict[str, Any] = Depends(require_permission("admin", "view")),
 ) -> list[RoleResponse]:
     return AdminActions(db, hospital_id).list_roles()
 
@@ -111,13 +121,23 @@ def delete_role(
 
 
 # ── Users ──────────────────────────────────────────────────────────────────────
-@router.get("/users", response_model=list[HospitalUserResponse])
+@router.get("/users", response_model=HospitalUserPage)
 def list_users(
+    page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
+    search: str | None = Query(None, max_length=255), is_active: bool | None = None,
+    role_id: UUID | None = None, department_id: UUID | None = None,
     db: Session = Depends(get_transitional_sync_session),
     hospital_id: UUID = Depends(get_hospital_context),
-    _: dict[str, Any] = Depends(require_hospital_user),
-) -> list[HospitalUserResponse]:
-    return AdminActions(db, hospital_id).list_users()
+    _: dict[str, Any] = Depends(require_permission("admin", "view")),
+) -> HospitalUserPage:
+    return AdminActions(db, hospital_id).list_users_page(page,page_size,search,is_active,role_id,department_id)
+
+
+@router.get("/users/{user_id}", response_model=HospitalUserResponse)
+def get_user(user_id: UUID, db: Session = Depends(get_transitional_sync_session),
+             hospital_id: UUID = Depends(get_hospital_context),
+             _: dict[str, Any] = Depends(require_permission("admin", "view"))) -> HospitalUserResponse:
+    return AdminActions(db, hospital_id).get_user(user_id)
 
 
 @router.post("/users", response_model=HospitalUserResponse, status_code=status.HTTP_201_CREATED,
@@ -224,6 +244,114 @@ def get_shift_roster_snapshot(
     _: dict[str, Any] = Depends(require_hospital_user),
 ) -> ShiftRosterSnapshot:
     return AdminActions(db, hospital_id).get_shift_roster_snapshot(roster_date)
+
+
+@router.post("/shift-roster/segments", response_model=StaffRosterSegmentItem, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("admin", "edit"))])
+def add_duty_segment(
+    payload: RosterDutySegmentCreate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> StaffRosterSegmentItem:
+    return AdminActions(db, hospital_id, actor).add_duty_segment(payload)
+
+
+@router.put("/shift-roster/segments/{segment_id}", response_model=StaffRosterSegmentItem,
+    dependencies=[Depends(require_permission("admin", "edit"))])
+def update_duty_segment(
+    segment_id: UUID,
+    payload: RosterDutySegmentUpdate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> StaffRosterSegmentItem:
+    return AdminActions(db, hospital_id, actor).update_duty_segment(segment_id, payload)
+
+
+@router.delete("/shift-roster/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response,
+    dependencies=[Depends(require_permission("admin", "edit"))])
+def delete_duty_segment(
+    segment_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> Response:
+    AdminActions(db, hospital_id, actor).delete_duty_segment(segment_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put("/shift-roster/day", response_model=ShiftRosterEntry,
+    dependencies=[Depends(require_permission("admin", "edit"))])
+def update_roster_day(
+    payload: StaffRosterDayUpdate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> ShiftRosterEntry:
+    return AdminActions(db, hospital_id, actor).update_roster_day(payload)
+
+
+# ── Staff Recurring Work Patterns ──────────────────────────────────────────────
+@router.get("/staff/{user_id}/work-pattern", response_model=StaffWorkPatternResponse)
+def get_staff_work_pattern(
+    user_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    _: dict[str, Any] = Depends(require_hospital_user),
+) -> StaffWorkPatternResponse:
+    return AdminActions(db, hospital_id).get_staff_work_pattern(user_id)
+
+
+@router.put("/staff/{user_id}/work-pattern", response_model=StaffWorkPatternResponse,
+    dependencies=[Depends(require_permission("admin", "edit"))])
+def update_staff_work_pattern(
+    user_id: UUID,
+    payload: StaffWorkPatternUpdate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> StaffWorkPatternResponse:
+    return AdminActions(db, hospital_id, actor).update_staff_work_pattern(user_id, payload)
+
+
+@router.post("/staff/{user_id}/work-pattern/segments", response_model=WorkPatternSegmentItem, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("admin", "edit"))])
+def add_work_pattern_segment(
+    user_id: UUID,
+    payload: WorkPatternSegmentCreate,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> WorkPatternSegmentItem:
+    return AdminActions(db, hospital_id, actor).add_work_pattern_segment(user_id, payload)
+
+
+@router.delete("/staff/{user_id}/work-pattern/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response,
+    dependencies=[Depends(require_permission("admin", "edit"))])
+def delete_work_pattern_segment(
+    user_id: UUID,
+    segment_id: UUID,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> Response:
+    AdminActions(db, hospital_id, actor).delete_work_pattern_segment(user_id, segment_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/staff/{user_id}/work-pattern/days/{day_of_week}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response,
+    dependencies=[Depends(require_permission("admin", "edit"))])
+def clear_work_pattern_day(
+    user_id: UUID,
+    day_of_week: int,
+    db: Session = Depends(get_transitional_sync_session),
+    hospital_id: UUID = Depends(get_hospital_context),
+    actor: dict[str, Any] = Depends(require_hospital_admin),
+) -> Response:
+    AdminActions(db, hospital_id, actor).clear_work_pattern_day(user_id, day_of_week)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 
 # ── Hospital Facility Settings (SCR-022) ───────────────────────────────────────

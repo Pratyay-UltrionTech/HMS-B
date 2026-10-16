@@ -200,11 +200,36 @@ def hospital_b(db_session: Session) -> Hospital:
 
 @pytest.fixture(scope="function")
 def doctor(db_session: Session, hospital: Hospital) -> HospitalUser:
-    """Primary doctor user in hospital."""
+    """Primary doctor user in hospital with explicitly configured shift."""
+    from modules.doctors.entities.doctor import ShiftType, StaffRole
+    from modules.masters.entities.organization_entities import Department
+    dept = Department(
+        id=uuid.uuid4(),
+        hospital_id=hospital.id,
+        name="General Medicine",
+        code="MED",
+        is_active=True,
+    )
+    db_session.add(dept)
+    role = StaffRole(id=uuid.uuid4(), hospital_id=hospital.id, name="Doctor")
+    db_session.add(role)
+    shift = ShiftType(
+        id=uuid.uuid4(),
+        hospital_id=hospital.id,
+        department_id=dept.id,
+        name="General OPD Shift",
+        start_time=time(8, 0),
+        end_time=time(20, 0),
+        is_active=True,
+    )
+    db_session.add(shift)
+    db_session.flush()
     doc = HospitalUser(
         id=uuid.uuid4(),
         hospital_id=hospital.id,
-        role_id=uuid.uuid4(),
+        role_id=role.id,
+        department_id=dept.id,
+        shift_id=shift.id,
         name="Dr. Gregory House",
         phone="555-0101",
         email="house@apollocity.com",
@@ -219,11 +244,36 @@ def doctor(db_session: Session, hospital: Hospital) -> HospitalUser:
 
 @pytest.fixture(scope="function")
 def doctor_b(db_session: Session, hospital_b: Hospital) -> HospitalUser:
-    """Doctor in secondary hospital."""
+    """Doctor in secondary hospital with explicitly configured shift."""
+    from modules.doctors.entities.doctor import ShiftType, StaffRole
+    from modules.masters.entities.organization_entities import Department
+    dept = Department(
+        id=uuid.uuid4(),
+        hospital_id=hospital_b.id,
+        name="Oncology",
+        code="ONC",
+        is_active=True,
+    )
+    db_session.add(dept)
+    role = StaffRole(id=uuid.uuid4(), hospital_id=hospital_b.id, name="Doctor")
+    db_session.add(role)
+    shift = ShiftType(
+        id=uuid.uuid4(),
+        hospital_id=hospital_b.id,
+        department_id=dept.id,
+        name="General OPD Shift",
+        start_time=time(8, 0),
+        end_time=time(20, 0),
+        is_active=True,
+    )
+    db_session.add(shift)
+    db_session.flush()
     doc = HospitalUser(
         id=uuid.uuid4(),
         hospital_id=hospital_b.id,
-        role_id=uuid.uuid4(),
+        role_id=role.id,
+        department_id=dept.id,
+        shift_id=shift.id,
         name="Dr. James Wilson",
         phone="555-0201",
         email="wilson@fortisreg.com",

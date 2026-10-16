@@ -256,44 +256,14 @@ class AppointmentsRepository(BaseRepository[Appointment]):
     # -----------------------------------------------------------------------
     def list_active_doctors(self) -> list[dict[str, Any]]:
         """List active doctors for appointment booking."""
-        stmt = (
-            select(
-                _hospital_users.c.id,
-                _hospital_users.c.name,
-                _hospital_users.c.phone,
-                _hospital_users.c.email,
-                _hospital_users.c.specialization,
-                _hospital_users.c.qualification,
-                _hospital_users.c.medical_registration_number,
-                _hospital_users.c.years_of_experience,
-                _hospital_users.c.consultation_room,
-            )
-            .select_from(
-                _hospital_users.join(
-                    _staff_roles, _hospital_users.c.role_id == _staff_roles.c.id
-                )
-            )
-            .where(
-                _hospital_users.c.hospital_id == self.hospital_id,
-                _hospital_users.c.is_active.is_(True),
-                func.lower(_staff_roles.c.name).like("%doctor%"),
-            )
-            .order_by(_hospital_users.c.name.asc())
-        )
-        return [
-            {
-                "id": str(r["id"]),
-                "name": r["name"],
-                "phone": r["phone"],
-                "email": r["email"],
-                "specialization": r["specialization"],
-                "qualification": r["qualification"],
-                "medical_registration_number": r["medical_registration_number"],
-                "years_of_experience": r["years_of_experience"],
-                "consultation_room": r["consultation_room"],
-            }
-            for r in self.db.execute(stmt).mappings().all()
-        ]
+        from modules.doctors.entities.doctor import HospitalUser
+        from modules.doctors.services.doctor_eligibility import doctor_eligibility_clause
+        fields = ("id", "name", "phone", "email", "specialization", "qualification",
+                  "medical_registration_number", "years_of_experience", "consultation_room")
+        stmt = select(*(getattr(HospitalUser, f) for f in fields)).where(
+            doctor_eligibility_clause(self.hospital_id)
+        ).order_by(HospitalUser.name)
+        return [{**dict(r), "id": str(r["id"])} for r in self.db.execute(stmt).mappings().all()]
 
     def list_active_nurses(self) -> list[dict[str, Any]]:
         """List active nurses for assignment."""
